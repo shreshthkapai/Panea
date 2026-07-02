@@ -82,6 +82,13 @@ If a task does not fit, redesign it before implementation.
   and idle wakeups; added diagnostics-side performance overlay text and gate
   evaluation; and wired optional desktop performance reporting through the
   diagnostics config.
+- Implemented the Phase 9 native multiplexer model foundation: added
+  workspace/window/tab/pane/session IDs and state, a proportional split layout
+  tree, tab lifecycle operations, pane split/focus/resize/zoom/swap/close
+  operations, session restore snapshots for workspace names, tab names, layout,
+  profile identities and working directories, portable mux action names, default
+  mux keybindings, and an explicit compatibility policy that tmux/screen/zellij
+  remain ordinary terminal applications inside panes.
 
 ## Deferred By Design
 
@@ -129,3 +136,7 @@ If a task does not fit, redesign it before implementation.
   GPU timestamp queries and richer in-window overlay rendering remain deferred
   until the renderer has the later batched glyph path and stable overlay
   composition.
+- Phase 9 establishes the native mux state model and action contract. Full
+  split-pane desktop rendering, tab chrome, per-pane transport orchestration,
+  and cross-OS native mux runtime smoke tests remain follow-up work on top of
+  the model.

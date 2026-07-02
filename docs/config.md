@@ -51,6 +51,11 @@ Baseline configurable sections:
 - `platform`
 - `diagnostics`
 
+Mux settings include `enabled`, `restore_sessions`, `default_workspace`,
+`show_tab_bar`, `pane_resize_step`, and `remember_working_directory`. Session
+restore persists layout/profile identity only; it does not promise process
+resurrection.
+
 The public key is `font`. `fonts` is accepted as an alias for compatibility
 while the static schema stabilizes.
 

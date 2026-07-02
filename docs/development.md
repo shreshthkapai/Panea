@@ -41,3 +41,10 @@ No pull request is mergeable unless it answers:
 
 Each crate owns one layer. Lower layers must not import higher layers casually.
 If a lower layer needs a higher-layer concept, redesign the boundary.
+
+## Native Mux Rule
+
+Panea's native mux owns workspaces, tabs, panes, sessions, and layout state.
+External multiplexers such as tmux, screen, and zellij must continue to run as
+normal terminal applications inside a pane. Mux features may resize and focus
+Panea panes, but must not special-case or parse external mux internals.

@@ -8,3 +8,5 @@ description = "Tabs, panes, workspaces, sessions, and layout tree."
 [lints]
 workspace = true
 
+[dependencies]
+serde.workspace = true

@@ -129,6 +129,7 @@ impl AppConfig {
         self.validate_keybindings(&mut report);
         self.validate_shell_profiles(&mut report);
         self.validate_ssh_profiles(&mut report);
+        self.validate_mux(&mut report);
         self.validate_performance(&mut report);
         self.validate_platform_overrides(&mut report);
 
@@ -193,6 +194,9 @@ impl AppConfig {
                 path: "ssh_profiles".to_owned(),
                 reason: "SSH profile changes only affect new sessions".to_owned(),
             });
+        }
+        if self.mux != next.mux {
+            plan.live.push(ReloadableSection::Mux);
         }
         if self.platform_overrides != next.platform_overrides {
             plan.restart_required.push(RestartRequiredChange {
@@ -288,6 +292,18 @@ impl AppConfig {
                     "SSH port must be greater than zero",
                 );
             }
+        }
+    }
+
+    fn validate_mux(&self, report: &mut ValidationReport) {
+        if self.mux.default_workspace.trim().is_empty() {
+            report.error("mux.default_workspace", "default workspace cannot be empty");
+        }
+        if !(0.01..=0.5).contains(&self.mux.pane_resize_step) {
+            report.error(
+                "mux.pane_resize_step",
+                "pane resize step must be between 0.01 and 0.5",
+            );
         }
     }
 
@@ -622,6 +638,24 @@ impl Default for KeyboardConfig {
                 KeyBinding::new("Ctrl+Shift+M", "toggle_frameless"),
                 KeyBinding::new("Ctrl+Shift+W", "close_window"),
                 KeyBinding::new("Ctrl+Shift+P", "open_command_palette_later"),
+                KeyBinding::new("Ctrl+Shift+T", "new_tab"),
+                KeyBinding::new("Ctrl+Shift+Q", "close_tab"),
+                KeyBinding::new("Ctrl+PageDown", "next_tab"),
+                KeyBinding::new("Ctrl+PageUp", "previous_tab"),
+                KeyBinding::new("Ctrl+Shift+H", "split_horizontal"),
+                KeyBinding::new("Ctrl+Shift+E", "split_vertical"),
+                KeyBinding::new("Ctrl+Shift+X", "close_pane"),
+                KeyBinding::new("Alt+Left", "focus_left"),
+                KeyBinding::new("Alt+Right", "focus_right"),
+                KeyBinding::new("Alt+Up", "focus_up"),
+                KeyBinding::new("Alt+Down", "focus_down"),
+                KeyBinding::new("Alt+Shift+Left", "resize_pane_left"),
+                KeyBinding::new("Alt+Shift+Right", "resize_pane_right"),
+                KeyBinding::new("Alt+Shift+Up", "resize_pane_up"),
+                KeyBinding::new("Alt+Shift+Down", "resize_pane_down"),
+                KeyBinding::new("Ctrl+Shift+Z", "zoom_pane"),
+                KeyBinding::new("Ctrl+Shift+R", "rename_tab"),
+                KeyBinding::new("Ctrl+Shift+O", "move_pane"),
             ],
         }
     }
@@ -756,11 +790,15 @@ impl Default for SshProfile {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MuxConfig {
     pub enabled: bool,
     pub restore_sessions: bool,
+    pub default_workspace: String,
+    pub show_tab_bar: bool,
+    pub pane_resize_step: f64,
+    pub remember_working_directory: bool,
 }
 
 impl Default for MuxConfig {
@@ -768,6 +806,10 @@ impl Default for MuxConfig {
         Self {
             enabled: true,
             restore_sessions: false,
+            default_workspace: "default".to_owned(),
+            show_tab_bar: true,
+            pane_resize_step: 0.05,
+            remember_working_directory: true,
         }
     }
 }
@@ -1127,6 +1169,7 @@ pub enum ReloadableSection {
     Font,
     Input,
     Keybindings,
+    Mux,
     VisualSemantics,
     WindowPadding,
 }
@@ -1321,6 +1364,47 @@ pub fn export_schema() -> ConfigSchema {
                         "performance.glyph_cache_entries",
                         "integer",
                         default.performance.glyph_cache_entries,
+                        false,
+                        false,
+                    ),
+                ],
+            },
+            ConfigSchemaSection {
+                name: "mux",
+                fields: vec![
+                    field("mux.enabled", "boolean", default.mux.enabled, false, false),
+                    field(
+                        "mux.restore_sessions",
+                        "boolean",
+                        default.mux.restore_sessions,
+                        false,
+                        false,
+                    ),
+                    field(
+                        "mux.default_workspace",
+                        "string",
+                        &default.mux.default_workspace,
+                        false,
+                        false,
+                    ),
+                    field(
+                        "mux.show_tab_bar",
+                        "boolean",
+                        default.mux.show_tab_bar,
+                        false,
+                        false,
+                    ),
+                    field(
+                        "mux.pane_resize_step",
+                        "number",
+                        default.mux.pane_resize_step,
+                        false,
+                        false,
+                    ),
+                    field(
+                        "mux.remember_working_directory",
+                        "boolean",
+                        default.mux.remember_working_directory,
                         false,
                         false,
                     ),
