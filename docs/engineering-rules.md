@@ -39,7 +39,8 @@ The remaining high-level work is:
 - Stronger architecture/layer-boundary checks.
 - Long-running fuzz history and crash-regression intake from the fuzzing
   harness.
-- Fully batched GPU glyph rendering and cross-OS screenshot verification.
+- Cross-OS screenshot verification and accumulated runtime evidence for the
+  batched GPU glyph renderer.
 - Real Linux X11/Wayland compositor verification.
 - Full clipboard/selection/OSC clipboard policy.
 - Automated app compatibility tests: shells, editors, TUIs,

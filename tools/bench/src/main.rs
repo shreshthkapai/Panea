@@ -49,6 +49,36 @@ fn run() -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         "render-grid" => render_grid(),
+        "render-full-ascii" => batch_scene_bench(
+            "render-full-ascii",
+            generated_scene(
+                DEFAULT_COLS,
+                DEFAULT_ROWS,
+                OptionalFeatureCostMode::Disabled,
+            ),
+            10,
+        ),
+        "render-mixed-unicode" => batch_scene_bench(
+            "render-mixed-unicode",
+            unicode_scene(DEFAULT_COLS, DEFAULT_ROWS, false),
+            10,
+        ),
+        "render-emoji-heavy" => batch_scene_bench(
+            "render-emoji-heavy",
+            unicode_scene(DEFAULT_COLS, DEFAULT_ROWS, true),
+            10,
+        ),
+        "render-fast-scrolling" => {
+            parse_and_render("render-fast-scrolling", large_log_fixture(8_000), 4)
+        }
+        "render-large-scrollback-viewport" => batch_scene_bench(
+            "render-large-scrollback-viewport",
+            generated_scene(180, 64, OptionalFeatureCostMode::Disabled),
+            5,
+        ),
+        "render-many-panes" => render_many_panes(),
+        "render-cursor-animation" => cursor_animation_cost(),
+        "render-command-blocks" => render_command_blocks(),
         "cat-large-file" => parse_fixture("cat-large-file", large_log_fixture(20_000), 1),
         "color-heavy" => parse_and_render("color-heavy", color_heavy_fixture(4_000), 2),
         "scrollback" => parse_fixture("scrollback", large_log_fixture(50_000), 1),
@@ -59,25 +89,39 @@ fn run() -> Result<(), Box<dyn Error>> {
             parse_fixture("alternate-screen", alternate_screen_fixture(2_000), 20)
         }
         "cursor-animation" => cursor_animation_cost(),
-        "command-blocks" => {
-            println!(
-                "command-blocks benchmark is deferred until semantic command blocks exist; no hot-path work is measured today"
-            );
-            Ok(())
-        }
+        "command-blocks" => render_command_blocks(),
         other => Err(format!("unknown benchmark '{other}'").into()),
     }
 }
 
 fn print_help() {
     println!(
-        "usage: cargo xtask bench <all|profiles|render-grid|cat-large-file|color-heavy|scrollback|resize|input-latency|unicode|alternate-screen|cursor-animation|command-blocks>"
+        "usage: cargo xtask bench <all|profiles|render-grid|render-full-ascii|render-mixed-unicode|render-emoji-heavy|render-fast-scrolling|render-large-scrollback-viewport|render-many-panes|render-cursor-animation|render-command-blocks|cat-large-file|color-heavy|scrollback|resize|input-latency|unicode|alternate-screen|cursor-animation|command-blocks>"
     );
 }
 
 fn run_all() -> Result<(), Box<dyn Error>> {
     print_profiles();
     render_grid()?;
+    batch_scene_bench(
+        "render-full-ascii",
+        generated_scene(
+            DEFAULT_COLS,
+            DEFAULT_ROWS,
+            OptionalFeatureCostMode::Disabled,
+        ),
+        10,
+    )?;
+    batch_scene_bench(
+        "render-mixed-unicode",
+        unicode_scene(DEFAULT_COLS, DEFAULT_ROWS, false),
+        10,
+    )?;
+    batch_scene_bench(
+        "render-emoji-heavy",
+        unicode_scene(DEFAULT_COLS, DEFAULT_ROWS, true),
+        10,
+    )?;
     parse_fixture("cat-large-file", large_log_fixture(20_000), 1)?;
     parse_and_render("color-heavy", color_heavy_fixture(4_000), 2)?;
     parse_fixture("scrollback", large_log_fixture(50_000), 1)?;
@@ -86,6 +130,8 @@ fn run_all() -> Result<(), Box<dyn Error>> {
     parse_and_render("unicode", unicode_fixture(4_000), 2)?;
     parse_fixture("alternate-screen", alternate_screen_fixture(2_000), 20)?;
     cursor_animation_cost()?;
+    render_many_panes()?;
+    render_command_blocks()?;
     Ok(())
 }
 
@@ -128,6 +174,32 @@ fn render_grid() -> Result<(), Box<dyn Error>> {
 
     print_result(BenchmarkResult {
         name: "render-grid",
+        iterations,
+        bytes: scene.grid.cells.len(),
+        elapsed: started.elapsed(),
+        instrumentation: last,
+    });
+    Ok(())
+}
+
+fn batch_scene_bench(
+    name: &'static str,
+    scene: RenderScene,
+    iterations: u64,
+) -> Result<(), Box<dyn Error>> {
+    let mut fonts = FontSystem::new(FontConfig::default());
+    let mut rasterizer = TerminalRasterizer::default();
+    let started = Instant::now();
+    let mut last = RenderInstrumentation::default();
+
+    for _ in 0..iterations {
+        last = rasterizer
+            .prepare_batches(&scene, &mut fonts)?
+            .instrumentation;
+    }
+
+    print_result(BenchmarkResult {
+        name,
         iterations,
         bytes: scene.grid.cells.len(),
         elapsed: started.elapsed(),
@@ -250,9 +322,14 @@ fn cursor_animation_cost() -> Result<(), Box<dyn Error>> {
         OptionalFeatureCostMode::EnabledDefault,
         OptionalFeatureCostMode::EnabledHeavy,
     ] {
-        let scene = generated_scene(DEFAULT_COLS, DEFAULT_ROWS, mode);
+        let mut scene = generated_scene(DEFAULT_COLS, DEFAULT_ROWS, mode);
+        scene.damage_regions = scene
+            .animations
+            .iter()
+            .map(|animation| animation.affected_region)
+            .collect();
         let instrumentation = rasterizer
-            .rasterize_instrumented(&scene, &mut fonts)?
+            .prepare_batches(&scene, &mut fonts)?
             .instrumentation;
         let report = evaluate_performance_gate(instrumentation, PerformanceBudget::default());
         println!(
@@ -265,6 +342,75 @@ fn cursor_animation_cost() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+fn render_many_panes() -> Result<(), Box<dyn Error>> {
+    let mut fonts = FontSystem::new(FontConfig::default());
+    let mut rasterizer = TerminalRasterizer::default();
+    let scenes = (0..8)
+        .map(|index| {
+            generated_scene(
+                80 + (index % 3) * 10,
+                24 + (index % 2) * 8,
+                OptionalFeatureCostMode::Disabled,
+            )
+        })
+        .collect::<Vec<_>>();
+    let started = Instant::now();
+    let iterations = 4_u64;
+    let mut last = RenderInstrumentation::default();
+
+    for _ in 0..iterations {
+        for scene in &scenes {
+            last = rasterizer
+                .prepare_batches(scene, &mut fonts)?
+                .instrumentation;
+        }
+    }
+
+    print_result(BenchmarkResult {
+        name: "render-many-panes",
+        iterations,
+        bytes: scenes.iter().map(|scene| scene.grid.cells.len()).sum(),
+        elapsed: started.elapsed(),
+        instrumentation: last,
+    });
+    Ok(())
+}
+
+fn render_command_blocks() -> Result<(), Box<dyn Error>> {
+    let mut scene = generated_scene(
+        DEFAULT_COLS,
+        DEFAULT_ROWS,
+        OptionalFeatureCostMode::Disabled,
+    );
+    scene.semantic_overlays = (0..18)
+        .map(|index| OverlayPrimitive {
+            kind: OverlayKind::CommandBlock,
+            bounds: RenderRect {
+                x: 8,
+                y: 8 + index * 22,
+                width: 680,
+                height: 18,
+            },
+            color: RenderColor {
+                red: 48,
+                green: 90,
+                blue: 120,
+                alpha: 48,
+            },
+            border_color: Some(RenderColor {
+                red: 90,
+                green: 140,
+                blue: 160,
+                alpha: 80,
+            }),
+            corner_radius_px: 2,
+            z_index: 10,
+            label: None,
+        })
+        .collect();
+    batch_scene_bench("render-command-blocks", scene, 10)
 }
 
 fn generated_scene(cols: u16, rows: u16, feature_mode: OptionalFeatureCostMode) -> RenderScene {
@@ -349,14 +495,27 @@ fn generated_scene(cols: u16, rows: u16, feature_mode: OptionalFeatureCostMode) 
             Vec::new()
         },
         animations,
-        damage_regions: vec![RenderRect {
-            x: 0,
-            y: 0,
-            width: 80,
-            height: 24,
-        }],
         ..RenderScene::default()
     }
+}
+
+fn unicode_scene(cols: u16, rows: u16, emoji_heavy: bool) -> RenderScene {
+    let samples = if emoji_heavy {
+        [
+            "P",
+            "\u{1f680}",
+            "\u{1f469}\u{200d}\u{1f4bb}",
+            "\u{2728}",
+            " ",
+        ]
+    } else {
+        ["P", "a", "\u{7aef}", "e\u{301}", "\u{2713}"]
+    };
+    let mut scene = generated_scene(cols, rows, OptionalFeatureCostMode::Disabled);
+    for (index, cell) in scene.grid.cells.iter_mut().enumerate() {
+        cell.text = samples[index % samples.len()].to_owned();
+    }
+    scene
 }
 
 fn animation(id: u64, x: i32, y: i32) -> AnimationHandle {
@@ -589,7 +748,7 @@ fn print_result(result: BenchmarkResult) {
     };
     let budget = PerformanceBudget::default();
     let gate = evaluate_performance_gate(result.instrumentation, budget);
-    let mut overlay = PerformanceOverlay::new(true, "cpu-raster-wgpu-present");
+    let mut overlay = PerformanceOverlay::new(true, "batched-renderer");
     overlay.record(result.instrumentation);
     let overlay_text = overlay
         .render_text(budget)

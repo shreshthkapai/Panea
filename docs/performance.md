@@ -5,11 +5,20 @@ costs and near-zero cost when disabled.
 
 ## Local Benchmarks
 
-Run the repeatable harness through xtask:
+Run the repeatable harness through xtask. The wrapper uses the release profile
+so benchmark results are not dominated by debug-mode overhead:
 
 ```powershell
 cargo xtask bench all
 cargo xtask bench render-grid
+cargo xtask bench render-full-ascii
+cargo xtask bench render-mixed-unicode
+cargo xtask bench render-emoji-heavy
+cargo xtask bench render-fast-scrolling
+cargo xtask bench render-large-scrollback-viewport
+cargo xtask bench render-many-panes
+cargo xtask bench render-cursor-animation
+cargo xtask bench render-command-blocks
 cargo xtask bench cat-large-file
 cargo xtask bench color-heavy
 cargo xtask bench scrollback
@@ -24,6 +33,9 @@ The harness reports elapsed time, byte throughput where applicable, frame
 timing, CPU render preparation time, glyph cache hits/misses, atlas uploads,
 damage region count, draw-call count, animated region count, idle wakeups, and
 performance-gate warnings.
+
+Renderer batching details and the Phase 4 design note live in
+[renderer-batching.md](renderer-batching.md).
 
 ## Profiles
 

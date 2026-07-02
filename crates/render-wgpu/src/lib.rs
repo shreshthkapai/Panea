@@ -15,6 +15,7 @@ use render_core::{
     CellPosition, CursorVisual, DamageRegion, FrameRequestReason, RenderCell, RenderCellStyle,
     RenderColor, RenderCursorShape, RenderGrid, RenderInstrumentation, RenderRect, RenderScene,
 };
+use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +153,11 @@ impl GlyphAtlas {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    #[must_use]
+    pub const fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
     }
 
     fn clear(&mut self) {
@@ -331,6 +337,638 @@ impl FrameScheduler {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuadBatchKind {
+    Background,
+    Decoration,
+    Selection,
+    Cursor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BatchVertex {
+    pub position_px: [f32; 2],
+    pub uv: [f32; 2],
+    pub color: [f32; 4],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuadBatch {
+    pub kind: QuadBatchKind,
+    pub vertices: Vec<BatchVertex>,
+    pub indices: Vec<u32>,
+}
+
+impl QuadBatch {
+    #[must_use]
+    pub fn new(kind: QuadBatchKind) -> Self {
+        Self {
+            kind,
+            vertices: Vec::new(),
+            indices: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+
+    #[must_use]
+    pub fn quad_count(&self) -> usize {
+        self.indices.len() / 6
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlyphBatch {
+    pub vertices: Vec<BatchVertex>,
+    pub indices: Vec<u32>,
+    pub glyph_count: usize,
+}
+
+impl GlyphBatch {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AtlasUpload {
+    pub key: GlyphCacheKey,
+    pub entry: AtlasEntry,
+    pub pixels: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedRenderBatches {
+    pub frame_width: u32,
+    pub frame_height: u32,
+    pub damage_regions: Vec<DamageRegion>,
+    pub background: QuadBatch,
+    pub glyphs: GlyphBatch,
+    pub decorations: QuadBatch,
+    pub selections: QuadBatch,
+    pub cursor: QuadBatch,
+    pub atlas_uploads: Vec<AtlasUpload>,
+    pub instrumentation: RenderInstrumentation,
+}
+
+impl PreparedRenderBatches {
+    #[must_use]
+    pub fn draw_call_count(&self) -> u32 {
+        [
+            !self.background.is_empty(),
+            !self.glyphs.is_empty(),
+            !self.decorations.is_empty(),
+            !self.selections.is_empty(),
+            !self.cursor.is_empty(),
+        ]
+        .into_iter()
+        .filter(|non_empty| *non_empty)
+        .count() as u32
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GlyphRunKey {
+    font_id: u64,
+    text: String,
+    size_millipoints: u32,
+    bold: bool,
+    italic: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GlyphRunItem {
+    key: Option<GlyphCacheKey>,
+}
+
+#[derive(Debug)]
+pub struct RenderBatchPlanner {
+    glyph_cache: GlyphCache,
+    atlas: GlyphAtlas,
+    glyph_runs: HashMap<GlyphRunKey, Vec<GlyphRunItem>>,
+    max_glyph_runs: usize,
+}
+
+struct GlyphBatchContext<'a> {
+    atlas_uploads: &'a mut Vec<AtlasUpload>,
+    instrumentation: &'a mut RenderInstrumentation,
+    fonts: &'a mut FontSystem,
+    font_id: u64,
+    metrics: CellMetrics,
+    rect: RenderRect,
+}
+
+impl Default for RenderBatchPlanner {
+    fn default() -> Self {
+        Self::new(4096, 2048, 2048)
+    }
+}
+
+impl RenderBatchPlanner {
+    #[must_use]
+    pub fn new(glyph_capacity: usize, atlas_width: u32, atlas_height: u32) -> Self {
+        Self {
+            glyph_cache: GlyphCache::new(glyph_capacity),
+            atlas: GlyphAtlas::new(atlas_width, atlas_height),
+            glyph_runs: HashMap::new(),
+            max_glyph_runs: glyph_capacity.max(1),
+        }
+    }
+
+    pub fn prepare(
+        &mut self,
+        scene: &RenderScene,
+        fonts: &mut FontSystem,
+    ) -> Result<PreparedRenderBatches, RendererError> {
+        let started = Instant::now();
+        let metrics = fonts.cell_metrics()?;
+        let frame_width = (f32::from(scene.grid.columns) * metrics.cell_width)
+            .ceil()
+            .max(1.0) as u32;
+        let frame_height = (f32::from(scene.grid.rows) * metrics.cell_height)
+            .ceil()
+            .max(1.0) as u32;
+        let damage_regions = effective_damage_regions(scene, metrics);
+        let font_id = fonts.primary_font()?.id();
+
+        let mut background = QuadBatch::new(QuadBatchKind::Background);
+        let mut glyphs = GlyphBatch {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            glyph_count: 0,
+        };
+        let mut decorations = QuadBatch::new(QuadBatchKind::Decoration);
+        let mut selections = QuadBatch::new(QuadBatchKind::Selection);
+        let mut cursor = QuadBatch::new(QuadBatchKind::Cursor);
+        let mut atlas_uploads = Vec::new();
+        let mut instrumentation = RenderInstrumentation {
+            damage_region_count: damage_regions.len(),
+            animated_region_count: scene.animations.len(),
+            ..RenderInstrumentation::default()
+        };
+
+        for cell in &scene.grid.cells {
+            let rect = cell_region(cell.position, metrics);
+            if !intersects_any(rect, &damage_regions) {
+                continue;
+            }
+
+            push_solid_quad(&mut background, rect, cell.background);
+            let mut glyph_context = GlyphBatchContext {
+                atlas_uploads: &mut atlas_uploads,
+                instrumentation: &mut instrumentation,
+                fonts,
+                font_id,
+                metrics,
+                rect,
+            };
+            self.push_glyphs(&mut glyphs, cell, &mut glyph_context)?;
+            push_text_decorations(&mut decorations, cell, metrics, rect);
+        }
+
+        let mut overlays = scene
+            .search_highlights
+            .iter()
+            .chain(scene.semantic_overlays.iter())
+            .collect::<Vec<_>>();
+        overlays.sort_by_key(|overlay| overlay.z_index);
+
+        for overlay in overlays {
+            if intersects_any(overlay.bounds, &damage_regions) {
+                push_solid_quad(&mut decorations, overlay.bounds, overlay.color);
+                if let Some(border_color) = overlay.border_color {
+                    push_stroke_quads(&mut decorations, overlay.bounds, border_color);
+                }
+            }
+        }
+
+        for decoration in &scene.decorations {
+            if intersects_any(decoration.bounds, &damage_regions) {
+                push_solid_quad(&mut decorations, decoration.bounds, decoration.color);
+                if let Some(border_color) = decoration.border_color {
+                    push_stroke_quads(&mut decorations, decoration.bounds, border_color);
+                }
+            }
+        }
+
+        for selection in &scene.selections {
+            for position in &selection.cells {
+                let rect = cell_region(*position, metrics);
+                if intersects_any(rect, &damage_regions) {
+                    push_solid_quad(&mut selections, rect, selection.color);
+                }
+            }
+        }
+
+        if let Some(cursor_visual) = scene.cursor
+            && cursor_visual.visible
+        {
+            push_cursor_quads(&mut cursor, cursor_visual, metrics, &damage_regions);
+        }
+
+        instrumentation.draw_call_count = count_non_empty_batches([
+            !background.is_empty(),
+            !glyphs.is_empty(),
+            !decorations.is_empty(),
+            !selections.is_empty(),
+            !cursor.is_empty(),
+        ]);
+        instrumentation.cpu_prepare_time = started.elapsed();
+        instrumentation.frame_time = instrumentation.cpu_prepare_time;
+
+        Ok(PreparedRenderBatches {
+            frame_width,
+            frame_height,
+            damage_regions,
+            background,
+            glyphs,
+            decorations,
+            selections,
+            cursor,
+            atlas_uploads,
+            instrumentation,
+        })
+    }
+
+    pub fn prepare_full(
+        &mut self,
+        scene: &RenderScene,
+        fonts: &mut FontSystem,
+    ) -> Result<PreparedRenderBatches, RendererError> {
+        let metrics = fonts.cell_metrics()?;
+        let mut scene = scene.clone();
+        scene.damage_regions = vec![grid_region(&scene.grid, metrics)];
+        self.prepare(&scene, fonts)
+    }
+
+    #[must_use]
+    pub fn atlas_len(&self) -> usize {
+        self.atlas.len()
+    }
+
+    #[must_use]
+    pub fn glyph_cache_len(&self) -> usize {
+        self.glyph_cache.len()
+    }
+
+    #[must_use]
+    pub fn atlas_dimensions(&self) -> (u32, u32) {
+        self.atlas.dimensions()
+    }
+
+    fn push_glyphs(
+        &mut self,
+        glyphs: &mut GlyphBatch,
+        cell: &RenderCell,
+        context: &mut GlyphBatchContext<'_>,
+    ) -> Result<(), RendererError> {
+        if cell.text.trim().is_empty() {
+            return Ok(());
+        }
+
+        let run_key = GlyphRunKey {
+            font_id: context.font_id,
+            text: cell.text.clone(),
+            size_millipoints: (context.metrics.font_size * 1000.0).round().max(1.0) as u32,
+            bold: cell.style.bold,
+            italic: cell.style.italic,
+        };
+        let run = if let Some(run) = self.glyph_runs.get(&run_key) {
+            run.clone()
+        } else {
+            while self.glyph_runs.len() >= self.max_glyph_runs {
+                let Some(oldest) = self.glyph_runs.keys().next().cloned() else {
+                    break;
+                };
+                self.glyph_runs.remove(&oldest);
+            }
+            let run = cell
+                .text
+                .chars()
+                .filter(|ch| !ch.is_control())
+                .map(|ch| GlyphRunItem {
+                    key: if ch == ' ' {
+                        None
+                    } else {
+                        Some(GlyphCacheKey::new(
+                            context.font_id,
+                            ch,
+                            context.metrics.font_size,
+                            cell.style.bold,
+                            cell.style.italic,
+                        ))
+                    },
+                })
+                .collect::<Vec<_>>();
+            self.glyph_runs.insert(run_key, run.clone());
+            run
+        };
+
+        let mut pen_x = context.rect.x;
+        for item in run {
+            let Some(key) = item.key else {
+                pen_x += context.metrics.cell_width.ceil() as i32;
+                continue;
+            };
+            let cache_hit = self.glyph_cache.contains_key(key);
+            let bitmap = self.glyph_cache.get_or_insert_with(key, || {
+                context.fonts.rasterize_glyph(key).unwrap_or_else(|_| {
+                    GlyphBitmap::missing(
+                        context.metrics.cell_width,
+                        context.metrics.cell_height as u32,
+                    )
+                })
+            });
+            if cache_hit {
+                context.instrumentation.glyphs.cache_hits =
+                    context.instrumentation.glyphs.cache_hits.saturating_add(1);
+            } else {
+                context.instrumentation.glyphs.cache_misses = context
+                    .instrumentation
+                    .glyphs
+                    .cache_misses
+                    .saturating_add(1);
+            }
+
+            let atlas_hit = self.atlas.entry(key).is_some();
+            if let Some(entry) = self.atlas.allocate(key, bitmap.as_ref()) {
+                if !atlas_hit {
+                    context.instrumentation.glyphs.atlas_uploads = context
+                        .instrumentation
+                        .glyphs
+                        .atlas_uploads
+                        .saturating_add(1);
+                    context.atlas_uploads.push(AtlasUpload {
+                        key,
+                        entry,
+                        pixels: bitmap.pixels.clone(),
+                    });
+                }
+                push_glyph_quad(
+                    glyphs,
+                    RenderRect {
+                        x: pen_x + bitmap.offset_x,
+                        y: context.rect.y + bitmap.offset_y,
+                        width: bitmap.width,
+                        height: bitmap.height,
+                    },
+                    entry,
+                    self.atlas.dimensions(),
+                    cell.foreground,
+                );
+            }
+            pen_x += bitmap.advance_width.ceil() as i32;
+        }
+
+        Ok(())
+    }
+}
+
+fn count_non_empty_batches<const N: usize>(batches: [bool; N]) -> u32 {
+    batches.into_iter().filter(|non_empty| *non_empty).count() as u32
+}
+
+fn effective_damage_regions(scene: &RenderScene, metrics: CellMetrics) -> Vec<DamageRegion> {
+    if scene.damage_regions.is_empty() {
+        vec![grid_region(&scene.grid, metrics)]
+    } else {
+        merge_regions(scene.damage_regions.clone())
+    }
+}
+
+fn intersects_any(rect: RenderRect, regions: &[DamageRegion]) -> bool {
+    regions.iter().any(|region| rects_intersect(rect, *region))
+}
+
+fn rects_intersect(a: RenderRect, b: RenderRect) -> bool {
+    let ax0 = i64::from(a.x);
+    let ay0 = i64::from(a.y);
+    let ax1 = ax0 + i64::from(a.width);
+    let ay1 = ay0 + i64::from(a.height);
+    let bx0 = i64::from(b.x);
+    let by0 = i64::from(b.y);
+    let bx1 = bx0 + i64::from(b.width);
+    let by1 = by0 + i64::from(b.height);
+
+    ax0 < bx1 && ax1 > bx0 && ay0 < by1 && ay1 > by0
+}
+
+fn push_solid_quad(batch: &mut QuadBatch, rect: RenderRect, color: RenderColor) {
+    push_quad(
+        &mut batch.vertices,
+        &mut batch.indices,
+        rect,
+        [[0.0, 0.0]; 4],
+        color,
+    );
+}
+
+fn push_glyph_quad(
+    batch: &mut GlyphBatch,
+    rect: RenderRect,
+    atlas_entry: AtlasEntry,
+    atlas_dimensions: (u32, u32),
+    color: RenderColor,
+) {
+    let (atlas_width, atlas_height) = atlas_dimensions;
+    let atlas_width = atlas_width.max(1) as f32;
+    let atlas_height = atlas_height.max(1) as f32;
+    let x0 = atlas_entry.x as f32 / atlas_width;
+    let y0 = atlas_entry.y as f32 / atlas_height;
+    let x1 = atlas_entry.x.saturating_add(atlas_entry.width) as f32 / atlas_width;
+    let y1 = atlas_entry.y.saturating_add(atlas_entry.height) as f32 / atlas_height;
+
+    push_quad(
+        &mut batch.vertices,
+        &mut batch.indices,
+        rect,
+        [[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
+        color,
+    );
+    batch.glyph_count = batch.glyph_count.saturating_add(1);
+}
+
+fn push_quad(
+    vertices: &mut Vec<BatchVertex>,
+    indices: &mut Vec<u32>,
+    rect: RenderRect,
+    uv: [[f32; 2]; 4],
+    color: RenderColor,
+) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+
+    let Ok(base) = u32::try_from(vertices.len()) else {
+        return;
+    };
+    let x0 = rect.x as f32;
+    let y0 = rect.y as f32;
+    let x1 = rect.x as f32 + rect.width as f32;
+    let y1 = rect.y as f32 + rect.height as f32;
+    let color = color_to_f32(color);
+    vertices.extend([
+        BatchVertex {
+            position_px: [x0, y0],
+            uv: uv[0],
+            color,
+        },
+        BatchVertex {
+            position_px: [x1, y0],
+            uv: uv[1],
+            color,
+        },
+        BatchVertex {
+            position_px: [x1, y1],
+            uv: uv[2],
+            color,
+        },
+        BatchVertex {
+            position_px: [x0, y1],
+            uv: uv[3],
+            color,
+        },
+    ]);
+    indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+fn color_to_f32(color: RenderColor) -> [f32; 4] {
+    [
+        f32::from(color.red) / 255.0,
+        f32::from(color.green) / 255.0,
+        f32::from(color.blue) / 255.0,
+        f32::from(color.alpha) / 255.0,
+    ]
+}
+
+fn push_stroke_quads(batch: &mut QuadBatch, rect: RenderRect, color: RenderColor) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+
+    push_solid_quad(batch, RenderRect { height: 1, ..rect }, color);
+    push_solid_quad(
+        batch,
+        RenderRect {
+            y: rect.y + rect.height.saturating_sub(1) as i32,
+            height: 1,
+            ..rect
+        },
+        color,
+    );
+    push_solid_quad(batch, RenderRect { width: 1, ..rect }, color);
+    push_solid_quad(
+        batch,
+        RenderRect {
+            x: rect.x + rect.width.saturating_sub(1) as i32,
+            width: 1,
+            ..rect
+        },
+        color,
+    );
+}
+
+fn push_text_decorations(
+    decorations: &mut QuadBatch,
+    cell: &RenderCell,
+    _metrics: CellMetrics,
+    rect: RenderRect,
+) {
+    if cell.style.underline {
+        push_solid_quad(
+            decorations,
+            RenderRect {
+                y: rect.y + rect.height as i32 - 2,
+                height: 1,
+                ..rect
+            },
+            cell.foreground,
+        );
+    }
+
+    if cell.style.strikethrough {
+        push_solid_quad(
+            decorations,
+            RenderRect {
+                y: rect.y + (rect.height / 2) as i32,
+                height: 1,
+                ..rect
+            },
+            cell.foreground,
+        );
+    }
+}
+
+fn push_cursor_quads(
+    batch: &mut QuadBatch,
+    cursor: CursorVisual,
+    metrics: CellMetrics,
+    damage_regions: &[DamageRegion],
+) {
+    let mut rect = cell_region(cursor.position, metrics);
+    if !intersects_any(rect, damage_regions) {
+        return;
+    }
+
+    let thickness = u32::from(cursor.thickness_percent.clamp(1, 100));
+    match cursor.shape {
+        RenderCursorShape::Block
+        | RenderCursorShape::Custom
+        | RenderCursorShape::CustomStaticShape => {}
+        RenderCursorShape::HollowBlock => {
+            let line = ((rect.width.min(rect.height) * thickness) / 100).max(1);
+            push_solid_quad(
+                batch,
+                RenderRect {
+                    height: line,
+                    ..rect
+                },
+                cursor.color,
+            );
+            push_solid_quad(
+                batch,
+                RenderRect {
+                    y: rect.y + rect.height.saturating_sub(line) as i32,
+                    height: line,
+                    ..rect
+                },
+                cursor.color,
+            );
+            push_solid_quad(
+                batch,
+                RenderRect {
+                    width: line,
+                    ..rect
+                },
+                cursor.color,
+            );
+            push_solid_quad(
+                batch,
+                RenderRect {
+                    x: rect.x + rect.width.saturating_sub(line) as i32,
+                    width: line,
+                    ..rect
+                },
+                cursor.color,
+            );
+            return;
+        }
+        RenderCursorShape::Beam => {
+            rect.width = ((rect.width * thickness) / 100).max(1);
+        }
+        RenderCursorShape::Underline => {
+            let cell_height = rect.height;
+            rect.height = ((rect.height * thickness) / 100).max(1);
+            rect.y += cell_height.saturating_sub(rect.height) as i32;
+        }
+    }
+    push_solid_quad(batch, rect, cursor.color);
+}
+
 #[derive(Debug)]
 pub struct CpuFrame {
     pub width: u32,
@@ -356,28 +994,30 @@ pub struct InstrumentedCpuFrame {
     pub instrumentation: RenderInstrumentation,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct TerminalRasterizer {
-    glyph_cache: GlyphCache,
-    atlas: GlyphAtlas,
-}
-
-impl Default for TerminalRasterizer {
-    fn default() -> Self {
-        Self {
-            glyph_cache: GlyphCache::new(4096),
-            atlas: GlyphAtlas::new(2048, 2048),
-        }
-    }
+    batch_planner: RenderBatchPlanner,
 }
 
 impl TerminalRasterizer {
     #[must_use]
     pub fn new(glyph_capacity: usize, atlas_width: u32, atlas_height: u32) -> Self {
         Self {
-            glyph_cache: GlyphCache::new(glyph_capacity),
-            atlas: GlyphAtlas::new(atlas_width, atlas_height),
+            batch_planner: RenderBatchPlanner::new(glyph_capacity, atlas_width, atlas_height),
         }
+    }
+
+    pub fn prepare_batches(
+        &mut self,
+        scene: &RenderScene,
+        fonts: &mut FontSystem,
+    ) -> Result<PreparedRenderBatches, RendererError> {
+        self.batch_planner.prepare(scene, fonts)
+    }
+
+    #[must_use]
+    pub fn atlas_dimensions(&self) -> (u32, u32) {
+        self.batch_planner.atlas_dimensions()
     }
 
     pub fn rasterize(
@@ -395,6 +1035,7 @@ impl TerminalRasterizer {
         fonts: &mut FontSystem,
     ) -> Result<InstrumentedCpuFrame, RendererError> {
         let started = Instant::now();
+        let batches = self.batch_planner.prepare_full(scene, fonts)?;
         let metrics = fonts.cell_metrics()?;
         let width = (f32::from(scene.grid.columns) * metrics.cell_width)
             .ceil()
@@ -418,11 +1059,7 @@ impl TerminalRasterizer {
             },
             RenderColor::rgb(12, 12, 12),
         );
-        let mut instrumentation = RenderInstrumentation {
-            damage_region_count: scene.damage_regions.len(),
-            animated_region_count: scene.animations.len(),
-            ..RenderInstrumentation::default()
-        };
+        let mut instrumentation = batches.instrumentation;
 
         for cell in &scene.grid.cells {
             self.draw_cell(&mut frame, cell, fonts, metrics, &mut instrumentation)?;
@@ -453,9 +1090,6 @@ impl TerminalRasterizer {
 
         if let Some(cursor) = scene.cursor {
             draw_cursor(&mut frame, cursor, metrics);
-            if cursor.visible {
-                instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
-            }
         }
 
         instrumentation.cpu_prepare_time = started.elapsed();
@@ -473,11 +1107,10 @@ impl TerminalRasterizer {
         cell: &RenderCell,
         fonts: &mut FontSystem,
         metrics: CellMetrics,
-        instrumentation: &mut RenderInstrumentation,
+        _instrumentation: &mut RenderInstrumentation,
     ) -> Result<(), RendererError> {
         let rect = cell_region(cell.position, metrics);
         fill_rect(frame, rect, cell.background);
-        instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
 
         let font_id = fonts.primary_font()?.id();
         let mut pen_x = rect.x;
@@ -495,24 +1128,11 @@ impl TerminalRasterizer {
                 cell.style.bold,
                 cell.style.italic,
             );
-            let cache_hit = self.glyph_cache.contains_key(key);
-            let bitmap = self.glyph_cache.get_or_insert_with(key, || {
+            let bitmap = self.batch_planner.glyph_cache.get_or_insert_with(key, || {
                 fonts.rasterize_glyph(key).unwrap_or_else(|_| {
                     GlyphBitmap::missing(metrics.cell_width, metrics.cell_height as u32)
                 })
             });
-            if cache_hit {
-                instrumentation.glyphs.cache_hits =
-                    instrumentation.glyphs.cache_hits.saturating_add(1);
-            } else {
-                instrumentation.glyphs.cache_misses =
-                    instrumentation.glyphs.cache_misses.saturating_add(1);
-            }
-            let atlas_hit = self.atlas.entry(key).is_some();
-            if self.atlas.allocate(key, bitmap.as_ref()).is_some() && !atlas_hit {
-                instrumentation.glyphs.atlas_uploads =
-                    instrumentation.glyphs.atlas_uploads.saturating_add(1);
-            }
             draw_glyph(
                 frame,
                 pen_x + bitmap.offset_x,
@@ -520,7 +1140,6 @@ impl TerminalRasterizer {
                 bitmap.as_ref(),
                 cell.foreground,
             );
-            instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
             pen_x += bitmap.advance_width.ceil() as i32;
         }
 
@@ -535,7 +1154,6 @@ impl TerminalRasterizer {
                 },
                 cell.foreground,
             );
-            instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
         }
 
         if cell.style.strikethrough {
@@ -549,11 +1167,38 @@ impl TerminalRasterizer {
                 },
                 cell.foreground,
             );
-            instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
         }
 
         Ok(())
     }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuVertex {
+    position: [f32; 2],
+    uv: [f32; 2],
+    color: [f32; 4],
+}
+
+impl GpuVertex {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 3] =
+        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4];
+
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBUTES,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GpuBatchBuffers {
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    index_count: u32,
 }
 
 fn fill_rect(frame: &mut CpuFrame, rect: RenderRect, color: RenderColor) {
@@ -713,12 +1358,13 @@ pub struct GpuTerminalRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
-    texture: Option<wgpu::Texture>,
-    texture_view: Option<wgpu::TextureView>,
-    bind_group: Option<wgpu::BindGroup>,
+    quad_pipeline: wgpu::RenderPipeline,
+    glyph_pipeline: wgpu::RenderPipeline,
+    glyph_bind_group_layout: wgpu::BindGroupLayout,
+    glyph_sampler: wgpu::Sampler,
+    glyph_atlas_texture: Option<wgpu::Texture>,
+    glyph_atlas_size: Option<(u32, u32)>,
+    glyph_bind_group: Option<wgpu::BindGroup>,
     rasterizer: TerminalRasterizer,
     last_instrumentation: RenderInstrumentation,
 }
@@ -783,64 +1429,63 @@ impl GpuTerminalRenderer {
         };
         surface.configure(&device, &config);
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("panea-present-shader"),
-            source: wgpu::ShaderSource::Wgsl(PRESENT_SHADER.into()),
+        let batch_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("panea-batch-shader"),
+            source: wgpu::ShaderSource::Wgsl(BATCH_SHADER.into()),
         });
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("panea-present-bind-group-layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("panea-present-pipeline-layout"),
-            bind_group_layouts: &[&bind_group_layout],
+        let quad_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("panea-quad-pipeline-layout"),
+            bind_group_layouts: &[],
             push_constant_ranges: &[],
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("panea-present-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_main",
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-        });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("panea-present-sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
+        let quad_pipeline = create_batch_pipeline(
+            &device,
+            &quad_pipeline_layout,
+            &batch_shader,
+            format,
+            "panea-quad-pipeline",
+            "fs_color",
+        );
+        let glyph_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("panea-glyph-bind-group-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let glyph_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("panea-glyph-pipeline-layout"),
+                bind_group_layouts: &[&glyph_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let glyph_pipeline = create_batch_pipeline(
+            &device,
+            &glyph_pipeline_layout,
+            &batch_shader,
+            format,
+            "panea-glyph-pipeline",
+            "fs_glyph",
+        );
+        let glyph_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("panea-glyph-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             ..wgpu::SamplerDescriptor::default()
         });
 
@@ -849,12 +1494,13 @@ impl GpuTerminalRenderer {
             device,
             queue,
             config,
-            pipeline,
-            bind_group_layout,
-            sampler,
-            texture: None,
-            texture_view: None,
-            bind_group: None,
+            quad_pipeline,
+            glyph_pipeline,
+            glyph_bind_group_layout,
+            glyph_sampler,
+            glyph_atlas_texture: None,
+            glyph_atlas_size: None,
+            glyph_bind_group: None,
             rasterizer: TerminalRasterizer::default(),
             last_instrumentation: RenderInstrumentation::default(),
         })
@@ -876,13 +1522,13 @@ impl GpuTerminalRenderer {
         fonts: &mut FontSystem,
     ) -> Result<(), RendererError> {
         let frame_started = Instant::now();
-        let mut frame = self.rasterizer.rasterize_instrumented(scene, fonts)?;
+        let mut batches = self.rasterizer.prepare_batches(scene, fonts)?;
         let gpu_started = Instant::now();
-        self.upload_frame(&frame.frame);
-        let result = self.present();
-        frame.instrumentation.gpu_submit_time = Some(gpu_started.elapsed());
-        frame.instrumentation.frame_time = frame_started.elapsed();
-        self.last_instrumentation = frame.instrumentation;
+        self.upload_atlas(&batches);
+        let result = self.present_batches(&batches);
+        batches.instrumentation.gpu_submit_time = Some(gpu_started.elapsed());
+        batches.instrumentation.frame_time = frame_started.elapsed();
+        self.last_instrumentation = batches.instrumentation;
         result
     }
 
@@ -891,69 +1537,85 @@ impl GpuTerminalRenderer {
         self.last_instrumentation
     }
 
-    fn upload_frame(&mut self, frame: &CpuFrame) {
-        let needs_texture = self.texture.as_ref().is_none_or(|texture| {
-            texture.width() != frame.width || texture.height() != frame.height
-        });
-
-        if needs_texture {
+    fn upload_atlas(&mut self, batches: &PreparedRenderBatches) {
+        let atlas_size = self.rasterizer.atlas_dimensions();
+        if self.glyph_atlas_size != Some(atlas_size) {
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("panea-terminal-frame-texture"),
+                label: Some("panea-glyph-atlas"),
                 size: wgpu::Extent3d {
-                    width: frame.width,
-                    height: frame.height,
+                    width: atlas_size.0,
+                    height: atlas_size.1,
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                format: wgpu::TextureFormat::R8Unorm,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("panea-present-bind-group"),
-                layout: &self.bind_group_layout,
+                label: Some("panea-glyph-bind-group"),
+                layout: &self.glyph_bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&texture_view),
+                        resource: wgpu::BindingResource::TextureView(&view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        resource: wgpu::BindingResource::Sampler(&self.glyph_sampler),
                     },
                 ],
             });
-            self.texture = Some(texture);
-            self.texture_view = Some(texture_view);
-            self.bind_group = Some(bind_group);
+            self.glyph_atlas_texture = Some(texture);
+            self.glyph_atlas_size = Some(atlas_size);
+            self.glyph_bind_group = Some(bind_group);
         }
 
-        let texture = self.texture.as_ref().expect("frame texture exists");
-        self.queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &frame.pixels,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * frame.width),
-                rows_per_image: Some(frame.height),
-            },
-            wgpu::Extent3d {
-                width: frame.width,
-                height: frame.height,
-                depth_or_array_layers: 1,
-            },
-        );
+        let Some(texture) = self.glyph_atlas_texture.as_ref() else {
+            return;
+        };
+
+        for upload in &batches.atlas_uploads {
+            if upload.entry.width == 0 || upload.entry.height == 0 {
+                continue;
+            }
+            for row in 0..upload.entry.height {
+                let start = (row * upload.entry.width) as usize;
+                let end = start + upload.entry.width as usize;
+                if end > upload.pixels.len() {
+                    break;
+                }
+                self.queue.write_texture(
+                    wgpu::ImageCopyTexture {
+                        texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: upload.entry.x,
+                            y: upload.entry.y + row,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &upload.pixels[start..end],
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: None,
+                        rows_per_image: None,
+                    },
+                    wgpu::Extent3d {
+                        width: upload.entry.width,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
     }
 
-    fn present(&mut self) -> Result<(), RendererError> {
+    fn present_batches(&mut self, batches: &PreparedRenderBatches) -> Result<(), RendererError> {
         let output = match self.surface.get_current_texture() {
             Ok(output) => output,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -966,15 +1628,23 @@ impl GpuTerminalRenderer {
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        let background =
+            self.make_buffers(&batches.background.vertices, &batches.background.indices);
+        let decorations =
+            self.make_buffers(&batches.decorations.vertices, &batches.decorations.indices);
+        let selections =
+            self.make_buffers(&batches.selections.vertices, &batches.selections.indices);
+        let cursor = self.make_buffers(&batches.cursor.vertices, &batches.cursor.indices);
+        let glyphs = self.make_buffers(&batches.glyphs.vertices, &batches.glyphs.indices);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("panea-present-encoder"),
+                label: Some("panea-batch-encoder"),
             });
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("panea-present-pass"),
+                label: Some("panea-batch-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -987,52 +1657,150 @@ impl GpuTerminalRenderer {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(
-                0,
-                self.bind_group.as_ref().expect("present bind group exists"),
-                &[],
-            );
-            pass.draw(0..3, 0..1);
+
+            pass.set_pipeline(&self.quad_pipeline);
+            draw_buffers(&mut pass, background.as_ref());
+            draw_buffers(&mut pass, selections.as_ref());
+
+            if let Some(glyph_bind_group) = &self.glyph_bind_group {
+                pass.set_pipeline(&self.glyph_pipeline);
+                pass.set_bind_group(0, glyph_bind_group, &[]);
+                draw_buffers(&mut pass, glyphs.as_ref());
+            }
+
+            pass.set_pipeline(&self.quad_pipeline);
+            draw_buffers(&mut pass, decorations.as_ref());
+            draw_buffers(&mut pass, cursor.as_ref());
         }
 
         self.queue.submit(Some(encoder.finish()));
         output.present();
         Ok(())
     }
+
+    fn make_buffers(&self, vertices: &[BatchVertex], indices: &[u32]) -> Option<GpuBatchBuffers> {
+        if vertices.is_empty() || indices.is_empty() {
+            return None;
+        }
+
+        let vertices = vertices
+            .iter()
+            .map(|vertex| vertex_to_gpu(*vertex, self.config.width, self.config.height))
+            .collect::<Vec<_>>();
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("panea-batch-vertices"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("panea-batch-indices"),
+                contents: bytemuck::cast_slice(indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+
+        Some(GpuBatchBuffers {
+            vertices: vertex_buffer,
+            indices: index_buffer,
+            index_count: indices.len() as u32,
+        })
+    }
 }
 
-const PRESENT_SHADER: &str = r#"
+fn draw_buffers<'a>(pass: &mut wgpu::RenderPass<'a>, buffers: Option<&'a GpuBatchBuffers>) {
+    let Some(buffers) = buffers else {
+        return;
+    };
+
+    pass.set_vertex_buffer(0, buffers.vertices.slice(..));
+    pass.set_index_buffer(buffers.indices.slice(..), wgpu::IndexFormat::Uint32);
+    pass.draw_indexed(0..buffers.index_count, 0, 0..1);
+}
+
+fn vertex_to_gpu(vertex: BatchVertex, surface_width: u32, surface_height: u32) -> GpuVertex {
+    let width = surface_width.max(1) as f32;
+    let height = surface_height.max(1) as f32;
+    GpuVertex {
+        position: [
+            (vertex.position_px[0] / width) * 2.0 - 1.0,
+            1.0 - (vertex.position_px[1] / height) * 2.0,
+        ],
+        uv: vertex.uv,
+        color: vertex.color,
+    }
+}
+
+fn create_batch_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat,
+    label: &'static str,
+    fragment_entry: &'static str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: "vs_batch",
+            buffers: &[GpuVertex::layout()],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: fragment_entry,
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    })
+}
+
+const BATCH_SHADER: &str = r#"
+struct VertexIn {
+    @location(0) position: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+};
+
 struct VertexOut {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
 };
 
 @vertex
-fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
-    var positions = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -3.0),
-        vec2<f32>(-1.0, 1.0),
-        vec2<f32>(3.0, 1.0)
-    );
-    var uvs = array<vec2<f32>, 3>(
-        vec2<f32>(0.0, 2.0),
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(2.0, 0.0)
-    );
-
+fn vs_batch(in: VertexIn) -> VertexOut {
     var out: VertexOut;
-    out.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
-    out.uv = uvs[vertex_index];
+    out.position = vec4<f32>(in.position, 0.0, 1.0);
+    out.uv = in.uv;
+    out.color = in.color;
     return out;
 }
 
-@group(0) @binding(0) var terminal_texture: texture_2d<f32>;
-@group(0) @binding(1) var terminal_sampler: sampler;
+@fragment
+fn fs_color(in: VertexOut) -> @location(0) vec4<f32> {
+    return in.color;
+}
+
+@group(0) @binding(0) var glyph_atlas: texture_2d<f32>;
+@group(0) @binding(1) var glyph_sampler: sampler;
 
 @fragment
-fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    return textureSample(terminal_texture, terminal_sampler, in.uv);
+fn fs_glyph(in: VertexOut) -> @location(0) vec4<f32> {
+    let coverage = textureSample(glyph_atlas, glyph_sampler, in.uv).r;
+    return vec4<f32>(in.color.rgb, in.color.a * coverage);
 }
 "#;
 
@@ -1152,5 +1920,57 @@ mod tests {
             .expect("same resolved font should render second snapshot");
 
         assert_ne!(first.snapshot_hash(), second.snapshot_hash());
+    }
+
+    #[test]
+    fn batch_planner_groups_cells_into_few_draws() {
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let mut planner = RenderBatchPlanner::default();
+        let Ok(batches) = planner.prepare_full(
+            &scene(vec![cell(0, 0, "a"), cell(0, 1, "b"), cell(1, 0, "c")]),
+            &mut fonts,
+        ) else {
+            return;
+        };
+
+        assert_eq!(batches.background.quad_count(), 3);
+        assert_eq!(batches.glyphs.glyph_count, 3);
+        assert!(batches.instrumentation.draw_call_count <= 3);
+        assert!(batches.instrumentation.glyphs.atlas_uploads > 0);
+    }
+
+    #[test]
+    fn batch_planner_reuses_cached_glyphs_and_atlas_entries() {
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let mut planner = RenderBatchPlanner::default();
+        let test_scene = scene_without_cursor(vec![cell(0, 0, "panea")]);
+        if planner.prepare_full(&test_scene, &mut fonts).is_err() {
+            return;
+        }
+        let second = planner
+            .prepare_full(&test_scene, &mut fonts)
+            .expect("same resolved font should prepare second batch");
+
+        assert!(second.instrumentation.glyphs.cache_hits > 0);
+        assert_eq!(second.instrumentation.glyphs.atlas_uploads, 0);
+    }
+
+    #[test]
+    fn cursor_damage_only_batches_cursor_region() {
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let mut planner = RenderBatchPlanner::default();
+        let mut test_scene = scene(vec![cell(0, 0, "a"), cell(0, 1, "b")]);
+        let Ok(font_metrics) = fonts.cell_metrics() else {
+            return;
+        };
+        test_scene.damage_regions =
+            vec![cell_region(CellPosition { row: 0, col: 0 }, font_metrics)];
+        let Ok(batches) = planner.prepare(&test_scene, &mut fonts) else {
+            return;
+        };
+
+        assert!(batches.background.quad_count() <= 1);
+        assert_eq!(batches.cursor.quad_count(), 1);
+        assert_eq!(batches.damage_regions.len(), 1);
     }
 }

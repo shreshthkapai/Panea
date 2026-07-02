@@ -169,6 +169,7 @@ fn run_bench() -> ExitCode {
     let args = std::env::args().skip(2).collect::<Vec<_>>();
     let mut cargo_args = vec![
         "run".to_owned(),
+        "--release".to_owned(),
         "-p".to_owned(),
         "panea-bench".to_owned(),
         "--".to_owned(),

@@ -86,6 +86,16 @@ to more visible features before the dependencies they rely on are hardened.
   proptest property smoke coverage, parser and shell OSC/CSI payload bounds,
   `cargo xtask fuzz-smoke`, `cargo xtask fuzz <target>`, and scheduled
   cross-OS fuzz-smoke CI.
+- Completed next-pass Phase 4 GPU renderer batching and glyph pipeline:
+  added a damage-aware batch planner for background, glyph, decoration,
+  selection, and cursor quads; added GPU-facing vertex/index batches, glyph run
+  caching, glyph bitmap cache reuse, atlas entry reuse, row-scoped atlas upload
+  records, WGPU colored-quad and glyph-atlas pipelines, indexed batch
+  submission in `GpuTerminalRenderer::render_scene`, renderer-focused
+  benchmark commands for ASCII, Unicode, emoji, scrolling, large viewports,
+  many panes, cursor animation, and command-block overlays, plus renderer
+  batching documentation and unit coverage for batch grouping, cache reuse, and
+  cursor-only damage.
 - Completed Phase 2 terminal core baseline: platform-neutral grid/cell storage,
   scrollback, line wrapping, scroll regions, alternate screen storage, resize
   reflow, cursor/mode metadata, raw selection extraction, ANSI/VT parser adapter,
@@ -216,10 +226,11 @@ to more visible features before the dependencies they rely on are hardened.
   host shells. On the current Windows host, the one-shot, interactive, and
   event-loop smoke tests pass quickly. macOS and Linux smoke status is still
   unverified until those platforms are actually run.
-- The first GPU renderer presents a rasterized terminal frame through WGPU and
-  has a glyph atlas/cache foundation. Fully batched GPU glyph rendering,
-  partial texture updates by damage region, and cross-OS screenshot automation
-  are deferred render-performance work.
+- The renderer now submits GPU-facing background/glyph/decoration/selection/
+  cursor batches and uploads only new glyph atlas rows. Cross-OS screenshot
+  automation, hardware GPU timestamp queries, full device-loss recovery, batch
+  vector reuse/pooling, and deeper font fallback/shaping validation remain
+  deferred render-performance work.
 - Phase 5 has build/test verification on the current Windows host. macOS,
   Linux X11, and Linux Wayland rendering remain unverified until run on those
   platforms.
@@ -238,8 +249,8 @@ to more visible features before the dependencies they rely on are hardened.
   render hot path.
 - Phase 8 uses CPU-side timing plus WGPU submission wall-clock timing. Hardware
   GPU timestamp queries and richer in-window overlay rendering remain deferred
-  until the renderer has the later batched glyph path and stable overlay
-  composition.
+  until device-loss recovery, screenshot verification, and stable overlay
+  composition are in place.
 - Phase 9 establishes the native mux state model and action contract. Full
   split-pane desktop rendering, tab chrome, per-pane transport orchestration,
   and cross-OS native mux runtime smoke tests remain follow-up work on top of

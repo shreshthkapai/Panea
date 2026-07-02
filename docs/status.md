@@ -67,7 +67,7 @@ These areas are real foundations but must not be called complete:
 | --- | --- | --- |
 | Desktop app runtime | partial | Full app lifecycle, polished UI chrome, complete mux integration, runtime config reload, installed doctor command, packaging, and cross-OS manual validation. |
 | Platform windowing | partial | Real macOS lifecycle, real Linux X11/Wayland compositor behavior, decoration negotiation, IME validation, native notifications, and platform-specific fallback verification. |
-| GPU renderer | partial | Fully batched GPU glyph quads, partial atlas/texture updates by damage, hardware timestamp queries, screenshot verification, full device-loss recovery, and cross-OS render validation. |
+| GPU renderer | tested | WGPU surface/device setup, glyph atlas/cache policy, damage-aware batch preparation, indexed background/glyph/decoration/selection/cursor batches, row-scoped atlas uploads, and renderer benchmarks exist; hardware timestamp queries, screenshot verification, full device-loss recovery, and cross-OS render validation remain. |
 | Font system | partial | Deeper shaping, full fallback validation across installed font sets, emoji fallback, and grapheme-aware metrics. |
 | Unicode support | tested | Core/parser Unicode hardening is covered by automated tests; renderer font fallback, shaping, screenshot parity, and real app conformance remain later phases. |
 | Clipboard and selection | partial | Mouse-driven selection UX, primary selection on Linux, OSC 52 policy, permission/security prompts, and full copy/paste app compatibility coverage. |
@@ -106,7 +106,7 @@ The following major accepted features have no complete product behavior yet:
   real-world fuzz findings.
 - Unicode/font/render conformance beyond the core parser model, including
   cross-OS font fallback and screenshot verification.
-- Fully batched GPU glyph rendering.
+- Cross-OS runtime verification of the batched GPU glyph renderer.
 - GPU device-loss recreation.
 - Cross-OS screenshot verification.
 - OSC 52 clipboard policy and permission model.
@@ -127,7 +127,7 @@ The following major accepted features have no complete product behavior yet:
 | --- | --- | --- |
 | core correctness | partial | Strong baseline, Unicode cell hardening, and fuzz harness exist, but app compatibility and conformance hardening remain. |
 | platform parity | partial | Capabilities and desktop window foundations exist; real macOS/Linux X11/Linux Wayland verification remains open. |
-| render performance | partial | WGPU foundation, glyph cache, damage, scheduling, and benchmarks exist; batched GPU text and device-loss recovery remain. |
+| render performance | partial | WGPU foundation, glyph cache, damage, scheduling, batched glyph/quad rendering, atlas uploads, and benchmarks exist; device-loss recovery, screenshot parity, and cross-OS runtime validation remain. |
 | config portability | partial | Static config model is useful; runtime reload and advanced config are deferred. |
 | semantic meaning | partial | Semantic events and timeline exist; runtime shell activation and real-shell verification remain. |
 | visual overlay | partial | Overlay contracts and basic generation exist; polished command blocks/cursor assets remain. |
@@ -138,5 +138,5 @@ The following major accepted features have no complete product behavior yet:
 
 ## Immediate Next Slice
 
-After the real fuzzing harness, the next dependency-ordered phase is GPU
-renderer batching and glyph pipeline hardening.
+After GPU renderer batching and glyph pipeline hardening, the next
+dependency-ordered phase is GPU device-loss recovery.

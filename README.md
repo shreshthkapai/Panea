@@ -54,6 +54,7 @@ cargo xtask fuzz-smoke
 - [Capability matrix](docs/capability-matrix.md)
 - [Layer boundaries](docs/layer-boundaries.md)
 - [Fuzzing](docs/fuzzing.md)
+- [Renderer batching](docs/renderer-batching.md)
 - [Configuration](docs/config.md)
 - [Themes](docs/themes.md)
 - [Cursor customization](docs/cursor-customization.md)
