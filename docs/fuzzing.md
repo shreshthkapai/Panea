@@ -46,6 +46,11 @@ cargo xtask fuzz-smoke
 Coverage-guided local fuzzing with `cargo-fuzz` installed:
 
 ```text
+rustup toolchain install nightly
+cargo install cargo-fuzz
+```
+
+```text
 cargo xtask fuzz parser_input -- -runs=100000
 cargo xtask fuzz grid_actions -- -runs=100000
 cargo xtask fuzz resize -- -runs=100000
@@ -54,6 +59,11 @@ cargo xtask fuzz selection_ranges -- -runs=100000
 cargo xtask fuzz osc_dcs -- -runs=100000
 cargo xtask fuzz shell_markers -- -runs=100000
 ```
+
+`cargo xtask fuzz ...` invokes `cargo +nightly fuzz run ...` because
+`cargo-fuzz` uses sanitizer flags that are not available on stable Rust. The
+workspace's normal build, test, lint, and smoke commands still use the
+repository toolchain.
 
 Long-running scheduled jobs should run each target with a time budget, for
 example:

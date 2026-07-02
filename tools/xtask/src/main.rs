@@ -217,7 +217,7 @@ fn run_fuzz() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let mut cargo_args = vec!["fuzz".to_owned(), "run".to_owned()];
+    let mut cargo_args = vec!["+nightly".to_owned(), "fuzz".to_owned(), "run".to_owned()];
     cargo_args.append(&mut args);
     let refs = cargo_args.iter().map(String::as_str).collect::<Vec<_>>();
     run("cargo", &refs)

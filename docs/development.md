@@ -31,6 +31,8 @@ cargo xtask config-default
 cargo xtask config-schema
 cargo xtask bench all
 cargo xtask fuzz-smoke
+rustup toolchain install nightly
+cargo install cargo-fuzz
 cargo xtask fuzz parser_input -- -runs=100000
 cargo xtask doctor
 cargo xtask bug-report
