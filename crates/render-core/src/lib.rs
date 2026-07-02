@@ -139,6 +139,76 @@ pub struct FrameRequest {
     pub damage: Option<DamageRegion>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionalFeature {
+    CursorAnimation,
+    SemanticOverlays,
+    CommandBlocks,
+    VisualEffects,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionalFeatureCostMode {
+    Disabled,
+    EnabledDefault,
+    EnabledHeavy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GlyphInstrumentation {
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub atlas_uploads: u64,
+}
+
+impl GlyphInstrumentation {
+    #[must_use]
+    pub const fn total_lookups(self) -> u64 {
+        self.cache_hits + self.cache_misses
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderInstrumentation {
+    pub frame_time: Duration,
+    pub cpu_prepare_time: Duration,
+    pub gpu_submit_time: Option<Duration>,
+    pub glyphs: GlyphInstrumentation,
+    pub damage_region_count: usize,
+    pub draw_call_count: u32,
+    pub animated_region_count: usize,
+    pub idle_wakeups: u64,
+}
+
+impl Default for RenderInstrumentation {
+    fn default() -> Self {
+        Self {
+            frame_time: Duration::ZERO,
+            cpu_prepare_time: Duration::ZERO,
+            gpu_submit_time: None,
+            glyphs: GlyphInstrumentation::default(),
+            damage_region_count: 0,
+            draw_call_count: 0,
+            animated_region_count: 0,
+            idle_wakeups: 0,
+        }
+    }
+}
+
+impl RenderInstrumentation {
+    #[must_use]
+    pub fn over_budget(self, max_frame_time: Duration) -> bool {
+        self.frame_time > max_frame_time
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeatureCostSample {
+    pub feature: OptionalFeature,
+    pub mode: OptionalFeatureCostMode,
+    pub instrumentation: RenderInstrumentation,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RenderScene {
     pub grid: RenderGrid,

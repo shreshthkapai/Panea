@@ -100,6 +100,17 @@ Validation catches:
 Unknown and deprecated settings produce diagnostics. Validation errors stop
 startup.
 
+## Performance Profiles
+
+Supported portable profile names:
+
+- `maximum_performance`
+- `balanced`
+- `visual`
+- `battery_saver`
+
+The deprecated spelling `battery_conscious` is still accepted as an alias.
+
 ## Reload Contract
 
 `config-core` can classify config changes into:

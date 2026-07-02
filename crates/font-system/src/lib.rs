@@ -433,6 +433,11 @@ impl GlyphCache {
         self.entries.is_empty()
     }
 
+    #[must_use]
+    pub fn contains_key(&self, key: GlyphCacheKey) -> bool {
+        self.entries.contains_key(&key)
+    }
+
     fn touch(&mut self, key: GlyphCacheKey) {
         self.order.retain(|entry| *entry != key);
         self.order.push_back(key);

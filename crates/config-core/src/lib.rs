@@ -779,7 +779,8 @@ pub enum PerformanceProfile {
     #[default]
     Balanced,
     Visual,
-    BatteryConscious,
+    #[serde(alias = "battery_conscious")]
+    BatterySaver,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

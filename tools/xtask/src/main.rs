@@ -4,7 +4,7 @@ fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("help") | None => {
             eprintln!(
-                "usage: cargo xtask <fmt|clippy|test|build|check|ci|config-default|config-schema>"
+                "usage: cargo xtask <fmt|clippy|test|build|check|ci|config-default|config-schema|bench>"
             );
             ExitCode::SUCCESS
         }
@@ -15,12 +15,26 @@ fn main() -> ExitCode {
         Some("check") => run("cargo", &["check", "--workspace"]),
         Some("config-default") => print_config_default(),
         Some("config-schema") => print_config_schema(),
+        Some("bench") => run_bench(),
         Some("ci") => run_ci(),
         Some(command) => {
             eprintln!("unknown xtask command: {command}");
             ExitCode::from(2)
         }
     }
+}
+
+fn run_bench() -> ExitCode {
+    let args = std::env::args().skip(2).collect::<Vec<_>>();
+    let mut cargo_args = vec![
+        "run".to_owned(),
+        "-p".to_owned(),
+        "panea-bench".to_owned(),
+        "--".to_owned(),
+    ];
+    cargo_args.extend(args);
+    let refs = cargo_args.iter().map(String::as_str).collect::<Vec<_>>();
+    run("cargo", &refs)
 }
 
 fn print_config_default() -> ExitCode {

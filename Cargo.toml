@@ -21,6 +21,7 @@ members = [
     "crates/transport-core",
     "crates/transport-pty",
     "crates/transport-ssh",
+    "tools/bench",
     "tools/xtask",
 ]
 

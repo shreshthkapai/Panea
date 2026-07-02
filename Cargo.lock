@@ -469,6 +469,9 @@ dependencies = [
 [[package]]
 name = "diagnostics"
 version = "0.1.0"
+dependencies = [
+ "render-core",
+]
 
 [[package]]
 name = "dispatch"
@@ -1314,11 +1317,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "panea-bench"
+version = "0.1.0"
+dependencies = [
+ "config-core",
+ "diagnostics",
+ "font-system",
+ "render-core",
+ "render-wgpu",
+ "semantics",
+ "term-core",
+ "term-parser",
+]
+
+[[package]]
 name = "panea-desktop"
 version = "0.1.0"
 dependencies = [
  "config-core",
  "config-toml",
+ "diagnostics",
  "font-system",
  "platform-core",
  "platform-winit",

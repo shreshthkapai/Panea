@@ -7,12 +7,13 @@ use std::{
     error::Error,
     fmt,
     sync::Arc,
+    time::Instant,
 };
 
 use font_system::{CellMetrics, FontError, FontSystem, GlyphBitmap, GlyphCache, GlyphCacheKey};
 use render_core::{
     CellPosition, CursorVisual, DamageRegion, FrameRequestReason, RenderCell, RenderCellStyle,
-    RenderColor, RenderCursorShape, RenderGrid, RenderRect, RenderScene,
+    RenderColor, RenderCursorShape, RenderGrid, RenderInstrumentation, RenderRect, RenderScene,
 };
 use winit::window::Window;
 
@@ -274,6 +275,7 @@ pub enum FrameDecision {
 #[derive(Debug, Default)]
 pub struct FrameScheduler {
     pending: Option<FrameRequestReason>,
+    idle_wakeups: u64,
 }
 
 impl FrameScheduler {
@@ -308,9 +310,24 @@ impl FrameScheduler {
 
     #[must_use]
     pub fn next_frame(&mut self) -> FrameDecision {
-        self.pending
-            .take()
-            .map_or(FrameDecision::NoFrameNeeded, FrameDecision::FrameNeeded)
+        self.pending.take().map_or_else(
+            || {
+                self.idle_wakeups = self.idle_wakeups.saturating_add(1);
+                FrameDecision::NoFrameNeeded
+            },
+            FrameDecision::FrameNeeded,
+        )
+    }
+
+    #[must_use]
+    pub const fn idle_wakeups(&self) -> u64 {
+        self.idle_wakeups
+    }
+
+    pub fn take_idle_wakeups(&mut self) -> u64 {
+        let idle_wakeups = self.idle_wakeups;
+        self.idle_wakeups = 0;
+        idle_wakeups
     }
 }
 
@@ -331,6 +348,12 @@ impl CpuFrame {
         }
         hash
     }
+}
+
+#[derive(Debug)]
+pub struct InstrumentedCpuFrame {
+    pub frame: CpuFrame,
+    pub instrumentation: RenderInstrumentation,
 }
 
 #[derive(Debug)]
@@ -362,6 +385,16 @@ impl TerminalRasterizer {
         scene: &RenderScene,
         fonts: &mut FontSystem,
     ) -> Result<CpuFrame, RendererError> {
+        self.rasterize_instrumented(scene, fonts)
+            .map(|frame| frame.frame)
+    }
+
+    pub fn rasterize_instrumented(
+        &mut self,
+        scene: &RenderScene,
+        fonts: &mut FontSystem,
+    ) -> Result<InstrumentedCpuFrame, RendererError> {
+        let started = Instant::now();
         let metrics = fonts.cell_metrics()?;
         let width = (f32::from(scene.grid.columns) * metrics.cell_width)
             .ceil()
@@ -385,9 +418,14 @@ impl TerminalRasterizer {
             },
             RenderColor::rgb(12, 12, 12),
         );
+        let mut instrumentation = RenderInstrumentation {
+            damage_region_count: scene.damage_regions.len(),
+            animated_region_count: scene.animations.len(),
+            ..RenderInstrumentation::default()
+        };
 
         for cell in &scene.grid.cells {
-            self.draw_cell(&mut frame, cell, fonts, metrics)?;
+            self.draw_cell(&mut frame, cell, fonts, metrics, &mut instrumentation)?;
         }
 
         for overlay in scene
@@ -396,19 +434,30 @@ impl TerminalRasterizer {
             .chain(scene.semantic_overlays.iter())
         {
             blend_rect(&mut frame, overlay.bounds, overlay.color);
+            instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
         }
 
         for selection in &scene.selections {
             for position in &selection.cells {
                 fill_rect(&mut frame, cell_region(*position, metrics), selection.color);
+                instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
             }
         }
 
         if let Some(cursor) = scene.cursor {
             draw_cursor(&mut frame, cursor, metrics);
+            if cursor.visible {
+                instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
+            }
         }
 
-        Ok(frame)
+        instrumentation.cpu_prepare_time = started.elapsed();
+        instrumentation.frame_time = instrumentation.cpu_prepare_time;
+
+        Ok(InstrumentedCpuFrame {
+            frame,
+            instrumentation,
+        })
     }
 
     fn draw_cell(
@@ -417,9 +466,11 @@ impl TerminalRasterizer {
         cell: &RenderCell,
         fonts: &mut FontSystem,
         metrics: CellMetrics,
+        instrumentation: &mut RenderInstrumentation,
     ) -> Result<(), RendererError> {
         let rect = cell_region(cell.position, metrics);
         fill_rect(frame, rect, cell.background);
+        instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
 
         let font_id = fonts.primary_font()?.id();
         let mut pen_x = rect.x;
@@ -437,12 +488,24 @@ impl TerminalRasterizer {
                 cell.style.bold,
                 cell.style.italic,
             );
+            let cache_hit = self.glyph_cache.contains_key(key);
             let bitmap = self.glyph_cache.get_or_insert_with(key, || {
                 fonts.rasterize_glyph(key).unwrap_or_else(|_| {
                     GlyphBitmap::missing(metrics.cell_width, metrics.cell_height as u32)
                 })
             });
-            let _ = self.atlas.allocate(key, bitmap.as_ref());
+            if cache_hit {
+                instrumentation.glyphs.cache_hits =
+                    instrumentation.glyphs.cache_hits.saturating_add(1);
+            } else {
+                instrumentation.glyphs.cache_misses =
+                    instrumentation.glyphs.cache_misses.saturating_add(1);
+            }
+            let atlas_hit = self.atlas.entry(key).is_some();
+            if self.atlas.allocate(key, bitmap.as_ref()).is_some() && !atlas_hit {
+                instrumentation.glyphs.atlas_uploads =
+                    instrumentation.glyphs.atlas_uploads.saturating_add(1);
+            }
             draw_glyph(
                 frame,
                 pen_x + bitmap.offset_x,
@@ -450,6 +513,7 @@ impl TerminalRasterizer {
                 bitmap.as_ref(),
                 cell.foreground,
             );
+            instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
             pen_x += bitmap.advance_width.ceil() as i32;
         }
 
@@ -464,6 +528,7 @@ impl TerminalRasterizer {
                 },
                 cell.foreground,
             );
+            instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
         }
 
         if cell.style.strikethrough {
@@ -477,6 +542,7 @@ impl TerminalRasterizer {
                 },
                 cell.foreground,
             );
+            instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
         }
 
         Ok(())
@@ -578,6 +644,7 @@ pub struct GpuTerminalRenderer {
     texture_view: Option<wgpu::TextureView>,
     bind_group: Option<wgpu::BindGroup>,
     rasterizer: TerminalRasterizer,
+    last_instrumentation: RenderInstrumentation,
 }
 
 impl GpuTerminalRenderer {
@@ -713,6 +780,7 @@ impl GpuTerminalRenderer {
             texture_view: None,
             bind_group: None,
             rasterizer: TerminalRasterizer::default(),
+            last_instrumentation: RenderInstrumentation::default(),
         })
     }
 
@@ -731,9 +799,20 @@ impl GpuTerminalRenderer {
         scene: &RenderScene,
         fonts: &mut FontSystem,
     ) -> Result<(), RendererError> {
-        let frame = self.rasterizer.rasterize(scene, fonts)?;
-        self.upload_frame(&frame);
-        self.present()
+        let frame_started = Instant::now();
+        let mut frame = self.rasterizer.rasterize_instrumented(scene, fonts)?;
+        let gpu_started = Instant::now();
+        self.upload_frame(&frame.frame);
+        let result = self.present();
+        frame.instrumentation.gpu_submit_time = Some(gpu_started.elapsed());
+        frame.instrumentation.frame_time = frame_started.elapsed();
+        self.last_instrumentation = frame.instrumentation;
+        result
+    }
+
+    #[must_use]
+    pub const fn last_instrumentation(&self) -> RenderInstrumentation {
+        self.last_instrumentation
     }
 
     fn upload_frame(&mut self, frame: &CpuFrame) {

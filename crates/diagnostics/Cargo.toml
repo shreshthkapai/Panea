@@ -8,3 +8,5 @@ description = "Doctor commands, capability reports, logs, and performance overla
 [lints]
 workspace = true
 
+[dependencies]
+render-core = { path = "../render-core" }

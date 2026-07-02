@@ -1,11 +1,12 @@
 [package]
-name = "panea-desktop"
+name = "panea-bench"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Repeatable local benchmark runner and fixtures for Panea."
 
 [[bin]]
-name = "panea"
+name = "panea-bench"
 path = "src/main.rs"
 
 [lints]
@@ -13,17 +14,10 @@ workspace = true
 
 [dependencies]
 config-core = { path = "../../crates/config-core" }
-config-toml = { path = "../../crates/config-toml" }
 diagnostics = { path = "../../crates/diagnostics" }
 font-system = { path = "../../crates/font-system" }
-platform-core = { path = "../../crates/platform-core" }
-platform-winit = { path = "../../crates/platform-winit" }
-pollster.workspace = true
 render-core = { path = "../../crates/render-core" }
 render-wgpu = { path = "../../crates/render-wgpu" }
 semantics = { path = "../../crates/semantics" }
 term-core = { path = "../../crates/term-core" }
 term-parser = { path = "../../crates/term-parser" }
-transport-core = { path = "../../crates/transport-core" }
-transport-pty = { path = "../../crates/transport-pty" }
-winit.workspace = true

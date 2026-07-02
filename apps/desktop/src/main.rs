@@ -1,9 +1,10 @@
-use std::{collections::BTreeSet, error::Error, path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, error::Error, path::PathBuf, sync::Arc, time::Duration};
 
 use config_core::{
     AppConfig, ConfigDiagnosticSeverity, DecorationStrategyConfig, LinuxBackendConfig, PasteConfig,
     PresentModePreference, ShellProfile, ShellProfileKind, WindowModeConfig,
 };
+use diagnostics::{PerformanceBudget, PerformanceOverlay};
 use font_system::{CellMetrics, FontConfig as RuntimeFontConfig, FontSystem};
 use platform_core::{
     DecorationMode, InputEvent, KeyEvent, KeyModifiers, KeyState, LinuxWindowBackend, MouseButton,
@@ -78,6 +79,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         renderer_options(&config),
     ))?;
     let mut scheduler = FrameScheduler::new();
+    let mut performance_overlay =
+        PerformanceOverlay::new(config.diagnostics.performance_overlay, "wgpu");
+    let performance_budget = performance_budget(&config);
     let mut transport = match spawn_initial_transport(&config, initial_size) {
         Ok(transport) => Some(transport),
         Err(error) => {
@@ -97,8 +101,20 @@ fn run() -> Result<(), Box<dyn Error>> {
                 WindowEvent::RedrawRequested => {
                     let metrics = fonts.cell_metrics().ok();
                     let scene = scene_from_terminal(&terminal, metrics, &config);
-                    if let Err(error) = renderer.render_scene(&scene, &mut fonts) {
-                        eprintln!("render error: {error}");
+                    let idle_wakeups = scheduler.take_idle_wakeups();
+                    match renderer.render_scene(&scene, &mut fonts) {
+                        Ok(()) => {
+                            let mut instrumentation = renderer.last_instrumentation();
+                            instrumentation.idle_wakeups = idle_wakeups;
+                            performance_overlay.record(instrumentation);
+                            if let Some(text) = performance_overlay.render_text(performance_budget)
+                            {
+                                eprintln!("performance {text}");
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("render error: {error}");
+                        }
                     }
                 }
                 _ => {
@@ -268,6 +284,13 @@ fn renderer_options(config: &AppConfig) -> RendererOptions {
             | PresentModePreference::Mailbox => PresentMode::Vsync,
         },
         damage_tracking: config.renderer.damage_tracking,
+    }
+}
+
+fn performance_budget(config: &AppConfig) -> PerformanceBudget {
+    PerformanceBudget {
+        max_frame_time: Duration::from_millis(u64::from(config.performance.max_frame_time_ms)),
+        ..PerformanceBudget::default()
     }
 }
 

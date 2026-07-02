@@ -71,6 +71,17 @@ If a task does not fit, redesign it before implementation.
   generation, schema JSON export, platform override resolution, reload-impact
   classification, xtask helpers, and desktop startup wiring through the config
   model.
+- Implemented the Phase 8 performance harness foundation: added a repeatable
+  `panea-bench` runner and `cargo xtask bench` wrapper for render-grid,
+  cat-large-file, color-heavy, scrollback, resize, input-latency, Unicode,
+  alternate-screen, and cursor-animation cost cases; added deterministic
+  benchmark fixture seeds; defined portable performance profiles including
+  `battery_saver`; added renderer instrumentation for frame time, CPU render
+  preparation, GPU submission timing where available, glyph cache hits/misses,
+  atlas uploads, damage region count, draw-call count, animated region count,
+  and idle wakeups; added diagnostics-side performance overlay text and gate
+  evaluation; and wired optional desktop performance reporting through the
+  diagnostics config.
 
 ## Deferred By Design
 
@@ -114,3 +125,7 @@ If a task does not fit, redesign it before implementation.
 - Programmable config remains deferred until the static TOML model has more
   runtime mileage. It must compile into the same `AppConfig` and stay out of the
   render hot path.
+- Phase 8 uses CPU-side timing plus WGPU submission wall-clock timing. Hardware
+  GPU timestamp queries and richer in-window overlay rendering remain deferred
+  until the renderer has the later batched glyph path and stable overlay
+  composition.

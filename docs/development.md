@@ -23,6 +23,7 @@ cargo xtask build
 cargo xtask ci
 cargo xtask config-default
 cargo xtask config-schema
+cargo xtask bench all
 ```
 
 ## Contribution Gates
