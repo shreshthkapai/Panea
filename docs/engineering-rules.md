@@ -58,7 +58,8 @@ The remaining high-level work is:
 - Real cross-OS verification runners.
 - Installed terminal doctor binary.
 - Packaging artifacts.
-- Full GPU device-loss recovery.
+- Real GPU device-loss validation across sleep/wake, display changes, DPI
+  changes, and backend failure scenarios.
 - Native iOS shell, iOS GPU surface, Keychain provider, device validation.
 
 This list must not be implemented randomly. It must be implemented in

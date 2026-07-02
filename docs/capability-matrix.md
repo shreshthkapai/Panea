@@ -39,8 +39,8 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | IME/composed text | partial | partial | partial | partial | Event contract exists; real composed-input verification is not complete. |
 | System clipboard | partial | partial | partial | partial | Clipboard bridge exists; primary selection, OSC 52, and security policy remain. |
 | OSC 52 clipboard | planned | planned | planned | planned | Not implemented. |
-| GPU surface/device path | partial | partial | partial | partial | WGPU initialization exists; cross-OS screenshot and backend validation remain. |
-| GPU glyph rendering | partial | partial | partial | partial | Damage-aware batched glyph/quad submission exists; runtime screenshot parity and cross-OS GPU validation remain open. |
+| GPU surface/device path | partial | partial | partial | partial | WGPU initialization and device-loss recovery foundation exist; cross-OS screenshot, sleep/wake, monitor-change, and backend validation remain. |
+| GPU glyph rendering | partial | partial | partial | partial | Damage-aware batched glyph/quad submission and atlas rebuild after recovery exist; runtime screenshot parity and cross-OS GPU validation remain open. |
 | Damage tracking | tested | implemented | implemented | implemented | Renderer-independent tracking exists; real GPU partial-update behavior needs hardening. |
 | Frame scheduler | tested | implemented | implemented | implemented | Scheduler distinctions exist; idle behavior still needs platform profiling. |
 | Font discovery/fallback | partial | partial | partial | partial | Font fallback chain exists; installed-font variance and emoji fallback remain. |

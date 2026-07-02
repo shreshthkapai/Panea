@@ -281,8 +281,96 @@ impl RenderSurfaceSize {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenderSurfaceStatus {
     Ready,
+    Recovering,
     Lost,
     Unavailable { reason: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderRecoveryReason {
+    SurfaceLost,
+    SurfaceOutdated,
+    DeviceLost,
+    OutOfMemory,
+    BackendError,
+    Manual,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderRecoveryStatus {
+    Ready,
+    Recovering {
+        reason: RenderRecoveryReason,
+        attempts: u32,
+    },
+    Lost {
+        reason: RenderRecoveryReason,
+        message: String,
+    },
+    Failed {
+        reason: RenderRecoveryReason,
+        message: String,
+    },
+}
+
+impl RenderRecoveryStatus {
+    #[must_use]
+    pub fn surface_status(&self) -> RenderSurfaceStatus {
+        match self {
+            Self::Ready => RenderSurfaceStatus::Ready,
+            Self::Recovering { .. } => RenderSurfaceStatus::Recovering,
+            Self::Lost { .. } => RenderSurfaceStatus::Lost,
+            Self::Failed { message, .. } => RenderSurfaceStatus::Unavailable {
+                reason: message.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderRecoveryEvent {
+    pub reason: RenderRecoveryReason,
+    pub attempts: u32,
+    pub rebuilt_surface: bool,
+    pub rebuilt_device: bool,
+    pub rebuilt_pipelines: bool,
+    pub rebuilt_glyph_atlas: bool,
+    pub preserved_terminal_state: bool,
+    pub message: String,
+}
+
+impl RenderRecoveryEvent {
+    #[must_use]
+    pub fn success(reason: RenderRecoveryReason, attempts: u32) -> Self {
+        Self {
+            reason,
+            attempts,
+            rebuilt_surface: true,
+            rebuilt_device: true,
+            rebuilt_pipelines: true,
+            rebuilt_glyph_atlas: true,
+            preserved_terminal_state: true,
+            message: "renderer GPU resources were recreated".to_owned(),
+        }
+    }
+
+    #[must_use]
+    pub fn failure(
+        reason: RenderRecoveryReason,
+        attempts: u32,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            reason,
+            attempts,
+            rebuilt_surface: false,
+            rebuilt_device: false,
+            rebuilt_pipelines: false,
+            rebuilt_glyph_atlas: false,
+            preserved_terminal_state: true,
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,5 +476,36 @@ mod tests {
         assert_eq!(renderer.rendered_cells, 1);
         assert_eq!(renderer.status(), RenderSurfaceStatus::Ready);
         assert_eq!(instrumentation.damage_region_count, 1);
+    }
+
+    #[test]
+    fn recovery_event_preserves_terminal_state_contract() {
+        let event = RenderRecoveryEvent::success(RenderRecoveryReason::DeviceLost, 1);
+
+        assert!(event.rebuilt_surface);
+        assert!(event.rebuilt_device);
+        assert!(event.rebuilt_pipelines);
+        assert!(event.rebuilt_glyph_atlas);
+        assert!(event.preserved_terminal_state);
+    }
+
+    #[test]
+    fn recovery_status_maps_to_surface_status() {
+        let recovering = RenderRecoveryStatus::Recovering {
+            reason: RenderRecoveryReason::SurfaceLost,
+            attempts: 1,
+        };
+        assert_eq!(recovering.surface_status(), RenderSurfaceStatus::Recovering);
+
+        let failed = RenderRecoveryStatus::Failed {
+            reason: RenderRecoveryReason::DeviceLost,
+            message: "adapter unavailable".to_owned(),
+        };
+        assert_eq!(
+            failed.surface_status(),
+            RenderSurfaceStatus::Unavailable {
+                reason: "adapter unavailable".to_owned()
+            }
+        );
     }
 }

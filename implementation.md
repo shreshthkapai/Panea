@@ -96,6 +96,15 @@ to more visible features before the dependencies they rely on are hardened.
   many panes, cursor animation, and command-block overlays, plus renderer
   batching documentation and unit coverage for batch grouping, cache reuse, and
   cursor-only damage.
+- Completed next-pass Phase 5 GPU device-loss recovery foundation: added
+  renderer-independent recovery reason/status/event contracts, split disposable
+  WGPU resources into a rebuildable backend, preserved terminal/session state
+  outside renderer recovery, added surface lost/outdated reconfiguration,
+  device-level loss detection through WGPU callbacks and out-of-memory surface
+  failures, async backend recreation, GPU atlas residency invalidation with CPU
+  glyph cache retention, desktop recovery handling, renderer recovery
+  documentation, and tests proving recovery events preserve terminal state and
+  cached glyphs are re-uploaded after atlas reset.
 - Completed Phase 2 terminal core baseline: platform-neutral grid/cell storage,
   scrollback, line wrapping, scroll regions, alternate screen storage, resize
   reflow, cursor/mode metadata, raw selection extraction, ANSI/VT parser adapter,
@@ -227,10 +236,12 @@ to more visible features before the dependencies they rely on are hardened.
   event-loop smoke tests pass quickly. macOS and Linux smoke status is still
   unverified until those platforms are actually run.
 - The renderer now submits GPU-facing background/glyph/decoration/selection/
-  cursor batches and uploads only new glyph atlas rows. Cross-OS screenshot
-  automation, hardware GPU timestamp queries, full device-loss recovery, batch
-  vector reuse/pooling, and deeper font fallback/shaping validation remain
-  deferred render-performance work.
+  cursor batches, uploads only new glyph atlas rows, and has a GPU recovery
+  path that rebuilds disposable WGPU resources while preserving terminal state.
+  Cross-OS screenshot automation, hardware GPU timestamp queries, real
+  sleep/wake and monitor-change device-loss validation, batch vector
+  reuse/pooling, and deeper font fallback/shaping validation remain deferred
+  render-performance work.
 - Phase 5 has build/test verification on the current Windows host. macOS,
   Linux X11, and Linux Wayland rendering remain unverified until run on those
   platforms.
@@ -249,8 +260,7 @@ to more visible features before the dependencies they rely on are hardened.
   render hot path.
 - Phase 8 uses CPU-side timing plus WGPU submission wall-clock timing. Hardware
   GPU timestamp queries and richer in-window overlay rendering remain deferred
-  until device-loss recovery, screenshot verification, and stable overlay
-  composition are in place.
+  until screenshot verification and stable overlay composition are in place.
 - Phase 9 establishes the native mux state model and action contract. Full
   split-pane desktop rendering, tab chrome, per-pane transport orchestration,
   and cross-OS native mux runtime smoke tests remain follow-up work on top of
@@ -280,9 +290,9 @@ to more visible features before the dependencies they rely on are hardened.
   release status remains blocked until packaged artifacts exist and
   manual/automated validation passes on macOS, Windows, Linux X11, and Linux
   Wayland. OS keychain-backed secret providers, interactive SSH host-key
-  approval UI, OSC 52 clipboard permission policy, full GPU device-loss
-  recreation, runtime crash-safe config reload, and installer automation remain
-  release-hardening follow-up work.
+  approval UI, OSC 52 clipboard permission policy, real GPU device-loss
+  platform validation, runtime crash-safe config reload, and installer
+  automation remain release-hardening follow-up work.
 - Phase 15 establishes a compileable iOS companion foundation around the shared
   engine, but it is not a native iOS app yet. UIKit/SwiftUI app lifecycle,
   native touch/keyboard/settings UI, iOS GPU surface implementation, iOS

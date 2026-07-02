@@ -28,7 +28,7 @@ use render_core::{
     RenderColor, RenderCursorShape, RenderGrid, RenderRect, RenderScene,
 };
 use render_wgpu::{
-    FrameDecision, FrameScheduler, GpuTerminalRenderer, PresentMode, RendererOptions,
+    FrameDecision, FrameScheduler, GpuTerminalRenderer, PresentMode, RendererError, RendererOptions,
 };
 use semantics::detect_url_hints;
 use semantics::{BufferPosition, CommandStatus, SemanticRegionKind, SemanticTimelineStore};
@@ -134,9 +134,25 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 eprintln!("performance {text}");
                             }
                         }
-                        Ok(Err(error)) => {
-                            eprintln!("render error: {error}");
-                        }
+                        Ok(Err(error)) => match error {
+                            RendererError::DeviceLost { reason, message } => {
+                                eprintln!("render device lost ({reason:?}): {message}");
+                                match pollster::block_on(renderer.recover_from_device_loss(reason))
+                                {
+                                    Ok(event) => {
+                                        eprintln!("render recovery: {}", event.message);
+                                        scheduler.terminal_content_changed();
+                                        window.request_redraw();
+                                    }
+                                    Err(recovery_error) => {
+                                        eprintln!("render recovery failed: {recovery_error}");
+                                    }
+                                }
+                            }
+                            error => {
+                                eprintln!("render error: {error}");
+                            }
+                        },
                         Err(panic) => {
                             eprintln!("render panic boundary: {}", panic_payload(panic));
                             scheduler.terminal_content_changed();

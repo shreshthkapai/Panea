@@ -36,6 +36,8 @@ performance-gate warnings.
 
 Renderer batching details and the Phase 4 design note live in
 [renderer-batching.md](renderer-batching.md).
+Renderer device-loss recovery details and the Phase 5 design note live in
+[renderer-device-recovery.md](renderer-device-recovery.md).
 
 ## Profiles
 

@@ -80,7 +80,9 @@ repeatable measurements for regression detection and feature-cost review.
 
 - Cross-OS screenshot verification is Phase 6.
 - Linux X11/Wayland compositor runtime verification is Phase 7.
-- Full GPU device-loss recovery is Phase 5.
+- GPU device-loss recovery foundation is documented in
+  [renderer-device-recovery.md](renderer-device-recovery.md); real platform
+  event validation remains.
 - Hardware GPU timestamp queries and installed in-window overlay remain later
   performance instrumentation work.
 - Batch vector reuse/pooling and deeper shaping/fallback behavior remain future

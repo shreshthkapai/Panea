@@ -55,6 +55,7 @@ cargo xtask fuzz-smoke
 - [Layer boundaries](docs/layer-boundaries.md)
 - [Fuzzing](docs/fuzzing.md)
 - [Renderer batching](docs/renderer-batching.md)
+- [Renderer device recovery](docs/renderer-device-recovery.md)
 - [Configuration](docs/config.md)
 - [Themes](docs/themes.md)
 - [Cursor customization](docs/cursor-customization.md)

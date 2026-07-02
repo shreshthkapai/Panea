@@ -809,7 +809,7 @@ pub fn stability_hardening_report(_input: &DoctorInput) -> ReadinessReport {
                 area: "renderer recovery",
                 status: ReadinessStatus::Warning,
                 message:
-                    "surface lost/outdated paths reconfigure; full GPU device-loss recreation is still a release hardening item"
+                    "renderer device-loss recovery contract and WGPU resource recreation path exist; real sleep/wake, monitor-change, and cross-OS GPU failure validation remain"
                         .to_owned(),
             },
             ReadinessItem {

@@ -6,14 +6,15 @@ use std::{
     collections::{HashMap, VecDeque},
     error::Error,
     fmt,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
 use font_system::{CellMetrics, FontError, FontSystem, GlyphBitmap, GlyphCache, GlyphCacheKey};
 use render_core::{
     CellPosition, CursorVisual, DamageRegion, FrameRequestReason, RenderCell, RenderCellStyle,
-    RenderColor, RenderCursorShape, RenderGrid, RenderInstrumentation, RenderRect, RenderScene,
+    RenderColor, RenderCursorShape, RenderGrid, RenderInstrumentation, RenderRecoveryEvent,
+    RenderRecoveryReason, RenderRecoveryStatus, RenderRect, RenderScene, RenderSurfaceStatus,
 };
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -45,6 +46,12 @@ pub enum RendererError {
     AdapterUnavailable,
     DeviceCreation(String),
     Surface(String),
+    DeviceLost {
+        reason: RenderRecoveryReason,
+        message: String,
+    },
+    DeviceUnavailable(String),
+    RecoveryFailed(String),
     Font(String),
     EmptySurface,
 }
@@ -58,6 +65,11 @@ impl fmt::Display for RendererError {
             Self::AdapterUnavailable => f.write_str("no compatible GPU adapter is available"),
             Self::DeviceCreation(message) => write!(f, "failed to create GPU device: {message}"),
             Self::Surface(message) => write!(f, "surface error: {message}"),
+            Self::DeviceLost { reason, message } => {
+                write!(f, "GPU device lost ({reason:?}): {message}")
+            }
+            Self::DeviceUnavailable(message) => write!(f, "GPU device unavailable: {message}"),
+            Self::RecoveryFailed(message) => write!(f, "GPU recovery failed: {message}"),
             Self::Font(message) => write!(f, "font error: {message}"),
             Self::EmptySurface => f.write_str("surface has zero width or height"),
         }
@@ -620,6 +632,10 @@ impl RenderBatchPlanner {
         self.atlas.dimensions()
     }
 
+    pub fn reset_gpu_resident_glyphs(&mut self) {
+        self.atlas.clear();
+    }
+
     fn push_glyphs(
         &mut self,
         glyphs: &mut GlyphBatch,
@@ -1020,6 +1036,10 @@ impl TerminalRasterizer {
         self.batch_planner.atlas_dimensions()
     }
 
+    pub fn reset_gpu_resident_glyphs(&mut self) {
+        self.batch_planner.reset_gpu_resident_glyphs();
+    }
+
     pub fn rasterize(
         &mut self,
         scene: &RenderScene,
@@ -1354,6 +1374,17 @@ fn draw_cursor(frame: &mut CpuFrame, cursor: CursorVisual, metrics: CellMetrics)
 }
 
 pub struct GpuTerminalRenderer {
+    window: Arc<Window>,
+    options: RendererOptions,
+    backend: Option<GpuBackend>,
+    rasterizer: TerminalRasterizer,
+    last_instrumentation: RenderInstrumentation,
+    recovery_status: RenderRecoveryStatus,
+    recovery_attempts: u32,
+    recovery_events: Vec<RenderRecoveryEvent>,
+}
+
+struct GpuBackend {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -1365,12 +1396,190 @@ pub struct GpuTerminalRenderer {
     glyph_atlas_texture: Option<wgpu::Texture>,
     glyph_atlas_size: Option<(u32, u32)>,
     glyph_bind_group: Option<wgpu::BindGroup>,
-    rasterizer: TerminalRasterizer,
-    last_instrumentation: RenderInstrumentation,
+    device_loss_signal: Arc<Mutex<Option<DeviceLossSignal>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeviceLossSignal {
+    reason: RenderRecoveryReason,
+    message: String,
 }
 
 impl GpuTerminalRenderer {
     pub async fn new(window: Arc<Window>, options: RendererOptions) -> Result<Self, RendererError> {
+        let backend = GpuBackend::new(Arc::clone(&window), options).await?;
+
+        Ok(Self {
+            window,
+            options,
+            backend: Some(backend),
+            rasterizer: TerminalRasterizer::default(),
+            last_instrumentation: RenderInstrumentation::default(),
+            recovery_status: RenderRecoveryStatus::Ready,
+            recovery_attempts: 0,
+            recovery_events: Vec::new(),
+        })
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if let Some(backend) = self.backend.as_mut() {
+            backend.resize(width, height);
+        }
+    }
+
+    pub fn render_scene(
+        &mut self,
+        scene: &RenderScene,
+        fonts: &mut FontSystem,
+    ) -> Result<(), RendererError> {
+        let Some(backend) = self.backend.as_mut() else {
+            return Err(RendererError::DeviceUnavailable(
+                "renderer backend is unavailable until GPU recovery succeeds".to_owned(),
+            ));
+        };
+        if let Some(signal) = backend.take_device_loss_signal() {
+            let error = RendererError::DeviceLost {
+                reason: signal.reason,
+                message: signal.message,
+            };
+            self.mark_backend_lost(&error);
+            return Err(error);
+        }
+
+        let frame_started = Instant::now();
+        let mut batches = self.rasterizer.prepare_batches(scene, fonts)?;
+        let gpu_started = Instant::now();
+        backend.upload_atlas(&self.rasterizer, &batches);
+        let result = backend.present_batches(&batches);
+        batches.instrumentation.gpu_submit_time = Some(gpu_started.elapsed());
+        batches.instrumentation.frame_time = frame_started.elapsed();
+        self.last_instrumentation = batches.instrumentation;
+
+        match result {
+            Ok(PresentOutcome::Submitted | PresentOutcome::Timeout) => Ok(()),
+            Ok(PresentOutcome::SurfaceReconfigured(reason)) => {
+                self.record_surface_recovery(reason);
+                self.retry_present_after_surface_reconfigure(&batches)
+            }
+            Err(error @ RendererError::DeviceLost { .. }) => {
+                self.mark_backend_lost(&error);
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[must_use]
+    pub const fn last_instrumentation(&self) -> RenderInstrumentation {
+        self.last_instrumentation
+    }
+
+    #[must_use]
+    pub fn status(&self) -> RenderSurfaceStatus {
+        self.recovery_status.surface_status()
+    }
+
+    #[must_use]
+    pub const fn recovery_status(&self) -> &RenderRecoveryStatus {
+        &self.recovery_status
+    }
+
+    #[must_use]
+    pub fn recovery_events(&self) -> &[RenderRecoveryEvent] {
+        &self.recovery_events
+    }
+
+    pub async fn recover_from_device_loss(
+        &mut self,
+        reason: RenderRecoveryReason,
+    ) -> Result<RenderRecoveryEvent, RendererError> {
+        self.recovery_attempts = self.recovery_attempts.saturating_add(1);
+        self.recovery_status = RenderRecoveryStatus::Recovering {
+            reason,
+            attempts: self.recovery_attempts,
+        };
+        self.backend = None;
+        self.invalidate_gpu_resident_resources();
+
+        match GpuBackend::new(Arc::clone(&self.window), self.options).await {
+            Ok(backend) => {
+                self.backend = Some(backend);
+                self.recovery_status = RenderRecoveryStatus::Ready;
+                let event = RenderRecoveryEvent::success(reason, self.recovery_attempts);
+                self.recovery_events.push(event.clone());
+                Ok(event)
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.recovery_status = RenderRecoveryStatus::Failed {
+                    reason,
+                    message: message.clone(),
+                };
+                let event =
+                    RenderRecoveryEvent::failure(reason, self.recovery_attempts, message.clone());
+                self.recovery_events.push(event);
+                Err(RendererError::RecoveryFailed(message))
+            }
+        }
+    }
+
+    fn invalidate_gpu_resident_resources(&mut self) {
+        self.rasterizer.reset_gpu_resident_glyphs();
+        self.last_instrumentation = RenderInstrumentation::default();
+    }
+
+    fn retry_present_after_surface_reconfigure(
+        &mut self,
+        batches: &PreparedRenderBatches,
+    ) -> Result<(), RendererError> {
+        let Some(backend) = self.backend.as_mut() else {
+            return Err(RendererError::DeviceUnavailable(
+                "renderer backend disappeared during surface recovery".to_owned(),
+            ));
+        };
+
+        match backend.present_batches(batches) {
+            Ok(PresentOutcome::Submitted | PresentOutcome::Timeout) => Ok(()),
+            Ok(PresentOutcome::SurfaceReconfigured(_)) => Ok(()),
+            Err(error @ RendererError::DeviceLost { .. }) => {
+                self.mark_backend_lost(&error);
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn record_surface_recovery(&mut self, reason: RenderRecoveryReason) {
+        let event = RenderRecoveryEvent {
+            reason,
+            attempts: self.recovery_attempts,
+            rebuilt_surface: true,
+            rebuilt_device: false,
+            rebuilt_pipelines: false,
+            rebuilt_glyph_atlas: false,
+            preserved_terminal_state: true,
+            message: "surface was reconfigured after a recoverable surface event".to_owned(),
+        };
+        self.recovery_events.push(event);
+        self.recovery_status = RenderRecoveryStatus::Ready;
+    }
+
+    fn mark_backend_lost(&mut self, error: &RendererError) {
+        let (reason, message) = match error {
+            RendererError::DeviceLost { reason, message } => (*reason, message.clone()),
+            _ => (
+                RenderRecoveryReason::BackendError,
+                "renderer backend failed".to_owned(),
+            ),
+        };
+        self.backend = None;
+        self.invalidate_gpu_resident_resources();
+        self.recovery_status = RenderRecoveryStatus::Lost { reason, message };
+    }
+}
+
+impl GpuBackend {
+    async fn new(window: Arc<Window>, options: RendererOptions) -> Result<Self, RendererError> {
         let size = window.inner_size();
         if size.width == 0 || size.height == 0 {
             return Err(RendererError::EmptySurface);
@@ -1399,6 +1608,15 @@ impl GpuTerminalRenderer {
             )
             .await
             .map_err(|err| RendererError::DeviceCreation(err.to_string()))?;
+        let device_loss_signal = Arc::new(Mutex::new(None));
+        let callback_signal = Arc::clone(&device_loss_signal);
+        device.set_device_lost_callback(move |reason, message| {
+            if let Some(reason) = map_device_lost_reason(reason)
+                && let Ok(mut signal) = callback_signal.lock()
+            {
+                *signal = Some(DeviceLossSignal { reason, message });
+            }
+        });
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -1501,12 +1719,11 @@ impl GpuTerminalRenderer {
             glyph_atlas_texture: None,
             glyph_atlas_size: None,
             glyph_bind_group: None,
-            rasterizer: TerminalRasterizer::default(),
-            last_instrumentation: RenderInstrumentation::default(),
+            device_loss_signal,
         })
     }
 
-    pub fn resize(&mut self, width: u32, height: u32) {
+    fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
         }
@@ -1516,29 +1733,15 @@ impl GpuTerminalRenderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    pub fn render_scene(
-        &mut self,
-        scene: &RenderScene,
-        fonts: &mut FontSystem,
-    ) -> Result<(), RendererError> {
-        let frame_started = Instant::now();
-        let mut batches = self.rasterizer.prepare_batches(scene, fonts)?;
-        let gpu_started = Instant::now();
-        self.upload_atlas(&batches);
-        let result = self.present_batches(&batches);
-        batches.instrumentation.gpu_submit_time = Some(gpu_started.elapsed());
-        batches.instrumentation.frame_time = frame_started.elapsed();
-        self.last_instrumentation = batches.instrumentation;
-        result
+    fn take_device_loss_signal(&self) -> Option<DeviceLossSignal> {
+        self.device_loss_signal
+            .lock()
+            .ok()
+            .and_then(|mut signal| signal.take())
     }
 
-    #[must_use]
-    pub const fn last_instrumentation(&self) -> RenderInstrumentation {
-        self.last_instrumentation
-    }
-
-    fn upload_atlas(&mut self, batches: &PreparedRenderBatches) {
-        let atlas_size = self.rasterizer.atlas_dimensions();
+    fn upload_atlas(&mut self, rasterizer: &TerminalRasterizer, batches: &PreparedRenderBatches) {
+        let atlas_size = rasterizer.atlas_dimensions();
         if self.glyph_atlas_size != Some(atlas_size) {
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("panea-glyph-atlas"),
@@ -1615,15 +1818,32 @@ impl GpuTerminalRenderer {
         }
     }
 
-    fn present_batches(&mut self, batches: &PreparedRenderBatches) -> Result<(), RendererError> {
+    fn present_batches(
+        &mut self,
+        batches: &PreparedRenderBatches,
+    ) -> Result<PresentOutcome, RendererError> {
         let output = match self.surface.get_current_texture() {
             Ok(output) => output,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            Err(wgpu::SurfaceError::Lost) => {
                 self.surface.configure(&self.device, &self.config);
-                return Ok(());
+                return Ok(PresentOutcome::SurfaceReconfigured(
+                    RenderRecoveryReason::SurfaceLost,
+                ));
             }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
-            Err(error) => return Err(RendererError::Surface(error.to_string())),
+            Err(wgpu::SurfaceError::Outdated) => {
+                self.surface.configure(&self.device, &self.config);
+                return Ok(PresentOutcome::SurfaceReconfigured(
+                    RenderRecoveryReason::SurfaceOutdated,
+                ));
+            }
+            Err(wgpu::SurfaceError::Timeout) => return Ok(PresentOutcome::Timeout),
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                return Err(RendererError::DeviceLost {
+                    reason: RenderRecoveryReason::OutOfMemory,
+                    message: "surface reported out-of-memory; GPU resources must be recreated"
+                        .to_owned(),
+                });
+            }
         };
         let view = output
             .texture
@@ -1675,7 +1895,7 @@ impl GpuTerminalRenderer {
 
         self.queue.submit(Some(encoder.finish()));
         output.present();
-        Ok(())
+        Ok(PresentOutcome::Submitted)
     }
 
     fn make_buffers(&self, vertices: &[BatchVertex], indices: &[u32]) -> Option<GpuBatchBuffers> {
@@ -1707,6 +1927,24 @@ impl GpuTerminalRenderer {
             indices: index_buffer,
             index_count: indices.len() as u32,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresentOutcome {
+    Submitted,
+    SurfaceReconfigured(RenderRecoveryReason),
+    Timeout,
+}
+
+fn map_device_lost_reason(reason: wgpu::DeviceLostReason) -> Option<RenderRecoveryReason> {
+    match reason {
+        wgpu::DeviceLostReason::Unknown | wgpu::DeviceLostReason::DeviceInvalid => {
+            Some(RenderRecoveryReason::DeviceLost)
+        }
+        wgpu::DeviceLostReason::Destroyed
+        | wgpu::DeviceLostReason::Dropped
+        | wgpu::DeviceLostReason::ReplacedCallback => None,
     }
 }
 
@@ -1953,6 +2191,48 @@ mod tests {
 
         assert!(second.instrumentation.glyphs.cache_hits > 0);
         assert_eq!(second.instrumentation.glyphs.atlas_uploads, 0);
+    }
+
+    #[test]
+    fn resetting_gpu_resident_glyphs_reuploads_cached_glyphs() {
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let mut planner = RenderBatchPlanner::default();
+        let test_scene = scene_without_cursor(vec![cell(0, 0, "panea")]);
+        if planner.prepare_full(&test_scene, &mut fonts).is_err() {
+            return;
+        }
+        let cached = planner
+            .prepare_full(&test_scene, &mut fonts)
+            .expect("same resolved font should prepare cached batch");
+        assert_eq!(cached.instrumentation.glyphs.atlas_uploads, 0);
+
+        planner.reset_gpu_resident_glyphs();
+        let recovered = planner
+            .prepare_full(&test_scene, &mut fonts)
+            .expect("cached glyph bitmaps should re-upload after atlas reset");
+
+        assert!(recovered.instrumentation.glyphs.cache_hits > 0);
+        assert!(recovered.instrumentation.glyphs.atlas_uploads > 0);
+    }
+
+    #[test]
+    fn device_lost_callback_mapping_ignores_intentional_teardown() {
+        assert_eq!(
+            map_device_lost_reason(wgpu::DeviceLostReason::Unknown),
+            Some(RenderRecoveryReason::DeviceLost)
+        );
+        assert_eq!(
+            map_device_lost_reason(wgpu::DeviceLostReason::DeviceInvalid),
+            Some(RenderRecoveryReason::DeviceLost)
+        );
+        assert_eq!(
+            map_device_lost_reason(wgpu::DeviceLostReason::Dropped),
+            None
+        );
+        assert_eq!(
+            map_device_lost_reason(wgpu::DeviceLostReason::ReplacedCallback),
+            None
+        );
     }
 
     #[test]
