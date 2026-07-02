@@ -22,6 +22,41 @@ Every task must clearly fit one or more of these categories:
 
 If a task does not fit, redesign it before implementation.
 
+## Next Hardening Roadmap
+
+The first fifteen phases established foundations across the core, transport,
+platform, renderer, config, mux, semantics, visuals, SSH, diagnostics,
+hardening, and iOS companion layers. The next pass is not a random feature
+backlog. It follows the dependency-ordered plan in
+[docs/engineering-rules.md](docs/engineering-rules.md):
+
+1. Phase 0 - Current-state freeze and status matrix
+2. Phase 1 - Architecture and layer-boundary hardening
+3. Phase 2 - Unicode, grapheme, emoji, and width correctness
+4. Phase 3 - Real fuzzing harness
+5. Phase 4 - GPU renderer batching and glyph pipeline
+6. Phase 5 - GPU device-loss recovery
+7. Phase 6 - Cross-OS screenshot verification
+8. Phase 7 - Linux X11/Wayland compositor verification
+9. Phase 8 - Clipboard, selection, and OSC clipboard policy
+10. Phase 9 - Runtime config watching and live reload
+11. Phase 10 - Desktop multiplexer runtime wiring
+12. Phase 11 - Shell integration activation and verification
+13. Phase 12 - Command blocks and visual overlays
+14. Phase 13 - Cursor animation and animated image cursor pipeline
+15. Phase 14 - App compatibility test suite
+16. Phase 15 - SSH trust, secrets, and keychain providers
+17. Phase 16 - Real SSH server smoke tests
+18. Phase 17 - Performance instrumentation and in-window overlay
+19. Phase 18 - Terminal doctor binary
+20. Phase 19 - Cross-OS verification runners
+21. Phase 20 - Packaging artifacts
+22. Phase 21 - Advanced programmable config
+23. Phase 22 - Native iOS SSH companion path
+
+Each phase should be implemented as its own assigned slice. Do not jump ahead
+to more visible features before the dependencies they rely on are hardened.
+
 ## Completed
 
 - Created the initial Rust workspace and repository layer skeleton.

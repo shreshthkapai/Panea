@@ -1,8 +1,10 @@
 # Development
 
-Build in layers. Do not introduce a higher-layer dependency into a lower layer.
-Feature work must also follow the design, rollout, testing, diagnostics, and
-release-readiness rules in [Engineering rules](engineering-rules.md).
+Build in layers. Read `architecture.md` before implementation work, then work
+only on the currently assigned slice. Do not introduce a higher-layer
+dependency into a lower layer. Feature work must also follow the design,
+rollout, testing, diagnostics, and release-readiness rules in
+[Engineering rules](engineering-rules.md).
 
 ## Standard Commands
 

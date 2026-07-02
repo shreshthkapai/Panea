@@ -4,6 +4,98 @@ This document is the execution contract for feature work. It complements
 `architecture.md`: architecture defines what the product is; this file defines
 how accepted features are routed, designed, tested, diagnosed, and rolled out.
 
+## 0. Execution Rules
+
+Every implementation task must obey these rules:
+
+1. Read `architecture.md` before making changes.
+2. Implement only the current assigned slice.
+3. Do not jump ahead to future phases.
+4. Do not redesign the architecture unless explicitly asked.
+5. Do not make user-facing features OS-specific.
+6. Do not mutate the terminal buffer for visual effects.
+7. Do not put config scripting in the hot render path.
+8. Do not block PTY input/output on rendering, animations, config, or UI.
+9. Every feature must have a test, smoke test, benchmark, or manual
+   verification path.
+10. Every cross-platform feature must degrade clearly if the platform blocks
+    exact behavior.
+
+Panea's core promise is:
+
+```text
+Same config.
+Same behavior.
+Same visual system.
+Same performance discipline.
+Different OS internals hidden underneath.
+```
+
+## 1. Remaining Work Overview
+
+The remaining high-level work is:
+
+- Full Unicode/grapheme/emoji hardening.
+- Stronger architecture/layer-boundary checks.
+- Real fuzzing harness.
+- Fully batched GPU glyph rendering and cross-OS screenshot verification.
+- Real Linux X11/Wayland compositor verification.
+- Full clipboard/selection/OSC clipboard policy.
+- Automated app compatibility tests: shells, editors, TUIs,
+  tmux/screen/zellij, SSH.
+- Runtime config watching/live reload.
+- Advanced programmable config later.
+- GPU timestamp queries and in-window performance overlay.
+- Full desktop mux runtime wiring: split panes, tab chrome, per-pane
+  transports, PTY resizing.
+- Runtime shell integration activation and real shell verification.
+- Product-complete command blocks/visual overlays.
+- Animated image cursor pipeline.
+- Interactive SSH trust/secret UI and OS keychain providers.
+- Real SSH server smoke tests.
+- Real cross-OS verification runners.
+- Installed terminal doctor binary.
+- Packaging artifacts.
+- Full GPU device-loss recovery.
+- Native iOS shell, iOS GPU surface, Keychain provider, device validation.
+
+This list must not be implemented randomly. It must be implemented in
+dependency order.
+
+## 2. Dependency-Ordered Phase Plan
+
+The correct order for the next implementation pass is:
+
+```text
+Phase 0  - Current-state freeze and status matrix
+Phase 1  - Architecture and layer-boundary hardening
+Phase 2  - Unicode, grapheme, emoji, and width correctness
+Phase 3  - Real fuzzing harness
+Phase 4  - GPU renderer batching and glyph pipeline
+Phase 5  - GPU device-loss recovery
+Phase 6  - Cross-OS screenshot verification
+Phase 7  - Linux X11/Wayland compositor verification
+Phase 8  - Clipboard, selection, and OSC clipboard policy
+Phase 9  - Runtime config watching and live reload
+Phase 10 - Desktop multiplexer runtime wiring
+Phase 11 - Shell integration activation and verification
+Phase 12 - Command blocks and visual overlays
+Phase 13 - Cursor animation and animated image cursor pipeline
+Phase 14 - App compatibility test suite
+Phase 15 - SSH trust, secrets, and keychain providers
+Phase 16 - Real SSH server smoke tests
+Phase 17 - Performance instrumentation and in-window overlay
+Phase 18 - Terminal doctor binary
+Phase 19 - Cross-OS verification runners
+Phase 20 - Packaging artifacts
+Phase 21 - Advanced programmable config
+Phase 22 - Native iOS SSH companion path
+```
+
+Do not skip ahead because a later phase is more visible. Each phase exists to
+make the following phases possible without weakening terminal correctness,
+platform parity, performance discipline, or security.
+
 ## 16. Feature Implementation Map
 
 This table tells workers where each accepted feature belongs.
