@@ -1,6 +1,14 @@
 use std::{error::Error, sync::Arc};
 
+use config_core::{AppConfig, DecorationStrategyConfig, LinuxBackendConfig, WindowModeConfig};
 use font_system::{CellMetrics, FontConfig, FontSystem};
+use platform_core::{
+    DecorationMode, InputEvent, KeyEvent, KeyState, LinuxWindowBackend, WindowAction, WindowMode,
+};
+use platform_winit::{
+    ClipboardBridge, DesktopWindow, InputTranslator, WindowSettings, apply_window_mode,
+    platform_capabilities,
+};
 use render_core::{
     CellPosition, CursorVisual, RenderCell, RenderCellStyle, RenderColor, RenderCursorShape,
     RenderGrid, RenderScene,
@@ -13,15 +21,9 @@ use term_parser::TerminalEmulator;
 use transport_core::{TerminalSize as TransportSize, TerminalTransport};
 use transport_pty::LocalPtyTransport;
 use winit::{
-    dpi::LogicalSize,
-    event::{ElementState, Event, WindowEvent},
+    event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
-    keyboard::{Key, NamedKey},
-    window::WindowBuilder,
 };
-
-const DEFAULT_COLS: u16 = 100;
-const DEFAULT_ROWS: u16 = 32;
 
 fn main() {
     if let Err(error) = run() {
@@ -31,18 +33,25 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
+    let config = AppConfig::default();
     let event_loop = EventLoop::new()?;
-    let window = Arc::new(
-        WindowBuilder::new()
-            .with_title("Panea")
-            .with_inner_size(LogicalSize::new(960.0, 560.0))
-            .build(&event_loop)?,
-    );
+    let desktop_window = DesktopWindow::create(&event_loop, &window_settings(&config))?;
+    let window = desktop_window.window();
+    let capabilities = platform_capabilities(&event_loop, &window);
+    let _diagnostics =
+        DesktopDiagnosticsPlaceholder::new(desktop_window.diagnostics().clone(), capabilities);
+    let _session_manager = SessionManagerPlaceholder;
+    let mut input_translator = InputTranslator::new();
+    let mut clipboard = ClipboardBridge::new();
+    let mut current_window_mode = map_window_mode(config.window.mode);
 
     let mut fonts = FontSystem::new(FontConfig::default());
     let metrics = fonts.cell_metrics()?;
-    let initial_size = terminal_size_for_window(DEFAULT_COLS, DEFAULT_ROWS, metrics);
-    let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(DEFAULT_COLS, DEFAULT_ROWS));
+    let initial_size = terminal_size_for_window(config.window.columns, config.window.rows, metrics);
+    let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(
+        config.window.columns,
+        config.window.rows,
+    ));
     let mut renderer = pollster::block_on(GpuTerminalRenderer::new(
         Arc::clone(&window),
         RendererOptions::default(),
@@ -64,44 +73,95 @@ fn run() -> Result<(), Box<dyn Error>> {
 
         match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
-                WindowEvent::CloseRequested => {
-                    if let Some(transport) = transport.as_mut() {
-                        let _ = transport.shutdown();
-                    }
-                    target.exit();
-                }
-                WindowEvent::Resized(size) => {
-                    renderer.resize(size.width, size.height);
-                    if let Ok(metrics) = fonts.cell_metrics() {
-                        let cols = cols_for_width(size.width, metrics).max(1);
-                        let rows = rows_for_height(size.height, metrics).max(1);
-                        let core_size = CoreTerminalSize::new(cols, rows);
-                        let transport_size =
-                            TransportSize::new(cols, rows, size.width, size.height);
-                        let _ = terminal.resize(core_size);
-                        if let Some(transport) = transport.as_mut() {
-                            let _ = transport.resize(transport_size);
-                        }
-                    }
-                    scheduler.window_resized();
-                    window.request_redraw();
-                }
-                WindowEvent::KeyboardInput { event, .. }
-                    if event.state == ElementState::Pressed =>
-                {
-                    if let Some(transport) = transport.as_mut()
-                        && let Some(bytes) = input_bytes(&event)
-                    {
-                        let _ = transport.write_input(&bytes);
-                    }
-                }
                 WindowEvent::RedrawRequested => {
                     let scene = scene_from_terminal(&terminal);
                     if let Err(error) = renderer.render_scene(&scene, &mut fonts) {
                         eprintln!("render error: {error}");
                     }
                 }
-                _ => {}
+                _ => {
+                    let platform_events = input_translator.translate_window_event(&event);
+                    for platform_event in platform_events {
+                        match platform_event {
+                            InputEvent::CloseRequested => {
+                                shutdown_transport(transport.as_mut());
+                                target.exit();
+                            }
+                            InputEvent::Resized { width, height } => {
+                                renderer.resize(width, height);
+                                if let Ok(metrics) = fonts.cell_metrics() {
+                                    let cols = cols_for_width(width, metrics).max(1);
+                                    let rows = rows_for_height(height, metrics).max(1);
+                                    let core_size = CoreTerminalSize::new(cols, rows);
+                                    let transport_size =
+                                        TransportSize::new(cols, rows, width, height);
+                                    let _ = terminal.resize(core_size);
+                                    if let Some(transport) = transport.as_mut() {
+                                        let _ = transport.resize(transport_size);
+                                    }
+                                }
+                                scheduler.window_resized();
+                                window.request_redraw();
+                            }
+                            InputEvent::Key(key) => {
+                                if is_copy_shortcut(&key) {
+                                    if let Some(text) = terminal.state().selected_text() {
+                                        let _ = clipboard.copy_text(&text);
+                                    }
+                                } else if let Some(transport) = transport.as_mut() {
+                                    if is_paste_shortcut(&key) {
+                                        if let Ok(text) = clipboard.paste_text() {
+                                            let _ = transport.write_input(text.as_bytes());
+                                        }
+                                    } else if let Some(bytes) = input_bytes(&key) {
+                                        let _ = transport.write_input(&bytes);
+                                    }
+                                }
+                            }
+                            InputEvent::Ime(platform_core::ImeEvent::Commit { text }) => {
+                                if let Some(transport) = transport.as_mut() {
+                                    let _ = transport.write_input(text.as_bytes());
+                                }
+                            }
+                            InputEvent::WindowAction(action) => match action {
+                                WindowAction::ToggleFullscreen => {
+                                    current_window_mode =
+                                        if matches!(current_window_mode, WindowMode::Windowed) {
+                                            WindowMode::BorderlessFullscreen
+                                        } else {
+                                            WindowMode::Windowed
+                                        };
+                                    let _ = apply_window_mode(&window, current_window_mode);
+                                }
+                                WindowAction::RestoreWindowDecorations => {
+                                    current_window_mode = WindowMode::Windowed;
+                                    let _ = apply_window_mode(&window, current_window_mode);
+                                }
+                                WindowAction::ToggleFrameless => {
+                                    current_window_mode = if matches!(
+                                        current_window_mode,
+                                        WindowMode::FramelessWindowed
+                                    ) {
+                                        WindowMode::Windowed
+                                    } else {
+                                        WindowMode::FramelessWindowed
+                                    };
+                                    let _ = apply_window_mode(&window, current_window_mode);
+                                }
+                                WindowAction::CloseWindow => {
+                                    shutdown_transport(transport.as_mut());
+                                    target.exit();
+                                }
+                                WindowAction::OpenCommandPaletteLater => {
+                                    eprintln!(
+                                        "command palette action is reserved for a later phase"
+                                    );
+                                }
+                            },
+                            _ => {}
+                        }
+                    }
+                }
             },
             Event::AboutToWait => {
                 if let Some(transport) = transport.as_mut() {
@@ -160,19 +220,110 @@ fn rows_for_height(height: u32, metrics: CellMetrics) -> u16 {
     ((height as f32 / metrics.cell_height).floor() as u16).max(1)
 }
 
-fn input_bytes(event: &winit::event::KeyEvent) -> Option<Vec<u8>> {
-    match &event.logical_key {
-        Key::Named(NamedKey::Enter) => Some(b"\r".to_vec()),
-        Key::Named(NamedKey::Backspace) => Some(vec![0x08]),
-        Key::Named(NamedKey::Tab) => Some(b"\t".to_vec()),
-        Key::Named(NamedKey::Escape) => Some(vec![0x1b]),
-        Key::Character(text) if !text.is_empty() => Some(text.as_bytes().to_vec()),
-        _ => event.text.as_ref().map(|text| text.as_bytes().to_vec()),
+fn input_bytes(event: &KeyEvent) -> Option<Vec<u8>> {
+    if event.state != KeyState::Pressed
+        || event.modifiers.ctrl
+        || event.modifiers.alt
+        || event.modifiers.super_key
+    {
+        return None;
+    }
+
+    match event.logical_key.as_str() {
+        "Enter" => Some(b"\r".to_vec()),
+        "Backspace" => Some(vec![0x08]),
+        "Tab" => Some(b"\t".to_vec()),
+        "Escape" => Some(vec![0x1b]),
+        _ => event
+            .text
+            .as_ref()
+            .filter(|text| !text.is_empty())
+            .map(|text| text.as_bytes().to_vec()),
+    }
+}
+
+fn is_paste_shortcut(event: &KeyEvent) -> bool {
+    event.state == KeyState::Pressed
+        && event.modifiers.ctrl
+        && event.modifiers.shift
+        && event.logical_key.eq_ignore_ascii_case("v")
+}
+
+fn is_copy_shortcut(event: &KeyEvent) -> bool {
+    event.state == KeyState::Pressed
+        && event.modifiers.ctrl
+        && event.modifiers.shift
+        && event.logical_key.eq_ignore_ascii_case("c")
+}
+
+fn shutdown_transport(transport: Option<&mut LocalPtyTransport>) {
+    if let Some(transport) = transport {
+        let _ = transport.shutdown();
     }
 }
 
 fn contains_cpr_query(bytes: &[u8]) -> bool {
     bytes.windows(4).any(|window| window == b"\x1b[6n")
+}
+
+fn window_settings(config: &AppConfig) -> WindowSettings {
+    WindowSettings {
+        title: config.window.title.clone(),
+        initial_width: config.window.initial_width,
+        initial_height: config.window.initial_height,
+        mode: map_window_mode(config.window.mode),
+        linux_backend: map_linux_backend(config.window.linux_backend),
+        decoration_mode: map_decoration_mode(config.window.decoration_strategy),
+    }
+}
+
+fn map_window_mode(mode: WindowModeConfig) -> WindowMode {
+    match mode {
+        WindowModeConfig::Windowed => WindowMode::Windowed,
+        WindowModeConfig::Maximized => WindowMode::Maximized,
+        WindowModeConfig::Fullscreen => WindowMode::Fullscreen,
+        WindowModeConfig::BorderlessFullscreen => WindowMode::BorderlessFullscreen,
+        WindowModeConfig::FramelessWindowed => WindowMode::FramelessWindowed,
+        WindowModeConfig::FramelessFullscreen => WindowMode::FramelessFullscreen,
+    }
+}
+
+fn map_linux_backend(backend: LinuxBackendConfig) -> LinuxWindowBackend {
+    match backend {
+        LinuxBackendConfig::Auto => LinuxWindowBackend::Auto,
+        LinuxBackendConfig::X11 => LinuxWindowBackend::X11,
+        LinuxBackendConfig::Wayland => LinuxWindowBackend::Wayland,
+    }
+}
+
+fn map_decoration_mode(mode: DecorationStrategyConfig) -> DecorationMode {
+    match mode {
+        DecorationStrategyConfig::Auto => DecorationMode::Auto,
+        DecorationStrategyConfig::Native => DecorationMode::Native,
+        DecorationStrategyConfig::ClientSide => DecorationMode::ClientSide,
+        DecorationStrategyConfig::Custom => DecorationMode::Custom,
+        DecorationStrategyConfig::None => DecorationMode::None,
+        DecorationStrategyConfig::FallbackDecorated => DecorationMode::FallbackDecorated,
+    }
+}
+
+struct SessionManagerPlaceholder;
+
+struct DesktopDiagnosticsPlaceholder {
+    _window: platform_winit::DesktopWindowDiagnostics,
+    _capabilities: platform_core::PlatformCapabilities,
+}
+
+impl DesktopDiagnosticsPlaceholder {
+    fn new(
+        window: platform_winit::DesktopWindowDiagnostics,
+        capabilities: platform_core::PlatformCapabilities,
+    ) -> Self {
+        Self {
+            _window: window,
+            _capabilities: capabilities,
+        }
+    }
 }
 
 fn scene_from_terminal(terminal: &TerminalEmulator) -> RenderScene {

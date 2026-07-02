@@ -8,3 +8,7 @@ description = "Desktop window and event integration."
 [lints]
 workspace = true
 
+[dependencies]
+arboard.workspace = true
+platform-core = { path = "../platform-core" }
+winit.workspace = true

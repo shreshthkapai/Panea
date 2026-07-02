@@ -14,16 +14,38 @@ pub enum DesktopPlatform {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowMode {
     Windowed,
+    Maximized,
     Fullscreen,
     BorderlessFullscreen,
-    Frameless,
+    FramelessWindowed,
+    FramelessFullscreen,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecorationMode {
+    Auto,
+    Native,
     ServerSide,
     ClientSide,
+    Custom,
     None,
+    FallbackDecorated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxWindowBackend {
+    Auto,
+    X11,
+    Wayland,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowAction {
+    ToggleFullscreen,
+    RestoreWindowDecorations,
+    ToggleFrameless,
+    CloseWindow,
+    OpenCommandPaletteLater,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,12 +135,12 @@ pub enum MouseButton {
     Other(u16),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MouseEventKind {
     Pressed(MouseButton),
     Released(MouseButton),
     Moved,
-    Wheel { delta_x: i32, delta_y: i32 },
+    Wheel { delta_x: f64, delta_y: f64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -144,6 +166,8 @@ pub enum InputEvent {
     Ime(ImeEvent),
     Focused(bool),
     Resized { width: u32, height: u32 },
+    CloseRequested,
+    WindowAction(WindowAction),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +192,43 @@ pub struct PlatformFallback {
     pub requested: String,
     pub effective: String,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardOperation {
+    Copy,
+    Paste,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardAvailability {
+    Available,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardDiagnostic {
+    pub operation: ClipboardOperation,
+    pub availability: ClipboardAvailability,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowModeDiagnostic {
+    pub requested: WindowMode,
+    pub effective: WindowMode,
+    pub fallback: Option<PlatformFallback>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxWindowBackendDiagnostic {
+    pub requested_backend: LinuxWindowBackend,
+    pub backend_used: DesktopPlatform,
+    pub compositor: Option<CompositorInfo>,
+    pub decoration_requested: DecorationMode,
+    pub decoration_used: DecorationMode,
+    pub fallback: Option<PlatformFallback>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

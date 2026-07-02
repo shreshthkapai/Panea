@@ -44,6 +44,12 @@ If a task does not fit, redesign it before implementation.
   states, non-blocking Drop cleanup, bounded shutdown, reader diagnostics,
   failure diagnostics for real PTY smoke tests, and Windows verification of
   one-shot, interactive, and event-loop smoke cases.
+- Completed Phase 4 platform/window foundation: desktop app entrypoint
+  placeholders for config/session/diagnostics, Winit-backed window creation,
+  monitor and DPI snapshots, platform-neutral keyboard/mouse/IME/resize/close
+  event translation, clipboard copy/paste bridge with diagnostics, portable
+  window-mode config, Linux backend and decoration strategy config/diagnostics,
+  and emergency restore window actions.
 - Implemented the Phase 5 GPU renderer foundation: WGPU surface/device/queue
   initialization, surface resize/present lifecycle, font discovery and fallback
   chain resolution, glyph rasterization and cache policy, glyph atlas allocation,
@@ -58,6 +64,17 @@ If a task does not fit, redesign it before implementation.
 - Mouse/focus/application keypad behavior is represented as modes in Phase 2;
   event semantics are implemented in later platform and parser compatibility
   phases.
+- Phase 4 translates platform mouse/focus/IME events into platform-neutral
+  events, but terminal mouse reporting, mouse-driven selection UI, focus escape
+  reports, and application keypad/cursor encoding remain later compatibility
+  work.
+- Phase 4 models Linux X11/Wayland backend and decoration preferences and emits
+  diagnostics, but compositor-specific fullscreen/frameless behavior still
+  needs real Linux X11/Wayland host verification before it can be called
+  complete.
+- Clipboard copy/paste has a platform bridge and diagnostics; OSC clipboard,
+  primary selection, and full selection-driven copy behavior remain later
+  platform/compatibility work.
 - Real local transport smoke tests remain ignored by default because they spawn
   host shells. On the current Windows host, the one-shot, interactive, and
   event-loop smoke tests pass quickly. macOS and Linux smoke status is still

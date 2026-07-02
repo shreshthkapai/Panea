@@ -30,9 +30,12 @@ pub struct WindowConfig {
     pub title: String,
     pub columns: u16,
     pub rows: u16,
+    pub initial_width: u32,
+    pub initial_height: u32,
     pub opacity: f32,
-    pub fullscreen: bool,
-    pub frameless: bool,
+    pub mode: WindowModeConfig,
+    pub linux_backend: LinuxBackendConfig,
+    pub decoration_strategy: DecorationStrategyConfig,
 }
 
 impl Default for WindowConfig {
@@ -41,11 +44,41 @@ impl Default for WindowConfig {
             title: "Panea".to_owned(),
             columns: 100,
             rows: 32,
+            initial_width: 960,
+            initial_height: 560,
             opacity: 1.0,
-            fullscreen: false,
-            frameless: false,
+            mode: WindowModeConfig::Windowed,
+            linux_backend: LinuxBackendConfig::Auto,
+            decoration_strategy: DecorationStrategyConfig::Auto,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowModeConfig {
+    Windowed,
+    Maximized,
+    Fullscreen,
+    BorderlessFullscreen,
+    FramelessWindowed,
+    FramelessFullscreen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinuxBackendConfig {
+    Auto,
+    X11,
+    Wayland,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DecorationStrategyConfig {
+    Auto,
+    Native,
+    ClientSide,
+    Custom,
+    None,
+    FallbackDecorated,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,15 +212,41 @@ pub struct PromptDecorationsConfig {
     pub show_remote_host: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyboardConfig {
     pub keybindings: Vec<KeyBinding>,
+}
+
+impl Default for KeyboardConfig {
+    fn default() -> Self {
+        Self {
+            keybindings: vec![
+                KeyBinding::new("Ctrl+Shift+C", "copy"),
+                KeyBinding::new("Ctrl+Shift+V", "paste"),
+                KeyBinding::new("Ctrl+Shift+F", "toggle_fullscreen"),
+                KeyBinding::new("Ctrl+Shift+D", "restore_window_decorations"),
+                KeyBinding::new("Ctrl+Shift+M", "toggle_frameless"),
+                KeyBinding::new("Ctrl+Shift+W", "close_window"),
+                KeyBinding::new("Ctrl+Shift+P", "open_command_palette_later"),
+            ],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyBinding {
     pub keys: String,
     pub action: String,
+}
+
+impl KeyBinding {
+    #[must_use]
+    pub fn new(keys: impl Into<String>, action: impl Into<String>) -> Self {
+        Self {
+            keys: keys.into(),
+            action: action.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

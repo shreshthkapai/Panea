@@ -22,3 +22,16 @@ over time and must include:
 
 Any unsupported or degraded behavior must be represented as a capability,
 fallback, and diagnostic.
+
+## Current Verification Status
+
+| Area | Windows | macOS | Linux X11 | Linux Wayland |
+| --- | --- | --- | --- | --- |
+| Workspace build/test/lint | Verified on current host | Unverified | Unverified | Unverified |
+| Local PTY real-shell smoke | Verified on current host | Unverified | Unverified | Unverified |
+| Window creation/input translation | Build-verified on current host | Unverified | Unverified | Unverified |
+| GPU renderer window path | Build-verified on current host | Unverified | Unverified | Unverified |
+
+Linux backend and decoration preferences are represented in config and
+diagnostics. Exact compositor behavior is not considered verified until tested
+on real X11 and Wayland sessions.

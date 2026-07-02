@@ -12,7 +12,10 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+config-core = { path = "../../crates/config-core" }
 font-system = { path = "../../crates/font-system" }
+platform-core = { path = "../../crates/platform-core" }
+platform-winit = { path = "../../crates/platform-winit" }
 pollster.workspace = true
 render-core = { path = "../../crates/render-core" }
 render-wgpu = { path = "../../crates/render-wgpu" }
