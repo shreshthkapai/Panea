@@ -1,6 +1,8 @@
 # Development
 
 Build in layers. Do not introduce a higher-layer dependency into a lower layer.
+Feature work must also follow the design, rollout, testing, diagnostics, and
+release-readiness rules in [Engineering rules](engineering-rules.md).
 
 ## Standard Commands
 
@@ -43,6 +45,9 @@ No pull request is mergeable unless it answers:
 - Does this affect cross-OS behavior?
 - Does this require diagnostics?
 - Does this require a benchmark?
+
+Every user-facing feature also needs the short cross-OS design note defined in
+[Engineering rules](engineering-rules.md) before implementation begins.
 
 ## Layer Boundary Rule
 

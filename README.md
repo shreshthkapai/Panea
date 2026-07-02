@@ -46,6 +46,7 @@ cargo clippy --workspace --all-targets
 ## Docs
 
 - [Getting started](docs/getting-started.md)
+- [Engineering rules](docs/engineering-rules.md)
 - [Configuration](docs/config.md)
 - [Themes](docs/themes.md)
 - [Cursor customization](docs/cursor-customization.md)

@@ -1,6 +1,9 @@
 # Implementation
 
 This file tracks implementation steps as they are accepted and completed.
+Feature routing, rollout order, test expectations, diagnostics requirements,
+and release readiness gates are defined in
+[docs/engineering-rules.md](docs/engineering-rules.md).
 
 ## Execution Categories
 

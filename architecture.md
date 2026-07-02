@@ -3,6 +3,9 @@
 > This document defines the soul, constraints, and architectural laws of the terminal.  
 > It is not a roadmap, not an implementation checklist, and not a list of tickets.  
 > All future design and implementation decisions must preserve the rules in this document.
+>
+> Operational feature routing, rollout order, testing, diagnostics, and release
+> readiness rules live in [docs/engineering-rules.md](docs/engineering-rules.md).
 
 ## 1. Product Identity
 
