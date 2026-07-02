@@ -4,7 +4,7 @@ fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("help") | None => {
             eprintln!(
-                "usage: cargo xtask <fmt|clippy|test|build|check|ci|config-default|config-schema|bench|doctor|bug-report|hardening|security-review|package-plan|release-check>"
+                "usage: cargo xtask <fmt|clippy|test|build|check|ci|config-default|config-schema|bench|doctor|bug-report|hardening|security-review|package-plan|release-check|ios-readiness>"
             );
             ExitCode::SUCCESS
         }
@@ -22,12 +22,21 @@ fn main() -> ExitCode {
         Some("security-review") => run_security_review(),
         Some("package-plan") => run_package_plan(),
         Some("release-check") => run_release_check(),
+        Some("ios-readiness") => run_ios_readiness(),
         Some("ci") => run_ci(),
         Some(command) => {
             eprintln!("unknown xtask command: {command}");
             ExitCode::from(2)
         }
     }
+}
+
+fn run_ios_readiness() -> ExitCode {
+    println!(
+        "{}",
+        diagnostics::ios_companion_readiness_report().render_text()
+    );
+    ExitCode::SUCCESS
 }
 
 fn run_hardening() -> ExitCode {

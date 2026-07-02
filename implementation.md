@@ -127,6 +127,12 @@ If a task does not fit, redesign it before implementation.
   operational docs for getting started, themes, cursor customization, SSH
   profiles, mux usage, troubleshooting, packaging, release validation, and
   Linux compositor notes.
+- Implemented the Phase 15 iOS SSH companion foundation: added `apps/ios` as a
+  shared-engine Rust crate, modeled mobile lifecycle/touch/keyboard/safe-area
+  sizing contracts, mapped portable SSH profiles into mobile SSH session specs
+  while preserving host-key and auth policy, proved terminal bytes flow through
+  the shared parser/core, added mobile render-frame sizing helpers, documented
+  iOS lifecycle/security limits, and exposed `cargo xtask ios-readiness`.
 
 ## Deferred By Design
 
@@ -206,3 +212,9 @@ If a task does not fit, redesign it before implementation.
   approval UI, OSC 52 clipboard permission policy, full GPU device-loss
   recreation, runtime crash-safe config reload, and installer automation remain
   release-hardening follow-up work.
+- Phase 15 establishes a compileable iOS companion foundation around the shared
+  engine, but it is not a native iOS app yet. UIKit/SwiftUI app lifecycle,
+  native touch/keyboard/settings UI, iOS GPU surface implementation, iOS
+  Keychain-backed `SecretProvider`, host-key approval UI, key import UX, remote
+  shell-integration activation, simulator/device validation, and App Store/Test
+  Flight packaging remain follow-up work.

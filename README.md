@@ -53,6 +53,7 @@ cargo clippy --workspace --all-targets
 - [Shell integration](docs/shell-integration.md)
 - [SSH profiles](docs/ssh-profiles.md)
 - [Multiplexer usage](docs/multiplexer.md)
+- [iOS SSH companion](docs/ios-companion.md)
 - [Performance](docs/performance.md)
 - [Platform support](docs/platform-support.md)
 - [Linux compositor notes](docs/linux-compositor-notes.md)

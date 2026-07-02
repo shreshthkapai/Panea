@@ -1,0 +1,24 @@
+[package]
+name = "panea-ios"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "iOS SSH companion shell contracts around the shared Panea engine."
+
+[lib]
+name = "panea_ios"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+config-core = { path = "../../crates/config-core" }
+font-system = { path = "../../crates/font-system" }
+render-core = { path = "../../crates/render-core" }
+security = { path = "../../crates/security" }
+semantics = { path = "../../crates/semantics" }
+term-core = { path = "../../crates/term-core" }
+term-parser = { path = "../../crates/term-parser" }
+transport-core = { path = "../../crates/transport-core" }
+transport-ssh = { path = "../../crates/transport-ssh" }

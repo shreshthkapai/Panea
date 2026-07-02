@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "apps/desktop",
+    "apps/ios",
     "crates/assets",
     "crates/config-core",
     "crates/config-lua",

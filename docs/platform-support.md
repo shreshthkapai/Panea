@@ -134,3 +134,20 @@ library rather than reimplementing these checks.
 The privacy-aware bug-report snapshot intentionally excludes terminal contents,
 command output, environment variables, secrets, SSH keys, and clipboard contents
 by default.
+
+## iOS Companion Status
+
+The iOS SSH companion is tracked separately from desktop platform parity. Its
+foundation reuses the shared terminal/parser/semantic/render/config/transport
+contracts, but the native iOS app shell, iOS GPU surface, Keychain-backed secret
+provider, and real device validation are not implemented yet.
+
+Run:
+
+```text
+cargo xtask ios-readiness
+```
+
+Do not mark the iOS companion as complete until secure SSH, host-key approval,
+mobile rendering, keyboard behavior, and lifecycle behavior are verified on
+simulator and real iPhone/iPad hardware.

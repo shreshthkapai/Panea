@@ -1040,6 +1040,64 @@ pub fn release_validation_report(input: &DoctorInput) -> ReadinessReport {
     }
 }
 
+#[must_use]
+pub fn ios_companion_readiness_report() -> ReadinessReport {
+    ReadinessReport {
+        title: "Panea iOS SSH companion readiness",
+        items: vec![
+            ReadinessItem {
+                area: "shared engine",
+                status: ReadinessStatus::Pass,
+                message:
+                    "iOS shell foundation reuses terminal core, parser, semantics, render-core, config-core, transport-core, and SSH contracts"
+                        .to_owned(),
+            },
+            ReadinessItem {
+                area: "native app shell",
+                status: ReadinessStatus::Blocked,
+                message:
+                    "native iOS lifecycle, touch, keyboard, settings UI, and iPad multitasking host are modeled but not implemented in UIKit/SwiftUI"
+                        .to_owned(),
+            },
+            ReadinessItem {
+                area: "iOS render surface",
+                status: ReadinessStatus::Blocked,
+                message:
+                    "render-core is reusable, but a native iOS GPU surface/backend has not been implemented or profiled"
+                        .to_owned(),
+            },
+            ReadinessItem {
+                area: "SSH security",
+                status: ReadinessStatus::Warning,
+                message:
+                    "host-key and SSH profile policy are shared; iOS Keychain-backed SecretProvider and host-key approval UI are still required"
+                        .to_owned(),
+            },
+            ReadinessItem {
+                area: "lifecycle honesty",
+                status: ReadinessStatus::Pass,
+                message:
+                    "mobile policy explicitly avoids promising indefinite background SSH sessions and prefers graceful disconnect plus quick reconnect"
+                        .to_owned(),
+            },
+            ReadinessItem {
+                area: "remote semantics",
+                status: ReadinessStatus::Warning,
+                message:
+                    "semantic command-block concepts are shared, but remote shell integration install/activation remains follow-up work"
+                        .to_owned(),
+            },
+            ReadinessItem {
+                area: "real device validation",
+                status: ReadinessStatus::NotVerified,
+                message:
+                    "iPhone and iPad SSH, rendering, keyboard, secure storage, and lifecycle behavior have not been run on device or simulator"
+                        .to_owned(),
+            },
+        ],
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PerformanceBudget {
     pub max_frame_time: Duration,
@@ -1728,5 +1786,16 @@ mod tests {
 
         assert!(report.has_blockers());
         assert!(report.render_text().contains("Linux Wayland"));
+    }
+
+    #[test]
+    fn ios_readiness_blocks_native_shell_and_renderer() {
+        let report = ios_companion_readiness_report();
+        let text = report.render_text();
+
+        assert!(report.has_blockers());
+        assert!(text.contains("shared engine"));
+        assert!(text.contains("native iOS"));
+        assert!(text.contains("GPU surface"));
     }
 }

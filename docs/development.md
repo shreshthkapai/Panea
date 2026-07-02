@@ -30,6 +30,7 @@ cargo xtask hardening
 cargo xtask security-review
 cargo xtask package-plan
 cargo xtask release-check
+cargo xtask ios-readiness
 ```
 
 ## Contribution Gates
