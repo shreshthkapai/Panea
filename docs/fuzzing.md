@@ -65,6 +65,12 @@ cargo xtask fuzz shell_markers -- -runs=100000
 workspace's normal build, test, lint, and smoke commands still use the
 repository toolchain.
 
+On Windows, the wrapper also looks for `clang_rt.asan_dynamic-x86_64.dll` in
+common Visual Studio Build Tools and LLVM install paths and adds that directory
+to the fuzz subprocess `PATH`. If the DLL is not installed, the fuzz target may
+build but fail to launch with `STATUS_DLL_NOT_FOUND`; install the Visual Studio
+C++/LLVM sanitizer runtime or put the DLL directory on `PATH`.
+
 Long-running scheduled jobs should run each target with a time budget, for
 example:
 

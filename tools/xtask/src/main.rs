@@ -220,6 +220,17 @@ fn run_fuzz() -> ExitCode {
     let mut cargo_args = vec!["+nightly".to_owned(), "fuzz".to_owned(), "run".to_owned()];
     cargo_args.append(&mut args);
     let refs = cargo_args.iter().map(String::as_str).collect::<Vec<_>>();
+
+    #[cfg(windows)]
+    if let Some(asan_dir) = windows_asan_runtime_dir() {
+        return run_with_extra_path("cargo", &refs, &asan_dir);
+    }
+
+    #[cfg(windows)]
+    eprintln!(
+        "warning: clang_rt.asan_dynamic-x86_64.dll was not found in common Visual Studio/LLVM locations; cargo-fuzz may fail at runtime"
+    );
+
     run("cargo", &refs)
 }
 
@@ -614,6 +625,97 @@ fn run(program: &str, args: &[&str]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+#[cfg(windows)]
+fn run_with_extra_path(program: &str, args: &[&str], path: &Path) -> ExitCode {
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![path.to_owned()];
+    paths.extend(std::env::split_paths(&old_path));
+    let joined = match std::env::join_paths(paths) {
+        Ok(joined) => joined,
+        Err(error) => {
+            eprintln!("failed to prepare PATH for {program}: {error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    match Command::new(program)
+        .args(args)
+        .env("PATH", joined)
+        .status()
+    {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Err(error) => {
+            eprintln!("failed to run {program}: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_asan_runtime_dir() -> Option<PathBuf> {
+    let dll = "clang_rt.asan_dynamic-x86_64.dll";
+    for dir in windows_asan_candidate_dirs() {
+        let direct = dir.join(dll);
+        if direct.exists() {
+            return Some(dir);
+        }
+        if let Some(found) = find_file_bounded(&dir, dll, 16) {
+            return found.parent().map(Path::to_owned);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn windows_asan_candidate_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)") {
+        dirs.push(
+            PathBuf::from(program_files_x86)
+                .join("Microsoft Visual Studio")
+                .join("2022"),
+        );
+    }
+    if let Some(program_files) = std::env::var_os("ProgramFiles") {
+        let program_files = PathBuf::from(program_files);
+        dirs.push(program_files.join("Microsoft Visual Studio").join("2022"));
+        dirs.push(program_files.join("LLVM").join("bin"));
+    }
+    dirs.push(PathBuf::from(
+        r"C:\Program Files (x86)\Microsoft Visual Studio\2022",
+    ));
+    dirs.push(PathBuf::from(
+        r"C:\Program Files\Microsoft Visual Studio\2022",
+    ));
+    dirs.push(PathBuf::from(r"C:\Program Files\LLVM\bin"));
+    dirs
+}
+
+#[cfg(windows)]
+fn find_file_bounded(dir: &Path, file_name: &str, depth: usize) -> Option<PathBuf> {
+    if depth == 0 {
+        return None;
+    }
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && path.file_name().is_some_and(|candidate| {
+                candidate.to_string_lossy().eq_ignore_ascii_case(file_name)
+            })
+        {
+            return Some(path);
+        }
+        if path.is_dir()
+            && let Some(found) = find_file_bounded(&path, file_name, depth - 1)
+        {
+            return Some(found);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
