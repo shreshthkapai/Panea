@@ -1,0 +1,29 @@
+[visual_theme]
+name = "minimal-aesthetic"
+grouping_style = "minimal_headers"
+cursor_profile = "thin"
+prompt_decoration_profile = "separator"
+command_block_profile = "subtle"
+
+[cursor]
+shape = "beam"
+blink = true
+thickness = 0.08
+corner_radius = 0.0
+animations_enabled = false
+
+[prompt_decorations]
+enabled = true
+style = "minimal_separator"
+show_current_directory = false
+show_remote_host = true
+
+[command_blocks]
+enabled = true
+style = "minimal_header"
+show_duration = false
+show_exit_status = true
+
+[performance]
+profile = "balanced"
+expensive_effect_warnings = true

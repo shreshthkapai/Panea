@@ -1,0 +1,21 @@
+[visual_theme]
+name = "plain-fast"
+grouping_style = "traditional"
+animation_profile = "off"
+
+[cursor]
+shape = "block"
+blink = false
+animations_enabled = false
+
+[command_blocks]
+enabled = false
+
+[prompt_decorations]
+enabled = false
+
+[performance]
+profile = "maximum_performance"
+max_animation_fps = 1
+max_active_animations = 0
+expensive_effect_warnings = true

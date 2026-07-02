@@ -428,13 +428,20 @@ impl TerminalRasterizer {
             self.draw_cell(&mut frame, cell, fonts, metrics, &mut instrumentation)?;
         }
 
-        for overlay in scene
+        let mut overlays = scene
             .search_highlights
             .iter()
             .chain(scene.semantic_overlays.iter())
-        {
+            .collect::<Vec<_>>();
+        overlays.sort_by_key(|overlay| overlay.z_index);
+
+        for overlay in overlays {
             blend_rect(&mut frame, overlay.bounds, overlay.color);
             instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
+            if let Some(border_color) = overlay.border_color {
+                stroke_rect(&mut frame, overlay.bounds, border_color);
+                instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
+            }
         }
 
         for selection in &scene.selections {
@@ -580,6 +587,33 @@ fn blend_rect(frame: &mut CpuFrame, rect: RenderRect, color: RenderColor) {
     }
 }
 
+fn stroke_rect(frame: &mut CpuFrame, rect: RenderRect, color: RenderColor) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+
+    fill_rect(frame, RenderRect { height: 1, ..rect }, color);
+    fill_rect(
+        frame,
+        RenderRect {
+            y: rect.y + rect.height.saturating_sub(1) as i32,
+            height: 1,
+            ..rect
+        },
+        color,
+    );
+    fill_rect(frame, RenderRect { width: 1, ..rect }, color);
+    fill_rect(
+        frame,
+        RenderRect {
+            x: rect.x + rect.width.saturating_sub(1) as i32,
+            width: 1,
+            ..rect
+        },
+        color,
+    );
+}
+
 fn draw_glyph(frame: &mut CpuFrame, x: i32, y: i32, bitmap: &GlyphBitmap, color: RenderColor) {
     for gy in 0..bitmap.height {
         for gx in 0..bitmap.width {
@@ -619,14 +653,56 @@ fn draw_cursor(frame: &mut CpuFrame, cursor: CursorVisual, metrics: CellMetrics)
     }
 
     let mut rect = cell_region(cursor.position, metrics);
+    let thickness = u32::from(cursor.thickness_percent.clamp(1, 100));
     match cursor.shape {
-        RenderCursorShape::Block | RenderCursorShape::Custom => {}
+        RenderCursorShape::Block
+        | RenderCursorShape::Custom
+        | RenderCursorShape::CustomStaticShape => {}
+        RenderCursorShape::HollowBlock => {
+            let line = ((rect.width.min(rect.height) * thickness) / 100).max(1);
+            fill_rect(
+                frame,
+                RenderRect {
+                    height: line,
+                    ..rect
+                },
+                cursor.color,
+            );
+            fill_rect(
+                frame,
+                RenderRect {
+                    y: rect.y + rect.height.saturating_sub(line) as i32,
+                    height: line,
+                    ..rect
+                },
+                cursor.color,
+            );
+            fill_rect(
+                frame,
+                RenderRect {
+                    width: line,
+                    ..rect
+                },
+                cursor.color,
+            );
+            fill_rect(
+                frame,
+                RenderRect {
+                    x: rect.x + rect.width.saturating_sub(line) as i32,
+                    width: line,
+                    ..rect
+                },
+                cursor.color,
+            );
+            return;
+        }
         RenderCursorShape::Beam => {
-            rect.width = 2;
+            rect.width = ((rect.width * thickness) / 100).max(1);
         }
         RenderCursorShape::Underline => {
-            rect.y += rect.height as i32 - 2;
-            rect.height = 2;
+            let cell_height = rect.height;
+            rect.height = ((rect.height * thickness) / 100).max(1);
+            rect.y += cell_height.saturating_sub(rect.height) as i32;
         }
     }
     fill_rect(frame, rect, cursor.color);
@@ -997,6 +1073,9 @@ mod tests {
                 shape: RenderCursorShape::Block,
                 color: RenderColor::rgb(255, 255, 255),
                 visible: true,
+                thickness_percent: 15,
+                corner_radius_px: 0,
+                inactive: false,
             }),
             ..RenderScene::default()
         }
@@ -1034,6 +1113,9 @@ mod tests {
             shape: RenderCursorShape::Block,
             color: RenderColor::rgb(255, 255, 255),
             visible: true,
+            thickness_percent: 15,
+            corner_radius_px: 0,
+            inactive: false,
         });
 
         let damage = tracker.update(&second, metrics());

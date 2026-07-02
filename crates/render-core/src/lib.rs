@@ -59,7 +59,9 @@ pub enum RenderCursorShape {
     Block,
     Beam,
     Underline,
+    HollowBlock,
     Custom,
+    CustomStaticShape,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +70,9 @@ pub struct CursorVisual {
     pub shape: RenderCursorShape,
     pub color: RenderColor,
     pub visible: bool,
+    pub thickness_percent: u8,
+    pub corner_radius_px: u8,
+    pub inactive: bool,
 }
 
 pub type RenderCursor = CursorVisual;
@@ -88,6 +93,10 @@ pub enum OverlayKind {
     SearchHighlight,
     Semantic,
     Decoration,
+    PromptDecoration,
+    CommandBlock,
+    InputOutputGroup,
+    Badge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,7 +104,25 @@ pub struct OverlayPrimitive {
     pub kind: OverlayKind,
     pub bounds: RenderRect,
     pub color: RenderColor,
+    pub border_color: Option<RenderColor>,
+    pub corner_radius_px: u8,
+    pub z_index: i16,
     pub label: Option<String>,
+}
+
+impl OverlayPrimitive {
+    #[must_use]
+    pub const fn filled(kind: OverlayKind, bounds: RenderRect, color: RenderColor) -> Self {
+        Self {
+            kind,
+            bounds,
+            color,
+            border_color: None,
+            corner_radius_px: 0,
+            z_index: 0,
+            label: None,
+        }
+    }
 }
 
 pub type RenderOverlay = OverlayPrimitive;
@@ -114,8 +141,20 @@ pub struct RenderDecoration {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnimationKind {
+    CursorSmoothMovement,
+    CursorTypingPulse,
+    CursorTypingStretch,
+    CursorTrail,
+    CursorBlinkEasing,
+    CursorGlow,
+    OverlayTransition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AnimationHandle {
     pub id: u64,
+    pub kind: AnimationKind,
     pub affected_region: RenderRect,
     pub elapsed: Duration,
     pub remaining: Option<Duration>,

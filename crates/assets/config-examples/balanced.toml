@@ -1,0 +1,28 @@
+[visual_theme]
+name = "balanced"
+grouping_style = "subtle_separators"
+cursor_profile = "default"
+prompt_decoration_profile = "minimal"
+command_block_profile = "subtle"
+animation_profile = "quiet"
+
+[cursor]
+shape = "block"
+blink = true
+thickness = 0.15
+animations_enabled = false
+
+[prompt_decorations]
+enabled = true
+style = "minimal_separator"
+show_current_directory = true
+show_remote_host = true
+
+[command_blocks]
+enabled = false
+style = "subtle"
+
+[performance]
+profile = "balanced"
+max_animation_fps = 60
+max_active_animations = 8

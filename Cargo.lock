@@ -1348,6 +1348,7 @@ dependencies = [
  "render-core",
  "render-wgpu",
  "semantics",
+ "shell-integration",
  "term-core",
  "term-parser",
  "transport-core",

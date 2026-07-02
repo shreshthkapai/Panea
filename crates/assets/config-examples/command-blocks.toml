@@ -1,0 +1,39 @@
+[visual_theme]
+name = "command-blocks"
+grouping_style = "command_cards"
+prompt_decoration_profile = "pill"
+command_block_profile = "card"
+
+[visual_theme.borders]
+width_px = 1
+radius_px = 6
+
+[cursor]
+shape = "beam"
+blink = true
+thickness = 0.12
+animations_enabled = false
+
+[prompt_decorations]
+enabled = true
+style = "pill_header"
+show_shell_badge = true
+show_current_directory = true
+show_remote_host = true
+show_previous_status_accent = true
+
+[command_blocks]
+enabled = true
+style = "card"
+separate_prompt_input_output = true
+show_duration = true
+show_exit_status = true
+show_current_directory = true
+show_shell_host = true
+copy_actions_enabled = true
+jump_actions_enabled = true
+
+[performance]
+profile = "visual"
+max_animation_fps = 60
+max_active_animations = 12

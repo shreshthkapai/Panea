@@ -1,0 +1,45 @@
+[visual_theme]
+name = "heavy-visual-demo"
+grouping_style = "custom_theme"
+cursor_profile = "animated"
+prompt_decoration_profile = "pill"
+command_block_profile = "card"
+animation_profile = "demo"
+
+[cursor]
+shape = "block"
+blink = true
+corner_radius = 0.25
+animations_enabled = true
+smooth_movement = true
+typing_pulse = true
+typing_stretch = true
+trail = true
+blink_easing = true
+short_lived_glow = true
+
+[prompt_decorations]
+enabled = true
+style = "pill_header"
+show_shell_badge = true
+show_current_directory = true
+show_remote_host = true
+show_admin_badge = true
+show_previous_status_accent = true
+
+[command_blocks]
+enabled = true
+style = "card"
+show_duration = true
+show_exit_status = true
+show_current_directory = true
+show_shell_host = true
+
+[performance]
+profile = "visual"
+max_animation_fps = 60
+max_cursor_asset_size_kb = 256
+max_active_animations = 16
+max_animated_region_pixels = 400000
+disable_expensive_effects_on_battery = true
+expensive_effect_warnings = true

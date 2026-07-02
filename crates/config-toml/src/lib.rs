@@ -410,6 +410,29 @@ fn known_paths() -> BTreeSet<&'static str> {
         "colors.selection_background.blue",
         "colors.selection_background.alpha",
         "colors.palette",
+        "visual_theme",
+        "visual_theme.name",
+        "visual_theme.cursor_profile",
+        "visual_theme.prompt_decoration_profile",
+        "visual_theme.command_block_profile",
+        "visual_theme.animation_profile",
+        "visual_theme.grouping_style",
+        "visual_theme.spacing",
+        "visual_theme.spacing.cell_gap_px",
+        "visual_theme.spacing.block_padding_px",
+        "visual_theme.spacing.badge_gap_px",
+        "visual_theme.borders",
+        "visual_theme.borders.width_px",
+        "visual_theme.borders.radius_px",
+        "visual_theme.borders.color",
+        "visual_theme.badges",
+        "visual_theme.badges.shell",
+        "visual_theme.badges.current_directory",
+        "visual_theme.badges.remote",
+        "visual_theme.badges.admin",
+        "visual_theme.badges.status",
+        "visual_theme.success_color",
+        "visual_theme.error_color",
         "scrollback",
         "scrollback.lines",
         "scrollback.preserve_on_resize",
@@ -418,15 +441,36 @@ fn known_paths() -> BTreeSet<&'static str> {
         "cursor.blink",
         "cursor.blink_interval_ms",
         "cursor.thickness",
+        "cursor.corner_radius",
+        "cursor.color",
+        "cursor.inactive_shape",
+        "cursor.mode_specific_styles",
         "cursor.animations_enabled",
+        "cursor.smooth_movement",
+        "cursor.typing_pulse",
+        "cursor.typing_stretch",
+        "cursor.trail",
+        "cursor.blink_easing",
+        "cursor.short_lived_glow",
         "command_blocks",
         "command_blocks.enabled",
+        "command_blocks.style",
+        "command_blocks.separate_prompt_input_output",
         "command_blocks.show_duration",
         "command_blocks.show_exit_status",
+        "command_blocks.show_current_directory",
+        "command_blocks.show_shell_host",
+        "command_blocks.copy_actions_enabled",
+        "command_blocks.jump_actions_enabled",
+        "command_blocks.collapse_long_output",
         "prompt_decorations",
         "prompt_decorations.enabled",
+        "prompt_decorations.style",
+        "prompt_decorations.show_shell_badge",
         "prompt_decorations.show_current_directory",
         "prompt_decorations.show_remote_host",
+        "prompt_decorations.show_admin_badge",
+        "prompt_decorations.show_previous_status_accent",
         "shell_integration",
         "shell_integration.enabled",
         "shell_integration.activation",
@@ -460,6 +504,11 @@ fn known_paths() -> BTreeSet<&'static str> {
         "performance.glyph_cache_entries",
         "performance.max_frame_time_ms",
         "performance.expensive_effect_warnings",
+        "performance.max_animation_fps",
+        "performance.max_cursor_asset_size_kb",
+        "performance.max_active_animations",
+        "performance.max_animated_region_pixels",
+        "performance.disable_expensive_effects_on_battery",
         "platform",
         "platform.macos",
         "platform.linux",
@@ -488,6 +537,11 @@ fn is_known_dynamic_path(path: &str) -> bool {
         "platform.linux_wayland.",
         "platform_overrides.",
         "colors.palette.",
+        "cursor.color.",
+        "cursor.mode_specific_styles.",
+        "visual_theme.borders.color.",
+        "visual_theme.success_color.",
+        "visual_theme.error_color.",
     ];
 
     dynamic_prefixes
@@ -642,5 +696,34 @@ mod tests {
         let schema = schema_json().expect("schema should serialize");
         assert!(schema.contains("\"schema_version\""));
         assert!(schema.contains("font.family"));
+    }
+
+    #[test]
+    fn shipped_visual_examples_parse() {
+        for (name, contents) in [
+            (
+                "plain-fast.toml",
+                include_str!("../../assets/config-examples/plain-fast.toml"),
+            ),
+            (
+                "balanced.toml",
+                include_str!("../../assets/config-examples/balanced.toml"),
+            ),
+            (
+                "command-blocks.toml",
+                include_str!("../../assets/config-examples/command-blocks.toml"),
+            ),
+            (
+                "minimal-aesthetic.toml",
+                include_str!("../../assets/config-examples/minimal-aesthetic.toml"),
+            ),
+            (
+                "heavy-visual-demo.toml",
+                include_str!("../../assets/config-examples/heavy-visual-demo.toml"),
+            ),
+        ] {
+            parse_str(contents, None, ConfigPlatform::Unknown)
+                .unwrap_or_else(|error| panic!("{name} should parse: {error}"));
+        }
     }
 }

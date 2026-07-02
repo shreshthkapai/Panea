@@ -1,8 +1,9 @@
 use std::{collections::BTreeSet, error::Error, path::PathBuf, sync::Arc, time::Duration};
 
 use config_core::{
-    AppConfig, ConfigDiagnosticSeverity, DecorationStrategyConfig, LinuxBackendConfig, PasteConfig,
-    PresentModePreference, ShellProfile, ShellProfileKind, WindowModeConfig,
+    AppConfig, CommandBlockStyle, ConfigDiagnosticSeverity, DecorationStrategyConfig,
+    LinuxBackendConfig, PasteConfig, PresentModePreference, PromptDecorationStyle, ShellProfile,
+    ShellProfileKind, WindowModeConfig,
 };
 use diagnostics::{PerformanceBudget, PerformanceOverlay};
 use font_system::{CellMetrics, FontConfig as RuntimeFontConfig, FontSystem};
@@ -22,6 +23,8 @@ use render_wgpu::{
     FrameDecision, FrameScheduler, GpuTerminalRenderer, PresentMode, RendererOptions,
 };
 use semantics::detect_url_hints;
+use semantics::{BufferPosition, CommandStatus, SemanticRegionKind, SemanticTimelineStore};
+use shell_integration::SemanticEscapeParser;
 use term_core::{
     CellAttributes, Color, CursorShape, TerminalCore, TerminalMode,
     TerminalSize as CoreTerminalSize,
@@ -74,6 +77,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         config.window.columns,
         config.window.rows,
     ));
+    let mut semantic_parser = SemanticEscapeParser::new();
+    let mut semantic_timeline = SemanticTimelineStore::new();
     let mut renderer = pollster::block_on(GpuTerminalRenderer::new(
         Arc::clone(&window),
         renderer_options(&config),
@@ -100,7 +105,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
                 WindowEvent::RedrawRequested => {
                     let metrics = fonts.cell_metrics().ok();
-                    let scene = scene_from_terminal(&terminal, metrics, &config);
+                    let scene =
+                        scene_from_terminal(&terminal, &semantic_timeline, metrics, &config);
                     let idle_wakeups = scheduler.take_idle_wakeups();
                     match renderer.render_scene(&scene, &mut fonts) {
                         Ok(()) => {
@@ -240,6 +246,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                         }
 
                         if !output.bytes.is_empty() {
+                            let cursor = terminal.cursor_state();
+                            let semantic_position =
+                                BufferPosition::new(cursor.position.row, cursor.position.col);
+                            for parsed in semantic_parser.parse(&output.bytes, semantic_position) {
+                                semantic_timeline.apply_event(parsed.event);
+                            }
                             let _ = terminal.apply_bytes(&output.bytes);
                             flush_terminal_responses(&mut terminal, transport);
                             content_changed = true;
@@ -506,6 +518,7 @@ impl DesktopDiagnosticsPlaceholder {
 
 fn scene_from_terminal(
     terminal: &TerminalEmulator,
+    semantic_timeline: &SemanticTimelineStore,
     metrics: Option<CellMetrics>,
     config: &AppConfig,
 ) -> RenderScene {
@@ -528,7 +541,15 @@ fn scene_from_terminal(
     }
 
     let semantic_overlays = metrics.map_or_else(Vec::new, |metrics| {
-        url_hint_overlays(terminal, visible.viewport.size.rows, metrics)
+        let mut overlays = url_hint_overlays(terminal, visible.viewport.size.rows, metrics);
+        overlays.extend(semantic_visual_overlays(
+            semantic_timeline,
+            visible.viewport.size.rows,
+            visible.viewport.size.cols,
+            metrics,
+            config,
+        ));
+        overlays
     });
 
     RenderScene {
@@ -543,16 +564,35 @@ fn scene_from_terminal(
                 col: cursor.position.col,
             },
             shape: match cursor.shape {
-                CursorShape::Block => RenderCursorShape::Block,
+                CursorShape::Block => render_cursor_shape(config.cursor.shape),
                 CursorShape::Beam => RenderCursorShape::Beam,
                 CursorShape::Underline => RenderCursorShape::Underline,
             },
-            color: render_color(config.colors.cursor),
+            color: render_color(config.cursor.color.unwrap_or(config.colors.cursor)),
             visible: cursor.visible,
+            thickness_percent: (config.cursor.thickness.clamp(0.05, 1.0) * 100.0).round() as u8,
+            corner_radius_px: cursor_radius_px(config),
+            inactive: false,
         }),
         semantic_overlays,
         ..RenderScene::default()
     }
+}
+
+fn render_cursor_shape(shape: config_core::CursorShape) -> RenderCursorShape {
+    match shape {
+        config_core::CursorShape::Block => RenderCursorShape::Block,
+        config_core::CursorShape::Beam => RenderCursorShape::Beam,
+        config_core::CursorShape::Underline => RenderCursorShape::Underline,
+        config_core::CursorShape::HollowBlock => RenderCursorShape::HollowBlock,
+        config_core::CursorShape::Custom => RenderCursorShape::Custom,
+        config_core::CursorShape::CustomStaticShape => RenderCursorShape::CustomStaticShape,
+    }
+}
+
+fn cursor_radius_px(config: &AppConfig) -> u8 {
+    let radius = config.cursor.corner_radius.clamp(0.0, 0.5) * 16.0;
+    radius.round() as u8
 }
 
 fn url_hint_overlays(
@@ -589,9 +629,215 @@ fn url_hint_overlays(
                 blue: 255,
                 alpha: 64,
             },
+            border_color: None,
+            corner_radius_px: 2,
+            z_index: 10,
             label: Some(hint.text),
         })
         .collect()
+}
+
+fn semantic_visual_overlays(
+    semantic_timeline: &SemanticTimelineStore,
+    rows: u16,
+    cols: u16,
+    metrics: CellMetrics,
+    config: &AppConfig,
+) -> Vec<OverlayPrimitive> {
+    let mut overlays = Vec::new();
+
+    if config.prompt_decorations.enabled {
+        overlays.extend(prompt_decoration_overlays(
+            semantic_timeline,
+            rows,
+            cols,
+            metrics,
+            config,
+        ));
+    }
+    if config.command_blocks.enabled {
+        overlays.extend(command_block_overlays(
+            semantic_timeline,
+            rows,
+            cols,
+            metrics,
+            config,
+        ));
+    }
+
+    overlays
+}
+
+fn prompt_decoration_overlays(
+    semantic_timeline: &SemanticTimelineStore,
+    rows: u16,
+    cols: u16,
+    metrics: CellMetrics,
+    config: &AppConfig,
+) -> Vec<OverlayPrimitive> {
+    semantic_timeline
+        .regions()
+        .iter()
+        .filter(|region| region.kind == SemanticRegionKind::Prompt)
+        .filter_map(|region| region.span())
+        .filter_map(|span| row_overlay_bounds(span.start.row, span.end.row, rows, cols, metrics))
+        .map(|bounds| OverlayPrimitive {
+            kind: OverlayKind::PromptDecoration,
+            bounds,
+            color: prompt_decoration_color(config),
+            border_color: match config.prompt_decorations.style {
+                PromptDecorationStyle::MinimalSeparator => None,
+                PromptDecorationStyle::RoundedBox | PromptDecorationStyle::PillHeader => {
+                    Some(render_color(config.visual_theme.borders.color))
+                }
+            },
+            corner_radius_px: match config.prompt_decorations.style {
+                PromptDecorationStyle::MinimalSeparator => 0,
+                PromptDecorationStyle::RoundedBox | PromptDecorationStyle::PillHeader => {
+                    config.visual_theme.borders.radius_px
+                }
+            },
+            z_index: 20,
+            label: prompt_badge_label(config),
+        })
+        .collect()
+}
+
+fn command_block_overlays(
+    semantic_timeline: &SemanticTimelineStore,
+    rows: u16,
+    cols: u16,
+    metrics: CellMetrics,
+    config: &AppConfig,
+) -> Vec<OverlayPrimitive> {
+    semantic_timeline
+        .command_blocks()
+        .iter()
+        .filter_map(|block| {
+            semantic_timeline
+                .command_span(block)
+                .map(|span| (block, span))
+        })
+        .filter_map(|(block, span)| {
+            row_overlay_bounds(span.start.row, span.end.row, rows, cols, metrics).map(|bounds| {
+                let status_color = command_status_color(&block.status, config);
+                OverlayPrimitive {
+                    kind: OverlayKind::CommandBlock,
+                    bounds,
+                    color: command_block_fill(config),
+                    border_color: Some(status_color),
+                    corner_radius_px: match config.command_blocks.style {
+                        CommandBlockStyle::Subtle => 2,
+                        CommandBlockStyle::Card
+                        | CommandBlockStyle::Split
+                        | CommandBlockStyle::MinimalHeader
+                        | CommandBlockStyle::CustomTheme => config.visual_theme.borders.radius_px,
+                    },
+                    z_index: 15,
+                    label: command_block_label(&block.status, config),
+                }
+            })
+        })
+        .collect()
+}
+
+fn row_overlay_bounds(
+    start_row: i64,
+    end_row: i64,
+    rows: u16,
+    cols: u16,
+    metrics: CellMetrics,
+) -> Option<RenderRect> {
+    if end_row < 0 || start_row >= i64::from(rows) {
+        return None;
+    }
+
+    let start = start_row.max(0);
+    let end = end_row.max(start + 1).min(i64::from(rows));
+    Some(RenderRect {
+        x: 0,
+        y: (start as f32 * metrics.cell_height).floor() as i32,
+        width: (f32::from(cols) * metrics.cell_width).ceil() as u32,
+        height: ((end - start) as f32 * metrics.cell_height).ceil() as u32,
+    })
+}
+
+fn prompt_decoration_color(config: &AppConfig) -> RenderColor {
+    match config.prompt_decorations.style {
+        PromptDecorationStyle::MinimalSeparator => RenderColor {
+            red: 180,
+            green: 190,
+            blue: 205,
+            alpha: 36,
+        },
+        PromptDecorationStyle::RoundedBox | PromptDecorationStyle::PillHeader => RenderColor {
+            red: 80,
+            green: 150,
+            blue: 255,
+            alpha: 28,
+        },
+    }
+}
+
+fn command_block_fill(config: &AppConfig) -> RenderColor {
+    match config.command_blocks.style {
+        CommandBlockStyle::Subtle => RenderColor {
+            red: 220,
+            green: 225,
+            blue: 235,
+            alpha: 20,
+        },
+        CommandBlockStyle::Card
+        | CommandBlockStyle::Split
+        | CommandBlockStyle::MinimalHeader
+        | CommandBlockStyle::CustomTheme => RenderColor {
+            red: 38,
+            green: 44,
+            blue: 52,
+            alpha: 82,
+        },
+    }
+}
+
+fn prompt_badge_label(config: &AppConfig) -> Option<String> {
+    let mut badges = Vec::new();
+    if config.prompt_decorations.show_shell_badge || config.visual_theme.badges.shell {
+        badges.push("shell");
+    }
+    if config.prompt_decorations.show_current_directory
+        || config.visual_theme.badges.current_directory
+    {
+        badges.push("cwd");
+    }
+    if config.prompt_decorations.show_remote_host || config.visual_theme.badges.remote {
+        badges.push("remote");
+    }
+    (!badges.is_empty()).then(|| badges.join(" "))
+}
+
+fn command_status_color(status: &CommandStatus, config: &AppConfig) -> RenderColor {
+    match status {
+        CommandStatus::Code(0) => render_color(config.visual_theme.success_color),
+        CommandStatus::Code(_) | CommandStatus::Signal(_) => {
+            render_color(config.visual_theme.error_color)
+        }
+        CommandStatus::Running | CommandStatus::Unknown => {
+            render_color(config.visual_theme.borders.color)
+        }
+    }
+}
+
+fn command_block_label(status: &CommandStatus, config: &AppConfig) -> Option<String> {
+    if !config.command_blocks.show_exit_status {
+        return None;
+    }
+
+    match status {
+        CommandStatus::Code(0) => Some("ok".to_owned()),
+        CommandStatus::Code(status) => Some(format!("exit {status}")),
+        CommandStatus::Signal(signal) => Some(format!("signal {signal}")),
+        CommandStatus::Running | CommandStatus::Unknown => None,
+    }
 }
 
 fn style_for_attributes(attributes: CellAttributes) -> RenderCellStyle {

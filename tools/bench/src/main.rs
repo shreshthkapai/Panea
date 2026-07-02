@@ -11,7 +11,7 @@ use diagnostics::{
 };
 use font_system::{FontConfig, FontSystem};
 use render_core::{
-    AnimationHandle, CellPosition, CursorVisual, FeatureCostSample, OptionalFeature,
+    AnimationHandle, AnimationKind, CellPosition, CursorVisual, FeatureCostSample, OptionalFeature,
     OptionalFeatureCostMode, OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle,
     RenderColor, RenderCursorShape, RenderGrid, RenderInstrumentation, RenderRect, RenderScene,
 };
@@ -321,6 +321,9 @@ fn generated_scene(cols: u16, rows: u16, feature_mode: OptionalFeatureCostMode) 
             shape: RenderCursorShape::Block,
             color: RenderColor::rgb(255, 255, 255),
             visible: true,
+            thickness_percent: 15,
+            corner_radius_px: 0,
+            inactive: false,
         }),
         semantic_overlays: if feature_mode == OptionalFeatureCostMode::EnabledHeavy {
             vec![OverlayPrimitive {
@@ -337,6 +340,9 @@ fn generated_scene(cols: u16, rows: u16, feature_mode: OptionalFeatureCostMode) 
                     blue: 255,
                     alpha: 48,
                 },
+                border_color: None,
+                corner_radius_px: 2,
+                z_index: 10,
                 label: Some("synthetic expensive overlay".to_owned()),
             }]
         } else {
@@ -356,6 +362,7 @@ fn generated_scene(cols: u16, rows: u16, feature_mode: OptionalFeatureCostMode) 
 fn animation(id: u64, x: i32, y: i32) -> AnimationHandle {
     AnimationHandle {
         id,
+        kind: AnimationKind::CursorTypingPulse,
         affected_region: RenderRect {
             x,
             y,
@@ -409,6 +416,9 @@ fn scene_from_terminal(terminal: &TerminalEmulator) -> RenderScene {
             },
             color: RenderColor::rgb(235, 235, 235),
             visible: cursor.visible,
+            thickness_percent: 15,
+            corner_radius_px: 0,
+            inactive: false,
         }),
         ..RenderScene::default()
     }

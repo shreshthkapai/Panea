@@ -97,6 +97,13 @@ If a task does not fit, redesign it before implementation.
   777 events, baseline hook scripts for bash/zsh/fish/PowerShell, portable
   shell integration config and keybindings, and diagnostics reports for active
   or inactive shell integration state.
+- Implemented the Phase 11 visual enhancement foundation: added a portable
+  visual theme model, cursor customization and bounded animation config,
+  prompt decoration and command block styles, input/output grouping modes,
+  renderer-independent overlay kinds for prompts, command blocks, grouping, and
+  badges, semantic OSC feeding in the desktop app, basic semantic overlay
+  generation from `SemanticTimelineStore`, visual budget diagnostics, and
+  shipped example visual configs.
 
 ## Deferred By Design
 
@@ -153,3 +160,8 @@ If a task does not fit, redesign it before implementation.
   remote installation flows, heuristic fallback, and cross-shell real-session
   verification remain follow-up work before command blocks can be considered
   product-complete.
+- Phase 11 establishes visual overlay contracts and basic semantic overlay
+  generation, but animated image cursors, off-render-thread decoding, GPU frame
+  caching for animated assets, polished badge text rendering, collapse/expand
+  long output UI, and real shell-driven command-block verification remain
+  deferred until the renderer and desktop semantic runtime are hardened.

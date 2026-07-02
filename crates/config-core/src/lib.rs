@@ -14,6 +14,7 @@ pub struct AppConfig {
     #[serde(alias = "fonts")]
     pub font: FontConfig,
     pub colors: ColorConfig,
+    pub visual_theme: VisualThemeConfig,
     pub cursor: CursorConfig,
     pub scrollback: ScrollbackConfig,
     pub command_blocks: CommandBlocksConfig,
@@ -107,6 +108,8 @@ impl AppConfig {
             );
         }
 
+        self.validate_visual_theme(&mut report);
+
         if self.cursor.blink_interval_ms < 150 || self.cursor.blink_interval_ms > 2000 {
             report.error(
                 "cursor.blink_interval_ms",
@@ -117,6 +120,12 @@ impl AppConfig {
             report.error(
                 "cursor.thickness",
                 "cursor thickness must be between 0.05 and 1.0",
+            );
+        }
+        if self.cursor.corner_radius > 0.5 {
+            report.error(
+                "cursor.corner_radius",
+                "cursor corner radius must be between 0.0 and 0.5 terminal cells",
             );
         }
 
@@ -162,7 +171,8 @@ impl AppConfig {
         if self.mouse != next.mouse || self.paste != next.paste {
             plan.live.push(ReloadableSection::Input);
         }
-        if self.command_blocks != next.command_blocks
+        if self.visual_theme != next.visual_theme
+            || self.command_blocks != next.command_blocks
             || self.prompt_decorations != next.prompt_decorations
             || self.shell_integration != next.shell_integration
         {
@@ -231,6 +241,26 @@ impl AppConfig {
                     format!("keybinding conflict for {keys}: {previous_action} and {action}"),
                 );
             }
+        }
+    }
+
+    fn validate_visual_theme(&self, report: &mut ValidationReport) {
+        if self.visual_theme.name.trim().is_empty() {
+            report.error("visual_theme.name", "visual theme name cannot be empty");
+        }
+        if self.visual_theme.spacing.cell_gap_px > 24
+            || self.visual_theme.spacing.block_padding_px > 64
+        {
+            report.error(
+                "visual_theme.spacing",
+                "visual spacing values must stay within conservative overlay bounds",
+            );
+        }
+        if self.visual_theme.borders.width_px > 8 {
+            report.error(
+                "visual_theme.borders.width_px",
+                "visual border width must be between 0 and 8 pixels",
+            );
         }
     }
 
@@ -353,6 +383,30 @@ impl AppConfig {
             report.error(
                 "performance.max_frame_time_ms",
                 "max frame time budget must be between 1 and 100 ms",
+            );
+        }
+        if !(1..=240).contains(&self.performance.max_animation_fps) {
+            report.error(
+                "performance.max_animation_fps",
+                "animation FPS cap must be between 1 and 240",
+            );
+        }
+        if self.performance.max_cursor_asset_size_kb > 4096 {
+            report.error(
+                "performance.max_cursor_asset_size_kb",
+                "cursor animation assets must be capped at 4096 KiB or less",
+            );
+        }
+        if self.performance.max_active_animations > 256 {
+            report.error(
+                "performance.max_active_animations",
+                "active animation budget must be 256 or less",
+            );
+        }
+        if self.performance.max_animated_region_pixels > 8_294_400 {
+            report.warning(
+                "performance.max_animated_region_pixels",
+                "animated visual regions above 4K frame size can consume substantial GPU time",
             );
         }
     }
@@ -552,6 +606,115 @@ impl Default for ColorConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VisualThemeConfig {
+    pub name: String,
+    pub cursor_profile: String,
+    pub prompt_decoration_profile: String,
+    pub command_block_profile: String,
+    pub animation_profile: String,
+    pub grouping_style: InputOutputGroupingStyle,
+    pub spacing: VisualSpacingConfig,
+    pub borders: VisualBorderConfig,
+    pub badges: VisualBadgeConfig,
+    pub success_color: RgbaColor,
+    pub error_color: RgbaColor,
+}
+
+impl Default for VisualThemeConfig {
+    fn default() -> Self {
+        Self {
+            name: "balanced".to_owned(),
+            cursor_profile: "default".to_owned(),
+            prompt_decoration_profile: "minimal".to_owned(),
+            command_block_profile: "subtle".to_owned(),
+            animation_profile: "off".to_owned(),
+            grouping_style: InputOutputGroupingStyle::Traditional,
+            spacing: VisualSpacingConfig::default(),
+            borders: VisualBorderConfig::default(),
+            badges: VisualBadgeConfig::default(),
+            success_color: RgbaColor::rgb(43, 185, 115),
+            error_color: RgbaColor::rgb(230, 72, 86),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InputOutputGroupingStyle {
+    #[default]
+    Traditional,
+    SubtleSeparators,
+    CommandCards,
+    InputOutputSplit,
+    MinimalHeaders,
+    CustomTheme,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VisualSpacingConfig {
+    pub cell_gap_px: u8,
+    pub block_padding_px: u8,
+    pub badge_gap_px: u8,
+}
+
+impl Default for VisualSpacingConfig {
+    fn default() -> Self {
+        Self {
+            cell_gap_px: 0,
+            block_padding_px: 6,
+            badge_gap_px: 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VisualBorderConfig {
+    pub width_px: u8,
+    pub radius_px: u8,
+    pub color: RgbaColor,
+}
+
+impl Default for VisualBorderConfig {
+    fn default() -> Self {
+        Self {
+            width_px: 1,
+            radius_px: 4,
+            color: RgbaColor {
+                red: 180,
+                green: 190,
+                blue: 205,
+                alpha: 80,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VisualBadgeConfig {
+    pub shell: bool,
+    pub current_directory: bool,
+    pub remote: bool,
+    pub admin: bool,
+    pub status: bool,
+}
+
+impl Default for VisualBadgeConfig {
+    fn default() -> Self {
+        Self {
+            shell: false,
+            current_directory: true,
+            remote: true,
+            admin: true,
+            status: true,
+        }
+    }
+}
+
 #[must_use]
 pub fn default_ansi_palette() -> Vec<RgbaColor> {
     vec![
@@ -581,7 +744,9 @@ pub enum CursorShape {
     Block,
     Beam,
     Underline,
+    HollowBlock,
     Custom,
+    CustomStaticShape,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -591,7 +756,17 @@ pub struct CursorConfig {
     pub blink: bool,
     pub blink_interval_ms: u16,
     pub thickness: f64,
+    pub corner_radius: f64,
+    pub color: Option<RgbaColor>,
+    pub inactive_shape: CursorShape,
+    pub mode_specific_styles: BTreeMap<String, CursorShape>,
     pub animations_enabled: bool,
+    pub smooth_movement: bool,
+    pub typing_pulse: bool,
+    pub typing_stretch: bool,
+    pub trail: bool,
+    pub blink_easing: bool,
+    pub short_lived_glow: bool,
 }
 
 impl Default for CursorConfig {
@@ -601,7 +776,17 @@ impl Default for CursorConfig {
             blink: true,
             blink_interval_ms: 600,
             thickness: 0.15,
+            corner_radius: 0.0,
+            color: None,
+            inactive_shape: CursorShape::HollowBlock,
+            mode_specific_styles: BTreeMap::new(),
             animations_enabled: false,
+            smooth_movement: false,
+            typing_pulse: false,
+            typing_stretch: false,
+            trail: false,
+            blink_easing: false,
+            short_lived_glow: false,
         }
     }
 }
@@ -626,26 +811,64 @@ impl Default for ScrollbackConfig {
 #[serde(default)]
 pub struct CommandBlocksConfig {
     pub enabled: bool,
+    pub style: CommandBlockStyle,
+    pub separate_prompt_input_output: bool,
     pub show_duration: bool,
     pub show_exit_status: bool,
+    pub show_current_directory: bool,
+    pub show_shell_host: bool,
+    pub copy_actions_enabled: bool,
+    pub jump_actions_enabled: bool,
+    pub collapse_long_output: bool,
 }
 
 impl Default for CommandBlocksConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            style: CommandBlockStyle::Subtle,
+            separate_prompt_input_output: true,
             show_duration: true,
             show_exit_status: true,
+            show_current_directory: true,
+            show_shell_host: true,
+            copy_actions_enabled: true,
+            jump_actions_enabled: true,
+            collapse_long_output: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandBlockStyle {
+    #[default]
+    Subtle,
+    Card,
+    Split,
+    MinimalHeader,
+    CustomTheme,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PromptDecorationsConfig {
     pub enabled: bool,
+    pub style: PromptDecorationStyle,
+    pub show_shell_badge: bool,
     pub show_current_directory: bool,
     pub show_remote_host: bool,
+    pub show_admin_badge: bool,
+    pub show_previous_status_accent: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptDecorationStyle {
+    #[default]
+    MinimalSeparator,
+    RoundedBox,
+    PillHeader,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -904,6 +1127,11 @@ pub struct PerformanceConfig {
     pub glyph_cache_entries: usize,
     pub max_frame_time_ms: u16,
     pub expensive_effect_warnings: bool,
+    pub max_animation_fps: u16,
+    pub max_cursor_asset_size_kb: u32,
+    pub max_active_animations: u16,
+    pub max_animated_region_pixels: u32,
+    pub disable_expensive_effects_on_battery: bool,
 }
 
 impl Default for PerformanceConfig {
@@ -914,6 +1142,11 @@ impl Default for PerformanceConfig {
             glyph_cache_entries: 8192,
             max_frame_time_ms: 16,
             expensive_effect_warnings: true,
+            max_animation_fps: 60,
+            max_cursor_asset_size_kb: 256,
+            max_active_animations: 8,
+            max_animated_region_pixels: 250_000,
+            disable_expensive_effects_on_battery: true,
         }
     }
 }
@@ -969,6 +1202,10 @@ pub struct PlatformOverride {
     pub window: Option<WindowConfigPatch>,
     pub renderer: Option<RendererConfigPatch>,
     pub font: Option<FontConfigPatch>,
+    pub visual_theme: Option<VisualThemeConfigPatch>,
+    pub cursor: Option<CursorConfigPatch>,
+    pub command_blocks: Option<CommandBlocksConfigPatch>,
+    pub prompt_decorations: Option<PromptDecorationsConfigPatch>,
     pub shell_integration: Option<ShellIntegrationConfigPatch>,
     pub performance: Option<PerformanceConfigPatch>,
     pub diagnostics: Option<DiagnosticsConfigPatch>,
@@ -987,6 +1224,18 @@ impl PlatformOverride {
         }
         if let Some(font) = &self.font {
             font.apply_to(&mut config.font);
+        }
+        if let Some(visual_theme) = &self.visual_theme {
+            visual_theme.apply_to(&mut config.visual_theme);
+        }
+        if let Some(cursor) = &self.cursor {
+            cursor.apply_to(&mut config.cursor);
+        }
+        if let Some(command_blocks) = &self.command_blocks {
+            command_blocks.apply_to(&mut config.command_blocks);
+        }
+        if let Some(prompt_decorations) = &self.prompt_decorations {
+            prompt_decorations.apply_to(&mut config.prompt_decorations);
         }
         if let Some(shell_integration) = &self.shell_integration {
             shell_integration.apply_to(&mut config.shell_integration);
@@ -1070,6 +1319,152 @@ impl FontConfigPatch {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
+pub struct VisualThemeConfigPatch {
+    pub name: Option<String>,
+    pub cursor_profile: Option<String>,
+    pub prompt_decoration_profile: Option<String>,
+    pub command_block_profile: Option<String>,
+    pub animation_profile: Option<String>,
+    pub grouping_style: Option<InputOutputGroupingStyle>,
+    pub spacing: Option<VisualSpacingConfig>,
+    pub borders: Option<VisualBorderConfig>,
+    pub badges: Option<VisualBadgeConfig>,
+    pub success_color: Option<RgbaColor>,
+    pub error_color: Option<RgbaColor>,
+}
+
+impl VisualThemeConfigPatch {
+    fn apply_to(&self, config: &mut VisualThemeConfig) {
+        apply_opt(&mut config.name, &self.name);
+        apply_opt(&mut config.cursor_profile, &self.cursor_profile);
+        apply_opt(
+            &mut config.prompt_decoration_profile,
+            &self.prompt_decoration_profile,
+        );
+        apply_opt(
+            &mut config.command_block_profile,
+            &self.command_block_profile,
+        );
+        apply_opt(&mut config.animation_profile, &self.animation_profile);
+        apply_opt(&mut config.grouping_style, &self.grouping_style);
+        apply_opt(&mut config.spacing, &self.spacing);
+        apply_opt(&mut config.borders, &self.borders);
+        apply_opt(&mut config.badges, &self.badges);
+        apply_opt(&mut config.success_color, &self.success_color);
+        apply_opt(&mut config.error_color, &self.error_color);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CursorConfigPatch {
+    pub shape: Option<CursorShape>,
+    pub blink: Option<bool>,
+    pub blink_interval_ms: Option<u16>,
+    pub thickness: Option<f64>,
+    pub corner_radius: Option<f64>,
+    pub color: Option<Option<RgbaColor>>,
+    pub inactive_shape: Option<CursorShape>,
+    pub mode_specific_styles: Option<BTreeMap<String, CursorShape>>,
+    pub animations_enabled: Option<bool>,
+    pub smooth_movement: Option<bool>,
+    pub typing_pulse: Option<bool>,
+    pub typing_stretch: Option<bool>,
+    pub trail: Option<bool>,
+    pub blink_easing: Option<bool>,
+    pub short_lived_glow: Option<bool>,
+}
+
+impl CursorConfigPatch {
+    fn apply_to(&self, config: &mut CursorConfig) {
+        apply_opt(&mut config.shape, &self.shape);
+        apply_opt(&mut config.blink, &self.blink);
+        apply_opt(&mut config.blink_interval_ms, &self.blink_interval_ms);
+        apply_opt(&mut config.thickness, &self.thickness);
+        apply_opt(&mut config.corner_radius, &self.corner_radius);
+        if let Some(color) = self.color {
+            config.color = color;
+        }
+        apply_opt(&mut config.inactive_shape, &self.inactive_shape);
+        apply_opt(&mut config.mode_specific_styles, &self.mode_specific_styles);
+        apply_opt(&mut config.animations_enabled, &self.animations_enabled);
+        apply_opt(&mut config.smooth_movement, &self.smooth_movement);
+        apply_opt(&mut config.typing_pulse, &self.typing_pulse);
+        apply_opt(&mut config.typing_stretch, &self.typing_stretch);
+        apply_opt(&mut config.trail, &self.trail);
+        apply_opt(&mut config.blink_easing, &self.blink_easing);
+        apply_opt(&mut config.short_lived_glow, &self.short_lived_glow);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CommandBlocksConfigPatch {
+    pub enabled: Option<bool>,
+    pub style: Option<CommandBlockStyle>,
+    pub separate_prompt_input_output: Option<bool>,
+    pub show_duration: Option<bool>,
+    pub show_exit_status: Option<bool>,
+    pub show_current_directory: Option<bool>,
+    pub show_shell_host: Option<bool>,
+    pub copy_actions_enabled: Option<bool>,
+    pub jump_actions_enabled: Option<bool>,
+    pub collapse_long_output: Option<bool>,
+}
+
+impl CommandBlocksConfigPatch {
+    fn apply_to(&self, config: &mut CommandBlocksConfig) {
+        apply_opt(&mut config.enabled, &self.enabled);
+        apply_opt(&mut config.style, &self.style);
+        apply_opt(
+            &mut config.separate_prompt_input_output,
+            &self.separate_prompt_input_output,
+        );
+        apply_opt(&mut config.show_duration, &self.show_duration);
+        apply_opt(&mut config.show_exit_status, &self.show_exit_status);
+        apply_opt(
+            &mut config.show_current_directory,
+            &self.show_current_directory,
+        );
+        apply_opt(&mut config.show_shell_host, &self.show_shell_host);
+        apply_opt(&mut config.copy_actions_enabled, &self.copy_actions_enabled);
+        apply_opt(&mut config.jump_actions_enabled, &self.jump_actions_enabled);
+        apply_opt(&mut config.collapse_long_output, &self.collapse_long_output);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PromptDecorationsConfigPatch {
+    pub enabled: Option<bool>,
+    pub style: Option<PromptDecorationStyle>,
+    pub show_shell_badge: Option<bool>,
+    pub show_current_directory: Option<bool>,
+    pub show_remote_host: Option<bool>,
+    pub show_admin_badge: Option<bool>,
+    pub show_previous_status_accent: Option<bool>,
+}
+
+impl PromptDecorationsConfigPatch {
+    fn apply_to(&self, config: &mut PromptDecorationsConfig) {
+        apply_opt(&mut config.enabled, &self.enabled);
+        apply_opt(&mut config.style, &self.style);
+        apply_opt(&mut config.show_shell_badge, &self.show_shell_badge);
+        apply_opt(
+            &mut config.show_current_directory,
+            &self.show_current_directory,
+        );
+        apply_opt(&mut config.show_remote_host, &self.show_remote_host);
+        apply_opt(&mut config.show_admin_badge, &self.show_admin_badge);
+        apply_opt(
+            &mut config.show_previous_status_accent,
+            &self.show_previous_status_accent,
+        );
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ShellIntegrationConfigPatch {
     pub enabled: Option<bool>,
     pub activation: Option<ShellIntegrationActivationConfig>,
@@ -1101,6 +1496,11 @@ pub struct PerformanceConfigPatch {
     pub glyph_cache_entries: Option<usize>,
     pub max_frame_time_ms: Option<u16>,
     pub expensive_effect_warnings: Option<bool>,
+    pub max_animation_fps: Option<u16>,
+    pub max_cursor_asset_size_kb: Option<u32>,
+    pub max_active_animations: Option<u16>,
+    pub max_animated_region_pixels: Option<u32>,
+    pub disable_expensive_effects_on_battery: Option<bool>,
 }
 
 impl PerformanceConfigPatch {
@@ -1114,6 +1514,23 @@ impl PerformanceConfigPatch {
         apply_opt(
             &mut config.expensive_effect_warnings,
             &self.expensive_effect_warnings,
+        );
+        apply_opt(&mut config.max_animation_fps, &self.max_animation_fps);
+        apply_opt(
+            &mut config.max_cursor_asset_size_kb,
+            &self.max_cursor_asset_size_kb,
+        );
+        apply_opt(
+            &mut config.max_active_animations,
+            &self.max_active_animations,
+        );
+        apply_opt(
+            &mut config.max_animated_region_pixels,
+            &self.max_animated_region_pixels,
+        );
+        apply_opt(
+            &mut config.disable_expensive_effects_on_battery,
+            &self.disable_expensive_effects_on_battery,
         );
     }
 }
@@ -1411,6 +1828,120 @@ pub fn export_schema() -> ConfigSchema {
                 ],
             },
             ConfigSchemaSection {
+                name: "visual_theme",
+                fields: vec![
+                    field(
+                        "visual_theme.name",
+                        "string",
+                        &default.visual_theme.name,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "visual_theme.cursor_profile",
+                        "string",
+                        &default.visual_theme.cursor_profile,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "visual_theme.prompt_decoration_profile",
+                        "string",
+                        &default.visual_theme.prompt_decoration_profile,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "visual_theme.command_block_profile",
+                        "string",
+                        &default.visual_theme.command_block_profile,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "visual_theme.animation_profile",
+                        "string",
+                        &default.visual_theme.animation_profile,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "visual_theme.grouping_style",
+                        "input_output_grouping_style",
+                        format!("{:?}", default.visual_theme.grouping_style),
+                        true,
+                        false,
+                    ),
+                ],
+            },
+            ConfigSchemaSection {
+                name: "cursor",
+                fields: vec![
+                    field(
+                        "cursor.shape",
+                        "cursor_shape",
+                        format!("{:?}", default.cursor.shape),
+                        true,
+                        false,
+                    ),
+                    field("cursor.blink", "boolean", default.cursor.blink, true, false),
+                    field(
+                        "cursor.thickness",
+                        "number",
+                        default.cursor.thickness,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "cursor.corner_radius",
+                        "number",
+                        default.cursor.corner_radius,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "cursor.animations_enabled",
+                        "boolean",
+                        default.cursor.animations_enabled,
+                        true,
+                        false,
+                    ),
+                ],
+            },
+            ConfigSchemaSection {
+                name: "semantic_visuals",
+                fields: vec![
+                    field(
+                        "prompt_decorations.enabled",
+                        "boolean",
+                        default.prompt_decorations.enabled,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "prompt_decorations.style",
+                        "prompt_decoration_style",
+                        format!("{:?}", default.prompt_decorations.style),
+                        true,
+                        false,
+                    ),
+                    field(
+                        "command_blocks.enabled",
+                        "boolean",
+                        default.command_blocks.enabled,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "command_blocks.style",
+                        "command_block_style",
+                        format!("{:?}", default.command_blocks.style),
+                        true,
+                        false,
+                    ),
+                ],
+            },
+            ConfigSchemaSection {
                 name: "shell_profiles",
                 fields: vec![
                     field("default_shell_profile", "string?", "none", false, true),
@@ -1512,6 +2043,27 @@ pub fn export_schema() -> ConfigSchema {
                         "integer",
                         default.performance.glyph_cache_entries,
                         false,
+                        false,
+                    ),
+                    field(
+                        "performance.max_animation_fps",
+                        "integer",
+                        default.performance.max_animation_fps,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "performance.max_cursor_asset_size_kb",
+                        "integer",
+                        default.performance.max_cursor_asset_size_kb,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "performance.max_active_animations",
+                        "integer",
+                        default.performance.max_active_animations,
+                        true,
                         false,
                     ),
                 ],

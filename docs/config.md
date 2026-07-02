@@ -39,6 +39,7 @@ Baseline configurable sections:
 - `renderer`
 - `font`
 - `colors`
+- `visual_theme`
 - `cursor`
 - `scrollback`
 - `keyboard`
@@ -58,6 +59,31 @@ resurrection.
 
 The public key is `font`. `fonts` is accepted as an alias for compatibility
 while the static schema stabilizes.
+
+## Visual Theme
+
+Visual features are overlays. They must not rewrite terminal text and they must
+compile into renderer-independent primitives before a backend draws them.
+
+Baseline visual sections:
+
+- `visual_theme`: names the active theme/profile set, grouping style, spacing,
+  borders, badges, and success/error accent colors
+- `cursor`: shape, thickness, corner radius, inactive style, and bounded
+  animation flags
+- `prompt_decorations`: minimal separator, rounded box, and pill/header styles
+- `command_blocks`: command grouping style, status/duration badges, copy/jump
+  action flags, and output grouping groundwork
+- `performance`: animation FPS, cursor asset size, active animation, and
+  animated-region budgets
+
+Shipped example configs live in `crates/assets/config-examples`:
+
+- `plain-fast.toml`
+- `balanced.toml`
+- `command-blocks.toml`
+- `minimal-aesthetic.toml`
+- `heavy-visual-demo.toml`
 
 ## Platform Overrides
 
@@ -96,6 +122,7 @@ Validation catches:
 - invalid window sizes and unsafe frameless recovery settings
 - invalid font size and line-height ranges
 - malformed palette lengths
+- visual theme names, spacing, border, and animation budget ranges
 - cursor blink/thickness ranges
 - keybinding conflicts
 - duplicate or missing shell/SSH profile references

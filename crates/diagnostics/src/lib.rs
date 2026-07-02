@@ -24,6 +24,102 @@ impl Default for PerformanceBudget {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisualBudget {
+    pub max_animation_fps: u16,
+    pub max_cursor_asset_size_kb: u32,
+    pub max_active_animations: u16,
+    pub max_animated_region_pixels: u32,
+}
+
+impl Default for VisualBudget {
+    fn default() -> Self {
+        Self {
+            max_animation_fps: 60,
+            max_cursor_asset_size_kb: 256,
+            max_active_animations: 8,
+            max_animated_region_pixels: 250_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VisualRuntimeStats {
+    pub requested_animation_fps: u16,
+    pub cursor_asset_size_kb: u32,
+    pub active_animations: u16,
+    pub animated_region_pixels: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VisualWarningKind {
+    AnimationFpsOverBudget,
+    CursorAssetTooLarge,
+    TooManyAnimations,
+    AnimatedRegionTooLarge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisualWarning {
+    pub kind: VisualWarningKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisualBudgetReport {
+    pub passed: bool,
+    pub warnings: Vec<VisualWarning>,
+}
+
+pub fn evaluate_visual_budget(
+    stats: VisualRuntimeStats,
+    budget: VisualBudget,
+) -> VisualBudgetReport {
+    let mut warnings = Vec::new();
+
+    if stats.requested_animation_fps > budget.max_animation_fps {
+        warnings.push(VisualWarning {
+            kind: VisualWarningKind::AnimationFpsOverBudget,
+            message: format!(
+                "animation FPS {} exceeded cap {}",
+                stats.requested_animation_fps, budget.max_animation_fps
+            ),
+        });
+    }
+    if stats.cursor_asset_size_kb > budget.max_cursor_asset_size_kb {
+        warnings.push(VisualWarning {
+            kind: VisualWarningKind::CursorAssetTooLarge,
+            message: format!(
+                "cursor asset {} KiB exceeded cap {} KiB",
+                stats.cursor_asset_size_kb, budget.max_cursor_asset_size_kb
+            ),
+        });
+    }
+    if stats.active_animations > budget.max_active_animations {
+        warnings.push(VisualWarning {
+            kind: VisualWarningKind::TooManyAnimations,
+            message: format!(
+                "active animations {} exceeded cap {}",
+                stats.active_animations, budget.max_active_animations
+            ),
+        });
+    }
+    if stats.animated_region_pixels > budget.max_animated_region_pixels {
+        warnings.push(VisualWarning {
+            kind: VisualWarningKind::AnimatedRegionTooLarge,
+            message: format!(
+                "animated region {} px exceeded cap {} px",
+                stats.animated_region_pixels, budget.max_animated_region_pixels
+            ),
+        });
+    }
+
+    VisualBudgetReport {
+        passed: warnings.is_empty(),
+        warnings,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PerformanceWarningKind {
     FrameOverBudget,
@@ -347,6 +443,33 @@ mod tests {
         });
 
         assert!(!report.passed);
+    }
+
+    #[test]
+    fn visual_budget_reports_expensive_animation_regions() {
+        let report = evaluate_visual_budget(
+            VisualRuntimeStats {
+                requested_animation_fps: 120,
+                active_animations: 12,
+                animated_region_pixels: 300_000,
+                ..VisualRuntimeStats::default()
+            },
+            VisualBudget::default(),
+        );
+
+        assert!(!report.passed);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == VisualWarningKind::AnimationFpsOverBudget)
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == VisualWarningKind::AnimatedRegionTooLarge)
+        );
     }
 
     #[test]
