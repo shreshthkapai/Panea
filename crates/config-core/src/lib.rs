@@ -2,6 +2,8 @@
 
 pub const LAYER: &str = "config portability";
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -204,7 +206,27 @@ pub struct ShellProfile {
     pub name: String,
     pub program: String,
     pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
     pub working_directory: Option<String>,
+    pub startup_command: Option<String>,
+    pub platform_overrides: ShellProfilePlatformOverrides,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ShellProfilePlatformOverrides {
+    pub macos: Option<ShellProfileOverride>,
+    pub linux_x11: Option<ShellProfileOverride>,
+    pub linux_wayland: Option<ShellProfileOverride>,
+    pub windows: Option<ShellProfileOverride>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ShellProfileOverride {
+    pub program: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub env: Option<BTreeMap<String, String>>,
+    pub working_directory: Option<String>,
+    pub startup_command: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
