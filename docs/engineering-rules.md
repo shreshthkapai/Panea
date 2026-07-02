@@ -37,7 +37,8 @@ The remaining high-level work is:
 
 - Unicode/font/render conformance beyond the hardened core/parser cell model.
 - Stronger architecture/layer-boundary checks.
-- Real fuzzing harness.
+- Long-running fuzz history and crash-regression intake from the fuzzing
+  harness.
 - Fully batched GPU glyph rendering and cross-OS screenshot verification.
 - Real Linux X11/Wayland compositor verification.
 - Full clipboard/selection/OSC clipboard policy.

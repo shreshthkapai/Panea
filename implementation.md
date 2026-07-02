@@ -80,6 +80,12 @@ to more visible features before the dependencies they rely on are hardened.
   mark handling, wide CJK cells, emoji modifiers, ZWJ emoji, variation
   selectors, cursor movement, selection expansion, overwrite/delete/erase
   invariants, and resize/scrollback tests.
+- Completed next-pass Phase 3 real fuzzing harness: added cargo-fuzz targets
+  for parser input, grid actions, resize, Unicode, selection ranges, OSC/DCS
+  escape handling, and shell markers; added corpus/artifact structure,
+  proptest property smoke coverage, parser and shell OSC/CSI payload bounds,
+  `cargo xtask fuzz-smoke`, `cargo xtask fuzz <target>`, and scheduled
+  cross-OS fuzz-smoke CI.
 - Completed Phase 2 terminal core baseline: platform-neutral grid/cell storage,
   scrollback, line wrapping, scroll regions, alternate screen storage, resize
   reflow, cursor/mode metadata, raw selection extraction, ANSI/VT parser adapter,
@@ -189,6 +195,9 @@ to more visible features before the dependencies they rely on are hardened.
   variation selectors, selection, cursor movement, and resize/scrollback
   behavior are covered in the core/parser model. Font fallback, renderer
   shaping, screenshot parity, and real app conformance remain later phases.
+- The fuzzing harness exists and property smoke tests are wired into CI, but
+  long-running coverage-guided fuzz history and cross-OS scheduled results
+  must accumulate over time before fuzzing can be treated as exhaustive.
 - Mouse/focus/application keypad behavior is represented as modes in Phase 2;
   event semantics are implemented in later platform and parser compatibility
   phases.

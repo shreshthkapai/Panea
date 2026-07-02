@@ -1610,9 +1610,174 @@ pub trait TerminalCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn line_text(terminal: &TerminalState, row: u16) -> String {
         terminal.line(row).unwrap().raw_text()
+    }
+
+    fn assert_terminal_invariants(terminal: &TerminalState) {
+        let grid = terminal.grid();
+        let cols = usize::from(grid.size.cols.max(1));
+        let rows = usize::from(grid.size.rows.max(1));
+
+        assert_eq!(grid.lines.len(), rows);
+        for line in &grid.lines {
+            assert_eq!(line.cells.len(), cols);
+            assert_line_invariants(line);
+        }
+
+        let visible = terminal.visible_grid();
+        assert_eq!(visible.cells.len(), rows * cols);
+
+        for line in terminal.scrollback().lines {
+            assert_eq!(line.cells.len(), cols);
+            assert_line_invariants(&line);
+        }
+
+        let cursor = terminal.cursor_state().position;
+        assert!(cursor.row >= 0);
+        assert!(usize::try_from(cursor.row).is_ok_and(|row| row < rows));
+        assert!(usize::from(cursor.col) < cols);
+
+        if let Some(text) = terminal.selected_text() {
+            assert!(!text.contains('\u{fffd}'));
+        }
+    }
+
+    fn assert_line_invariants(line: &Line) {
+        for (index, cell) in line.cells.iter().enumerate() {
+            assert!(cell.width <= 2);
+            if cell.wide_continuation {
+                assert_eq!(cell.width, 0);
+                assert!(index > 0, "wide continuation at column 0");
+                assert_eq!(
+                    line.cells[index - 1].width,
+                    2,
+                    "wide continuation without wide base"
+                );
+            } else {
+                assert!(cell.width >= 1);
+                assert!(!cell.text.is_empty());
+                if cell.width == 2 && index + 1 < line.cells.len() {
+                    assert!(
+                        line.cells[index + 1].wide_continuation,
+                        "wide base without continuation"
+                    );
+                }
+            }
+        }
+    }
+
+    fn fuzz_char(selector: u8) -> char {
+        match selector % 18 {
+            0 => 'a',
+            1 => 'Z',
+            2 => '0',
+            3 => ' ',
+            4 => '\u{0301}',
+            5 => '\u{0308}',
+            6 => '界',
+            7 => '語',
+            8 => '👍',
+            9 => '\u{1f3fd}',
+            10 => '\u{200d}',
+            11 => '👨',
+            12 => '👩',
+            13 => '👧',
+            14 => '👦',
+            15 => '♥',
+            16 => '\u{fe0f}',
+            _ => '\u{1f1fa}',
+        }
+    }
+
+    fn apply_fuzz_tuple(terminal: &mut TerminalState, op: (u8, u16, u16, u16, u16)) {
+        let (tag, a, b, c, d) = op;
+        let size = terminal.grid().size;
+        let row = (a % size.rows.max(1)) + 1;
+        let col = (b % size.cols.max(1)) + 1;
+        let count = (c % 8) + 1;
+
+        let action = match tag % 22 {
+            0 => TerminalAction::Print(fuzz_char((a ^ b ^ c ^ d) as u8)),
+            1 => TerminalAction::CarriageReturn,
+            2 => TerminalAction::LineFeed,
+            3 => TerminalAction::Backspace,
+            4 => TerminalAction::Tab,
+            5 => TerminalAction::MoveCursor {
+                direction: CursorDirection::Up,
+                count,
+            },
+            6 => TerminalAction::MoveCursor {
+                direction: CursorDirection::Down,
+                count,
+            },
+            7 => TerminalAction::MoveCursor {
+                direction: CursorDirection::Forward,
+                count,
+            },
+            8 => TerminalAction::MoveCursor {
+                direction: CursorDirection::Back,
+                count,
+            },
+            9 => TerminalAction::SetCursorPosition { row, col },
+            10 => TerminalAction::SetCursorColumn(col),
+            11 => TerminalAction::ClearScreen(match d % 4 {
+                0 => ClearMode::FromCursor,
+                1 => ClearMode::ToCursor,
+                2 => ClearMode::All,
+                _ => ClearMode::Saved,
+            }),
+            12 => TerminalAction::ClearLine(match d % 3 {
+                0 => ClearMode::FromCursor,
+                1 => ClearMode::ToCursor,
+                _ => ClearMode::All,
+            }),
+            13 => TerminalAction::InsertLines(count),
+            14 => TerminalAction::DeleteLines(count),
+            15 => TerminalAction::InsertChars(count),
+            16 => TerminalAction::DeleteChars(count),
+            17 => TerminalAction::EraseChars(count),
+            18 => TerminalAction::SetMode {
+                mode: TerminalMode::AlternateScreen,
+                enabled: d % 2 == 0,
+            },
+            19 => TerminalAction::SetMode {
+                mode: TerminalMode::Insert,
+                enabled: d % 2 == 0,
+            },
+            20 => TerminalAction::SetGraphicRendition(vec![match d % 4 {
+                0 => GraphicRendition::Reset,
+                1 => GraphicRendition::Bold,
+                2 => GraphicRendition::Foreground(Color::Indexed((a % 256) as u8)),
+                _ => GraphicRendition::Background(Color::Rgb {
+                    red: a as u8,
+                    green: b as u8,
+                    blue: c as u8,
+                }),
+            }]),
+            _ => TerminalAction::SetScrollRegion {
+                top: row.min(size.rows),
+                bottom: (row + count).min(size.rows),
+            },
+        };
+
+        terminal.apply_action(action).unwrap();
+
+        if tag % 17 == 0 {
+            let cols = (a % 80).max(1);
+            let rows = (b % 24).max(1);
+            terminal.resize(TerminalSize::new(cols, rows)).unwrap();
+        }
+
+        if tag % 19 == 0 {
+            let size = terminal.grid().size;
+            terminal.set_selection(Selection::normal(
+                GridPosition::new(i64::from(a % size.rows.max(1)), b % size.cols.max(1)),
+                GridPosition::new(i64::from(c % size.rows.max(1)), d % size.cols.max(1)),
+            ));
+        }
     }
 
     #[test]
@@ -1862,5 +2027,48 @@ mod tests {
         );
         assert_eq!(line_text(&terminal, 0), "x");
         assert_eq!(line_text(&terminal, 1), "y");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(96))]
+
+        #[test]
+        fn fuzz_grid_resize_selection_invariants(
+            ops in prop::collection::vec(any::<(u8, u16, u16, u16, u16)>(), 0..256)
+        ) {
+            let mut terminal = TerminalState::new(TerminalSize::new(16, 6));
+            for op in ops {
+                apply_fuzz_tuple(&mut terminal, op);
+                assert_terminal_invariants(&terminal);
+            }
+        }
+
+        #[test]
+        fn fuzz_unicode_grapheme_input_invariants(
+            input in prop::collection::vec(any::<u8>(), 0..512)
+        ) {
+            let mut terminal = TerminalState::new(TerminalSize::new(18, 5));
+            for byte in input {
+                terminal
+                    .apply_action(TerminalAction::Print(fuzz_char(byte)))
+                    .unwrap();
+                assert_terminal_invariants(&terminal);
+            }
+        }
+
+        #[test]
+        fn fuzz_resize_keeps_grid_and_scrollback_consistent(
+            sizes in prop::collection::vec((1_u16..96, 1_u16..32), 0..128)
+        ) {
+            let mut terminal = TerminalState::new(TerminalSize::new(10, 4));
+            terminal
+                .apply_actions("a界e\u{301}👍🏽z\r\n".repeat(32).chars().map(TerminalAction::Print))
+                .unwrap();
+
+            for (cols, rows) in sizes {
+                terminal.resize(TerminalSize::new(cols, rows)).unwrap();
+                assert_terminal_invariants(&terminal);
+            }
+        }
     }
 }

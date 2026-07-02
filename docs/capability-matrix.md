@@ -22,6 +22,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Workspace build/test/lint | tested | partial | partial | partial | Verified on the current Windows host; other desktop OSes require runners. |
 | Terminal core grid/state | tested | implemented | implemented | implemented | Platform-neutral code exists; runtime app verification still needed off Windows. |
 | Parser baseline | tested | implemented | implemented | implemented | Lower-level tests exist; app-level compatibility suite is not complete. |
+| Fuzz/property harness | tested | implemented | implemented | implemented | cargo-fuzz targets and proptest smoke tests exist; scheduled CI runs smoke properties, but long-running fuzz history has not accumulated yet. |
 | Scrollback/alternate screen/resize | tested | implemented | implemented | implemented | Core behavior exists; full app smoke remains open per OS. |
 | Selection extraction | tested | implemented | implemented | implemented | Raw extraction exists; mouse-driven selection UX and platform clipboards remain partial. |
 | Unicode/grapheme cell model | tested | implemented | implemented | implemented | Platform-neutral parser/core tests cover split UTF-8, combining marks, CJK width, emoji modifiers, ZWJ emoji, variation selectors, selection, cursor movement, resize, and scrollback; cross-OS renderer/font screenshots remain open. |

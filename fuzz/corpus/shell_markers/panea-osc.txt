@@ -1,0 +1,1 @@
+777;command_finished;status=0;duration_ms=12

@@ -47,6 +47,7 @@ Lower layers must not import higher or runtime-specific layers.
 | `mux` | tabs, panes, sessions, layout model | `transport-core` when session contracts are needed |
 | `shell-integration` | shell hooks and semantic escape support | `semantics` |
 | `apps/*`, `tools/*` | composition, executable entrypoints, checks, benches | allowed to compose explicit layers by rule |
+| `fuzz` | coverage-guided parser/core/semantic fuzz targets | `term-core`, `term-parser`, `semantics`, `shell-integration` |
 
 `render-wgpu` currently uses `winit` as an external window-handle bridge for
 surface creation. That dependency must stay backend-local and must not become a

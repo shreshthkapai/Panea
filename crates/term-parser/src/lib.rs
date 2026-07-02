@@ -8,6 +8,9 @@ use term_core::{
     TerminalState, VisibleGrid,
 };
 
+const MAX_CSI_PARAM_BYTES: usize = 256;
+const MAX_OSC_PAYLOAD_BYTES: usize = 16 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalEmulator {
     parser: Parser,
@@ -142,6 +145,12 @@ impl Parser {
                     _ => self.state = ParserState::Ground,
                 },
                 ParserState::Csi(csi) => {
+                    if matches!(*byte, b'0'..=b'9' | b';' | b':')
+                        && csi.params.len() >= MAX_CSI_PARAM_BYTES
+                    {
+                        self.state = ParserState::IgnoringCsi;
+                        continue;
+                    }
                     if csi.consume(*byte) {
                         let action_set = dispatch_csi(csi);
                         actions.extend(action_set);
@@ -164,13 +173,31 @@ impl Parser {
                         self.state = ParserState::Ground;
                     }
                     (0x1b, _) => {
-                        content.push(*byte);
-                        *escape_seen = true;
+                        if content.len() >= MAX_OSC_PAYLOAD_BYTES {
+                            self.state = ParserState::IgnoringOsc { escape_seen: true };
+                        } else {
+                            content.push(*byte);
+                            *escape_seen = true;
+                        }
                     }
                     (_, _) => {
-                        content.push(*byte);
-                        *escape_seen = false;
+                        if content.len() >= MAX_OSC_PAYLOAD_BYTES {
+                            self.state = ParserState::IgnoringOsc { escape_seen: false };
+                        } else {
+                            content.push(*byte);
+                            *escape_seen = false;
+                        }
                     }
+                },
+                ParserState::IgnoringCsi => {
+                    if (0x40..=0x7e).contains(byte) {
+                        self.state = ParserState::Ground;
+                    }
+                }
+                ParserState::IgnoringOsc { escape_seen } => match (*byte, *escape_seen) {
+                    (0x07, _) | (b'\\', true) => self.state = ParserState::Ground,
+                    (0x1b, _) => *escape_seen = true,
+                    (_, _) => *escape_seen = false,
                 },
             }
         }
@@ -221,6 +248,8 @@ enum ParserState {
     Escape,
     Csi(CsiState),
     Osc { escape_seen: bool, content: Vec<u8> },
+    IgnoringCsi,
+    IgnoringOsc { escape_seen: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -531,6 +560,7 @@ fn dispatch_osc(content: &[u8]) -> Vec<TerminalAction> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use term_core::{CellAttributes, GridPosition, Selection};
 
     fn terminal(size: TerminalSize, input: &[u8]) -> TerminalEmulator {
@@ -541,6 +571,51 @@ mod tests {
 
     fn line_text(terminal: &TerminalEmulator, row: u16) -> String {
         terminal.state().line(row).unwrap().raw_text()
+    }
+
+    fn assert_terminal_invariants(terminal: &TerminalEmulator) {
+        let grid = terminal.state().grid();
+        let cols = usize::from(grid.size.cols.max(1));
+        let rows = usize::from(grid.size.rows.max(1));
+
+        assert_eq!(grid.lines.len(), rows);
+        for line in &grid.lines {
+            assert_eq!(line.cells.len(), cols);
+            assert_line_invariants(line);
+        }
+        for line in terminal.scrollback().lines {
+            assert_eq!(line.cells.len(), cols);
+            assert_line_invariants(&line);
+        }
+
+        let visible = terminal.visible_grid();
+        assert_eq!(visible.cells.len(), rows * cols);
+
+        let cursor = terminal.cursor_state().position;
+        assert!(cursor.row >= 0);
+        assert!(usize::try_from(cursor.row).is_ok_and(|row| row < rows));
+        assert!(usize::from(cursor.col) < cols);
+
+        if let Some(text) = terminal.state().selected_text() {
+            assert!(!text.contains('\u{fffd}'));
+        }
+    }
+
+    fn assert_line_invariants(line: &term_core::Line) {
+        for (index, cell) in line.cells.iter().enumerate() {
+            assert!(cell.width <= 2);
+            if cell.wide_continuation {
+                assert_eq!(cell.width, 0);
+                assert!(index > 0);
+                assert_eq!(line.cells[index - 1].width, 2);
+            } else {
+                assert!(cell.width >= 1);
+                assert!(!cell.text.is_empty());
+                if cell.width == 2 && index + 1 < line.cells.len() {
+                    assert!(line.cells[index + 1].wide_continuation);
+                }
+            }
+        }
     }
 
     #[test]
@@ -774,6 +849,80 @@ mod tests {
 
             let mut terminal = TerminalEmulator::new(TerminalSize::new(20, 5));
             terminal.apply_bytes(&input).unwrap();
+        }
+    }
+
+    #[test]
+    fn unterminated_osc_payload_is_bounded_and_dropped() {
+        let mut terminal = TerminalEmulator::new(TerminalSize::new(12, 3));
+        let mut payload = vec![0x1b, b']'];
+        payload.extend(std::iter::repeat_n(b'a', MAX_OSC_PAYLOAD_BYTES + 512));
+        payload.extend_from_slice(b"\x07visible");
+
+        terminal.apply_bytes(&payload).unwrap();
+
+        assert_terminal_invariants(&terminal);
+        assert_eq!(line_text(&terminal, 0), "visible");
+    }
+
+    #[test]
+    fn oversized_csi_parameters_are_dropped_without_panicking() {
+        let mut terminal = TerminalEmulator::new(TerminalSize::new(12, 3));
+        let mut payload = vec![0x1b, b'['];
+        payload.extend(std::iter::repeat_n(b'1', MAX_CSI_PARAM_BYTES + 128));
+        payload.extend_from_slice(b"mplain");
+
+        terminal.apply_bytes(&payload).unwrap();
+
+        assert_terminal_invariants(&terminal);
+        assert_eq!(line_text(&terminal, 0), "plain");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(96))]
+
+        #[test]
+        fn fuzz_parser_byte_streams_do_not_corrupt_terminal(
+            input in prop::collection::vec(any::<u8>(), 0..2048)
+        ) {
+            let mut terminal = TerminalEmulator::new(TerminalSize::new(24, 8));
+            terminal.apply_bytes(&input).unwrap();
+            assert_terminal_invariants(&terminal);
+        }
+
+        #[test]
+        fn fuzz_parser_chunk_boundaries_preserve_invariants(
+            input in prop::collection::vec(any::<u8>(), 0..1024),
+            chunk_size in 1_usize..32
+        ) {
+            let mut terminal = TerminalEmulator::new(TerminalSize::new(24, 8));
+            for chunk in input.chunks(chunk_size) {
+                terminal.apply_bytes(chunk).unwrap();
+                assert_terminal_invariants(&terminal);
+            }
+        }
+
+        #[test]
+        fn fuzz_parser_resize_and_selection_stay_valid(
+            input in prop::collection::vec(any::<u8>(), 0..512),
+            sizes in prop::collection::vec((1_u16..80, 1_u16..24), 0..64)
+        ) {
+            let mut terminal = TerminalEmulator::new(TerminalSize::new(20, 6));
+            terminal.apply_bytes(&input).unwrap();
+            for (index, (cols, rows)) in sizes.into_iter().enumerate() {
+                terminal.resize(TerminalSize::new(cols, rows)).unwrap();
+                terminal.state_mut().set_selection(Selection::normal(
+                    GridPosition::new(0, 0),
+                    GridPosition::new(
+                        i64::from(rows.saturating_sub(1)),
+                        cols.saturating_sub(1),
+                    ),
+                ));
+                if index % 3 == 0 {
+                    let _ = terminal.state().selected_text();
+                }
+                assert_terminal_invariants(&terminal);
+            }
         }
     }
 }

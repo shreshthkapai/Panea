@@ -49,6 +49,7 @@ stated scope:
 | Terminal core baseline | tested | Grid, cells, cursor, scrollback, alternate screen, resize, modes, selection extraction, and baseline golden coverage exist. |
 | Unicode/grapheme cell model | tested | UTF-8 scalar buffering, grapheme clustering, combining marks, wide CJK cells, emoji modifiers, ZWJ emoji, variation selectors, selection, cursor movement, overwrite/delete/erase, resize, and scrollback tests exist in `term-core` and `term-parser`. |
 | Parser baseline | tested | ANSI/VT parser adapter handles printable text, common controls, SGR colors/styles, alternate screen, clears, insert/delete groundwork, tab stops, title OSC, mouse/focus/bracketed-paste mode state, and pending responses. |
+| Fuzzing harness | tested | `fuzz/` contains cargo-fuzz targets for parser, grid, resize, Unicode, selection, OSC/DCS, and shell markers; property smoke tests run through `cargo xtask fuzz-smoke` and scheduled CI. |
 | Config model and TOML | tested | `AppConfig` defaults, TOML parsing, unknown/deprecated diagnostics, validation, platform overrides, default generation, schema export, and reload impact classification exist. |
 | Windows local transport | tested | Portable PTY/ConPTY lifecycle is bounded; Windows smoke tests were made non-hanging and observed output. |
 | Diagnostics foundations | tested | `cargo xtask doctor ...`, bug-report snapshots, release/security/hardening/package readiness reports, and iOS readiness reports exist through shared diagnostics models. |
@@ -101,7 +102,8 @@ The following major accepted features have no complete product behavior yet:
   Wayland.
 - Real Linux compositor verification for GNOME/Mutter, KDE/KWin, wlroots/Sway,
   Hyprland class, tiling window managers, and X11 window managers.
-- Real fuzzing harness such as proptest or cargo-fuzz style coverage.
+- Long-running coverage-guided fuzz history and crash-regression backlog from
+  real-world fuzz findings.
 - Unicode/font/render conformance beyond the core parser model, including
   cross-OS font fallback and screenshot verification.
 - Fully batched GPU glyph rendering.
@@ -123,7 +125,7 @@ The following major accepted features have no complete product behavior yet:
 
 | Layer | Status | Notes |
 | --- | --- | --- |
-| core correctness | partial | Strong baseline and Unicode cell hardening exist, but app compatibility, fuzzing, and conformance hardening remain. |
+| core correctness | partial | Strong baseline, Unicode cell hardening, and fuzz harness exist, but app compatibility and conformance hardening remain. |
 | platform parity | partial | Capabilities and desktop window foundations exist; real macOS/Linux X11/Linux Wayland verification remains open. |
 | render performance | partial | WGPU foundation, glyph cache, damage, scheduling, and benchmarks exist; batched GPU text and device-loss recovery remain. |
 | config portability | partial | Static config model is useful; runtime reload and advanced config are deferred. |
@@ -136,5 +138,5 @@ The following major accepted features have no complete product behavior yet:
 
 ## Immediate Next Slice
 
-After Unicode, grapheme, emoji, and width hardening, the next
-dependency-ordered phase is the real fuzzing harness.
+After the real fuzzing harness, the next dependency-ordered phase is GPU
+renderer batching and glyph pipeline hardening.

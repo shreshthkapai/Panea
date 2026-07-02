@@ -9,7 +9,7 @@ fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("help") | None => {
             eprintln!(
-                "usage: cargo xtask <fmt|clippy|test|build|check|layer-check|ci|config-default|config-schema|bench|doctor|bug-report|hardening|security-review|package-plan|release-check|ios-readiness>"
+                "usage: cargo xtask <fmt|clippy|test|build|check|layer-check|ci|config-default|config-schema|bench|fuzz-smoke|fuzz|doctor|bug-report|hardening|security-review|package-plan|release-check|ios-readiness>"
             );
             ExitCode::SUCCESS
         }
@@ -22,6 +22,8 @@ fn main() -> ExitCode {
         Some("config-default") => print_config_default(),
         Some("config-schema") => print_config_schema(),
         Some("bench") => run_bench(),
+        Some("fuzz-smoke") => run_fuzz_smoke(),
+        Some("fuzz") => run_fuzz(),
         Some("doctor") => run_doctor(),
         Some("bug-report") => run_bug_report(),
         Some("hardening") => run_hardening(),
@@ -176,6 +178,51 @@ fn run_bench() -> ExitCode {
     run("cargo", &refs)
 }
 
+const FUZZ_TARGETS: &[&str] = &[
+    "parser_input",
+    "grid_actions",
+    "resize",
+    "unicode",
+    "selection_ranges",
+    "osc_dcs",
+    "shell_markers",
+];
+
+fn run_fuzz_smoke() -> ExitCode {
+    for (program, args) in [
+        ("cargo", &["test", "-p", "term-core", "fuzz"][..]),
+        ("cargo", &["test", "-p", "term-parser", "fuzz"][..]),
+        ("cargo", &["test", "-p", "shell-integration", "fuzz"][..]),
+    ] {
+        let code = run(program, args);
+        if code != ExitCode::SUCCESS {
+            return code;
+        }
+    }
+
+    ExitCode::SUCCESS
+}
+
+fn run_fuzz() -> ExitCode {
+    let mut args = std::env::args().skip(2).collect::<Vec<_>>();
+    let Some(target) = args.first().cloned() else {
+        eprintln!("usage: cargo xtask fuzz <target> [-- <libfuzzer args>]");
+        eprintln!("known targets: {}", FUZZ_TARGETS.join(", "));
+        return ExitCode::from(2);
+    };
+
+    if !FUZZ_TARGETS.contains(&target.as_str()) {
+        eprintln!("unknown fuzz target: {target}");
+        eprintln!("known targets: {}", FUZZ_TARGETS.join(", "));
+        return ExitCode::from(2);
+    }
+
+    let mut cargo_args = vec!["fuzz".to_owned(), "run".to_owned()];
+    cargo_args.append(&mut args);
+    let refs = cargo_args.iter().map(String::as_str).collect::<Vec<_>>();
+    run("cargo", &refs)
+}
+
 fn print_config_default() -> ExitCode {
     match config_toml::default_config_toml() {
         Ok(config) => {
@@ -235,6 +282,7 @@ const WORKSPACE_PACKAGES: &[&str] = &[
     "mux",
     "panea-bench",
     "panea-desktop",
+    "panea-fuzz",
     "panea-ios",
     "platform-core",
     "platform-winit",
@@ -485,6 +533,10 @@ fn dependency_rules() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
                 "transport-pty",
                 "transport-ssh",
             ]),
+        ),
+        (
+            "panea-fuzz",
+            allowed(["semantics", "shell-integration", "term-core", "term-parser"]),
         ),
         (
             "panea-ios",

@@ -34,6 +34,7 @@ corrupting the raw terminal model.
 - `tools/xtask` - repository automation
 - `tools/bench` - benchmark fixtures
 - `tools/conformance` - terminal conformance fixtures
+- `fuzz` - parser, grid, resize, Unicode, OSC, and shell marker fuzz targets
 
 ## Development
 
@@ -42,6 +43,7 @@ cargo xtask layer-check
 cargo check --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets
+cargo xtask fuzz-smoke
 ```
 
 ## Docs
@@ -51,6 +53,7 @@ cargo clippy --workspace --all-targets
 - [Current status](docs/status.md)
 - [Capability matrix](docs/capability-matrix.md)
 - [Layer boundaries](docs/layer-boundaries.md)
+- [Fuzzing](docs/fuzzing.md)
 - [Configuration](docs/config.md)
 - [Themes](docs/themes.md)
 - [Cursor customization](docs/cursor-customization.md)

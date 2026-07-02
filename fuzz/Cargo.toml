@@ -1,0 +1,66 @@
+[package]
+name = "panea-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+semantics = { path = "../crates/semantics" }
+shell-integration = { path = "../crates/shell-integration" }
+term-core = { path = "../crates/term-core" }
+term-parser = { path = "../crates/term-parser" }
+
+[[bin]]
+name = "parser_input"
+path = "fuzz_targets/parser_input.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "grid_actions"
+path = "fuzz_targets/grid_actions.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "resize"
+path = "fuzz_targets/resize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "unicode"
+path = "fuzz_targets/unicode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "selection_ranges"
+path = "fuzz_targets/selection_ranges.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "osc_dcs"
+path = "fuzz_targets/osc_dcs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "shell_markers"
+path = "fuzz_targets/shell_markers.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

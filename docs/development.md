@@ -30,6 +30,8 @@ cargo xtask ci
 cargo xtask config-default
 cargo xtask config-schema
 cargo xtask bench all
+cargo xtask fuzz-smoke
+cargo xtask fuzz parser_input -- -runs=100000
 cargo xtask doctor
 cargo xtask bug-report
 cargo xtask hardening

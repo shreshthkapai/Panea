@@ -1,4 +1,5 @@
 /target/
+/fuzz/target/
 /.idea/
 /.vscode/
 *.pdb
@@ -7,3 +8,6 @@
 *.log
 *.tmp
 INTERNAL_TODO.md
+/fuzz/artifacts/*
+!/fuzz/artifacts/**/
+!/fuzz/artifacts/**/.gitkeep

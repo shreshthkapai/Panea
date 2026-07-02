@@ -10,6 +10,7 @@ use semantics::{
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
+const MAX_OSC_PAYLOAD_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellKind {
@@ -189,13 +190,26 @@ impl SemanticEscapeParser {
                         self.state = ParserState::Ground;
                     }
                     (ESC, _) => {
-                        content.push(*byte);
-                        *escape_seen = true;
+                        if content.len() >= MAX_OSC_PAYLOAD_BYTES {
+                            self.state = ParserState::IgnoringOsc { escape_seen: true };
+                        } else {
+                            content.push(*byte);
+                            *escape_seen = true;
+                        }
                     }
                     (_, _) => {
-                        content.push(*byte);
-                        *escape_seen = false;
+                        if content.len() >= MAX_OSC_PAYLOAD_BYTES {
+                            self.state = ParserState::IgnoringOsc { escape_seen: false };
+                        } else {
+                            content.push(*byte);
+                            *escape_seen = false;
+                        }
                     }
+                },
+                ParserState::IgnoringOsc { escape_seen } => match (*byte, *escape_seen) {
+                    (BEL, _) | (b'\\', true) => self.state = ParserState::Ground,
+                    (ESC, _) => *escape_seen = true,
+                    (_, _) => *escape_seen = false,
                 },
             }
         }
@@ -209,6 +223,7 @@ enum ParserState {
     Ground,
     Escape,
     Osc { escape_seen: bool, content: Vec<u8> },
+    IgnoringOsc { escape_seen: bool },
 }
 
 pub fn parse_osc_payload(
@@ -501,6 +516,8 @@ function global:prompt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use semantics::SemanticEventKind;
 
     #[test]
     fn parses_osc_133_boundaries() {
@@ -588,6 +605,46 @@ mod tests {
         ] {
             let script = script_for_shell(shell).expect("script");
             assert!(script.contents.contains("777"));
+        }
+    }
+
+    #[test]
+    fn unterminated_semantic_osc_payload_is_bounded_and_dropped() {
+        let mut parser = SemanticEscapeParser::new();
+        let mut input = vec![ESC, b']'];
+        input.extend(std::iter::repeat_n(b'a', MAX_OSC_PAYLOAD_BYTES + 512));
+        input.extend_from_slice(b"\x07\x1b]777;shell;shell=bash\x07");
+
+        let events = parser.parse(&input, BufferPosition::new(0, 0));
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].event.kind(),
+            SemanticEventKind::ShellMetadataChanged
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(96))]
+
+        #[test]
+        fn fuzz_semantic_escape_parser_never_panics(
+            input in prop::collection::vec(any::<u8>(), 0..2048),
+            row in 0_i64..4096,
+            col in 0_u16..512,
+        ) {
+            let mut parser = SemanticEscapeParser::new();
+            let events = parser.parse(&input, BufferPosition::new(row, col));
+            for parsed in events {
+                assert!(!parsed.raw_osc.is_empty());
+            }
+        }
+
+        #[test]
+        fn fuzz_semantic_osc_payload_parser_never_panics(
+            payload in prop::collection::vec(any::<u8>(), 0..2048)
+        ) {
+            let _ = parse_osc_payload(&payload, BufferPosition::new(0, 0));
         }
     }
 }
