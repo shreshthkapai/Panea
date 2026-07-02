@@ -38,6 +38,7 @@ corrupting the raw terminal model.
 ## Development
 
 ```powershell
+cargo xtask layer-check
 cargo check --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets
@@ -49,6 +50,7 @@ cargo clippy --workspace --all-targets
 - [Engineering rules](docs/engineering-rules.md)
 - [Current status](docs/status.md)
 - [Capability matrix](docs/capability-matrix.md)
+- [Layer boundaries](docs/layer-boundaries.md)
 - [Configuration](docs/config.md)
 - [Themes](docs/themes.md)
 - [Cursor customization](docs/cursor-customization.md)

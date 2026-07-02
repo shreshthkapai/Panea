@@ -1,0 +1,31 @@
+name: architecture-boundaries
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  layer-check:
+    name: layer check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - macos-latest
+          - ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check architecture dependencies
+        run: cargo run -p xtask -- layer-check
+      - name: Check terminal core independently
+        run: cargo check -p term-core
+      - name: Test renderer contract without shell or window
+        run: cargo test -p render-core

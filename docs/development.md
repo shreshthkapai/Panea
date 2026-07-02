@@ -11,6 +11,7 @@ rollout, testing, diagnostics, and release-readiness rules in
 ```powershell
 cargo fmt --all
 cargo fmt --all --check
+cargo xtask layer-check
 cargo clippy --workspace --all-targets
 cargo check --workspace
 cargo test --workspace
@@ -24,6 +25,7 @@ cargo xtask fmt
 cargo xtask clippy
 cargo xtask test
 cargo xtask build
+cargo xtask layer-check
 cargo xtask ci
 cargo xtask config-default
 cargo xtask config-schema
@@ -59,6 +61,8 @@ bar, not optional polish.
 
 Each crate owns one layer. Lower layers must not import higher layers casually.
 If a lower layer needs a higher-layer concept, redesign the boundary.
+The enforced boundary matrix lives in [Layer boundaries](layer-boundaries.md).
+Run `cargo xtask layer-check` before accepting dependency changes.
 
 ## Native Mux Rule
 

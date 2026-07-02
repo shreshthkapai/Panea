@@ -2276,6 +2276,43 @@ fn field(
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadedAppConfig {
+    pub config: AppConfig,
+    pub diagnostics: Vec<ConfigDiagnostic>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigProviderError {
+    pub source: Option<String>,
+    pub message: String,
+}
+
+impl ConfigProviderError {
+    #[must_use]
+    pub fn new(source: Option<String>, message: impl Into<String>) -> Self {
+        Self {
+            source,
+            message: message.into(),
+        }
+    }
+}
+
+/// Config loading boundary. Frontends compile into `AppConfig` before hot paths.
+pub trait ConfigProvider {
+    fn load_config(&self) -> Result<LoadedAppConfig, ConfigProviderError>;
+
+    fn validate_config(&self, config: &AppConfig) -> ValidationReport {
+        config.validate()
+    }
+
+    fn reload_plan(&self, current: &AppConfig) -> Result<ReloadPlan, ConfigProviderError> {
+        let loaded = self.load_config()?;
+        Ok(current.reload_plan_from(&loaded.config))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2443,6 +2480,37 @@ mod tests {
                 && !manifest.contains("transport-")
                 && !manifest.contains("term-core"),
             "config-core must not import runtime layer crates"
+        );
+    }
+
+    #[derive(Debug)]
+    struct DefaultConfigProvider;
+
+    impl ConfigProvider for DefaultConfigProvider {
+        fn load_config(&self) -> Result<LoadedAppConfig, ConfigProviderError> {
+            Ok(LoadedAppConfig {
+                config: AppConfig::default(),
+                diagnostics: Vec::new(),
+                source: "test-default".to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn config_provider_compiles_into_portable_app_config() {
+        let provider = DefaultConfigProvider;
+        let loaded = provider
+            .load_config()
+            .expect("default config provider should load");
+        let validation = provider.validate_config(&loaded.config);
+
+        assert_eq!(loaded.source, "test-default");
+        assert!(!validation.has_errors());
+        assert!(
+            !provider
+                .reload_plan(&loaded.config)
+                .unwrap()
+                .requires_restart()
         );
     }
 }

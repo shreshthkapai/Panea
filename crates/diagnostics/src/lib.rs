@@ -392,6 +392,35 @@ pub fn doctor_report(input: &DoctorInput, topic: DoctorTopic) -> DoctorReport {
     report
 }
 
+/// Diagnostics boundary for app code and future installed `terminal doctor`.
+pub trait DiagnosticsProvider {
+    fn doctor_report(&self, topic: DoctorTopic) -> DoctorReport;
+
+    fn bug_report_snapshot(&self) -> BugReportSnapshot;
+}
+
+#[derive(Debug, Clone)]
+pub struct StaticDiagnosticsProvider {
+    input: DoctorInput,
+}
+
+impl StaticDiagnosticsProvider {
+    #[must_use]
+    pub fn new(input: DoctorInput) -> Self {
+        Self { input }
+    }
+}
+
+impl DiagnosticsProvider for StaticDiagnosticsProvider {
+    fn doctor_report(&self, topic: DoctorTopic) -> DoctorReport {
+        doctor_report(&self.input, topic)
+    }
+
+    fn bug_report_snapshot(&self) -> BugReportSnapshot {
+        BugReportSnapshot::from_doctor_input(&self.input)
+    }
+}
+
 fn append_platform_report(input: &DoctorInput, report: &mut DoctorReport) {
     report.lines.extend([
         "platform:".to_owned(),
@@ -1697,6 +1726,26 @@ mod tests {
         assert!(text.contains("backend_preference=Dx12"));
         assert!(text.contains("profile=prod"));
         assert!(!text.to_ascii_lowercase().contains("secret"));
+    }
+
+    #[test]
+    fn diagnostics_provider_exposes_doctor_and_privacy_snapshot() {
+        let input = DoctorInput {
+            app_version: "0.1.0".to_owned(),
+            config_source: "default".to_owned(),
+            config: AppConfig::default(),
+            config_diagnostics: Vec::new(),
+            platform: PlatformSnapshot::detect(),
+            recent_errors: Vec::new(),
+        };
+        let provider = StaticDiagnosticsProvider::new(input);
+
+        let doctor = provider.doctor_report(DoctorTopic::Config).render_text();
+        let bug_report = provider.bug_report_snapshot().render_text();
+
+        assert!(doctor.contains("config:"));
+        assert!(bug_report.contains("terminal contents"));
+        assert!(bug_report.contains("secrets"));
     }
 
     #[test]

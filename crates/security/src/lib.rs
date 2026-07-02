@@ -253,12 +253,93 @@ pub trait SecretProvider: Send {
     fn request_secret(&mut self, request: SecretRequest) -> SecurityResult<Option<SecretString>>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeychainSecretKind {
+    SshPassword,
+    SshKeyPassphrase,
+    GenericToken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeychainEntry {
+    pub service: String,
+    pub account: String,
+    pub kind: KeychainSecretKind,
+}
+
+impl KeychainEntry {
+    #[must_use]
+    pub fn new(
+        service: impl Into<String>,
+        account: impl Into<String>,
+        kind: KeychainSecretKind,
+    ) -> Self {
+        Self {
+            service: service.into(),
+            account: account.into(),
+            kind,
+        }
+    }
+}
+
+/// OS keychain boundary for future platform-backed secret storage providers.
+pub trait KeychainProvider: Send {
+    fn get_secret(&mut self, entry: &KeychainEntry) -> SecurityResult<Option<SecretString>>;
+
+    fn set_secret(&mut self, entry: &KeychainEntry, secret: SecretString) -> SecurityResult<()>;
+
+    fn delete_secret(&mut self, entry: &KeychainEntry) -> SecurityResult<()>;
+}
+
 #[derive(Debug, Default)]
 pub struct EmptySecretProvider;
 
 impl SecretProvider for EmptySecretProvider {
     fn request_secret(&mut self, _request: SecretRequest) -> SecurityResult<Option<SecretString>> {
         Ok(None)
+    }
+}
+
+impl KeychainProvider for EmptySecretProvider {
+    fn get_secret(&mut self, _entry: &KeychainEntry) -> SecurityResult<Option<SecretString>> {
+        Ok(None)
+    }
+
+    fn set_secret(&mut self, _entry: &KeychainEntry, _secret: SecretString) -> SecurityResult<()> {
+        Err(SecurityError::new(
+            "no OS keychain provider is available in this build",
+        ))
+    }
+
+    fn delete_secret(&mut self, _entry: &KeychainEntry) -> SecurityResult<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct MemoryKeychainProvider {
+    entries: BTreeMap<String, SecretString>,
+}
+
+impl MemoryKeychainProvider {
+    fn key(entry: &KeychainEntry) -> String {
+        format!("{}:{}:{:?}", entry.service, entry.account, entry.kind)
+    }
+}
+
+impl KeychainProvider for MemoryKeychainProvider {
+    fn get_secret(&mut self, entry: &KeychainEntry) -> SecurityResult<Option<SecretString>> {
+        Ok(self.entries.get(&Self::key(entry)).cloned())
+    }
+
+    fn set_secret(&mut self, entry: &KeychainEntry, secret: SecretString) -> SecurityResult<()> {
+        self.entries.insert(Self::key(entry), secret);
+        Ok(())
+    }
+
+    fn delete_secret(&mut self, entry: &KeychainEntry) -> SecurityResult<()> {
+        self.entries.remove(&Self::key(entry));
+        Ok(())
     }
 }
 
@@ -328,5 +409,26 @@ mod tests {
         let secret = SecretString::new("hunter2");
 
         assert_eq!(format!("{secret:?}"), "SecretString(**redacted**)");
+    }
+
+    #[test]
+    fn keychain_provider_contract_keeps_secret_debug_redacted() {
+        let entry = KeychainEntry::new("panea", "prod", KeychainSecretKind::SshPassword);
+        let mut keychain = MemoryKeychainProvider::default();
+
+        keychain
+            .set_secret(&entry, SecretString::new("secret"))
+            .expect("memory keychain should store test secret");
+        let secret = keychain
+            .get_secret(&entry)
+            .expect("memory keychain should read test secret")
+            .expect("secret should exist");
+
+        assert_eq!(secret.expose(), "secret");
+        assert_eq!(format!("{secret:?}"), "SecretString(**redacted**)");
+        keychain
+            .delete_secret(&entry)
+            .expect("memory keychain delete should work");
+        assert!(keychain.get_secret(&entry).unwrap().is_none());
     }
 }

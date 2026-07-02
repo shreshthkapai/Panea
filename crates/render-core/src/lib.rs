@@ -260,8 +260,61 @@ pub struct RenderScene {
     pub damage_regions: Vec<DamageRegion>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RenderSurfaceSize {
+    pub width: u32,
+    pub height: u32,
+    pub scale_factor: f64,
+}
+
+impl RenderSurfaceSize {
+    #[must_use]
+    pub const fn new(width: u32, height: u32, scale_factor: f64) -> Self {
+        Self {
+            width,
+            height,
+            scale_factor,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderSurfaceStatus {
+    Ready,
+    Lost,
+    Unavailable { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderSurfaceError {
+    pub message: String,
+}
+
+impl RenderSurfaceError {
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Renderer surface contract used by app code without exposing a GPU backend.
+pub trait RendererSurface {
+    fn resize(&mut self, size: RenderSurfaceSize) -> Result<(), RenderSurfaceError>;
+
+    fn render_scene(
+        &mut self,
+        scene: &RenderScene,
+    ) -> Result<RenderInstrumentation, RenderSurfaceError>;
+
+    fn status(&self) -> RenderSurfaceStatus;
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn render_core_has_no_crate_dependencies() {
         let manifest = include_str!("../Cargo.toml");
@@ -270,5 +323,70 @@ mod tests {
             !manifest.contains("[dependencies]"),
             "render-core must stay renderer-independent and avoid GPU API dependencies"
         );
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeRenderer {
+        rendered_cells: usize,
+        size: Option<RenderSurfaceSize>,
+    }
+
+    impl RendererSurface for FakeRenderer {
+        fn resize(&mut self, size: RenderSurfaceSize) -> Result<(), RenderSurfaceError> {
+            self.size = Some(size);
+            Ok(())
+        }
+
+        fn render_scene(
+            &mut self,
+            scene: &RenderScene,
+        ) -> Result<RenderInstrumentation, RenderSurfaceError> {
+            self.rendered_cells += scene.grid.cells.len();
+            Ok(RenderInstrumentation {
+                damage_region_count: scene.damage_regions.len(),
+                ..RenderInstrumentation::default()
+            })
+        }
+
+        fn status(&self) -> RenderSurfaceStatus {
+            RenderSurfaceStatus::Ready
+        }
+    }
+
+    #[test]
+    fn renderer_contract_can_be_exercised_with_fake_terminal_data() {
+        let mut renderer = FakeRenderer::default();
+        renderer
+            .resize(RenderSurfaceSize::new(800, 600, 1.0))
+            .expect("fake resize should work");
+
+        let scene = RenderScene {
+            grid: RenderGrid {
+                columns: 1,
+                rows: 1,
+                cells: vec![RenderCell {
+                    position: CellPosition { row: 0, col: 0 },
+                    text: "P".to_owned(),
+                    foreground: RenderColor::rgb(230, 230, 230),
+                    background: RenderColor::rgb(10, 10, 10),
+                    style: RenderCellStyle::default(),
+                }],
+            },
+            damage_regions: vec![RenderRect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 20,
+            }],
+            ..RenderScene::default()
+        };
+
+        let instrumentation = renderer
+            .render_scene(&scene)
+            .expect("fake renderer should render scene");
+
+        assert_eq!(renderer.rendered_cells, 1);
+        assert_eq!(renderer.status(), RenderSurfaceStatus::Ready);
+        assert_eq!(instrumentation.damage_region_count, 1);
     }
 }

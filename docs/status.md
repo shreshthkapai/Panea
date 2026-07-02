@@ -45,6 +45,7 @@ stated scope:
 | --- | --- | --- |
 | Rust workspace | tested | Workspace members compile under the existing standard gates on the Windows host. |
 | Layer skeleton | tested | Crates exist for core, parser, renderer, transport, platform, config, mux, semantics, diagnostics, security, assets, desktop, iOS, xtask, and bench. |
+| Architecture boundary enforcement | tested | `cargo xtask layer-check` validates allowed workspace dependencies, `cargo xtask ci` runs it, and GitHub Actions runs the architecture boundary subset on Windows, macOS, and Ubuntu. |
 | Terminal core baseline | tested | Grid, cells, cursor, scrollback, alternate screen, resize, modes, selection extraction, and baseline golden coverage exist. |
 | Parser baseline | tested | ANSI/VT parser adapter handles printable text, common controls, SGR colors/styles, alternate screen, clears, insert/delete groundwork, tab stops, title OSC, mouse/focus/bracketed-paste mode state, and pending responses. |
 | Config model and TOML | tested | `AppConfig` defaults, TOML parsing, unknown/deprecated diagnostics, validation, platform overrides, default generation, schema export, and reload impact classification exist. |
@@ -133,6 +134,5 @@ The following major accepted features have no complete product behavior yet:
 
 ## Immediate Next Slice
 
-After this freeze, the next dependency-ordered phase is architecture and
-layer-boundary hardening. It should strengthen enforcement of the boundaries
-already described here before further feature implementation continues.
+After architecture and layer-boundary hardening, the next dependency-ordered
+phase is Unicode, grapheme, emoji, and width correctness.

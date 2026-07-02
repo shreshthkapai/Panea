@@ -246,8 +246,44 @@ pub struct PlatformCapabilities {
     pub fallbacks: Vec<PlatformFallback>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformError {
+    pub feature: String,
+    pub message: String,
+}
+
+impl PlatformError {
+    #[must_use]
+    pub fn new(feature: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            feature: feature.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Clipboard contract exposed to app code without leaking a concrete OS backend.
+pub trait ClipboardProvider {
+    fn copy_text(&mut self, text: &str) -> Result<(), ClipboardDiagnostic>;
+
+    fn paste_text(&mut self) -> Result<String, ClipboardDiagnostic>;
+
+    fn last_diagnostic(&self) -> ClipboardDiagnostic;
+}
+
+/// Window contract exposed to the application without exposing winit or OS APIs.
+pub trait WindowProvider {
+    fn capabilities(&self) -> PlatformCapabilities;
+
+    fn set_window_mode(&mut self, mode: WindowMode) -> Result<WindowModeDiagnostic, PlatformError>;
+
+    fn poll_input_events(&mut self) -> Vec<InputEvent>;
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn platform_core_has_no_crate_dependencies() {
         let manifest = include_str!("../Cargo.toml");
@@ -255,6 +291,65 @@ mod tests {
         assert!(
             !manifest.contains("[dependencies]"),
             "platform-core must report capability contracts without depending on renderers or transports"
+        );
+    }
+
+    #[derive(Debug)]
+    struct FakeClipboard {
+        value: String,
+        diagnostic: ClipboardDiagnostic,
+    }
+
+    impl Default for FakeClipboard {
+        fn default() -> Self {
+            Self {
+                value: String::new(),
+                diagnostic: ClipboardDiagnostic {
+                    operation: ClipboardOperation::Copy,
+                    availability: ClipboardAvailability::Available,
+                    message: None,
+                },
+            }
+        }
+    }
+
+    impl ClipboardProvider for FakeClipboard {
+        fn copy_text(&mut self, text: &str) -> Result<(), ClipboardDiagnostic> {
+            self.value = text.to_owned();
+            self.diagnostic = ClipboardDiagnostic {
+                operation: ClipboardOperation::Copy,
+                availability: ClipboardAvailability::Available,
+                message: None,
+            };
+            Ok(())
+        }
+
+        fn paste_text(&mut self) -> Result<String, ClipboardDiagnostic> {
+            self.diagnostic = ClipboardDiagnostic {
+                operation: ClipboardOperation::Paste,
+                availability: ClipboardAvailability::Available,
+                message: None,
+            };
+            Ok(self.value.clone())
+        }
+
+        fn last_diagnostic(&self) -> ClipboardDiagnostic {
+            self.diagnostic.clone()
+        }
+    }
+
+    #[test]
+    fn clipboard_provider_contract_is_backend_neutral() {
+        let mut clipboard = FakeClipboard::default();
+
+        clipboard
+            .copy_text("panea")
+            .expect("fake clipboard copy should work");
+
+        assert_eq!(clipboard.paste_text().as_deref(), Ok("panea"));
+        assert_eq!(
+            clipboard.last_diagnostic().availability,
+            ClipboardAvailability::Available
         );
     }
 }

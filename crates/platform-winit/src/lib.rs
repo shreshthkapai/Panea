@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use arboard::Clipboard;
 use platform_core::{
-    ClipboardAvailability, ClipboardDiagnostic, ClipboardOperation, CompositorInfo, DecorationMode,
-    DesktopPlatform, DpiBehavior, DpiInfo, ImeEvent, ImeSupport, InputEvent, KeyEvent,
-    KeyModifiers, KeyState, LinuxWindowBackend, LinuxWindowBackendDiagnostic, MonitorInfo,
-    MouseButton, MouseEvent, MouseEventKind, PlatformCapabilities, PlatformFallback,
+    ClipboardAvailability, ClipboardDiagnostic, ClipboardOperation, ClipboardProvider,
+    CompositorInfo, DecorationMode, DesktopPlatform, DpiBehavior, DpiInfo, ImeEvent, ImeSupport,
+    InputEvent, KeyEvent, KeyModifiers, KeyState, LinuxWindowBackend, LinuxWindowBackendDiagnostic,
+    MonitorInfo, MouseButton, MouseEvent, MouseEventKind, PlatformCapabilities, PlatformFallback,
     ShellEnvironmentInfo, WindowAction, WindowMode, WindowModeDiagnostic,
 };
 use winit::{
@@ -273,6 +273,20 @@ impl ClipboardBridge {
     #[must_use]
     pub fn last_diagnostic(&self) -> &ClipboardDiagnostic {
         &self.last_diagnostic
+    }
+}
+
+impl ClipboardProvider for ClipboardBridge {
+    fn copy_text(&mut self, text: &str) -> Result<(), ClipboardDiagnostic> {
+        ClipboardBridge::copy_text(self, text)
+    }
+
+    fn paste_text(&mut self) -> Result<String, ClipboardDiagnostic> {
+        ClipboardBridge::paste_text(self)
+    }
+
+    fn last_diagnostic(&self) -> ClipboardDiagnostic {
+        self.last_diagnostic.clone()
     }
 }
 
