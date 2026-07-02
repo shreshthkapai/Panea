@@ -4,7 +4,7 @@ fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("help") | None => {
             eprintln!(
-                "usage: cargo xtask <fmt|clippy|test|build|check|ci|config-default|config-schema|bench>"
+                "usage: cargo xtask <fmt|clippy|test|build|check|ci|config-default|config-schema|bench|doctor|bug-report>"
             );
             ExitCode::SUCCESS
         }
@@ -16,10 +16,77 @@ fn main() -> ExitCode {
         Some("config-default") => print_config_default(),
         Some("config-schema") => print_config_schema(),
         Some("bench") => run_bench(),
+        Some("doctor") => run_doctor(),
+        Some("bug-report") => run_bug_report(),
         Some("ci") => run_ci(),
         Some(command) => {
             eprintln!("unknown xtask command: {command}");
             ExitCode::from(2)
+        }
+    }
+}
+
+fn run_doctor() -> ExitCode {
+    let topic = std::env::args().nth(2).as_deref().map_or(
+        Some(diagnostics::DoctorTopic::All),
+        diagnostics::DoctorTopic::parse,
+    );
+    let Some(topic) = topic else {
+        eprintln!(
+            "unknown doctor topic; expected renderer, config, platform, shell-integration, performance, ssh, or window"
+        );
+        return ExitCode::from(2);
+    };
+
+    let input = match doctor_input() {
+        Ok(input) => input,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    println!(
+        "{}",
+        diagnostics::doctor_report(&input, topic).render_text()
+    );
+    ExitCode::SUCCESS
+}
+
+fn run_bug_report() -> ExitCode {
+    let input = match doctor_input() {
+        Ok(input) => input,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    println!(
+        "{}",
+        diagnostics::BugReportSnapshot::from_doctor_input(&input).render_text()
+    );
+    ExitCode::SUCCESS
+}
+
+fn doctor_input() -> Result<diagnostics::DoctorInput, config_toml::ConfigTomlError> {
+    let loaded = config_toml::load(config_toml::ConfigLoadOptions::default())?;
+    Ok(diagnostics::DoctorInput {
+        app_version: env!("CARGO_PKG_VERSION").to_owned(),
+        config_source: config_source_text(&loaded.source),
+        config: loaded.config,
+        config_diagnostics: loaded.diagnostics,
+        platform: diagnostics::PlatformSnapshot::detect(),
+        recent_errors: Vec::new(),
+    })
+}
+
+fn config_source_text(source: &config_toml::ConfigSource) -> String {
+    match source {
+        config_toml::ConfigSource::Default => "default".to_owned(),
+        config_toml::ConfigSource::File(path) => path.display().to_string(),
+        config_toml::ConfigSource::ExplicitFile(path) => {
+            format!("explicit:{}", path.display())
         }
     }
 }

@@ -110,6 +110,13 @@ If a task does not fit, redesign it before implementation.
   agent/public-key/password authentication boundaries, remote PTY allocation,
   read/write/resize/shutdown support, bounded best-effort drop behavior, SSH
   mux session specs, and desktop config-to-transport profile mapping.
+- Implemented the Phase 13 platform parity diagnostics foundation: replaced the
+  initial platform-support note with a feature-level macOS/Windows/Linux X11/
+  Linux Wayland parity matrix, added explicit polish checklists and verification
+  status, introduced shared support-level terminology, added reusable
+  `doctor`/bug-report diagnostics models for platform, window, renderer,
+  config, shell integration, performance, and SSH checks, and exposed them
+  through `cargo xtask doctor ...` and `cargo xtask bug-report`.
 
 ## Deferred By Design
 
@@ -176,3 +183,9 @@ If a task does not fit, redesign it before implementation.
   jump, remote shell-integration install flows, reconnect UI/actions, and real
   SSH server smoke tests across Windows/macOS/Linux remain unverified follow-up
   work.
+- Phase 13 adds the parity matrix and diagnostics command foundation, but it
+  does not magically verify macOS, Linux X11, or Linux Wayland from this Windows
+  host. Real platform labs/CI runners, compositor coverage, GPU backend
+  inventory, native notification support, OSC clipboard policy, and the final
+  installed `terminal doctor` binary remain follow-up work before platform
+  parity can be called product-complete.

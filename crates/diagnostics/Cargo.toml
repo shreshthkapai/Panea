@@ -9,5 +9,7 @@ description = "Doctor commands, capability reports, logs, and performance overla
 workspace = true
 
 [dependencies]
+config-core = { path = "../config-core" }
+platform-core = { path = "../platform-core" }
 render-core = { path = "../render-core" }
 semantics = { path = "../semantics" }

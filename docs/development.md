@@ -24,6 +24,8 @@ cargo xtask ci
 cargo xtask config-default
 cargo xtask config-schema
 cargo xtask bench all
+cargo xtask doctor
+cargo xtask bug-report
 ```
 
 ## Contribution Gates

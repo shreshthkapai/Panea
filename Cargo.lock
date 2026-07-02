@@ -504,6 +504,8 @@ dependencies = [
 name = "diagnostics"
 version = "0.1.0"
 dependencies = [
+ "config-core",
+ "platform-core",
  "render-core",
  "semantics",
 ]
@@ -2997,6 +2999,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "config-toml",
+ "diagnostics",
 ]
 
 [[package]]

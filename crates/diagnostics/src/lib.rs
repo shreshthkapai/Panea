@@ -2,10 +2,708 @@
 
 pub const LAYER: &str = "diagnostics";
 
-use std::{collections::VecDeque, time::Duration};
+use std::{collections::VecDeque, fmt, time::Duration};
 
+use config_core::{
+    AppConfig, ConfigDiagnostic, ConfigDiagnosticSeverity, ConfigPlatform, SshAuthMethod,
+    SshKnownHostsPolicy, WindowModeConfig,
+};
+use platform_core::{DesktopPlatform, DpiBehavior};
 use render_core::{FeatureCostSample, OptionalFeatureCostMode, RenderInstrumentation};
 use semantics::{CommandBlockConfidence, IntegrationMode, SemanticDiagnostics, SemanticEventKind};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupportLevel {
+    Full,
+    Partial,
+    Fallback,
+    UnsupportedByPlatform,
+    NotImplementedYet,
+}
+
+impl fmt::Display for SupportLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Full => "full",
+            Self::Partial => "partial",
+            Self::Fallback => "fallback",
+            Self::UnsupportedByPlatform => "unsupported by platform",
+            Self::NotImplementedYet => "not implemented yet",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformFeatureStatus {
+    pub feature: &'static str,
+    pub macos: SupportLevel,
+    pub windows: SupportLevel,
+    pub linux_x11: SupportLevel,
+    pub linux_wayland: SupportLevel,
+    pub notes: &'static str,
+}
+
+#[must_use]
+pub fn feature_parity_matrix() -> Vec<PlatformFeatureStatus> {
+    use SupportLevel::{Fallback, Full, NotImplementedYet, Partial};
+
+    vec![
+        PlatformFeatureStatus {
+            feature: "window modes",
+            macos: Partial,
+            windows: Partial,
+            linux_x11: Partial,
+            linux_wayland: Partial,
+            notes: "windowed, maximized, borderless fullscreen, and frameless states are modeled; real compositor validation remains open",
+        },
+        PlatformFeatureStatus {
+            feature: "frameless modes",
+            macos: Partial,
+            windows: Partial,
+            linux_x11: Fallback,
+            linux_wayland: Fallback,
+            notes: "implemented through winit decorations with Linux decoration negotiation still requiring compositor tests",
+        },
+        PlatformFeatureStatus {
+            feature: "fullscreen modes",
+            macos: Partial,
+            windows: Partial,
+            linux_x11: Partial,
+            linux_wayland: Fallback,
+            notes: "exclusive fullscreen currently falls back to borderless fullscreen",
+        },
+        PlatformFeatureStatus {
+            feature: "clipboard",
+            macos: Partial,
+            windows: Partial,
+            linux_x11: Partial,
+            linux_wayland: Partial,
+            notes: "system clipboard bridge exists; primary selection and OSC clipboard remain later compatibility work",
+        },
+        PlatformFeatureStatus {
+            feature: "IME",
+            macos: Partial,
+            windows: Partial,
+            linux_x11: Partial,
+            linux_wayland: Partial,
+            notes: "platform-neutral IME events are represented; real composed-input validation is still required",
+        },
+        PlatformFeatureStatus {
+            feature: "DPI/fractional scaling",
+            macos: Partial,
+            windows: Partial,
+            linux_x11: Partial,
+            linux_wayland: Partial,
+            notes: "monitor scale snapshots exist; fractional behavior needs real host verification",
+        },
+        PlatformFeatureStatus {
+            feature: "font fallback",
+            macos: Partial,
+            windows: Partial,
+            linux_x11: Partial,
+            linux_wayland: Partial,
+            notes: "fallback chains are configurable; per-OS font availability validation is not automated yet",
+        },
+        PlatformFeatureStatus {
+            feature: "GPU backend",
+            macos: Partial,
+            windows: Partial,
+            linux_x11: Partial,
+            linux_wayland: Partial,
+            notes: "wgpu surface/device path exists; GPU backend inventory and screenshot verification remain open",
+        },
+        PlatformFeatureStatus {
+            feature: "local PTY",
+            macos: Partial,
+            windows: Full,
+            linux_x11: Partial,
+            linux_wayland: Partial,
+            notes: "Windows real-shell smoke passed on current host; macOS/Linux real PTY smoke remains unverified",
+        },
+        PlatformFeatureStatus {
+            feature: "PowerShell/cmd/WSL",
+            macos: NotImplementedYet,
+            windows: Partial,
+            linux_x11: NotImplementedYet,
+            linux_wayland: NotImplementedYet,
+            notes: "Windows shell profile groundwork exists; WSL runtime smoke is not verified",
+        },
+        PlatformFeatureStatus {
+            feature: "shell integration",
+            macos: Partial,
+            windows: Partial,
+            linux_x11: Partial,
+            linux_wayland: Partial,
+            notes: "semantic parsers and scripts exist; desktop startup activation and real shell validation remain open",
+        },
+        PlatformFeatureStatus {
+            feature: "tabs/panes",
+            macos: Partial,
+            windows: Partial,
+            linux_x11: Partial,
+            linux_wayland: Partial,
+            notes: "mux state model exists; full desktop multi-pane runtime is deferred",
+        },
+        PlatformFeatureStatus {
+            feature: "command blocks",
+            macos: Partial,
+            windows: Partial,
+            linux_x11: Partial,
+            linux_wayland: Partial,
+            notes: "semantic storage and basic overlays exist; real shell-driven UI verification remains open",
+        },
+        PlatformFeatureStatus {
+            feature: "cursor animations",
+            macos: Partial,
+            windows: Partial,
+            linux_x11: Partial,
+            linux_wayland: Partial,
+            notes: "config and budget contracts exist; polished animation runtime and asset pipeline are deferred",
+        },
+        PlatformFeatureStatus {
+            feature: "SSH",
+            macos: Partial,
+            windows: Partial,
+            linux_x11: Partial,
+            linux_wayland: Partial,
+            notes: "secure transport backend exists; interactive trust UI and real server smoke tests remain open",
+        },
+        PlatformFeatureStatus {
+            feature: "config reload",
+            macos: Partial,
+            windows: Partial,
+            linux_x11: Partial,
+            linux_wayland: Partial,
+            notes: "reload impact is classified; runtime file watching/application is deferred",
+        },
+        PlatformFeatureStatus {
+            feature: "notifications",
+            macos: NotImplementedYet,
+            windows: NotImplementedYet,
+            linux_x11: NotImplementedYet,
+            linux_wayland: NotImplementedYet,
+            notes: "native notification surface has not been implemented",
+        },
+        PlatformFeatureStatus {
+            feature: "OSC clipboard",
+            macos: NotImplementedYet,
+            windows: NotImplementedYet,
+            linux_x11: NotImplementedYet,
+            linux_wayland: NotImplementedYet,
+            notes: "OSC 52 policy and security prompts remain later compatibility/security work",
+        },
+    ]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorTopic {
+    All,
+    Renderer,
+    Config,
+    Platform,
+    ShellIntegration,
+    Performance,
+    Ssh,
+    Window,
+}
+
+impl DoctorTopic {
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "all" => Some(Self::All),
+            "renderer" => Some(Self::Renderer),
+            "config" => Some(Self::Config),
+            "platform" => Some(Self::Platform),
+            "shell-integration" | "shell_integration" | "shell" => Some(Self::ShellIntegration),
+            "performance" => Some(Self::Performance),
+            "ssh" => Some(Self::Ssh),
+            "window" => Some(Self::Window),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::All => "doctor",
+            Self::Renderer => "doctor renderer",
+            Self::Config => "doctor config",
+            Self::Platform => "doctor platform",
+            Self::ShellIntegration => "doctor shell-integration",
+            Self::Performance => "doctor performance",
+            Self::Ssh => "doctor ssh",
+            Self::Window => "doctor window",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformSnapshot {
+    pub platform: ConfigPlatform,
+    pub os: String,
+    pub arch: String,
+    pub linux_backend: Option<DesktopPlatform>,
+    pub compositor_or_desktop: Option<String>,
+    pub dpi_behavior: DpiBehavior,
+    pub known_fallbacks: Vec<String>,
+}
+
+impl PlatformSnapshot {
+    #[must_use]
+    pub fn detect() -> Self {
+        let platform = ConfigPlatform::current();
+        let linux_backend = match platform {
+            ConfigPlatform::LinuxX11 => Some(DesktopPlatform::LinuxX11),
+            ConfigPlatform::LinuxWayland => Some(DesktopPlatform::LinuxWayland),
+            ConfigPlatform::Linux => Some(DesktopPlatform::Unknown),
+            ConfigPlatform::MacOs => Some(DesktopPlatform::MacOs),
+            ConfigPlatform::Windows => Some(DesktopPlatform::Windows),
+            ConfigPlatform::Unknown => None,
+        };
+        let compositor_or_desktop = std::env::var("XDG_CURRENT_DESKTOP")
+            .or_else(|_| std::env::var("DESKTOP_SESSION"))
+            .or_else(|_| std::env::var("WAYLAND_DISPLAY"))
+            .or_else(|_| std::env::var("DISPLAY"))
+            .ok();
+        let dpi_behavior = match platform {
+            ConfigPlatform::Windows => DpiBehavior::PerMonitor,
+            ConfigPlatform::MacOs | ConfigPlatform::LinuxX11 | ConfigPlatform::LinuxWayland => {
+                DpiBehavior::FractionalScale
+            }
+            ConfigPlatform::Linux | ConfigPlatform::Unknown => DpiBehavior::Unknown,
+        };
+        let mut known_fallbacks = Vec::new();
+        if matches!(platform, ConfigPlatform::Linux | ConfigPlatform::Unknown) {
+            known_fallbacks.push(
+                "Linux display backend could not be distinguished from environment".to_owned(),
+            );
+        }
+
+        Self {
+            platform,
+            os: std::env::consts::OS.to_owned(),
+            arch: std::env::consts::ARCH.to_owned(),
+            linux_backend,
+            compositor_or_desktop,
+            dpi_behavior,
+            known_fallbacks,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DoctorInput {
+    pub app_version: String,
+    pub config_source: String,
+    pub config: AppConfig,
+    pub config_diagnostics: Vec<ConfigDiagnostic>,
+    pub platform: PlatformSnapshot,
+    pub recent_errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+impl fmt::Display for DoctorSeverity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorFinding {
+    pub severity: DoctorSeverity,
+    pub area: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorReport {
+    pub topic: DoctorTopic,
+    pub lines: Vec<String>,
+    pub findings: Vec<DoctorFinding>,
+}
+
+impl DoctorReport {
+    #[must_use]
+    pub fn render_text(&self) -> String {
+        let mut output = vec![format!("Panea {}", self.topic.name())];
+        output.extend(self.lines.iter().cloned());
+        if !self.findings.is_empty() {
+            output.push("findings:".to_owned());
+            output.extend(self.findings.iter().map(|finding| {
+                format!(
+                    "- [{}] {}: {}",
+                    finding.severity, finding.area, finding.message
+                )
+            }));
+        }
+        output.join("\n")
+    }
+}
+
+#[must_use]
+pub fn doctor_report(input: &DoctorInput, topic: DoctorTopic) -> DoctorReport {
+    let mut report = DoctorReport {
+        topic,
+        lines: vec![format!("version: {}", input.app_version)],
+        findings: Vec::new(),
+    };
+
+    if matches!(topic, DoctorTopic::All | DoctorTopic::Platform) {
+        append_platform_report(input, &mut report);
+    }
+    if matches!(topic, DoctorTopic::All | DoctorTopic::Window) {
+        append_window_report(input, &mut report);
+    }
+    if matches!(topic, DoctorTopic::All | DoctorTopic::Renderer) {
+        append_renderer_report(input, &mut report);
+    }
+    if matches!(topic, DoctorTopic::All | DoctorTopic::Config) {
+        append_config_report(input, &mut report);
+    }
+    if matches!(topic, DoctorTopic::All | DoctorTopic::ShellIntegration) {
+        append_shell_integration_report(input, &mut report);
+    }
+    if matches!(topic, DoctorTopic::All | DoctorTopic::Performance) {
+        append_performance_report(input, &mut report);
+    }
+    if matches!(topic, DoctorTopic::All | DoctorTopic::Ssh) {
+        append_ssh_report(input, &mut report);
+    }
+
+    for error in &input.recent_errors {
+        report.findings.push(DoctorFinding {
+            severity: DoctorSeverity::Warning,
+            area: "recent_errors",
+            message: error.clone(),
+        });
+    }
+
+    report
+}
+
+fn append_platform_report(input: &DoctorInput, report: &mut DoctorReport) {
+    report.lines.extend([
+        "platform:".to_owned(),
+        format!(
+            "  os={} arch={} config_platform={:?}",
+            input.platform.os, input.platform.arch, input.platform.platform
+        ),
+        format!(
+            "  backend={}",
+            input
+                .platform
+                .linux_backend
+                .map_or_else(|| "n/a".to_owned(), |backend| format!("{backend:?}"))
+        ),
+        format!(
+            "  compositor_or_desktop={}",
+            input
+                .platform
+                .compositor_or_desktop
+                .as_deref()
+                .unwrap_or("unknown")
+        ),
+        format!("  dpi_behavior={:?}", input.platform.dpi_behavior),
+    ]);
+
+    for fallback in &input.platform.known_fallbacks {
+        report.findings.push(DoctorFinding {
+            severity: DoctorSeverity::Warning,
+            area: "platform",
+            message: fallback.clone(),
+        });
+    }
+}
+
+fn append_window_report(input: &DoctorInput, report: &mut DoctorReport) {
+    report.lines.extend([
+        "window:".to_owned(),
+        format!(
+            "  size={}x{} cells={}x{}",
+            input.config.window.initial_width,
+            input.config.window.initial_height,
+            input.config.window.columns,
+            input.config.window.rows
+        ),
+        format!(
+            "  mode={:?} linux_backend={:?} decoration_strategy={:?}",
+            input.config.window.mode,
+            input.config.window.linux_backend,
+            input.config.window.decoration_strategy
+        ),
+    ]);
+
+    if matches!(
+        input.config.window.mode,
+        WindowModeConfig::FramelessWindowed | WindowModeConfig::FramelessFullscreen
+    ) {
+        report.findings.push(DoctorFinding {
+            severity: DoctorSeverity::Info,
+            area: "window",
+            message: "frameless recovery depends on restore_window_decorations keybinding"
+                .to_owned(),
+        });
+    }
+}
+
+fn append_renderer_report(input: &DoctorInput, report: &mut DoctorReport) {
+    report.lines.extend([
+        "renderer:".to_owned(),
+        format!(
+            "  backend_preference={:?} present_mode={:?} damage_tracking={}",
+            input.config.renderer.backend,
+            input.config.renderer.present_mode,
+            input.config.renderer.damage_tracking
+        ),
+        format!(
+            "  gpu_backend=runtime window detection required; configured preference is {:?}",
+            input.config.renderer.backend
+        ),
+        format!(
+            "  font_family={} fallback_chain={}",
+            input.config.font.family,
+            if input.config.font.fallback_families.is_empty() {
+                "system".to_owned()
+            } else {
+                input.config.font.fallback_families.join(", ")
+            }
+        ),
+    ]);
+
+    if !input.config.renderer.damage_tracking {
+        report.findings.push(DoctorFinding {
+            severity: DoctorSeverity::Warning,
+            area: "renderer",
+            message: "damage tracking is disabled; renderer may redraw more than necessary"
+                .to_owned(),
+        });
+    }
+}
+
+fn append_config_report(input: &DoctorInput, report: &mut DoctorReport) {
+    report.lines.extend([
+        "config:".to_owned(),
+        format!("  source={}", input.config_source),
+        format!(
+            "  diagnostics={} platform_overrides macos={} windows={} linux={} x11={} wayland={}",
+            input.config_diagnostics.len(),
+            input.config.platform_overrides.macos.is_some(),
+            input.config.platform_overrides.windows.is_some(),
+            input.config.platform_overrides.linux.is_some(),
+            input.config.platform_overrides.linux_x11.is_some(),
+            input.config.platform_overrides.linux_wayland.is_some()
+        ),
+    ]);
+
+    for diagnostic in &input.config_diagnostics {
+        report.findings.push(DoctorFinding {
+            severity: match diagnostic.severity {
+                ConfigDiagnosticSeverity::Error => DoctorSeverity::Error,
+                ConfigDiagnosticSeverity::Warning => DoctorSeverity::Warning,
+            },
+            area: "config",
+            message: format!("{}: {}", diagnostic.path, diagnostic.message),
+        });
+    }
+}
+
+fn append_shell_integration_report(input: &DoctorInput, report: &mut DoctorReport) {
+    report.lines.extend([
+        "shell-integration:".to_owned(),
+        format!(
+            "  enabled={} activation={:?} auto_install={} remote_instructions={}",
+            input.config.shell_integration.enabled,
+            input.config.shell_integration.activation,
+            input.config.shell_integration.auto_install,
+            input.config.shell_integration.remote_instructions
+        ),
+        format!(
+            "  enabled_shells={}",
+            input.config.shell_integration.enabled_shells.join(", ")
+        ),
+    ]);
+
+    if !input.config.shell_integration.enabled {
+        report.findings.push(DoctorFinding {
+            severity: DoctorSeverity::Info,
+            area: "shell-integration",
+            message: "semantic command features are disabled by config".to_owned(),
+        });
+    }
+}
+
+fn append_performance_report(input: &DoctorInput, report: &mut DoctorReport) {
+    report.lines.extend([
+        "performance:".to_owned(),
+        format!(
+            "  profile={:?} max_frame_time_ms={} glyph_cache_entries={} frame_rate_limit={}",
+            input.config.performance.profile,
+            input.config.performance.max_frame_time_ms,
+            input.config.performance.glyph_cache_entries,
+            input
+                .config
+                .performance
+                .frame_rate_limit
+                .map_or_else(|| "none".to_owned(), |limit| limit.to_string())
+        ),
+        format!(
+            "  visual_budget fps={} cursor_asset_kb={} active_animations={} animated_pixels={}",
+            input.config.performance.max_animation_fps,
+            input.config.performance.max_cursor_asset_size_kb,
+            input.config.performance.max_active_animations,
+            input.config.performance.max_animated_region_pixels
+        ),
+    ]);
+
+    if input.config.diagnostics.performance_overlay {
+        report.findings.push(DoctorFinding {
+            severity: DoctorSeverity::Info,
+            area: "performance",
+            message: "performance overlay is enabled and may emit runtime diagnostics".to_owned(),
+        });
+    }
+}
+
+fn append_ssh_report(input: &DoctorInput, report: &mut DoctorReport) {
+    report.lines.extend([
+        "ssh:".to_owned(),
+        format!("  profiles={}", input.config.ssh_profiles.len()),
+    ]);
+
+    for profile in &input.config.ssh_profiles {
+        report.lines.push(format!(
+            "  profile={} target={}:{} auth={:?} host_key_policy={}",
+            profile.name,
+            profile.host,
+            profile.port,
+            profile.auth_method,
+            known_hosts_policy_name(&profile.known_hosts_policy)
+        ));
+        if matches!(
+            profile.known_hosts_policy,
+            SshKnownHostsPolicy::TrustOnFirstUse
+        ) {
+            report.findings.push(DoctorFinding {
+                severity: DoctorSeverity::Warning,
+                area: "ssh",
+                message: format!(
+                    "profile '{}' uses trust_on_first_use; changed host keys still block, but first trust must be intentional",
+                    profile.name
+                ),
+            });
+        }
+        if matches!(profile.auth_method, SshAuthMethod::None) {
+            report.findings.push(DoctorFinding {
+                severity: DoctorSeverity::Warning,
+                area: "ssh",
+                message: format!(
+                    "profile '{}' requests none authentication, which the current backend does not support",
+                    profile.name
+                ),
+            });
+        }
+        if profile.agent_forwarding {
+            report.findings.push(DoctorFinding {
+                severity: DoctorSeverity::Warning,
+                area: "ssh",
+                message: format!(
+                    "profile '{}' enables agent forwarding; use only with trusted hosts",
+                    profile.name
+                ),
+            });
+        }
+    }
+}
+
+fn known_hosts_policy_name(policy: &SshKnownHostsPolicy) -> &'static str {
+    match policy {
+        SshKnownHostsPolicy::Ask => "ask",
+        SshKnownHostsPolicy::RequireKnown => "require_known",
+        SshKnownHostsPolicy::TrustOnFirstUse => "trust_on_first_use",
+        SshKnownHostsPolicy::PinFingerprint { .. } => "pin_fingerprint",
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BugReportSnapshot {
+    pub app_version: String,
+    pub os: String,
+    pub arch: String,
+    pub platform: ConfigPlatform,
+    pub renderer_backend_preference: String,
+    pub config_source: String,
+    pub config_diagnostic_count: usize,
+    pub platform_capabilities: Vec<String>,
+    pub shell_integration_enabled: bool,
+    pub ssh_profile_count: usize,
+    pub recent_errors: Vec<String>,
+}
+
+impl BugReportSnapshot {
+    #[must_use]
+    pub fn from_doctor_input(input: &DoctorInput) -> Self {
+        let mut platform_capabilities = vec![format!("dpi={:?}", input.platform.dpi_behavior)];
+        if let Some(backend) = input.platform.linux_backend {
+            platform_capabilities.push(format!("backend={backend:?}"));
+        }
+        if let Some(compositor) = &input.platform.compositor_or_desktop {
+            platform_capabilities.push(format!("desktop={compositor}"));
+        }
+
+        Self {
+            app_version: input.app_version.clone(),
+            os: input.platform.os.clone(),
+            arch: input.platform.arch.clone(),
+            platform: input.platform.platform,
+            renderer_backend_preference: format!("{:?}", input.config.renderer.backend),
+            config_source: input.config_source.clone(),
+            config_diagnostic_count: input.config_diagnostics.len(),
+            platform_capabilities,
+            shell_integration_enabled: input.config.shell_integration.enabled,
+            ssh_profile_count: input.config.ssh_profiles.len(),
+            recent_errors: input.recent_errors.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn render_text(&self) -> String {
+        [
+            "Panea bug-report snapshot".to_owned(),
+            "privacy: terminal contents, command output, environment variables, secrets, SSH keys, and clipboard contents are not included".to_owned(),
+            format!("version: {}", self.app_version),
+            format!("os: {} {}", self.os, self.arch),
+            format!("platform: {:?}", self.platform),
+            format!(
+                "renderer_backend_preference: {}",
+                self.renderer_backend_preference
+            ),
+            format!("config_source: {}", self.config_source),
+            format!("config_diagnostic_count: {}", self.config_diagnostic_count),
+            format!(
+                "platform_capabilities: {}",
+                self.platform_capabilities.join(", ")
+            ),
+            format!(
+                "shell_integration_enabled: {}",
+                self.shell_integration_enabled
+            ),
+            format!("ssh_profile_count: {}", self.ssh_profile_count),
+            format!("recent_errors: {}", self.recent_errors.len()),
+        ]
+        .join("\n")
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PerformanceBudget {
@@ -438,6 +1136,7 @@ impl PerformanceOverlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use config_core::{RendererBackendPreference, SshProfile};
     use render_core::{FeatureCostSample, OptionalFeature, OptionalFeatureCostMode};
 
     #[test]
@@ -556,5 +1255,80 @@ mod tests {
                 .any(|warning| warning.kind == ShellIntegrationWarningKind::Inactive)
         );
         assert!(report.render_text().contains("shell=bash"));
+    }
+
+    #[test]
+    fn parity_matrix_uses_contract_statuses() {
+        let matrix = feature_parity_matrix();
+
+        assert!(matrix.iter().any(|row| row.feature == "SSH"));
+        assert!(matrix.iter().any(|row| row.feature == "OSC clipboard"));
+        assert!(matrix.iter().all(|row| !row.notes.is_empty()));
+    }
+
+    #[test]
+    fn doctor_reports_config_and_ssh_without_secrets() {
+        let config = AppConfig {
+            renderer: config_core::RendererConfig {
+                backend: RendererBackendPreference::Dx12,
+                ..config_core::RendererConfig::default()
+            },
+            ssh_profiles: vec![SshProfile {
+                name: "prod".to_owned(),
+                host: "example.com".to_owned(),
+                auth_method: SshAuthMethod::Password,
+                known_hosts_policy: SshKnownHostsPolicy::Ask,
+                ..SshProfile::default()
+            }],
+            ..AppConfig::default()
+        };
+        let input = DoctorInput {
+            app_version: "0.1.0".to_owned(),
+            config_source: "default".to_owned(),
+            config,
+            config_diagnostics: Vec::new(),
+            platform: PlatformSnapshot {
+                platform: ConfigPlatform::Windows,
+                os: "windows".to_owned(),
+                arch: "x86_64".to_owned(),
+                linux_backend: Some(DesktopPlatform::Windows),
+                compositor_or_desktop: None,
+                dpi_behavior: DpiBehavior::PerMonitor,
+                known_fallbacks: Vec::new(),
+            },
+            recent_errors: Vec::new(),
+        };
+
+        let text = doctor_report(&input, DoctorTopic::All).render_text();
+
+        assert!(text.contains("backend_preference=Dx12"));
+        assert!(text.contains("profile=prod"));
+        assert!(!text.to_ascii_lowercase().contains("secret"));
+    }
+
+    #[test]
+    fn bug_report_snapshot_excludes_terminal_content() {
+        let input = DoctorInput {
+            app_version: "0.1.0".to_owned(),
+            config_source: "default".to_owned(),
+            config: AppConfig::default(),
+            config_diagnostics: Vec::new(),
+            platform: PlatformSnapshot {
+                platform: ConfigPlatform::LinuxWayland,
+                os: "linux".to_owned(),
+                arch: "x86_64".to_owned(),
+                linux_backend: Some(DesktopPlatform::LinuxWayland),
+                compositor_or_desktop: Some("sway".to_owned()),
+                dpi_behavior: DpiBehavior::FractionalScale,
+                known_fallbacks: Vec::new(),
+            },
+            recent_errors: vec!["render surface lost".to_owned()],
+        };
+
+        let text = BugReportSnapshot::from_doctor_input(&input).render_text();
+
+        assert!(text.contains("terminal contents"));
+        assert!(text.contains("recent_errors: 1"));
+        assert!(!text.contains("render surface lost"));
     }
 }
