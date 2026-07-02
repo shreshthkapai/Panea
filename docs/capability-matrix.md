@@ -24,7 +24,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Parser baseline | tested | implemented | implemented | implemented | Lower-level tests exist; app-level compatibility suite is not complete. |
 | Scrollback/alternate screen/resize | tested | implemented | implemented | implemented | Core behavior exists; full app smoke remains open per OS. |
 | Selection extraction | tested | implemented | implemented | implemented | Raw extraction exists; mouse-driven selection UX and platform clipboards remain partial. |
-| Unicode basics | partial | partial | partial | partial | Wide/combining groundwork exists; grapheme/emoji correctness is not done. |
+| Unicode/grapheme cell model | tested | implemented | implemented | implemented | Platform-neutral parser/core tests cover split UTF-8, combining marks, CJK width, emoji modifiers, ZWJ emoji, variation selectors, selection, cursor movement, resize, and scrollback; cross-OS renderer/font screenshots remain open. |
 | Local PTY transport | tested | partial | partial | partial | Windows ConPTY smoke passed; macOS/Linux real PTY smoke is unverified. |
 | Local PTY lifecycle contract | tested | implemented | implemented | implemented | Shared bounded lifecycle exists; non-Windows real shell validation remains open. |
 | Windows PowerShell/cmd/WSL profiles | partial | planned | planned | planned | Windows profile groundwork exists; WSL smoke is unverified. |

@@ -2029,6 +2029,7 @@ dependencies = [
 name = "term-core"
 version = "0.1.0"
 dependencies = [
+ "unicode-segmentation",
  "unicode-width 0.2.2",
 ]
 

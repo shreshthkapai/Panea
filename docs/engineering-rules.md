@@ -35,7 +35,7 @@ Different OS internals hidden underneath.
 
 The remaining high-level work is:
 
-- Full Unicode/grapheme/emoji hardening.
+- Unicode/font/render conformance beyond the hardened core/parser cell model.
 - Stronger architecture/layer-boundary checks.
 - Real fuzzing harness.
 - Fully batched GPU glyph rendering and cross-OS screenshot verification.

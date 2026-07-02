@@ -69,6 +69,17 @@ to more visible features before the dependencies they rely on are hardened.
 - Completed Phase 1 architectural contracts: crate boundary READMEs, terminal
   data primitives, transport/platform/render/semantic contracts, serializable
   config skeleton, and dependency-boundary tests.
+- Completed next-pass Phase 0 current-state freeze: `docs/status.md` and
+  `docs/capability-matrix.md` record what is tested, partial, stubbed, planned,
+  and not cross-OS verified.
+- Completed next-pass Phase 1 architecture hardening: enforceable workspace
+  dependency checks, provider interfaces, architecture-boundary CI, independent
+  `term-core` checks, and fake renderer tests.
+- Completed next-pass Phase 2 Unicode, grapheme, emoji, and width correctness:
+  parser UTF-8 buffering across reads, grapheme-aware cell storage, combining
+  mark handling, wide CJK cells, emoji modifiers, ZWJ emoji, variation
+  selectors, cursor movement, selection expansion, overwrite/delete/erase
+  invariants, and resize/scrollback tests.
 - Completed Phase 2 terminal core baseline: platform-neutral grid/cell storage,
   scrollback, line wrapping, scroll regions, alternate screen storage, resize
   reflow, cursor/mode metadata, raw selection extraction, ANSI/VT parser adapter,
@@ -174,8 +185,10 @@ to more visible features before the dependencies they rely on are hardened.
 
 ## Deferred By Design
 
-- Full Unicode width/grapheme handling is deferred to the terminal compatibility
-  and font phases.
+- Unicode cell storage, grapheme boundaries, emoji modifiers, ZWJ sequences,
+  variation selectors, selection, cursor movement, and resize/scrollback
+  behavior are covered in the core/parser model. Font fallback, renderer
+  shaping, screenshot parity, and real app conformance remain later phases.
 - Mouse/focus/application keypad behavior is represented as modes in Phase 2;
   event semantics are implemented in later platform and parser compatibility
   phases.
@@ -205,9 +218,9 @@ to more visible features before the dependencies they rely on are hardened.
   but app-level smoke testing for bash/zsh/fish/PowerShell/cmd/vim/less/TUI
   apps/tmux/screen/zellij/SSH remains unverified until run on the relevant
   host platforms.
-- Full grapheme cluster editing, emoji ZWJ behavior, primary selection, OSC 52
-  clipboard, application keypad output mapping, a custom terminfo entry, and a
-  configurable hint engine remain deferred compatibility work.
+- Primary selection, OSC 52 clipboard, application keypad output mapping, a
+  custom terminfo entry, configurable hint patterns, and real app-level Unicode
+  conformance remain deferred compatibility work.
 - Phase 7 classifies safe live-reload changes, but the file watcher and runtime
   applier are deferred until the desktop lifecycle can apply changes without
   destabilizing sessions or the renderer.

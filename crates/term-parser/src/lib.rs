@@ -93,23 +93,23 @@ impl Parser {
             match &mut self.state {
                 ParserState::Ground => match *byte {
                     0x1b => {
-                        self.flush_print_buffer(&mut actions);
+                        self.flush_print_buffer(&mut actions, false);
                         self.state = ParserState::Escape;
                     }
                     b'\r' => {
-                        self.flush_print_buffer(&mut actions);
+                        self.flush_print_buffer(&mut actions, false);
                         actions.push(TerminalAction::CarriageReturn);
                     }
                     b'\n' => {
-                        self.flush_print_buffer(&mut actions);
+                        self.flush_print_buffer(&mut actions, false);
                         actions.push(TerminalAction::LineFeed);
                     }
                     0x08 => {
-                        self.flush_print_buffer(&mut actions);
+                        self.flush_print_buffer(&mut actions, false);
                         actions.push(TerminalAction::Backspace);
                     }
                     b'\t' => {
-                        self.flush_print_buffer(&mut actions);
+                        self.flush_print_buffer(&mut actions, false);
                         actions.push(TerminalAction::Tab);
                     }
                     0x00..=0x1f | 0x7f => {}
@@ -176,20 +176,42 @@ impl Parser {
         }
 
         if matches!(self.state, ParserState::Ground) {
-            self.flush_print_buffer(&mut actions);
+            self.flush_print_buffer(&mut actions, true);
         }
 
         actions
     }
 
-    fn flush_print_buffer(&mut self, actions: &mut Vec<TerminalAction>) {
-        if self.print_buffer.is_empty() {
-            return;
-        }
+    fn flush_print_buffer(&mut self, actions: &mut Vec<TerminalAction>, preserve_incomplete: bool) {
+        while !self.print_buffer.is_empty() {
+            match std::str::from_utf8(&self.print_buffer) {
+                Ok(text) => {
+                    actions.extend(text.chars().map(TerminalAction::Print));
+                    self.print_buffer.clear();
+                    return;
+                }
+                Err(error) => {
+                    let valid_up_to = error.valid_up_to();
+                    if valid_up_to > 0 {
+                        let valid = std::str::from_utf8(&self.print_buffer[..valid_up_to])
+                            .expect("valid_up_to always names valid UTF-8");
+                        actions.extend(valid.chars().map(TerminalAction::Print));
+                        self.print_buffer.drain(..valid_up_to);
+                    }
 
-        let text = String::from_utf8_lossy(&self.print_buffer);
-        actions.extend(text.chars().map(TerminalAction::Print));
-        self.print_buffer.clear();
+                    match error.error_len() {
+                        Some(invalid_len) => {
+                            self.print_buffer.drain(..invalid_len);
+                        }
+                        None if preserve_incomplete => return,
+                        None => {
+                            self.print_buffer.clear();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -703,6 +725,30 @@ mod tests {
         ));
 
         assert_eq!(terminal.state().selected_text().as_deref(), Some("abcdef"));
+    }
+
+    #[test]
+    fn split_utf8_scalar_across_reads_is_preserved() {
+        let mut terminal = TerminalEmulator::new(TerminalSize::new(8, 2));
+        let text = "👍🏽";
+        let bytes = text.as_bytes();
+
+        terminal.apply_bytes(&bytes[..2]).unwrap();
+        assert_eq!(line_text(&terminal, 0), "");
+
+        terminal.apply_bytes(&bytes[2..5]).unwrap();
+        terminal.apply_bytes(&bytes[5..]).unwrap();
+
+        assert_eq!(line_text(&terminal, 0), text);
+        assert_eq!(terminal.state().cell(0, 0).unwrap().text, text);
+        assert!(terminal.state().cell(0, 1).unwrap().wide_continuation);
+    }
+
+    #[test]
+    fn invalid_utf8_is_dropped_without_corrupting_later_text() {
+        let terminal = terminal(TerminalSize::new(8, 2), &[b'a', 0xff, b'b']);
+
+        assert_eq!(line_text(&terminal, 0), "ab");
     }
 
     #[test]

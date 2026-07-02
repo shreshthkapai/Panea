@@ -4,7 +4,8 @@ pub const LAYER: &str = "core correctness";
 
 use std::{cmp::Ordering, collections::BTreeSet, error::Error, fmt};
 
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalSize {
@@ -90,7 +91,7 @@ impl Cell {
     #[must_use]
     pub fn text(text: impl Into<String>, attributes: CellAttributes) -> Self {
         let text = text.into();
-        let width = display_width(&text).clamp(1, 2) as u8;
+        let width = cell_width_for_text(&text) as u8;
         Self {
             text,
             attributes,
@@ -235,6 +236,7 @@ impl Line {
             Ordering::Greater => self.cells.truncate(cols),
             Ordering::Equal => {}
         }
+        sanitize_cells(&mut self.cells, attributes);
     }
 }
 
@@ -563,6 +565,7 @@ impl TerminalState {
             .unwrap_or(self.active().size.cols.saturating_sub(1));
         let max_col = usize::from(self.active().size.cols.saturating_sub(1));
         self.active_mut().cursor_col = usize::from(next_tab).min(max_col);
+        self.active_mut().normalize_cursor_col();
     }
 
     fn clear_screen(&mut self, mode: ClearMode) {
@@ -723,6 +726,9 @@ impl TerminalState {
                 SelectionKind::Normal if row == end_row => (0, usize::from(end_col).min(line_end)),
                 SelectionKind::Normal => (0, line_end),
             };
+            let Some((from, to)) = expand_range_to_graphemes(line, from, to) else {
+                continue;
+            };
 
             for cell in &line.cells[from..=to] {
                 if !cell.wide_continuation {
@@ -858,13 +864,12 @@ impl ScreenBuffer {
         insert: bool,
         append_scrollback: bool,
     ) {
-        let width = UnicodeWidthChar::width(ch).unwrap_or(1).min(2);
-        if width == 0 {
-            self.append_combining_char(ch);
+        if self.try_append_to_previous_grapheme(ch) {
             return;
         }
 
         let cols = usize::from(self.size.cols);
+        let width = scalar_cell_width(ch, cols);
         if self.cursor_col >= cols {
             if autowrap {
                 self.wrap_line(append_scrollback);
@@ -884,7 +889,10 @@ impl ScreenBuffer {
             self.insert_chars(width as u16, attributes);
         }
 
-        self.clear_wide_at(self.cursor_row, self.cursor_col);
+        self.clear_grapheme_at(self.cursor_row, self.cursor_col, attributes);
+        if width == 2 {
+            self.clear_grapheme_at(self.cursor_row, self.cursor_col + 1, attributes);
+        }
         if let Some(cell) = self
             .lines
             .get_mut(self.cursor_row)
@@ -915,8 +923,59 @@ impl ScreenBuffer {
         }
     }
 
-    fn append_combining_char(&mut self, ch: char) {
-        let (row, col) = if self.cursor_col > 0 {
+    fn try_append_to_previous_grapheme(&mut self, ch: char) -> bool {
+        let Some((row, col)) = self.previous_grapheme_position() else {
+            return false;
+        };
+
+        let Some(previous_text) = self
+            .lines
+            .get(row)
+            .and_then(|line| line.cells.get(col))
+            .filter(|cell| !cell.wide_continuation)
+            .map(|cell| cell.text.as_str())
+        else {
+            return false;
+        };
+
+        if !extends_previous_grapheme(previous_text, ch) {
+            return false;
+        }
+
+        let cols = usize::from(self.size.cols);
+        let Some(line) = self.lines.get_mut(row) else {
+            return false;
+        };
+        let Some(cell) = line
+            .cells
+            .get_mut(col)
+            .filter(|cell| !cell.wide_continuation)
+        else {
+            return false;
+        };
+
+        cell.text.push(ch);
+        let width = cell_width_for_text_in_grid(&cell.text, cols.saturating_sub(col));
+        let attributes = cell.attributes;
+        cell.width = width as u8;
+
+        if width == 2 && col + 1 < cols {
+            line.cells[col + 1] = Cell::wide_continuation(attributes);
+        } else if col + 1 < cols && line.cells[col + 1].wide_continuation {
+            line.cells[col + 1] = Cell::blank(attributes);
+        }
+
+        if row == self.cursor_row {
+            self.cursor_col = self
+                .cursor_col
+                .max((col + width).min(cols.saturating_sub(1)));
+        }
+        sanitize_cells(&mut line.cells, CellAttributes::default());
+        true
+    }
+
+    fn previous_grapheme_position(&self) -> Option<(usize, usize)> {
+        let (row, mut col) = if self.cursor_col > 0 {
             (self.cursor_row, self.cursor_col - 1)
         } else if self.cursor_row > 0 {
             (
@@ -924,17 +983,20 @@ impl ScreenBuffer {
                 usize::from(self.size.cols.saturating_sub(1)),
             )
         } else {
-            return;
+            return None;
         };
 
-        if let Some(cell) = self
-            .lines
-            .get_mut(row)
-            .and_then(|line| line.cells.get_mut(col))
-            && !cell.wide_continuation
+        let line = self.lines.get(row)?;
+        if line
+            .cells
+            .get(col)
+            .is_some_and(|cell| cell.wide_continuation)
+            && col > 0
         {
-            cell.text.push(ch);
+            col -= 1;
         }
+
+        Some((row, col))
     }
 
     fn wrap_line(&mut self, append_scrollback: bool) {
@@ -955,7 +1017,10 @@ impl ScreenBuffer {
     }
 
     fn backspace(&mut self) {
-        self.cursor_col = self.cursor_col.saturating_sub(1);
+        let Some(line) = self.lines.get(self.cursor_row) else {
+            return;
+        };
+        self.cursor_col = previous_grapheme_col(line, self.cursor_col);
     }
 
     fn move_cursor(&mut self, direction: CursorDirection, count: u16) {
@@ -968,10 +1033,23 @@ impl ScreenBuffer {
                 self.cursor_row = (self.cursor_row + count).min(self.scroll_bottom);
             }
             CursorDirection::Forward => {
-                self.cursor_col =
-                    (self.cursor_col + count).min(usize::from(self.size.cols.saturating_sub(1)));
+                self.normalize_cursor_col();
+                for _ in 0..count {
+                    let Some(line) = self.lines.get(self.cursor_row) else {
+                        return;
+                    };
+                    self.cursor_col = next_grapheme_col(line, self.cursor_col);
+                }
             }
-            CursorDirection::Back => self.cursor_col = self.cursor_col.saturating_sub(count),
+            CursorDirection::Back => {
+                self.normalize_cursor_col();
+                for _ in 0..count {
+                    let Some(line) = self.lines.get(self.cursor_row) else {
+                        return;
+                    };
+                    self.cursor_col = previous_grapheme_col(line, self.cursor_col);
+                }
+            }
             CursorDirection::NextLine => {
                 self.cursor_row = (self.cursor_row + count).min(self.scroll_bottom);
                 self.cursor_col = 0;
@@ -986,10 +1064,12 @@ impl ScreenBuffer {
     fn set_cursor_position(&mut self, row: u16, col: u16) {
         self.cursor_row = usize::from(row.saturating_sub(1)).min(usize::from(self.size.rows) - 1);
         self.cursor_col = usize::from(col.saturating_sub(1)).min(usize::from(self.size.cols) - 1);
+        self.normalize_cursor_col();
     }
 
     fn set_cursor_column(&mut self, col: u16) {
         self.cursor_col = usize::from(col.saturating_sub(1)).min(usize::from(self.size.cols) - 1);
+        self.normalize_cursor_col();
     }
 
     fn clear_screen(&mut self, mode: ClearMode, attributes: CellAttributes) {
@@ -1026,9 +1106,12 @@ impl ScreenBuffer {
             ClearMode::All | ClearMode::Saved => 0..=last_col,
         };
 
-        for index in range {
-            line.cells[index] = Cell::blank(attributes);
-        }
+        blank_range_expanding_graphemes(
+            line,
+            range.start().to_owned(),
+            range.end().to_owned(),
+            attributes,
+        );
         line.hard_wrapped = false;
     }
 
@@ -1063,40 +1146,53 @@ impl ScreenBuffer {
     }
 
     fn insert_chars(&mut self, count: u16, attributes: CellAttributes) {
+        self.normalize_cursor_col();
         let Some(line) = self.lines.get_mut(self.cursor_row) else {
             return;
         };
         let count = usize::from(count).min(line.cells.len().saturating_sub(self.cursor_col));
+        blank_range_expanding_graphemes(line, self.cursor_col, self.cursor_col, attributes);
         for _ in 0..count {
             line.cells.insert(self.cursor_col, Cell::blank(attributes));
             line.cells.pop();
         }
+        sanitize_cells(&mut line.cells, attributes);
         line.hard_wrapped = false;
     }
 
     fn delete_chars(&mut self, count: u16, attributes: CellAttributes) {
+        self.normalize_cursor_col();
         let Some(line) = self.lines.get_mut(self.cursor_row) else {
             return;
         };
-        let count = usize::from(count).min(line.cells.len().saturating_sub(self.cursor_col));
-        for _ in 0..count {
-            line.cells.remove(self.cursor_col);
+        let Some(end) = grapheme_delete_end(line, self.cursor_col, usize::from(count)) else {
+            return;
+        };
+        let removed = end.saturating_sub(self.cursor_col);
+        line.cells.drain(self.cursor_col..end);
+        for _ in 0..removed {
             line.cells.push(Cell::blank(attributes));
         }
+        sanitize_cells(&mut line.cells, attributes);
         line.hard_wrapped = false;
     }
 
     fn erase_chars(&mut self, count: u16, attributes: CellAttributes) {
+        self.normalize_cursor_col();
         let Some(line) = self.lines.get_mut(self.cursor_row) else {
             return;
         };
-        let end = (self.cursor_col + usize::from(count)).min(line.cells.len());
-        for cell in &mut line.cells[self.cursor_col..end] {
-            *cell = Cell::blank(attributes);
+        if let Some(end) = grapheme_delete_end(line, self.cursor_col, usize::from(count)) {
+            blank_range_expanding_graphemes(
+                line,
+                self.cursor_col,
+                end.saturating_sub(1),
+                attributes,
+            );
         }
     }
 
-    fn clear_wide_at(&mut self, row: usize, col: usize) {
+    fn clear_grapheme_at(&mut self, row: usize, col: usize, attributes: CellAttributes) {
         let Some(line) = self.lines.get_mut(row) else {
             return;
         };
@@ -1107,13 +1203,13 @@ impl ScreenBuffer {
             .is_some_and(|cell| cell.wide_continuation)
             && col > 0
         {
-            line.cells[col - 1] = Cell::blank(CellAttributes::default());
-            line.cells[col] = Cell::blank(CellAttributes::default());
+            line.cells[col - 1] = Cell::blank(attributes);
+            line.cells[col] = Cell::blank(attributes);
             return;
         }
 
         if line.cells.get(col).is_some_and(|cell| cell.width > 1) && col + 1 < line.cells.len() {
-            line.cells[col + 1] = Cell::blank(CellAttributes::default());
+            line.cells[col + 1] = Cell::blank(attributes);
         }
     }
 
@@ -1190,6 +1286,21 @@ impl ScreenBuffer {
     fn clamp_cursor(&mut self) {
         self.cursor_row = self.cursor_row.min(usize::from(self.size.rows) - 1);
         self.cursor_col = self.cursor_col.min(usize::from(self.size.cols) - 1);
+        self.normalize_cursor_col();
+    }
+
+    fn normalize_cursor_col(&mut self) {
+        let Some(line) = self.lines.get(self.cursor_row) else {
+            return;
+        };
+        if line
+            .cells
+            .get(self.cursor_col)
+            .is_some_and(|cell| cell.wide_continuation)
+            && self.cursor_col > 0
+        {
+            self.cursor_col -= 1;
+        }
     }
 }
 
@@ -1235,21 +1346,33 @@ fn reflow_logical_lines(logical: Vec<Vec<Cell>>, cols: u16) -> Vec<Line> {
     let mut out = Vec::new();
 
     for cells in logical {
-        if cells.is_empty() {
-            out.push(Line::blank(cols as u16));
-            continue;
+        let mut line = Line {
+            cells: Vec::with_capacity(cols),
+            hard_wrapped: false,
+        };
+        let mut emitted_any = false;
+
+        for cell in cells.into_iter().filter(|cell| !cell.wide_continuation) {
+            let width = cell_width_for_text_in_grid(&cell.text, cols);
+            if !line.cells.is_empty() && line.cells.len() + width > cols {
+                line.hard_wrapped = true;
+                line.resize_to(cols as u16, CellAttributes::default());
+                out.push(line);
+                line = Line {
+                    cells: Vec::with_capacity(cols),
+                    hard_wrapped: false,
+                };
+            }
+
+            push_cell_with_continuation(&mut line.cells, cell, cols);
+            emitted_any = true;
         }
 
-        let mut index = 0;
-        while index < cells.len() {
-            let end = (index + cols).min(cells.len());
-            let mut line = Line {
-                cells: cells[index..end].to_vec(),
-                hard_wrapped: end < cells.len(),
-            };
+        if emitted_any {
             line.resize_to(cols as u16, CellAttributes::default());
             out.push(line);
-            index = end;
+        } else {
+            out.push(Line::blank(cols as u16));
         }
     }
 
@@ -1264,9 +1387,173 @@ fn trim_selection_text(mut text: String) -> String {
 }
 
 fn display_width(text: &str) -> usize {
-    text.chars()
-        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(1))
-        .sum()
+    text.graphemes(true).map(UnicodeWidthStr::width).sum()
+}
+
+fn cell_width_for_text(text: &str) -> usize {
+    display_width(text).clamp(1, 2)
+}
+
+fn cell_width_for_text_in_grid(text: &str, available_cols: usize) -> usize {
+    let width = cell_width_for_text(text);
+    if available_cols < width { 1 } else { width }
+}
+
+fn scalar_cell_width(ch: char, cols: usize) -> usize {
+    let width = UnicodeWidthChar::width(ch).unwrap_or(1).clamp(1, 2);
+    if cols < width { 1 } else { width }
+}
+
+fn extends_previous_grapheme(previous_text: &str, ch: char) -> bool {
+    if ch.is_ascii() {
+        return false;
+    }
+
+    let mut text = String::with_capacity(previous_text.len() + ch.len_utf8());
+    text.push_str(previous_text);
+    text.push(ch);
+
+    text.graphemes(true).count() == 1
+}
+
+fn previous_grapheme_col(line: &Line, col: usize) -> usize {
+    if col == 0 {
+        return 0;
+    }
+
+    let mut previous = col
+        .saturating_sub(1)
+        .min(line.cells.len().saturating_sub(1));
+    if line
+        .cells
+        .get(previous)
+        .is_some_and(|cell| cell.wide_continuation)
+        && previous > 0
+    {
+        previous -= 1;
+    }
+
+    previous
+}
+
+fn next_grapheme_col(line: &Line, col: usize) -> usize {
+    if line.cells.is_empty() {
+        return 0;
+    }
+
+    let col = normalize_col_to_grapheme_start(line, col.min(line.cells.len() - 1));
+    let width = line.cells[col].width.max(1) as usize;
+    (col + width).min(line.cells.len() - 1)
+}
+
+fn normalize_col_to_grapheme_start(line: &Line, col: usize) -> usize {
+    if line
+        .cells
+        .get(col)
+        .is_some_and(|cell| cell.wide_continuation)
+        && col > 0
+    {
+        col - 1
+    } else {
+        col
+    }
+}
+
+fn expand_range_to_graphemes(line: &Line, from: usize, to: usize) -> Option<(usize, usize)> {
+    if line.cells.is_empty() {
+        return None;
+    }
+
+    let mut from = from.min(line.cells.len() - 1);
+    let mut to = to.min(line.cells.len() - 1);
+    if from > to {
+        std::mem::swap(&mut from, &mut to);
+    }
+
+    from = normalize_col_to_grapheme_start(line, from);
+    if line.cells[to].wide_continuation && to > 0 {
+        to -= 1;
+    }
+    if line.cells[to].width > 1 && to + 1 < line.cells.len() {
+        to += 1;
+    }
+
+    Some((from, to))
+}
+
+fn blank_range_expanding_graphemes(
+    line: &mut Line,
+    from: usize,
+    to: usize,
+    attributes: CellAttributes,
+) {
+    let Some((from, to)) = expand_range_to_graphemes(line, from, to) else {
+        return;
+    };
+
+    for cell in &mut line.cells[from..=to] {
+        *cell = Cell::blank(attributes);
+    }
+}
+
+fn grapheme_delete_end(line: &Line, start: usize, count: usize) -> Option<usize> {
+    if line.cells.is_empty() || count == 0 {
+        return None;
+    }
+
+    let mut end = normalize_col_to_grapheme_start(line, start.min(line.cells.len() - 1));
+    let mut consumed = 0;
+    while end < line.cells.len() && consumed < count {
+        if line.cells[end].wide_continuation {
+            end += 1;
+            continue;
+        }
+
+        let width = line.cells[end].width.max(1) as usize;
+        consumed += width;
+        end += width;
+    }
+
+    Some(end.min(line.cells.len()))
+}
+
+fn push_cell_with_continuation(cells: &mut Vec<Cell>, mut cell: Cell, cols: usize) {
+    let available = cols.saturating_sub(cells.len());
+    let width = cell_width_for_text_in_grid(&cell.text, available);
+    cell.width = width as u8;
+    cell.wide_continuation = false;
+    let attributes = cell.attributes;
+    cells.push(cell);
+    if width == 2 && cells.len() < cols {
+        cells.push(Cell::wide_continuation(attributes));
+    }
+}
+
+fn sanitize_cells(cells: &mut [Cell], attributes: CellAttributes) {
+    let mut index = 0;
+    while index < cells.len() {
+        if cells[index].wide_continuation {
+            if index == 0 || cells[index - 1].width != 2 {
+                cells[index] = Cell::blank(attributes);
+            }
+            index += 1;
+            continue;
+        }
+
+        let width = cell_width_for_text_in_grid(&cells[index].text, cells.len() - index);
+        cells[index].width = width as u8;
+        if width == 2 {
+            if index + 1 < cells.len() {
+                cells[index + 1] = Cell::wide_continuation(cells[index].attributes);
+                index += 2;
+                continue;
+            }
+            cells[index].width = 1;
+        } else if index + 1 < cells.len() && cells[index + 1].wide_continuation {
+            cells[index + 1] = Cell::blank(attributes);
+        }
+        index += 1;
+    }
 }
 
 fn default_tab_stops(cols: u16) -> BTreeSet<u16> {
@@ -1324,6 +1611,10 @@ pub trait TerminalCore {
 mod tests {
     use super::*;
 
+    fn line_text(terminal: &TerminalState, row: u16) -> String {
+        terminal.line(row).unwrap().raw_text()
+    }
+
     #[test]
     fn term_core_has_no_crate_dependencies() {
         let manifest = include_str!("../Cargo.toml");
@@ -1331,6 +1622,10 @@ mod tests {
         assert!(
             manifest.contains("unicode-width.workspace = true"),
             "term-core may use low-level Unicode utilities for terminal cell width"
+        );
+        assert!(
+            manifest.contains("unicode-segmentation.workspace = true"),
+            "term-core may use low-level Unicode utilities for grapheme boundaries"
         );
         assert!(
             !manifest.contains("render-")
@@ -1373,5 +1668,199 @@ mod tests {
         ));
 
         assert_eq!(terminal.selected_text().as_deref(), Some("bc\nfg"));
+    }
+
+    #[test]
+    fn combining_marks_stay_in_the_base_cell() {
+        let mut terminal = TerminalState::new(TerminalSize::new(6, 2));
+        terminal
+            .apply_actions("e\u{301}x".chars().map(TerminalAction::Print))
+            .unwrap();
+
+        let accented = terminal.cell(0, 0).unwrap();
+        assert_eq!(accented.text, "e\u{301}");
+        assert_eq!(accented.width, 1);
+        assert_eq!(line_text(&terminal, 0), "e\u{301}x");
+        assert_eq!(terminal.cursor_state().position, GridPosition::new(0, 2));
+    }
+
+    #[test]
+    fn wide_cjk_occupies_base_and_continuation_cells() {
+        let mut terminal = TerminalState::new(TerminalSize::new(6, 2));
+        terminal
+            .apply_actions("界x".chars().map(TerminalAction::Print))
+            .unwrap();
+
+        assert_eq!(terminal.cell(0, 0).unwrap().text, "界");
+        assert_eq!(terminal.cell(0, 0).unwrap().width, 2);
+        assert!(terminal.cell(0, 1).unwrap().wide_continuation);
+        assert_eq!(terminal.cell(0, 2).unwrap().text, "x");
+        assert_eq!(terminal.cursor_state().position, GridPosition::new(0, 3));
+    }
+
+    #[test]
+    fn emoji_modifiers_stay_in_one_wide_grapheme() {
+        let mut terminal = TerminalState::new(TerminalSize::new(8, 2));
+        terminal
+            .apply_actions("👍🏽x".chars().map(TerminalAction::Print))
+            .unwrap();
+
+        assert_eq!(terminal.cell(0, 0).unwrap().text, "👍🏽");
+        assert_eq!(terminal.cell(0, 0).unwrap().width, 2);
+        assert!(terminal.cell(0, 1).unwrap().wide_continuation);
+        assert_eq!(terminal.cell(0, 2).unwrap().text, "x");
+        assert_eq!(line_text(&terminal, 0), "👍🏽x");
+    }
+
+    #[test]
+    fn zwj_emoji_sequence_stays_in_one_wide_grapheme() {
+        let mut terminal = TerminalState::new(TerminalSize::new(8, 2));
+        terminal
+            .apply_actions("👨‍👩‍👧‍👦x".chars().map(TerminalAction::Print))
+            .unwrap();
+
+        assert_eq!(terminal.cell(0, 0).unwrap().text, "👨‍👩‍👧‍👦");
+        assert_eq!(terminal.cell(0, 0).unwrap().width, 2);
+        assert!(terminal.cell(0, 1).unwrap().wide_continuation);
+        assert_eq!(terminal.cell(0, 2).unwrap().text, "x");
+        assert_eq!(line_text(&terminal, 0), "👨‍👩‍👧‍👦x");
+    }
+
+    #[test]
+    fn variation_selector_extends_previous_grapheme() {
+        let mut terminal = TerminalState::new(TerminalSize::new(8, 2));
+        terminal
+            .apply_actions("♥️x".chars().map(TerminalAction::Print))
+            .unwrap();
+
+        assert_eq!(terminal.cell(0, 0).unwrap().text, "♥️");
+        let x_col = terminal.cell(0, 0).unwrap().width as u16;
+        assert_eq!(terminal.cell(0, x_col).unwrap().text, "x");
+        assert_eq!(line_text(&terminal, 0), "♥️x");
+    }
+
+    #[test]
+    fn mixed_unicode_text_preserves_cell_boundaries() {
+        let mut terminal = TerminalState::new(TerminalSize::new(12, 2));
+        terminal
+            .apply_actions("a界e\u{301}👍🏽z".chars().map(TerminalAction::Print))
+            .unwrap();
+
+        assert_eq!(line_text(&terminal, 0), "a界e\u{301}👍🏽z");
+        assert_eq!(terminal.cell(0, 1).unwrap().text, "界");
+        assert!(terminal.cell(0, 2).unwrap().wide_continuation);
+        assert_eq!(terminal.cell(0, 3).unwrap().text, "e\u{301}");
+        assert_eq!(terminal.cell(0, 4).unwrap().text, "👍🏽");
+        assert!(terminal.cell(0, 5).unwrap().wide_continuation);
+    }
+
+    #[test]
+    fn cursor_movement_and_backspace_skip_wide_continuations() {
+        let mut terminal = TerminalState::new(TerminalSize::new(8, 2));
+        terminal
+            .apply_actions("界x".chars().map(TerminalAction::Print))
+            .unwrap();
+
+        terminal
+            .apply_action(TerminalAction::MoveCursor {
+                direction: CursorDirection::Back,
+                count: 1,
+            })
+            .unwrap();
+        assert_eq!(terminal.cursor_state().position, GridPosition::new(0, 2));
+
+        terminal.apply_action(TerminalAction::Backspace).unwrap();
+        assert_eq!(terminal.cursor_state().position, GridPosition::new(0, 0));
+    }
+
+    #[test]
+    fn selection_on_continuation_cell_extracts_whole_grapheme() {
+        let mut terminal = TerminalState::new(TerminalSize::new(6, 2));
+        terminal
+            .apply_actions("a界b".chars().map(TerminalAction::Print))
+            .unwrap();
+        terminal.set_selection(Selection::normal(
+            GridPosition::new(0, 2),
+            GridPosition::new(0, 2),
+        ));
+
+        assert_eq!(terminal.selected_text().as_deref(), Some("界"));
+    }
+
+    #[test]
+    fn overwriting_half_of_wide_grapheme_clears_the_whole_cell_pair() {
+        let mut terminal = TerminalState::new(TerminalSize::new(6, 2));
+        terminal
+            .apply_actions("界".chars().map(TerminalAction::Print))
+            .unwrap();
+        terminal
+            .apply_action(TerminalAction::SetCursorPosition { row: 1, col: 2 })
+            .unwrap();
+        terminal.apply_action(TerminalAction::Print('x')).unwrap();
+
+        assert_eq!(line_text(&terminal, 0), "x");
+        assert!(!terminal.cell(0, 1).unwrap().wide_continuation);
+    }
+
+    #[test]
+    fn erase_and_delete_do_not_leave_orphan_continuations() {
+        let mut erased = TerminalState::new(TerminalSize::new(8, 2));
+        erased
+            .apply_actions("a界b".chars().map(TerminalAction::Print))
+            .unwrap();
+        erased
+            .apply_action(TerminalAction::SetCursorPosition { row: 1, col: 2 })
+            .unwrap();
+        erased.apply_action(TerminalAction::EraseChars(1)).unwrap();
+        assert_eq!(line_text(&erased, 0), "a  b");
+        assert!(!erased.cell(0, 2).unwrap().wide_continuation);
+
+        let mut deleted = TerminalState::new(TerminalSize::new(8, 2));
+        deleted
+            .apply_actions("a界b".chars().map(TerminalAction::Print))
+            .unwrap();
+        deleted
+            .apply_action(TerminalAction::SetCursorPosition { row: 1, col: 2 })
+            .unwrap();
+        deleted
+            .apply_action(TerminalAction::DeleteChars(1))
+            .unwrap();
+        assert_eq!(line_text(&deleted, 0), "ab");
+        assert!(!deleted.cell(0, 1).unwrap().wide_continuation);
+    }
+
+    #[test]
+    fn resize_reflows_without_splitting_wide_graphemes() {
+        let mut terminal = TerminalState::new(TerminalSize::new(5, 2));
+        terminal
+            .apply_actions("a界b".chars().map(TerminalAction::Print))
+            .unwrap();
+
+        terminal.resize(TerminalSize::new(2, 4)).unwrap();
+
+        assert_eq!(line_text(&terminal, 0), "a");
+        assert_eq!(line_text(&terminal, 1), "界");
+        assert!(terminal.cell(1, 1).unwrap().wide_continuation);
+        assert_eq!(line_text(&terminal, 2), "b");
+    }
+
+    #[test]
+    fn scrollback_preserves_wide_graphemes() {
+        let mut terminal = TerminalState::new(TerminalSize::new(4, 2));
+        terminal
+            .apply_actions("界\r\nx\r\ny".chars().map(|ch| match ch {
+                '\r' => TerminalAction::CarriageReturn,
+                '\n' => TerminalAction::LineFeed,
+                _ => TerminalAction::Print(ch),
+            }))
+            .unwrap();
+
+        let scrollback = terminal.scrollback();
+        assert_eq!(
+            scrollback.lines.first().map(Line::raw_text).as_deref(),
+            Some("界")
+        );
+        assert_eq!(line_text(&terminal, 0), "x");
+        assert_eq!(line_text(&terminal, 1), "y");
     }
 }

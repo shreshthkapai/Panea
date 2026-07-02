@@ -34,12 +34,14 @@ Implemented in the baseline compatibility layer:
 - focus in/out reporting
 - normal, drag, wheel, and SGR mouse report encoding
 - URL detection and basic semantic highlight overlays
-- wide-character cell reservation and combining-mark append groundwork
+- Unicode cell storage for split UTF-8 input, combining marks, CJK width, emoji
+  modifiers, ZWJ emoji, variation selectors, selection, cursor movement,
+  resize, and scrollback
 
 ## Deferred Compatibility Work
 
 - Primary selection and OSC 52 clipboard behavior
-- Full grapheme cluster editing and emoji ZWJ sequence behavior
+- Real app-level Unicode conformance across shells, editors, TUIs, and SSH
 - Full configurable hint pattern engine
 - Application keypad output mapping
 - Full terminfo strategy and optional custom terminfo installation
