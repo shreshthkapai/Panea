@@ -34,5 +34,6 @@ repository = "https://example.invalid/panea"
 unsafe_code = "forbid"
 
 [workspace.dependencies]
+portable-pty = "0.9.0"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

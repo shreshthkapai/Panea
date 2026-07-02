@@ -8,3 +8,6 @@ description = "Unix PTY, Windows pseudoconsole, and portable PTY integration."
 [lints]
 workspace = true
 
+[dependencies]
+portable-pty.workspace = true
+transport-core = { path = "../transport-core" }
