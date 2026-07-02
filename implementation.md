@@ -117,6 +117,16 @@ If a task does not fit, redesign it before implementation.
   `doctor`/bug-report diagnostics models for platform, window, renderer,
   config, shell integration, performance, and SSH checks, and exposed them
   through `cargo xtask doctor ...` and `cargo xtask bug-report`.
+- Implemented the Phase 14 hardening and release-readiness foundation: added
+  desktop panic boundaries around platform event translation, renderer
+  frame/resize work, transport input/output/resize/shutdown, and parser
+  application; added diagnostics models for stability hardening, security
+  review, packaging planning, and release validation gates; exposed
+  `cargo xtask hardening`, `cargo xtask security-review`,
+  `cargo xtask package-plan`, and `cargo xtask release-check`; and added
+  operational docs for getting started, themes, cursor customization, SSH
+  profiles, mux usage, troubleshooting, packaging, release validation, and
+  Linux compositor notes.
 
 ## Deferred By Design
 
@@ -189,3 +199,10 @@ If a task does not fit, redesign it before implementation.
   inventory, native notification support, OSC clipboard policy, and the final
   installed `terminal doctor` binary remain follow-up work before platform
   parity can be called product-complete.
+- Phase 14 does not make Panea a daily-driver release by itself. Daily-driver
+  release status remains blocked until packaged artifacts exist and
+  manual/automated validation passes on macOS, Windows, Linux X11, and Linux
+  Wayland. OS keychain-backed secret providers, interactive SSH host-key
+  approval UI, OSC 52 clipboard permission policy, full GPU device-loss
+  recreation, runtime crash-safe config reload, and installer automation remain
+  release-hardening follow-up work.

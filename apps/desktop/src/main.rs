@@ -1,4 +1,12 @@
-use std::{collections::BTreeSet, error::Error, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    any::Any,
+    collections::BTreeSet,
+    error::Error,
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use config_core::{
     AppConfig, CommandBlockStyle, ConfigDiagnosticSeverity, DecorationStrategyConfig,
@@ -114,8 +122,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                     let scene =
                         scene_from_terminal(&terminal, &semantic_timeline, metrics, &config);
                     let idle_wakeups = scheduler.take_idle_wakeups();
-                    match renderer.render_scene(&scene, &mut fonts) {
-                        Ok(()) => {
+                    match catch_unwind(AssertUnwindSafe(|| {
+                        renderer.render_scene(&scene, &mut fonts)
+                    })) {
+                        Ok(Ok(())) => {
                             let mut instrumentation = renderer.last_instrumentation();
                             instrumentation.idle_wakeups = idle_wakeups;
                             performance_overlay.record(instrumentation);
@@ -124,13 +134,25 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 eprintln!("performance {text}");
                             }
                         }
-                        Err(error) => {
+                        Ok(Err(error)) => {
                             eprintln!("render error: {error}");
+                        }
+                        Err(panic) => {
+                            eprintln!("render panic boundary: {}", panic_payload(panic));
+                            scheduler.terminal_content_changed();
                         }
                     }
                 }
                 _ => {
-                    let platform_events = input_translator.translate_window_event(&event);
+                    let platform_events = match catch_unwind(AssertUnwindSafe(|| {
+                        input_translator.translate_window_event(&event)
+                    })) {
+                        Ok(events) => events,
+                        Err(panic) => {
+                            eprintln!("platform event panic boundary: {}", panic_payload(panic));
+                            Vec::new()
+                        }
+                    };
                     for platform_event in platform_events {
                         match platform_event {
                             InputEvent::CloseRequested => {
@@ -138,7 +160,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 target.exit();
                             }
                             InputEvent::Resized { width, height } => {
-                                renderer.resize(width, height);
+                                if let Err(panic) = catch_unwind(AssertUnwindSafe(|| {
+                                    renderer.resize(width, height)
+                                })) {
+                                    eprintln!(
+                                        "renderer resize panic boundary: {}",
+                                        panic_payload(panic)
+                                    );
+                                }
                                 if let Ok(metrics) = fonts.cell_metrics() {
                                     let cols = cols_for_width(width, metrics).max(1);
                                     let rows = rows_for_height(height, metrics).max(1);
@@ -147,7 +176,18 @@ fn run() -> Result<(), Box<dyn Error>> {
                                         TransportSize::new(cols, rows, width, height);
                                     let _ = terminal.resize(core_size);
                                     if let Some(transport) = transport.as_mut() {
-                                        let _ = transport.resize(transport_size);
+                                        match catch_unwind(AssertUnwindSafe(|| {
+                                            transport.resize(transport_size)
+                                        })) {
+                                            Ok(Ok(())) => {}
+                                            Ok(Err(error)) => {
+                                                eprintln!("transport resize error: {error}");
+                                            }
+                                            Err(panic) => eprintln!(
+                                                "transport resize panic boundary: {}",
+                                                panic_payload(panic)
+                                            ),
+                                        }
                                     }
                                 }
                                 scheduler.window_resized();
@@ -168,10 +208,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                                                     .modes()
                                                     .contains(&TerminalMode::BracketedPaste),
                                             );
-                                            let _ = transport.write_input(&bytes);
+                                            write_transport_input(transport, &bytes);
                                         }
                                     } else if let Some(bytes) = input_bytes(&key) {
-                                        let _ = transport.write_input(&bytes);
+                                        write_transport_input(transport, &bytes);
                                     }
                                 }
                             }
@@ -183,13 +223,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                                     if let Some(bytes) =
                                         mouse_protocol.report_bytes(mouse, metrics, &modes)
                                     {
-                                        let _ = transport.write_input(&bytes);
+                                        write_transport_input(transport, &bytes);
                                     }
                                 }
                             }
                             InputEvent::Ime(platform_core::ImeEvent::Commit { text }) => {
                                 if let Some(transport) = transport.as_mut() {
-                                    let _ = transport.write_input(text.as_bytes());
+                                    write_transport_input(transport, text.as_bytes());
                                 }
                             }
                             InputEvent::Focused(focused) => {
@@ -197,7 +237,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                                     && let Some(transport) = transport.as_mut()
                                 {
                                     let bytes = if focused { b"\x1b[I" } else { b"\x1b[O" };
-                                    let _ = transport.write_input(bytes);
+                                    write_transport_input(transport, bytes);
                                 }
                             }
                             InputEvent::WindowAction(action) => match action {
@@ -244,9 +284,21 @@ fn run() -> Result<(), Box<dyn Error>> {
                 if let Some(transport) = transport.as_mut() {
                     let mut content_changed = false;
                     for _ in 0..64 {
-                        let Ok(output) = transport.poll_output() else {
-                            break;
-                        };
+                        let output =
+                            match catch_unwind(AssertUnwindSafe(|| transport.poll_output())) {
+                                Ok(Ok(output)) => output,
+                                Ok(Err(error)) => {
+                                    eprintln!("transport poll error: {error}");
+                                    break;
+                                }
+                                Err(panic) => {
+                                    eprintln!(
+                                        "transport poll panic boundary: {}",
+                                        panic_payload(panic)
+                                    );
+                                    break;
+                                }
+                            };
                         if output.bytes.is_empty() && output.lifecycle.is_empty() {
                             break;
                         }
@@ -258,7 +310,15 @@ fn run() -> Result<(), Box<dyn Error>> {
                             for parsed in semantic_parser.parse(&output.bytes, semantic_position) {
                                 semantic_timeline.apply_event(parsed.event);
                             }
-                            let _ = terminal.apply_bytes(&output.bytes);
+                            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| {
+                                let _ = terminal.apply_bytes(&output.bytes);
+                            })) {
+                                eprintln!(
+                                    "terminal parser panic boundary: {}",
+                                    panic_payload(panic)
+                                );
+                                break;
+                            }
                             flush_terminal_responses(&mut terminal, transport);
                             content_changed = true;
                         }
@@ -481,14 +541,39 @@ fn paste_bytes(text: &str, config: &PasteConfig, bracketed_mode: bool) -> Vec<u8
 
 fn shutdown_transport(transport: Option<&mut LocalPtyTransport>) {
     if let Some(transport) = transport {
-        let _ = transport.shutdown();
+        match catch_unwind(AssertUnwindSafe(|| transport.shutdown())) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("transport shutdown error: {error}"),
+            Err(panic) => eprintln!(
+                "transport shutdown panic boundary: {}",
+                panic_payload(panic)
+            ),
+        }
     }
 }
 
 fn flush_terminal_responses(terminal: &mut TerminalEmulator, transport: &mut LocalPtyTransport) {
     let responses = terminal.state_mut().take_pending_output();
     if !responses.is_empty() {
-        let _ = transport.write_input(&responses);
+        write_transport_input(transport, &responses);
+    }
+}
+
+fn write_transport_input(transport: &mut LocalPtyTransport, bytes: &[u8]) {
+    match catch_unwind(AssertUnwindSafe(|| transport.write_input(bytes))) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("transport input error: {error}"),
+        Err(panic) => eprintln!("transport input panic boundary: {}", panic_payload(panic)),
+    }
+}
+
+fn panic_payload(panic: Box<dyn Any + Send>) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_owned()
     }
 }
 

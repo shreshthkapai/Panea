@@ -706,6 +706,341 @@ impl BugReportSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadinessStatus {
+    Pass,
+    Warning,
+    Blocked,
+    NotVerified,
+}
+
+impl fmt::Display for ReadinessStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Pass => "pass",
+            Self::Warning => "warning",
+            Self::Blocked => "blocked",
+            Self::NotVerified => "not verified",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadinessItem {
+    pub area: &'static str,
+    pub status: ReadinessStatus,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadinessReport {
+    pub title: &'static str,
+    pub items: Vec<ReadinessItem>,
+}
+
+impl ReadinessReport {
+    #[must_use]
+    pub fn has_blockers(&self) -> bool {
+        self.items
+            .iter()
+            .any(|item| item.status == ReadinessStatus::Blocked)
+    }
+
+    #[must_use]
+    pub fn render_text(&self) -> String {
+        let mut lines = vec![self.title.to_owned()];
+        lines.extend(
+            self.items
+                .iter()
+                .map(|item| format!("- [{}] {}: {}", item.status, item.area, item.message)),
+        );
+        lines.join("\n")
+    }
+}
+
+#[must_use]
+pub fn stability_hardening_report(_input: &DoctorInput) -> ReadinessReport {
+    ReadinessReport {
+        title: "Panea stability hardening",
+        items: vec![
+            ReadinessItem {
+                area: "panic boundaries",
+                status: ReadinessStatus::Pass,
+                message:
+                    "desktop app catches panics at platform, renderer, transport, and parser edges"
+                        .to_owned(),
+            },
+            ReadinessItem {
+                area: "session cleanup",
+                status: ReadinessStatus::Pass,
+                message:
+                    "local PTY and SSH transports expose bounded explicit shutdown contracts"
+                        .to_owned(),
+            },
+            ReadinessItem {
+                area: "renderer recovery",
+                status: ReadinessStatus::Warning,
+                message:
+                    "surface lost/outdated paths reconfigure; full GPU device-loss recreation is still a release hardening item"
+                        .to_owned(),
+            },
+            ReadinessItem {
+                area: "config reload",
+                status: ReadinessStatus::Warning,
+                message:
+                    "config reload impact is classified, but runtime file watching and crash-safe apply are not wired into the desktop app yet"
+                        .to_owned(),
+            },
+            ReadinessItem {
+                area: "window close",
+                status: ReadinessStatus::Pass,
+                message:
+                    "close requests call bounded transport shutdown before exiting the event loop"
+                        .to_owned(),
+            },
+            ReadinessItem {
+                area: "user errors",
+                status: ReadinessStatus::Pass,
+                message:
+                    "config, renderer, transport, SSH, and platform diagnostics have human-readable surfaces"
+                        .to_owned(),
+            },
+        ],
+    }
+}
+
+#[must_use]
+pub fn security_review_report(input: &DoctorInput) -> ReadinessReport {
+    let mut items = Vec::new();
+
+    let ssh_status = if input.config.ssh_profiles.iter().any(|profile| {
+        matches!(
+            profile.known_hosts_policy,
+            SshKnownHostsPolicy::TrustOnFirstUse
+        )
+    }) {
+        ReadinessStatus::Warning
+    } else {
+        ReadinessStatus::Pass
+    };
+    items.push(ReadinessItem {
+        area: "SSH host verification",
+        status: ssh_status,
+        message:
+            "host keys are never silently skipped; unknown and changed keys require explicit policy"
+                .to_owned(),
+    });
+    items.push(ReadinessItem {
+        area: "key storage",
+        status: ReadinessStatus::Blocked,
+        message:
+            "OS keychain-backed secret providers are not implemented; current default provider stores no secrets"
+                .to_owned(),
+    });
+    items.push(ReadinessItem {
+        area: "passphrases",
+        status: ReadinessStatus::Warning,
+        message:
+            "passphrases flow through redacted SecretProvider boundaries; interactive credential UX is still app work"
+                .to_owned(),
+    });
+    items.push(ReadinessItem {
+        area: "clipboard",
+        status: ReadinessStatus::Warning,
+        message:
+            "system clipboard bridge exists with paste sanitization; primary selection and OSC clipboard policy remain separate work"
+                .to_owned(),
+    });
+    items.push(ReadinessItem {
+        area: "OSC clipboard",
+        status: ReadinessStatus::Blocked,
+        message:
+            "OSC 52 clipboard behavior is intentionally not implemented until an explicit permission policy exists"
+                .to_owned(),
+    });
+    items.push(ReadinessItem {
+        area: "shell integration",
+        status: ReadinessStatus::Warning,
+        message:
+            "scripts emit semantic OSC events without mutating terminal text; installer trust and update policy need release review"
+                .to_owned(),
+    });
+    items.push(ReadinessItem {
+        area: "remote helpers",
+        status: ReadinessStatus::Warning,
+        message:
+            "remote shell integration is optional and must be treated as code running on the remote account"
+                .to_owned(),
+    });
+    items.push(ReadinessItem {
+        area: "logs and diagnostics",
+        status: ReadinessStatus::Pass,
+        message:
+            "bug-report snapshots exclude terminal contents, command output, environment variables, secrets, SSH keys, and clipboard contents"
+                .to_owned(),
+    });
+
+    ReadinessReport {
+        title: "Panea security review",
+        items,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageTarget {
+    pub target: &'static str,
+    pub status: ReadinessStatus,
+    pub requirements: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackagingPlan {
+    pub targets: Vec<PackageTarget>,
+}
+
+impl PackagingPlan {
+    #[must_use]
+    pub fn render_text(&self) -> String {
+        let mut lines = vec!["Panea packaging plan".to_owned()];
+        for target in &self.targets {
+            lines.push(format!("- [{}] {}", target.status, target.target));
+            for requirement in &target.requirements {
+                lines.push(format!("  - {requirement}"));
+            }
+        }
+        lines.join("\n")
+    }
+}
+
+#[must_use]
+pub fn packaging_plan() -> PackagingPlan {
+    PackagingPlan {
+        targets: vec![
+            PackageTarget {
+                target: "macOS app bundle",
+                status: ReadinessStatus::NotVerified,
+                requirements: vec![
+                    "bundle apps/desktop binary with assets and shell integration scripts",
+                    "preserve macOS config discovery path",
+                    "add signing and notarization plan before public release",
+                ],
+            },
+            PackageTarget {
+                target: "Windows installer",
+                status: ReadinessStatus::NotVerified,
+                requirements: vec![
+                    "install desktop binary, assets, themes, and shell scripts",
+                    "preserve Windows config discovery path",
+                    "include portable build or clearly document install location",
+                ],
+            },
+            PackageTarget {
+                target: "Windows portable build",
+                status: ReadinessStatus::NotVerified,
+                requirements: vec![
+                    "ship single extracted directory with binary and assets",
+                    "avoid writing secrets or config inside the install directory by default",
+                ],
+            },
+            PackageTarget {
+                target: "Linux AppImage or equivalent",
+                status: ReadinessStatus::NotVerified,
+                requirements: vec![
+                    "include assets, themes, and shell integration scripts",
+                    "validate both X11 and Wayland startup behavior",
+                    "document compositor-specific fallback behavior",
+                ],
+            },
+            PackageTarget {
+                target: "Linux distro packages",
+                status: ReadinessStatus::NotVerified,
+                requirements: vec![
+                    "defer until file layout, desktop entry, icons, and dependency policy are stable",
+                ],
+            },
+        ],
+    }
+}
+
+#[must_use]
+pub fn release_validation_report(input: &DoctorInput) -> ReadinessReport {
+    let config_status = if input
+        .config_diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == ConfigDiagnosticSeverity::Error)
+    {
+        ReadinessStatus::Blocked
+    } else {
+        ReadinessStatus::Pass
+    };
+
+    ReadinessReport {
+        title: "Panea release validation",
+        items: vec![
+            ReadinessItem {
+                area: "unit tests",
+                status: ReadinessStatus::NotVerified,
+                message: "run cargo test --workspace for this release candidate".to_owned(),
+            },
+            ReadinessItem {
+                area: "integration tests",
+                status: ReadinessStatus::NotVerified,
+                message:
+                    "run PTY, SSH, shell integration, and desktop smoke tests with bounded timeouts"
+                        .to_owned(),
+            },
+            ReadinessItem {
+                area: "parser and conformance",
+                status: ReadinessStatus::NotVerified,
+                message:
+                    "run parser fixtures and terminal conformance goldens before release"
+                        .to_owned(),
+            },
+            ReadinessItem {
+                area: "renderer smoke",
+                status: ReadinessStatus::NotVerified,
+                message:
+                    "run GPU window smoke and screenshots on macOS, Windows, Linux X11, and Linux Wayland"
+                        .to_owned(),
+            },
+            ReadinessItem {
+                area: "benchmarks",
+                status: ReadinessStatus::NotVerified,
+                message: "run cargo xtask bench all and review disabled-feature costs".to_owned(),
+            },
+            ReadinessItem {
+                area: "config compatibility",
+                status: config_status,
+                message: format!(
+                    "current config diagnostics: {}",
+                    input.config_diagnostics.len()
+                ),
+            },
+            ReadinessItem {
+                area: "platform parity",
+                status: ReadinessStatus::Blocked,
+                message:
+                    "release requires manual smoke tests on macOS, Windows, Linux X11, and Linux Wayland"
+                        .to_owned(),
+            },
+            ReadinessItem {
+                area: "packaging",
+                status: ReadinessStatus::Blocked,
+                message:
+                    "macOS, Windows, and Linux package artifacts are not produced by automation yet"
+                        .to_owned(),
+            },
+            ReadinessItem {
+                area: "performance comparison",
+                status: ReadinessStatus::NotVerified,
+                message:
+                    "do not compare publicly against other terminals until fair benchmark fixtures are published"
+                        .to_owned(),
+            },
+        ],
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PerformanceBudget {
     pub max_frame_time: Duration,
     pub max_idle_wakeups_per_second: u64,
@@ -1330,5 +1665,68 @@ mod tests {
         assert!(text.contains("terminal contents"));
         assert!(text.contains("recent_errors: 1"));
         assert!(!text.contains("render surface lost"));
+    }
+
+    #[test]
+    fn hardening_report_names_remaining_renderer_and_reload_work() {
+        let input = DoctorInput {
+            app_version: "0.1.0".to_owned(),
+            config_source: "default".to_owned(),
+            config: AppConfig::default(),
+            config_diagnostics: Vec::new(),
+            platform: PlatformSnapshot::detect(),
+            recent_errors: Vec::new(),
+        };
+
+        let text = stability_hardening_report(&input).render_text();
+
+        assert!(text.contains("panic boundaries"));
+        assert!(text.contains("device-loss"));
+        assert!(text.contains("config reload"));
+    }
+
+    #[test]
+    fn security_review_blocks_unimplemented_secret_and_osc_policy() {
+        let input = DoctorInput {
+            app_version: "0.1.0".to_owned(),
+            config_source: "default".to_owned(),
+            config: AppConfig::default(),
+            config_diagnostics: Vec::new(),
+            platform: PlatformSnapshot::detect(),
+            recent_errors: Vec::new(),
+        };
+
+        let report = security_review_report(&input);
+        let text = report.render_text();
+
+        assert!(report.has_blockers());
+        assert!(text.contains("OS keychain"));
+        assert!(text.contains("OSC 52"));
+    }
+
+    #[test]
+    fn packaging_plan_lists_all_required_desktop_targets() {
+        let text = packaging_plan().render_text();
+
+        assert!(text.contains("macOS app bundle"));
+        assert!(text.contains("Windows installer"));
+        assert!(text.contains("Linux AppImage"));
+    }
+
+    #[test]
+    fn release_validation_blocks_platform_parity_until_verified() {
+        let input = DoctorInput {
+            app_version: "0.1.0".to_owned(),
+            config_source: "default".to_owned(),
+            config: AppConfig::default(),
+            config_diagnostics: Vec::new(),
+            platform: PlatformSnapshot::detect(),
+            recent_errors: Vec::new(),
+        };
+
+        let report = release_validation_report(&input);
+
+        assert!(report.has_blockers());
+        assert!(report.render_text().contains("Linux Wayland"));
     }
 }

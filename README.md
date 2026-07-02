@@ -43,3 +43,20 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 ```
 
+## Docs
+
+- [Getting started](docs/getting-started.md)
+- [Configuration](docs/config.md)
+- [Themes](docs/themes.md)
+- [Cursor customization](docs/cursor-customization.md)
+- [Command blocks](docs/command-blocks.md)
+- [Shell integration](docs/shell-integration.md)
+- [SSH profiles](docs/ssh-profiles.md)
+- [Multiplexer usage](docs/multiplexer.md)
+- [Performance](docs/performance.md)
+- [Platform support](docs/platform-support.md)
+- [Linux compositor notes](docs/linux-compositor-notes.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Security](docs/security.md)
+- [Packaging](docs/packaging.md)
+- [Release validation](docs/release-validation.md)

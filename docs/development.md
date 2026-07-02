@@ -26,6 +26,10 @@ cargo xtask config-schema
 cargo xtask bench all
 cargo xtask doctor
 cargo xtask bug-report
+cargo xtask hardening
+cargo xtask security-review
+cargo xtask package-plan
+cargo xtask release-check
 ```
 
 ## Contribution Gates
@@ -50,3 +54,9 @@ Panea's native mux owns workspaces, tabs, panes, sessions, and layout state.
 External multiplexers such as tmux, screen, and zellij must continue to run as
 normal terminal applications inside a pane. Mux features may resize and focus
 Panea panes, but must not special-case or parse external mux internals.
+
+## Release Readiness Rule
+
+A release candidate is not daily-driver ready until `cargo xtask release-check`
+has no blockers and the platform matrix has been validated on macOS, Windows,
+Linux X11, and Linux Wayland. Local Windows success is not enough.

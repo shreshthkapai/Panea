@@ -4,7 +4,7 @@ fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("help") | None => {
             eprintln!(
-                "usage: cargo xtask <fmt|clippy|test|build|check|ci|config-default|config-schema|bench|doctor|bug-report>"
+                "usage: cargo xtask <fmt|clippy|test|build|check|ci|config-default|config-schema|bench|doctor|bug-report|hardening|security-review|package-plan|release-check>"
             );
             ExitCode::SUCCESS
         }
@@ -18,12 +18,69 @@ fn main() -> ExitCode {
         Some("bench") => run_bench(),
         Some("doctor") => run_doctor(),
         Some("bug-report") => run_bug_report(),
+        Some("hardening") => run_hardening(),
+        Some("security-review") => run_security_review(),
+        Some("package-plan") => run_package_plan(),
+        Some("release-check") => run_release_check(),
         Some("ci") => run_ci(),
         Some(command) => {
             eprintln!("unknown xtask command: {command}");
             ExitCode::from(2)
         }
     }
+}
+
+fn run_hardening() -> ExitCode {
+    let input = match doctor_input() {
+        Ok(input) => input,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    println!(
+        "{}",
+        diagnostics::stability_hardening_report(&input).render_text()
+    );
+    ExitCode::SUCCESS
+}
+
+fn run_security_review() -> ExitCode {
+    let input = match doctor_input() {
+        Ok(input) => input,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    println!(
+        "{}",
+        diagnostics::security_review_report(&input).render_text()
+    );
+    ExitCode::SUCCESS
+}
+
+fn run_package_plan() -> ExitCode {
+    println!("{}", diagnostics::packaging_plan().render_text());
+    ExitCode::SUCCESS
+}
+
+fn run_release_check() -> ExitCode {
+    let input = match doctor_input() {
+        Ok(input) => input,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    println!(
+        "{}",
+        diagnostics::release_validation_report(&input).render_text()
+    );
+    ExitCode::SUCCESS
 }
 
 fn run_doctor() -> ExitCode {
