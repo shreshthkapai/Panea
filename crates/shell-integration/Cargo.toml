@@ -8,3 +8,5 @@ description = "Shell hooks, OSC semantic events, and installer helpers."
 [lints]
 workspace = true
 
+[dependencies]
+semantics = { path = "../semantics" }

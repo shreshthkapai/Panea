@@ -89,6 +89,14 @@ If a task does not fit, redesign it before implementation.
   profile identities and working directories, portable mux action names, default
   mux keybindings, and an explicit compatibility policy that tmux/screen/zellij
   remain ordinary terminal applications inside panes.
+- Implemented the Phase 10 shell integration and semantic layer foundation:
+  added semantic event storage for prompt/input/output/command boundaries,
+  command blocks with exit status and duration, current directory and
+  shell/remote metadata, command navigation and output copy actions,
+  shell-integration parsers for OSC 133, OSC 633, OSC 7, and Panea-private OSC
+  777 events, baseline hook scripts for bash/zsh/fish/PowerShell, portable
+  shell integration config and keybindings, and diagnostics reports for active
+  or inactive shell integration state.
 
 ## Deferred By Design
 
@@ -140,3 +148,8 @@ If a task does not fit, redesign it before implementation.
   split-pane desktop rendering, tab chrome, per-pane transport orchestration,
   and cross-OS native mux runtime smoke tests remain follow-up work on top of
   the model.
+- Phase 10 establishes semantic storage, parsers, scripts, config, and
+  diagnostics. Desktop runtime injection/loading of shell integration scripts,
+  remote installation flows, heuristic fallback, and cross-shell real-session
+  verification remain follow-up work before command blocks can be considered
+  product-complete.

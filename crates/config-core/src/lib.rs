@@ -18,6 +18,7 @@ pub struct AppConfig {
     pub scrollback: ScrollbackConfig,
     pub command_blocks: CommandBlocksConfig,
     pub prompt_decorations: PromptDecorationsConfig,
+    pub shell_integration: ShellIntegrationConfig,
     pub keyboard: KeyboardConfig,
     pub mouse: MouseConfig,
     pub paste: PasteConfig,
@@ -127,6 +128,7 @@ impl AppConfig {
         }
 
         self.validate_keybindings(&mut report);
+        self.validate_shell_integration(&mut report);
         self.validate_shell_profiles(&mut report);
         self.validate_ssh_profiles(&mut report);
         self.validate_mux(&mut report);
@@ -162,6 +164,7 @@ impl AppConfig {
         }
         if self.command_blocks != next.command_blocks
             || self.prompt_decorations != next.prompt_decorations
+            || self.shell_integration != next.shell_integration
         {
             plan.live.push(ReloadableSection::VisualSemantics);
         }
@@ -226,6 +229,30 @@ impl AppConfig {
                 report.error(
                     "keyboard.keybindings",
                     format!("keybinding conflict for {keys}: {previous_action} and {action}"),
+                );
+            }
+        }
+    }
+
+    fn validate_shell_integration(&self, report: &mut ValidationReport) {
+        for (index, shell) in self.shell_integration.enabled_shells.iter().enumerate() {
+            if shell.trim().is_empty() {
+                report.error(
+                    format!("shell_integration.enabled_shells[{index}]"),
+                    "shell name cannot be empty",
+                );
+            }
+        }
+
+        for profile in &self.shell_integration.disabled_shell_profiles {
+            if !self
+                .shell_profiles
+                .iter()
+                .any(|shell_profile| shell_profile.name == *profile)
+            {
+                report.warning(
+                    "shell_integration.disabled_shell_profiles",
+                    format!("disabled shell integration profile '{profile}' is not defined"),
                 );
             }
         }
@@ -623,6 +650,45 @@ pub struct PromptDecorationsConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct ShellIntegrationConfig {
+    pub enabled: bool,
+    pub activation: ShellIntegrationActivationConfig,
+    pub auto_install: bool,
+    pub enabled_shells: Vec<String>,
+    pub disabled_shell_profiles: Vec<String>,
+    pub remote_instructions: bool,
+}
+
+impl Default for ShellIntegrationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            activation: ShellIntegrationActivationConfig::AutoDetect,
+            auto_install: false,
+            enabled_shells: vec![
+                "bash".to_owned(),
+                "zsh".to_owned(),
+                "fish".to_owned(),
+                "powershell".to_owned(),
+                "pwsh".to_owned(),
+            ],
+            disabled_shell_profiles: Vec::new(),
+            remote_instructions: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellIntegrationActivationConfig {
+    #[default]
+    AutoDetect,
+    Manual,
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct KeyboardConfig {
     pub keybindings: Vec<KeyBinding>,
 }
@@ -656,6 +722,11 @@ impl Default for KeyboardConfig {
                 KeyBinding::new("Ctrl+Shift+Z", "zoom_pane"),
                 KeyBinding::new("Ctrl+Shift+R", "rename_tab"),
                 KeyBinding::new("Ctrl+Shift+O", "move_pane"),
+                KeyBinding::new("Ctrl+Shift+Up", "jump_to_previous_command"),
+                KeyBinding::new("Ctrl+Shift+Down", "jump_to_next_command"),
+                KeyBinding::new("Ctrl+Shift+Y", "select_current_command_output"),
+                KeyBinding::new("Ctrl+Shift+U", "copy_current_command_output"),
+                KeyBinding::new("Ctrl+Shift+A", "copy_command_and_output"),
             ],
         }
     }
@@ -898,6 +969,7 @@ pub struct PlatformOverride {
     pub window: Option<WindowConfigPatch>,
     pub renderer: Option<RendererConfigPatch>,
     pub font: Option<FontConfigPatch>,
+    pub shell_integration: Option<ShellIntegrationConfigPatch>,
     pub performance: Option<PerformanceConfigPatch>,
     pub diagnostics: Option<DiagnosticsConfigPatch>,
 }
@@ -915,6 +987,9 @@ impl PlatformOverride {
         }
         if let Some(font) = &self.font {
             font.apply_to(&mut config.font);
+        }
+        if let Some(shell_integration) = &self.shell_integration {
+            shell_integration.apply_to(&mut config.shell_integration);
         }
         if let Some(performance) = &self.performance {
             performance.apply_to(&mut config.performance);
@@ -990,6 +1065,31 @@ impl FontConfigPatch {
         apply_opt(&mut config.line_height, &self.line_height);
         apply_opt(&mut config.fallback_families, &self.fallback_families);
         apply_opt(&mut config.ligatures, &self.ligatures);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ShellIntegrationConfigPatch {
+    pub enabled: Option<bool>,
+    pub activation: Option<ShellIntegrationActivationConfig>,
+    pub auto_install: Option<bool>,
+    pub enabled_shells: Option<Vec<String>>,
+    pub disabled_shell_profiles: Option<Vec<String>>,
+    pub remote_instructions: Option<bool>,
+}
+
+impl ShellIntegrationConfigPatch {
+    fn apply_to(&self, config: &mut ShellIntegrationConfig) {
+        apply_opt(&mut config.enabled, &self.enabled);
+        apply_opt(&mut config.activation, &self.activation);
+        apply_opt(&mut config.auto_install, &self.auto_install);
+        apply_opt(&mut config.enabled_shells, &self.enabled_shells);
+        apply_opt(
+            &mut config.disabled_shell_profiles,
+            &self.disabled_shell_profiles,
+        );
+        apply_opt(&mut config.remote_instructions, &self.remote_instructions);
     }
 }
 
@@ -1315,6 +1415,53 @@ pub fn export_schema() -> ConfigSchema {
                 fields: vec![
                     field("default_shell_profile", "string?", "none", false, true),
                     field("shell_profiles", "array<shell_profile>", "[]", false, true),
+                ],
+            },
+            ConfigSchemaSection {
+                name: "shell_integration",
+                fields: vec![
+                    field(
+                        "shell_integration.enabled",
+                        "boolean",
+                        default.shell_integration.enabled,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "shell_integration.activation",
+                        "shell_integration_activation",
+                        format!("{:?}", default.shell_integration.activation),
+                        true,
+                        false,
+                    ),
+                    field(
+                        "shell_integration.auto_install",
+                        "boolean",
+                        default.shell_integration.auto_install,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "shell_integration.enabled_shells",
+                        "array<string>",
+                        default.shell_integration.enabled_shells.join(","),
+                        true,
+                        false,
+                    ),
+                    field(
+                        "shell_integration.disabled_shell_profiles",
+                        "array<string>",
+                        "[]",
+                        true,
+                        false,
+                    ),
+                    field(
+                        "shell_integration.remote_instructions",
+                        "boolean",
+                        default.shell_integration.remote_instructions,
+                        true,
+                        false,
+                    ),
                 ],
             },
             ConfigSchemaSection {

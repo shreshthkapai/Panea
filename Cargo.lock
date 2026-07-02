@@ -471,6 +471,7 @@ name = "diagnostics"
 version = "0.1.0"
 dependencies = [
  "render-core",
+ "semantics",
 ]
 
 [[package]]
@@ -1762,6 +1763,9 @@ dependencies = [
 [[package]]
 name = "shell-integration"
 version = "0.1.0"
+dependencies = [
+ "semantics",
+]
 
 [[package]]
 name = "shell-words"

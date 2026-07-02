@@ -5,6 +5,7 @@ pub const LAYER: &str = "diagnostics";
 use std::{collections::VecDeque, time::Duration};
 
 use render_core::{FeatureCostSample, OptionalFeatureCostMode, RenderInstrumentation};
+use semantics::{CommandBlockConfidence, IntegrationMode, SemanticDiagnostics, SemanticEventKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PerformanceBudget {
@@ -120,6 +121,97 @@ pub fn evaluate_feature_cost(sample: &FeatureCostSample) -> PerformanceGateRepor
         }
     } else {
         PerformanceGateReport::pass()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellIntegrationWarningKind {
+    Disabled,
+    Inactive,
+    HeuristicMode,
+    RemoteInactive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellIntegrationWarning {
+    pub kind: ShellIntegrationWarningKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellIntegrationReport {
+    pub shell_detected: Option<String>,
+    pub integration_active: bool,
+    pub last_event: Option<SemanticEventKind>,
+    pub last_event_age: Option<Duration>,
+    pub command_block_confidence: CommandBlockConfidence,
+    pub remote_integration_active: bool,
+    pub warnings: Vec<ShellIntegrationWarning>,
+}
+
+impl ShellIntegrationReport {
+    #[must_use]
+    pub fn from_semantic_diagnostics(diagnostics: &SemanticDiagnostics) -> Self {
+        let mut warnings = Vec::new();
+
+        if diagnostics.mode == IntegrationMode::Disabled {
+            warnings.push(ShellIntegrationWarning {
+                kind: ShellIntegrationWarningKind::Disabled,
+                message: "shell integration is disabled; semantic command features are unavailable"
+                    .to_owned(),
+            });
+        } else if !diagnostics.integration_active {
+            warnings.push(ShellIntegrationWarning {
+                kind: ShellIntegrationWarningKind::Inactive,
+                message: "shell integration has not emitted semantic events for this session"
+                    .to_owned(),
+            });
+        }
+
+        if diagnostics.heuristic_mode {
+            warnings.push(ShellIntegrationWarning {
+                kind: ShellIntegrationWarningKind::HeuristicMode,
+                message: "command regions are heuristic because shell integration is inactive"
+                    .to_owned(),
+            });
+        }
+
+        if diagnostics.shell_detected.is_some() && !diagnostics.remote_integration_active {
+            warnings.push(ShellIntegrationWarning {
+                kind: ShellIntegrationWarningKind::RemoteInactive,
+                message: "remote shell integration status is unknown".to_owned(),
+            });
+        }
+
+        Self {
+            shell_detected: diagnostics.shell_detected.clone(),
+            integration_active: diagnostics.integration_active,
+            last_event: diagnostics.last_event,
+            last_event_age: diagnostics.last_event_age,
+            command_block_confidence: diagnostics.command_block_confidence,
+            remote_integration_active: diagnostics.remote_integration_active,
+            warnings,
+        }
+    }
+
+    #[must_use]
+    pub fn render_text(&self) -> String {
+        let shell = self.shell_detected.as_deref().unwrap_or("unknown");
+        let last_event = self
+            .last_event
+            .map_or_else(|| "none".to_owned(), |event| format!("{event:?}"));
+        let warning = self
+            .warnings
+            .first()
+            .map_or("ok", |warning| warning.message.as_str());
+
+        format!(
+            "shell={shell} active={} last_event={} confidence={:?} remote_active={} status={warning}",
+            self.integration_active,
+            last_event,
+            self.command_block_confidence,
+            self.remote_integration_active
+        )
     }
 }
 
@@ -255,5 +347,28 @@ mod tests {
         });
 
         assert!(!report.passed);
+    }
+
+    #[test]
+    fn shell_integration_report_explains_inactive_state() {
+        let report = ShellIntegrationReport::from_semantic_diagnostics(&SemanticDiagnostics {
+            mode: IntegrationMode::EscapeSequences,
+            shell_detected: Some("bash".to_owned()),
+            integration_active: false,
+            last_event: None,
+            last_event_age: None,
+            command_block_confidence: CommandBlockConfidence::None,
+            remote_integration_active: false,
+            heuristic_mode: false,
+        });
+
+        assert_eq!(report.shell_detected.as_deref(), Some("bash"));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == ShellIntegrationWarningKind::Inactive)
+        );
+        assert!(report.render_text().contains("shell=bash"));
     }
 }
