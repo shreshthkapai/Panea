@@ -8,3 +8,9 @@ description = "GPU renderer implementation, glyph atlas, batches, and frame sche
 [lints]
 workspace = true
 
+[dependencies]
+bytemuck.workspace = true
+font-system = { path = "../font-system" }
+render-core = { path = "../render-core" }
+wgpu.workspace = true
+winit.workspace = true

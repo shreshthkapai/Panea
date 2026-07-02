@@ -8,3 +8,6 @@ description = "Font shaping, fallback, glyph cache policy, and font discovery ab
 [lints]
 workspace = true
 
+[dependencies]
+ab_glyph.workspace = true
+fontdb.workspace = true

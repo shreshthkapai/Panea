@@ -24,7 +24,7 @@ impl RenderColor {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CellPosition {
     pub row: i64,
     pub col: u16,
@@ -36,6 +36,15 @@ pub struct RenderCell {
     pub text: String,
     pub foreground: RenderColor,
     pub background: RenderColor,
+    pub style: RenderCellStyle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RenderCellStyle {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strikethrough: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -116,9 +125,11 @@ pub type RenderAnimation = AnimationHandle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameRequestReason {
-    Damage,
+    TerminalContentChanged,
     CursorBlink,
     Animation,
+    WindowResized,
+    SelectionChanged,
     Explicit,
 }
 

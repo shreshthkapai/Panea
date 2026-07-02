@@ -11,3 +11,13 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[dependencies]
+font-system = { path = "../../crates/font-system" }
+pollster.workspace = true
+render-core = { path = "../../crates/render-core" }
+render-wgpu = { path = "../../crates/render-wgpu" }
+term-core = { path = "../../crates/term-core" }
+term-parser = { path = "../../crates/term-parser" }
+transport-core = { path = "../../crates/transport-core" }
+transport-pty = { path = "../../crates/transport-pty" }
+winit.workspace = true

@@ -44,6 +44,12 @@ If a task does not fit, redesign it before implementation.
   states, non-blocking Drop cleanup, bounded shutdown, reader diagnostics,
   failure diagnostics for real PTY smoke tests, and Windows verification of
   one-shot, interactive, and event-loop smoke cases.
+- Implemented the Phase 5 GPU renderer foundation: WGPU surface/device/queue
+  initialization, surface resize/present lifecycle, font discovery and fallback
+  chain resolution, glyph rasterization and cache policy, glyph atlas allocation,
+  renderer-independent style fields, damage tracking, frame scheduling, CPU
+  visual snapshot tests, and a desktop window path that feeds local PTY output
+  through the terminal parser/core into the renderer.
 
 ## Deferred By Design
 
@@ -56,3 +62,10 @@ If a task does not fit, redesign it before implementation.
   host shells. On the current Windows host, the one-shot, interactive, and
   event-loop smoke tests pass quickly. macOS and Linux smoke status is still
   unverified until those platforms are actually run.
+- The first GPU renderer presents a rasterized terminal frame through WGPU and
+  has a glyph atlas/cache foundation. Fully batched GPU glyph rendering,
+  partial texture updates by damage region, and cross-OS screenshot automation
+  are deferred render-performance work.
+- Phase 5 has build/test verification on the current Windows host. macOS,
+  Linux X11, and Linux Wayland rendering remain unverified until run on those
+  platforms.
