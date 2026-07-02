@@ -1,9 +1,10 @@
-use std::{collections::BTreeSet, error::Error, sync::Arc};
+use std::{collections::BTreeSet, error::Error, path::PathBuf, sync::Arc};
 
 use config_core::{
-    AppConfig, DecorationStrategyConfig, LinuxBackendConfig, PasteConfig, WindowModeConfig,
+    AppConfig, ConfigDiagnosticSeverity, DecorationStrategyConfig, LinuxBackendConfig, PasteConfig,
+    PresentModePreference, ShellProfile, ShellProfileKind, WindowModeConfig,
 };
-use font_system::{CellMetrics, FontConfig, FontSystem};
+use font_system::{CellMetrics, FontConfig as RuntimeFontConfig, FontSystem};
 use platform_core::{
     DecorationMode, InputEvent, KeyEvent, KeyModifiers, KeyState, LinuxWindowBackend, MouseButton,
     MouseEvent, MouseEventKind, WindowAction, WindowMode,
@@ -16,7 +17,9 @@ use render_core::{
     CellPosition, CursorVisual, OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle,
     RenderColor, RenderCursorShape, RenderGrid, RenderRect, RenderScene,
 };
-use render_wgpu::{FrameDecision, FrameScheduler, GpuTerminalRenderer, RendererOptions};
+use render_wgpu::{
+    FrameDecision, FrameScheduler, GpuTerminalRenderer, PresentMode, RendererOptions,
+};
 use semantics::detect_url_hints;
 use term_core::{
     CellAttributes, Color, CursorShape, TerminalCore, TerminalMode,
@@ -24,7 +27,7 @@ use term_core::{
 };
 use term_parser::TerminalEmulator;
 use transport_core::{TerminalSize as TransportSize, TerminalTransport};
-use transport_pty::LocalPtyTransport;
+use transport_pty::{LocalPtyTransport, LocalShellKind, LocalShellProfile};
 use winit::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
@@ -38,7 +41,18 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let config = AppConfig::default();
+    let loaded_config = config_toml::load(config_toml::ConfigLoadOptions::default())?;
+    for diagnostic in &loaded_config.diagnostics {
+        let level = match diagnostic.severity {
+            ConfigDiagnosticSeverity::Error => "error",
+            ConfigDiagnosticSeverity::Warning => "warning",
+        };
+        eprintln!(
+            "config {level} at {}: {}",
+            diagnostic.path, diagnostic.message
+        );
+    }
+    let config = loaded_config.config;
     let event_loop = EventLoop::new()?;
     let desktop_window = DesktopWindow::create(&event_loop, &window_settings(&config))?;
     let window = desktop_window.window();
@@ -52,7 +66,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let paste_config = config.paste.clone();
     let mut mouse_protocol = MouseProtocolState::default();
 
-    let mut fonts = FontSystem::new(FontConfig::default());
+    let mut fonts = FontSystem::new(font_config(&config.font));
     let metrics = fonts.cell_metrics()?;
     let initial_size = terminal_size_for_window(config.window.columns, config.window.rows, metrics);
     let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(
@@ -61,10 +75,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     ));
     let mut renderer = pollster::block_on(GpuTerminalRenderer::new(
         Arc::clone(&window),
-        RendererOptions::default(),
+        renderer_options(&config),
     ))?;
     let mut scheduler = FrameScheduler::new();
-    let mut transport = match LocalPtyTransport::spawn_default(initial_size) {
+    let mut transport = match spawn_initial_transport(&config, initial_size) {
         Ok(transport) => Some(transport),
         Err(error) => {
             terminal.apply_bytes(format!("failed to spawn local shell: {error}\r\n").as_bytes())?;
@@ -82,7 +96,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
                 WindowEvent::RedrawRequested => {
                     let metrics = fonts.cell_metrics().ok();
-                    let scene = scene_from_terminal(&terminal, metrics);
+                    let scene = scene_from_terminal(&terminal, metrics, &config);
                     if let Err(error) = renderer.render_scene(&scene, &mut fonts) {
                         eprintln!("render error: {error}");
                     }
@@ -236,6 +250,88 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn font_config(config: &config_core::FontConfig) -> RuntimeFontConfig {
+    RuntimeFontConfig {
+        family: config.family.clone(),
+        fallback_families: config.fallback_families.clone(),
+        size: config.size as f32,
+        line_height: config.line_height as f32,
+    }
+}
+
+fn renderer_options(config: &AppConfig) -> RendererOptions {
+    RendererOptions {
+        present_mode: match config.renderer.present_mode {
+            PresentModePreference::Immediate => PresentMode::Immediate,
+            PresentModePreference::Auto
+            | PresentModePreference::Fifo
+            | PresentModePreference::Mailbox => PresentMode::Vsync,
+        },
+        damage_tracking: config.renderer.damage_tracking,
+    }
+}
+
+fn spawn_initial_transport(
+    config: &AppConfig,
+    size: TransportSize,
+) -> transport_core::TransportResult<LocalPtyTransport> {
+    let Some(profile) = selected_shell_profile(config) else {
+        return LocalPtyTransport::spawn_default(size);
+    };
+
+    LocalPtyTransport::spawn(local_shell_profile(profile), size)
+}
+
+fn selected_shell_profile(config: &AppConfig) -> Option<&ShellProfile> {
+    if let Some(default_shell_profile) = &config.default_shell_profile
+        && let Some(profile) = config
+            .shell_profiles
+            .iter()
+            .find(|profile| &profile.name == default_shell_profile)
+    {
+        return Some(profile);
+    }
+
+    config.shell_profiles.first()
+}
+
+fn local_shell_profile(profile: &ShellProfile) -> LocalShellProfile {
+    let kind = match profile.kind {
+        ShellProfileKind::Default => LocalShellKind::Default,
+        ShellProfileKind::PowerShell => LocalShellKind::PowerShell,
+        ShellProfileKind::Cmd => LocalShellKind::Cmd,
+        ShellProfileKind::Wsl => LocalShellKind::Wsl,
+        ShellProfileKind::Custom => LocalShellKind::Custom,
+    };
+    let program = if profile.program.trim().is_empty() {
+        match profile.kind {
+            ShellProfileKind::PowerShell => "powershell.exe",
+            ShellProfileKind::Cmd => "cmd.exe",
+            ShellProfileKind::Wsl => "wsl.exe",
+            ShellProfileKind::Default | ShellProfileKind::Custom => {
+                if cfg!(windows) {
+                    "powershell.exe"
+                } else {
+                    "/bin/sh"
+                }
+            }
+        }
+        .to_owned()
+    } else {
+        profile.program.clone()
+    };
+
+    LocalShellProfile {
+        name: profile.name.clone(),
+        kind,
+        program,
+        args: profile.args.clone(),
+        env: profile.env.clone(),
+        working_directory: profile.working_directory.as_ref().map(PathBuf::from),
+        startup_command: profile.startup_command.clone(),
+    }
+}
+
 fn terminal_size_for_window(cols: u16, rows: u16, metrics: CellMetrics) -> TransportSize {
     TransportSize::new(
         cols,
@@ -385,7 +481,11 @@ impl DesktopDiagnosticsPlaceholder {
     }
 }
 
-fn scene_from_terminal(terminal: &TerminalEmulator, metrics: Option<CellMetrics>) -> RenderScene {
+fn scene_from_terminal(
+    terminal: &TerminalEmulator,
+    metrics: Option<CellMetrics>,
+    config: &AppConfig,
+) -> RenderScene {
     let visible = terminal.visible_grid();
     let cursor = terminal.cursor_state();
     let mut cells = Vec::with_capacity(visible.cells.len());
@@ -394,7 +494,7 @@ fn scene_from_terminal(terminal: &TerminalEmulator, metrics: Option<CellMetrics>
     for (index, cell) in visible.cells.iter().enumerate() {
         let row = (index / usize::from(cols)) as i64;
         let col = (index % usize::from(cols)) as u16;
-        let (foreground, background) = colors_for_attributes(cell.attributes);
+        let (foreground, background) = colors_for_attributes(cell.attributes, config);
         cells.push(RenderCell {
             position: CellPosition { row, col },
             text: cell.text.clone(),
@@ -424,7 +524,7 @@ fn scene_from_terminal(terminal: &TerminalEmulator, metrics: Option<CellMetrics>
                 CursorShape::Beam => RenderCursorShape::Beam,
                 CursorShape::Underline => RenderCursorShape::Underline,
             },
-            color: RenderColor::rgb(235, 235, 235),
+            color: render_color(config.colors.cursor),
             visible: cursor.visible,
         }),
         semantic_overlays,
@@ -480,9 +580,20 @@ fn style_for_attributes(attributes: CellAttributes) -> RenderCellStyle {
     }
 }
 
-fn colors_for_attributes(attributes: CellAttributes) -> (RenderColor, RenderColor) {
-    let mut foreground = color_or_default(attributes.foreground, RenderColor::rgb(230, 230, 230));
-    let mut background = color_or_default(attributes.background, RenderColor::rgb(12, 12, 12));
+fn colors_for_attributes(
+    attributes: CellAttributes,
+    config: &AppConfig,
+) -> (RenderColor, RenderColor) {
+    let mut foreground = color_or_default(
+        attributes.foreground,
+        render_color(config.colors.foreground),
+        config,
+    );
+    let mut background = color_or_default(
+        attributes.background,
+        render_color(config.colors.background),
+        config,
+    );
 
     if attributes.inverse {
         std::mem::swap(&mut foreground, &mut background);
@@ -491,11 +602,20 @@ fn colors_for_attributes(attributes: CellAttributes) -> (RenderColor, RenderColo
     (foreground, background)
 }
 
-fn color_or_default(color: Option<Color>, default: RenderColor) -> RenderColor {
+fn color_or_default(color: Option<Color>, default: RenderColor, config: &AppConfig) -> RenderColor {
     match color {
         Some(Color::Rgb { red, green, blue }) => RenderColor::rgb(red, green, blue),
-        Some(Color::Indexed(index)) => ansi_color(index),
+        Some(Color::Indexed(index)) => ansi_color(index, config),
         Some(Color::DefaultForeground | Color::DefaultBackground) | None => default,
+    }
+}
+
+fn render_color(color: config_core::RgbaColor) -> RenderColor {
+    RenderColor {
+        red: color.red,
+        green: color.green,
+        blue: color.blue,
+        alpha: color.alpha,
     }
 }
 
@@ -657,7 +777,7 @@ fn encode_legacy_mouse_coord(value: u16) -> u8 {
     value.saturating_add(32).min(255) as u8
 }
 
-fn ansi_color(index: u8) -> RenderColor {
+fn ansi_color(index: u8, config: &AppConfig) -> RenderColor {
     const PALETTE: [RenderColor; 16] = [
         RenderColor::rgb(12, 12, 12),
         RenderColor::rgb(197, 15, 31),
@@ -677,8 +797,12 @@ fn ansi_color(index: u8) -> RenderColor {
         RenderColor::rgb(242, 242, 242),
     ];
 
-    PALETTE
+    config
+        .colors
+        .palette
         .get(usize::from(index.min(15)))
         .copied()
+        .map(render_color)
+        .or_else(|| PALETTE.get(usize::from(index.min(15))).copied())
         .unwrap_or(PALETTE[7])
 }

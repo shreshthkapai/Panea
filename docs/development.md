@@ -21,6 +21,8 @@ cargo xtask clippy
 cargo xtask test
 cargo xtask build
 cargo xtask ci
+cargo xtask config-default
+cargo xtask config-schema
 ```
 
 ## Contribution Gates

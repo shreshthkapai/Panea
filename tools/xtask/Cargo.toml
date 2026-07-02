@@ -12,3 +12,5 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[dependencies]
+config-toml = { path = "../../crates/config-toml" }

@@ -3,7 +3,9 @@ use std::process::{Command, ExitCode};
 fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("help") | None => {
-            eprintln!("usage: cargo xtask <fmt|clippy|test|build|check|ci>");
+            eprintln!(
+                "usage: cargo xtask <fmt|clippy|test|build|check|ci|config-default|config-schema>"
+            );
             ExitCode::SUCCESS
         }
         Some("fmt") => run("cargo", &["fmt", "--all"]),
@@ -11,10 +13,38 @@ fn main() -> ExitCode {
         Some("test") => run("cargo", &["test", "--workspace"]),
         Some("build") => run("cargo", &["build", "--workspace"]),
         Some("check") => run("cargo", &["check", "--workspace"]),
+        Some("config-default") => print_config_default(),
+        Some("config-schema") => print_config_schema(),
         Some("ci") => run_ci(),
         Some(command) => {
             eprintln!("unknown xtask command: {command}");
             ExitCode::from(2)
+        }
+    }
+}
+
+fn print_config_default() -> ExitCode {
+    match config_toml::default_config_toml() {
+        Ok(config) => {
+            print!("{config}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn print_config_schema() -> ExitCode {
+    match config_toml::schema_json() {
+        Ok(schema) => {
+            println!("{schema}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::from(1)
         }
     }
 }

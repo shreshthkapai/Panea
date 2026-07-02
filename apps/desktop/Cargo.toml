@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 config-core = { path = "../../crates/config-core" }
+config-toml = { path = "../../crates/config-toml" }
 font-system = { path = "../../crates/font-system" }
 platform-core = { path = "../../crates/platform-core" }
 platform-winit = { path = "../../crates/platform-winit" }

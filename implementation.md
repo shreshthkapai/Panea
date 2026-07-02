@@ -63,6 +63,14 @@ If a task does not fit, redesign it before implementation.
   defaults, desktop forwarding for bracketed paste, focus, and SGR/legacy mouse
   reports, URL hint detection with basic semantic overlays, and Unicode
   wide/combining-cell groundwork.
+- Implemented the Phase 7 static configuration foundation: completed baseline
+  `AppConfig` sections for window/font/colors/cursor/scrollback/input/shell
+  profiles/renderer/performance/diagnostics/platform overrides, safe defaults,
+  TOML discovery and explicit path loading, parse locations, unknown and
+  deprecated setting diagnostics, validation diagnostics, default config
+  generation, schema JSON export, platform override resolution, reload-impact
+  classification, xtask helpers, and desktop startup wiring through the config
+  model.
 
 ## Deferred By Design
 
@@ -100,3 +108,9 @@ If a task does not fit, redesign it before implementation.
 - Full grapheme cluster editing, emoji ZWJ behavior, primary selection, OSC 52
   clipboard, application keypad output mapping, a custom terminfo entry, and a
   configurable hint engine remain deferred compatibility work.
+- Phase 7 classifies safe live-reload changes, but the file watcher and runtime
+  applier are deferred until the desktop lifecycle can apply changes without
+  destabilizing sessions or the renderer.
+- Programmable config remains deferred until the static TOML model has more
+  runtime mileage. It must compile into the same `AppConfig` and stay out of the
+  render hot path.
