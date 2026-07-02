@@ -96,6 +96,54 @@ Do not skip ahead because a later phase is more visible. Each phase exists to
 make the following phases possible without weakening terminal correctness,
 platform parity, performance discipline, or security.
 
+## 3. Review Checklist for Every Agent Diff
+
+Before accepting any agent output, review this checklist.
+
+Architecture:
+
+- Did it preserve layer boundaries?
+- Did it avoid OS-specific leakage?
+- Did it obey `architecture.md`?
+
+Scope:
+
+- Did it only implement the current task?
+- Did it avoid jumping ahead?
+- Did it avoid unrelated refactors?
+
+Correctness:
+
+- Are edge cases tested?
+- Are failures handled clearly?
+- Does it avoid panics?
+
+Performance:
+
+- Does disabled functionality have zero or near-zero cost?
+- Does it avoid unnecessary redraws?
+- Does it avoid blocking input/output?
+
+Cross-platform:
+
+- Does the feature have a path for Windows?
+- Does the feature have a path for macOS?
+- Does the feature have a path for Linux X11?
+- Does the feature have a path for Linux Wayland?
+- Are unavoidable platform differences documented?
+
+Testing:
+
+- Are unit tests included where appropriate?
+- Are smoke tests included where appropriate?
+- Are manual verification steps documented where automation is not possible?
+
+User impact:
+
+- Does it fail clearly?
+- Does it avoid silent breakage?
+- Does it preserve config compatibility?
+
 ## 16. Feature Implementation Map
 
 This table tells workers where each accepted feature belongs.
@@ -541,3 +589,41 @@ Nothing flashy happens first.
 
 The first win is not a beautiful terminal. The first win is a codebase that
 cannot easily become the wrong product.
+
+## 30. Final Definition of Done
+
+Panea is product-complete only when all of the following are true:
+
+- Core terminal behavior is correct.
+- Unicode/grapheme/emoji handling is hardened.
+- Renderer is GPU-batched and benchmarked.
+- Visual effects are overlays, not buffer mutations.
+- Cursor animation is performant and configurable.
+- Command blocks work through shell integration.
+- Multiplexer tabs/panes/sessions are wired at runtime.
+- Clipboard and OSC 52 policy are safe.
+- SSH trust and secrets are secure.
+- Real app compatibility tests pass.
+- Linux X11 and Wayland are verified.
+- Windows and macOS are verified.
+- Cross-OS screenshot verification exists.
+- Runtime config reload works safely.
+- Doctor diagnostics are installed.
+- Packaging artifacts exist.
+- GPU device-loss recovery exists.
+- Performance overlay exists.
+- Advanced config is powerful but not hot-path dangerous.
+- iOS SSH companion has a validated shared-core path.
+
+Panea must remain:
+
+```text
+Fast by default.
+Cross-platform by design.
+Config-compatible across OSes.
+GPU-first.
+Terminal-correct.
+Visually expressive without corrupting terminal semantics.
+Secure by default.
+Tested against real applications.
+```

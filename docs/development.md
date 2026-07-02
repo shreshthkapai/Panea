@@ -51,6 +51,10 @@ No pull request is mergeable unless it answers:
 Every user-facing feature also needs the short cross-OS design note defined in
 [Engineering rules](engineering-rules.md) before implementation begins.
 
+Before accepting an agent-generated diff, run through the review checklist in
+[Engineering rules](engineering-rules.md). The checklist is part of the merge
+bar, not optional polish.
+
 ## Layer Boundary Rule
 
 Each crate owns one layer. Lower layers must not import higher layers casually.
