@@ -39,6 +39,11 @@ If a task does not fit, redesign it before implementation.
   shell transport, default Unix shell profile, Windows PowerShell/cmd/WSL
   profile groundwork, byte write/read polling, resize propagation, lifecycle
   metadata, bounded transport event loop, and ignored real-shell smoke fixtures.
+- Completed Phase 3.5 deterministic PTY lifecycle hardening for the local
+  transport: explicit Running/ClosingInput/TerminatingChild/DrainingOutput/Closed
+  states, non-blocking Drop cleanup, bounded shutdown, reader diagnostics,
+  failure diagnostics for real PTY smoke tests, and Windows verification of
+  one-shot, interactive, and event-loop smoke cases.
 
 ## Deferred By Design
 
@@ -47,7 +52,7 @@ If a task does not fit, redesign it before implementation.
 - Mouse/focus/application keypad behavior is represented as modes in Phase 2;
   event semantics are implemented in later platform and parser compatibility
   phases.
-- Real local transport smoke tests are present but remain ignored until the
-  harness has reliable timeout and process-tree cleanup across operating
-  systems. On the current Windows host, manually running the ignored smoke test
-  timed out, so it is not claimed as a passing gate yet.
+- Real local transport smoke tests remain ignored by default because they spawn
+  host shells. On the current Windows host, the one-shot, interactive, and
+  event-loop smoke tests pass quickly. macOS and Linux smoke status is still
+  unverified until those platforms are actually run.

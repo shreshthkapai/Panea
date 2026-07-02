@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
     sync::mpsc::{self, Receiver},
     thread::{self, JoinHandle},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -163,6 +163,13 @@ impl LocalShellProfile {
         Ok(command)
     }
 
+    fn command_label(&self) -> String {
+        std::iter::once(self.program.as_str())
+            .chain(self.args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     fn effective_args(&self) -> TransportResult<Vec<String>> {
         let mut args = self.args.clone();
 
@@ -212,11 +219,60 @@ pub struct LocalPtyTransport {
     master: Option<Box<dyn MasterPty + Send>>,
     writer: Option<Box<dyn Write + Send>>,
     child: Box<dyn Child + Send + Sync>,
+    process_id: Option<u32>,
     reader_rx: Receiver<ReaderMessage>,
     reader_thread: Option<JoinHandle<()>>,
+    diagnostics: LocalPtyDiagnostics,
     metadata: SessionMetadata,
     state: TransportState,
     pending_lifecycle: VecDeque<TransportLifecycleEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalPtyDiagnostics {
+    pub command: String,
+    pub process_id: Option<u32>,
+    pub state: TransportState,
+    pub bytes_received: usize,
+    pub read_events: usize,
+    pub last_bytes_preview: Vec<u8>,
+    pub reader_started: bool,
+    pub reader_stopped: bool,
+    pub reader_error: Option<String>,
+    pub child_exited: bool,
+    pub kill_attempted: bool,
+    pub shutdown_timed_out: bool,
+}
+
+impl LocalPtyDiagnostics {
+    fn new(command: String, process_id: Option<u32>, state: TransportState) -> Self {
+        Self {
+            command,
+            process_id,
+            state,
+            bytes_received: 0,
+            read_events: 0,
+            last_bytes_preview: Vec::new(),
+            reader_started: false,
+            reader_stopped: false,
+            reader_error: None,
+            child_exited: false,
+            kill_attempted: false,
+            shutdown_timed_out: false,
+        }
+    }
+
+    fn record_bytes(&mut self, chunk: &[u8]) {
+        self.bytes_received += chunk.len();
+        self.read_events += 1;
+
+        const PREVIEW_LIMIT: usize = 256;
+        self.last_bytes_preview.extend_from_slice(chunk);
+        if self.last_bytes_preview.len() > PREVIEW_LIMIT {
+            let drain_count = self.last_bytes_preview.len() - PREVIEW_LIMIT;
+            self.last_bytes_preview.drain(..drain_count);
+        }
+    }
 }
 
 impl LocalPtyTransport {
@@ -230,6 +286,7 @@ impl LocalPtyTransport {
             .openpty(to_pty_size(size))
             .map_err(|error| TransportError::new(format!("failed to create PTY: {error}")))?;
 
+        let command_label = profile.command_label();
         let command = profile.command_builder()?;
         let child = pair
             .slave
@@ -255,8 +312,14 @@ impl LocalPtyTransport {
             master: Some(pair.master),
             writer: Some(writer),
             child,
+            process_id,
             reader_rx,
             reader_thread: Some(reader_thread),
+            diagnostics: LocalPtyDiagnostics::new(
+                command_label,
+                process_id,
+                TransportState::Running,
+            ),
             metadata: SessionMetadata {
                 id: make_session_id(process_id),
                 kind: platform_transport_kind(),
@@ -272,13 +335,145 @@ impl LocalPtyTransport {
         })
     }
 
-    fn mark_exited(&mut self, exit_code: Option<i32>) {
-        if !matches!(self.state, TransportState::Exited { .. }) {
-            self.state = TransportState::Exited { exit_code };
+    #[must_use]
+    pub fn diagnostics(&self) -> LocalPtyDiagnostics {
+        let mut diagnostics = self.diagnostics.clone();
+        diagnostics.state = self.state.clone();
+        diagnostics
+    }
+
+    fn mark_child_exited(&mut self, exit_code: Option<i32>) {
+        if !matches!(
+            self.state,
+            TransportState::DrainingOutput { .. } | TransportState::Closed { .. }
+        ) {
+            self.state = TransportState::DrainingOutput { exit_code };
+            self.diagnostics.child_exited = true;
+            self.diagnostics.state = self.state.clone();
+            self.writer.take();
+            self.close_master_without_blocking();
             self.pending_lifecycle
                 .push_back(TransportLifecycleEvent::Exited { exit_code });
+        }
+    }
+
+    fn mark_closed(&mut self, exit_code: Option<i32>) {
+        if !matches!(self.state, TransportState::Closed { .. }) {
+            self.state = TransportState::Closed { exit_code };
+            self.diagnostics.state = self.state.clone();
             self.pending_lifecycle
                 .push_back(TransportLifecycleEvent::Closed);
+        }
+    }
+
+    fn mark_failed(&mut self, message: impl Into<String>) {
+        self.state = TransportState::Failed {
+            message: message.into(),
+        };
+        self.diagnostics.state = self.state.clone();
+        self.pending_lifecycle
+            .push_back(TransportLifecycleEvent::Closed);
+    }
+
+    fn wait_for_child_exit(&mut self, timeout: Duration) -> TransportResult<Option<i32>> {
+        if let TransportState::Closed { exit_code } | TransportState::DrainingOutput { exit_code } =
+            self.state
+        {
+            return Ok(exit_code);
+        }
+
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    let exit_code = Some(status.exit_code() as i32);
+                    self.mark_child_exited(exit_code);
+                    return Ok(exit_code);
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => return Ok(None),
+                Err(error) => {
+                    self.mark_failed(error.to_string());
+                    return Err(TransportError::new(format!(
+                        "failed to wait for shell termination: {error}"
+                    )));
+                }
+            }
+        }
+    }
+
+    fn request_child_termination(&mut self) -> TransportResult<()> {
+        self.state = TransportState::TerminatingChild;
+        self.diagnostics.state = self.state.clone();
+        self.diagnostics.kill_attempted = true;
+        self.child
+            .kill()
+            .map_err(|error| TransportError::new(format!("failed to terminate shell: {error}")))
+    }
+
+    fn close_master_without_blocking(&mut self) {
+        if let Some(master) = self.master.take() {
+            thread::spawn(move || drop(master));
+        }
+    }
+
+    fn join_reader_if_finished(&mut self) {
+        if self
+            .reader_thread
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+            && let Some(reader_thread) = self.reader_thread.take()
+        {
+            let _ = reader_thread.join();
+        }
+    }
+
+    fn drain_reader_messages(&mut self) -> TransportOutput {
+        let mut bytes = Vec::new();
+        let mut lifecycle = Vec::new();
+        let mut closed = false;
+
+        while let Some(event) = self.pending_lifecycle.pop_front() {
+            if matches!(event, TransportLifecycleEvent::Closed) {
+                closed = true;
+            }
+            lifecycle.push(event);
+        }
+
+        while let Ok(message) = self.reader_rx.try_recv() {
+            match message {
+                ReaderMessage::Started => {
+                    self.diagnostics.reader_started = true;
+                }
+                ReaderMessage::Bytes(mut chunk) => {
+                    self.diagnostics.record_bytes(&chunk);
+                    bytes.append(&mut chunk);
+                }
+                ReaderMessage::Closed => {
+                    self.diagnostics.reader_stopped = true;
+                }
+                ReaderMessage::Failed(message) => {
+                    self.diagnostics.reader_error = Some(message.clone());
+                    self.mark_failed(message);
+                    closed = true;
+                }
+                ReaderMessage::Stopped => {
+                    self.diagnostics.reader_stopped = true;
+                }
+            }
+        }
+
+        if !bytes.is_empty() {
+            lifecycle.push(TransportLifecycleEvent::OutputReady);
+        }
+
+        TransportOutput {
+            bytes,
+            closed,
+            lifecycle,
         }
     }
 }
@@ -287,7 +482,11 @@ impl TerminalTransport for LocalPtyTransport {
     fn write_input(&mut self, bytes: &[u8]) -> TransportResult<()> {
         if matches!(
             self.state,
-            TransportState::Exited { .. } | TransportState::Failed { .. }
+            TransportState::ClosingInput
+                | TransportState::TerminatingChild
+                | TransportState::DrainingOutput { .. }
+                | TransportState::Closed { .. }
+                | TransportState::Failed { .. }
         ) {
             return Err(TransportError::new("cannot write to a closed local PTY"));
         }
@@ -303,6 +502,13 @@ impl TerminalTransport for LocalPtyTransport {
     }
 
     fn resize(&mut self, size: TerminalSize) -> TransportResult<()> {
+        if matches!(
+            self.state,
+            TransportState::Closed { .. } | TransportState::Failed { .. }
+        ) {
+            return Err(TransportError::new("cannot resize a closed local PTY"));
+        }
+
         self.master
             .as_ref()
             .ok_or_else(|| TransportError::new("local PTY master is closed"))?
@@ -314,94 +520,105 @@ impl TerminalTransport for LocalPtyTransport {
     }
 
     fn poll_output(&mut self) -> TransportResult<TransportOutput> {
-        let mut bytes = Vec::new();
-        let mut lifecycle = Vec::new();
-        let mut closed = false;
-
-        while let Some(event) = self.pending_lifecycle.pop_front() {
-            if matches!(event, TransportLifecycleEvent::Closed) {
-                closed = true;
-            }
-            lifecycle.push(event);
-        }
-
-        while let Ok(message) = self.reader_rx.try_recv() {
-            match message {
-                ReaderMessage::Bytes(mut chunk) => {
-                    bytes.append(&mut chunk);
-                }
-                ReaderMessage::Closed => {
-                    closed = true;
-                }
-                ReaderMessage::Failed(message) => {
-                    self.state = TransportState::Failed {
-                        message: message.clone(),
-                    };
-                    closed = true;
-                    return Ok(TransportOutput {
-                        bytes,
-                        closed,
-                        lifecycle: {
-                            lifecycle.push(TransportLifecycleEvent::Closed);
-                            lifecycle
-                        },
-                    });
-                }
-            }
-        }
-
-        if !bytes.is_empty() {
-            lifecycle.push(TransportLifecycleEvent::OutputReady);
-        }
+        let mut output = self.drain_reader_messages();
 
         if matches!(
             self.state,
-            TransportState::Running | TransportState::Exiting
+            TransportState::Running
+                | TransportState::ClosingInput
+                | TransportState::TerminatingChild
         ) {
             match self.child.try_wait() {
                 Ok(Some(status)) => {
                     let exit_code = Some(status.exit_code() as i32);
-                    self.mark_exited(exit_code);
+                    self.mark_child_exited(exit_code);
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    self.state = TransportState::Failed {
-                        message: error.to_string(),
-                    };
-                    lifecycle.push(TransportLifecycleEvent::Closed);
-                    closed = true;
+                    self.mark_failed(error.to_string());
                 }
             }
         }
 
         while let Some(event) = self.pending_lifecycle.pop_front() {
             if matches!(event, TransportLifecycleEvent::Closed) {
-                closed = true;
+                output.closed = true;
             }
-            lifecycle.push(event);
+            output.lifecycle.push(event);
         }
 
-        Ok(TransportOutput {
-            bytes,
-            closed,
-            lifecycle,
-        })
+        if matches!(self.state, TransportState::DrainingOutput { .. })
+            && self.diagnostics.reader_stopped
+        {
+            let exit_code = match self.state {
+                TransportState::DrainingOutput { exit_code } => exit_code,
+                _ => None,
+            };
+            self.mark_closed(exit_code);
+        }
+
+        while let Some(event) = self.pending_lifecycle.pop_front() {
+            if matches!(event, TransportLifecycleEvent::Closed) {
+                output.closed = true;
+            }
+            output.lifecycle.push(event);
+        }
+
+        self.join_reader_if_finished();
+        self.diagnostics.state = self.state.clone();
+
+        Ok(output)
     }
 
     fn shutdown(&mut self) -> TransportResult<()> {
-        if matches!(self.state, TransportState::Exited { .. }) {
+        if matches!(self.state, TransportState::Closed { .. }) {
             return Ok(());
         }
 
-        self.state = TransportState::Exiting;
+        self.state = TransportState::ClosingInput;
+        self.diagnostics.state = self.state.clone();
         self.pending_lifecycle
             .push_back(TransportLifecycleEvent::ShutdownRequested);
         self.writer.take();
-        self.master.take();
-        self.child
-            .kill()
-            .map_err(|error| TransportError::new(format!("failed to shut down shell: {error}")))?;
-        self.join_reader();
+
+        if self
+            .wait_for_child_exit(Duration::from_millis(250))?
+            .is_none()
+        {
+            self.request_child_termination()?;
+
+            if self
+                .wait_for_child_exit(Duration::from_millis(1000))?
+                .is_none()
+            {
+                self.diagnostics.shutdown_timed_out = true;
+                self.mark_failed(format!(
+                    "timed out terminating local shell process {:?}",
+                    self.process_id
+                ));
+                self.close_master_without_blocking();
+                self.join_reader_if_finished();
+                self.diagnostics.state = self.state.clone();
+                return Err(TransportError::new(format!(
+                    "timed out terminating local shell process {:?}",
+                    self.process_id
+                )));
+            }
+        }
+
+        self.close_master_without_blocking();
+        let _ = self.drain_reader_messages();
+        self.join_reader_if_finished();
+
+        let exit_code = match self.state {
+            TransportState::DrainingOutput { exit_code } | TransportState::Closed { exit_code } => {
+                exit_code
+            }
+            _ => None,
+        };
+        self.mark_closed(exit_code);
+        self.diagnostics.state = self.state.clone();
+
         Ok(())
     }
 
@@ -418,28 +635,28 @@ impl Drop for LocalPtyTransport {
     fn drop(&mut self) {
         if matches!(
             self.state,
-            TransportState::Running | TransportState::Exiting
+            TransportState::Running
+                | TransportState::ClosingInput
+                | TransportState::TerminatingChild
         ) {
             self.writer.take();
-            self.master.take();
+            self.diagnostics.kill_attempted = true;
             let _ = self.child.kill();
-            self.join_reader();
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.mark_child_exited(Some(status.exit_code() as i32));
+            }
+            self.close_master_without_blocking();
+            self.join_reader_if_finished();
         }
     }
 }
 
 enum ReaderMessage {
+    Started,
     Bytes(Vec<u8>),
     Closed,
     Failed(String),
-}
-
-impl LocalPtyTransport {
-    fn join_reader(&mut self) {
-        if let Some(reader_thread) = self.reader_thread.take() {
-            let _ = reader_thread.join();
-        }
-    }
+    Stopped,
 }
 
 fn spawn_reader(mut reader: Box<dyn Read + Send>) -> (Receiver<ReaderMessage>, JoinHandle<()>) {
@@ -447,6 +664,7 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>) -> (Receiver<ReaderMessage>, J
 
     let handle = thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
+        let _ = tx.send(ReaderMessage::Started);
 
         loop {
             match reader.read(&mut buffer) {
@@ -468,6 +686,8 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>) -> (Receiver<ReaderMessage>, J
                 }
             }
         }
+
+        let _ = tx.send(ReaderMessage::Stopped);
     });
 
     (rx, handle)
@@ -505,7 +725,11 @@ fn make_session_id(process_id: Option<u32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{thread, time::Duration};
+    use std::{
+        fmt::Write as _,
+        thread,
+        time::{Duration, Instant},
+    };
     use transport_core::{TransportCommand, TransportEvent, TransportEventLoop};
 
     fn test_size() -> TerminalSize {
@@ -548,9 +772,26 @@ mod tests {
 
     #[test]
     #[ignore = "spawns a real local shell"]
+    fn one_shot_shell_outputs_and_exits() {
+        let mut transport =
+            LocalPtyTransport::spawn(one_shot_smoke_profile(), test_size()).expect("spawn shell");
+
+        assert_spawned(&transport);
+        wait_for_output(&mut transport, b"panea-smoke", Duration::from_secs(3))
+            .unwrap_or_else(|message| panic!("{message}"));
+        wait_for_closed(&mut transport, Duration::from_secs(2))
+            .unwrap_or_else(|message| panic!("{message}"));
+        transport
+            .shutdown()
+            .unwrap_or_else(|error| panic!("shutdown after one-shot close failed: {error}"));
+    }
+
+    #[test]
+    #[ignore = "spawns a real local shell"]
     fn real_shell_starts_writes_resizes_exits_and_restarts() {
         let mut first =
             LocalPtyTransport::spawn(smoke_profile(), test_size()).expect("spawn shell");
+        assert_spawned(&first);
         first
             .write_input(shell_print_command())
             .expect("write command");
@@ -558,18 +799,21 @@ mod tests {
             .resize(TerminalSize::new(100, 30, 800, 480))
             .expect("resize shell");
 
-        let output = wait_for_output(&mut first, b"panea-smoke");
-        assert!(output);
+        wait_for_output(&mut first, b"panea-smoke", Duration::from_secs(3))
+            .unwrap_or_else(|message| panic!("{message}"));
 
         first.write_input(shell_exit_command()).expect("write exit");
-        assert!(wait_for_exit(&mut first));
+        wait_for_closed(&mut first, Duration::from_secs(2))
+            .unwrap_or_else(|message| panic!("{message}"));
 
         let mut second =
             LocalPtyTransport::spawn(smoke_profile(), test_size()).expect("restart shell");
+        assert_spawned(&second);
         second
             .write_input(shell_exit_command())
             .expect("write exit");
-        assert!(wait_for_exit(&mut second));
+        wait_for_closed(&mut second, Duration::from_secs(2))
+            .unwrap_or_else(|message| panic!("{message}"));
     }
 
     #[test]
@@ -583,16 +827,27 @@ mod tests {
             .send_command(TransportCommand::WriteInput(shell_print_command().to_vec()))
             .expect("send command");
 
+        let deadline = Instant::now() + Duration::from_secs(3);
         let mut saw_output = false;
-        for _ in 0..200 {
+        while Instant::now() < deadline {
             while let Some(event) = event_loop.poll_event() {
-                if let TransportEvent::Output(bytes) = event
-                    && bytes
+                if let TransportEvent::Output(bytes) = event {
+                    if bytes
+                        .windows(b"\x1b[6n".len())
+                        .any(|window| window == b"\x1b[6n")
+                    {
+                        event_loop
+                            .send_command(TransportCommand::WriteInput(b"\x1b[1;1R".to_vec()))
+                            .expect("answer terminal cursor query");
+                    }
+
+                    if bytes
                         .windows(b"panea-loop".len())
                         .any(|w| w == b"panea-loop")
-                {
-                    saw_output = true;
-                    break;
+                    {
+                        saw_output = true;
+                        break;
+                    }
                 }
             }
 
@@ -609,35 +864,131 @@ mod tests {
         assert!(saw_output);
     }
 
-    fn wait_for_output(transport: &mut LocalPtyTransport, needle: &[u8]) -> bool {
-        let mut output = Vec::new();
+    fn assert_spawned(transport: &LocalPtyTransport) {
+        let diagnostics = transport.diagnostics();
+        assert!(
+            !diagnostics.command.is_empty(),
+            "spawned command should be recorded"
+        );
+        assert!(
+            matches!(transport.state(), TransportState::Running),
+            "transport should start running: {}",
+            format_diagnostics(&diagnostics, &[], &[])
+        );
+    }
 
-        for _ in 0..200 {
+    fn wait_for_output(
+        transport: &mut LocalPtyTransport,
+        needle: &[u8],
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        let mut output = Vec::new();
+        let mut lifecycle = Vec::new();
+
+        while Instant::now() < deadline {
             let poll = transport.poll_output().expect("poll output");
+            answer_terminal_queries(transport, &poll.bytes)?;
+            lifecycle.extend(poll.lifecycle);
             output.extend(poll.bytes);
 
             if output.windows(needle.len()).any(|window| window == needle) {
-                return true;
+                return Ok(());
             }
 
             thread::sleep(Duration::from_millis(10));
         }
 
-        false
+        let before_shutdown = transport.diagnostics();
+        let shutdown_result = transport.shutdown();
+        let after_shutdown = transport.diagnostics();
+        Err(format!(
+            "timed out waiting for output {:?}\nBefore shutdown:\n{}\nAfter shutdown:\n{}\nShutdown result: {:?}",
+            String::from_utf8_lossy(needle),
+            format_diagnostics(&before_shutdown, &output, &lifecycle),
+            format_diagnostics(&after_shutdown, &output, &lifecycle),
+            shutdown_result.map_err(|error| error.to_string())
+        ))
     }
 
-    fn wait_for_exit(transport: &mut LocalPtyTransport) -> bool {
-        for _ in 0..200 {
-            let poll = transport.poll_output().expect("poll output");
+    fn wait_for_closed(transport: &mut LocalPtyTransport, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        let mut output = Vec::new();
+        let mut lifecycle = Vec::new();
 
-            if poll.closed || matches!(transport.state(), TransportState::Exited { .. }) {
-                return true;
+        while Instant::now() < deadline {
+            let poll = transport.poll_output().expect("poll output");
+            answer_terminal_queries(transport, &poll.bytes)?;
+            lifecycle.extend(poll.lifecycle);
+            output.extend(poll.bytes);
+
+            if poll.closed || matches!(transport.state(), TransportState::Closed { .. }) {
+                return Ok(());
             }
 
             thread::sleep(Duration::from_millis(10));
         }
 
-        false
+        let before_shutdown = transport.diagnostics();
+        let shutdown_result = transport.shutdown();
+        let after_shutdown = transport.diagnostics();
+        Err(format!(
+            "timed out waiting for transport close\nBefore shutdown:\n{}\nAfter shutdown:\n{}\nShutdown result: {:?}",
+            format_diagnostics(&before_shutdown, &output, &lifecycle),
+            format_diagnostics(&after_shutdown, &output, &lifecycle),
+            shutdown_result.map_err(|error| error.to_string())
+        ))
+    }
+
+    fn format_diagnostics(
+        diagnostics: &LocalPtyDiagnostics,
+        output: &[u8],
+        lifecycle: &[TransportLifecycleEvent],
+    ) -> String {
+        let mut message = String::new();
+        let _ = writeln!(message, "command: {}", diagnostics.command);
+        let _ = writeln!(message, "pid: {:?}", diagnostics.process_id);
+        let _ = writeln!(message, "state: {:?}", diagnostics.state);
+        let _ = writeln!(message, "bytes_received: {}", diagnostics.bytes_received);
+        let _ = writeln!(message, "read_events: {}", diagnostics.read_events);
+        let _ = writeln!(
+            message,
+            "last_reader_preview: {:?}",
+            String::from_utf8_lossy(&diagnostics.last_bytes_preview)
+        );
+        let _ = writeln!(
+            message,
+            "accumulated_preview: {:?}",
+            String::from_utf8_lossy(output)
+        );
+        let _ = writeln!(message, "reader_started: {}", diagnostics.reader_started);
+        let _ = writeln!(message, "reader_stopped: {}", diagnostics.reader_stopped);
+        let _ = writeln!(message, "reader_error: {:?}", diagnostics.reader_error);
+        let _ = writeln!(message, "child_exited: {}", diagnostics.child_exited);
+        let _ = writeln!(message, "kill_attempted: {}", diagnostics.kill_attempted);
+        let _ = writeln!(
+            message,
+            "shutdown_timed_out: {}",
+            diagnostics.shutdown_timed_out
+        );
+        let _ = writeln!(message, "lifecycle: {lifecycle:?}");
+        message
+    }
+
+    fn answer_terminal_queries(
+        transport: &mut LocalPtyTransport,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        if bytes
+            .windows(b"\x1b[6n".len())
+            .any(|window| window == b"\x1b[6n")
+        {
+            transport
+                .write_input(b"\x1b[1;1R")
+                .map_err(|error| format!("failed to answer terminal cursor query: {error}"))?;
+        }
+
+        Ok(())
     }
 
     fn shell_print_command() -> &'static [u8] {
@@ -661,6 +1012,14 @@ mod tests {
             LocalShellProfile::cmd()
         } else {
             LocalShellProfile::default_for_platform()
+        }
+    }
+
+    fn one_shot_smoke_profile() -> LocalShellProfile {
+        if cfg!(windows) {
+            LocalShellProfile::cmd().with_args(["/D", "/C", "echo panea-smoke"])
+        } else {
+            LocalShellProfile::custom("sh", "sh").with_args(["-lc", "printf '%s\\n' panea-smoke"])
         }
     }
 }

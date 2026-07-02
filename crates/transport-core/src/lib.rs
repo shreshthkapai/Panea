@@ -65,8 +65,10 @@ pub enum TransportLifecycleEvent {
 pub enum TransportState {
     Starting,
     Running,
-    Exiting,
-    Exited { exit_code: Option<i32> },
+    ClosingInput,
+    TerminatingChild,
+    DrainingOutput { exit_code: Option<i32> },
+    Closed { exit_code: Option<i32> },
     Failed { message: String },
 }
 
