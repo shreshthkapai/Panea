@@ -1,0 +1,10 @@
+[package]
+name = "render-wgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GPU renderer implementation, glyph atlas, batches, and frame scheduler."
+
+[lints]
+workspace = true
+

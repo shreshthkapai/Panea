@@ -1,0 +1,10 @@
+[package]
+name = "diagnostics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Doctor commands, capability reports, logs, and performance overlays."
+
+[lints]
+workspace = true
+

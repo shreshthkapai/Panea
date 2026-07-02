@@ -1,0 +1,10 @@
+[package]
+name = "transport-ssh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SSH sessions, host keys, authentication, and remote PTY handling."
+
+[lints]
+workspace = true
+

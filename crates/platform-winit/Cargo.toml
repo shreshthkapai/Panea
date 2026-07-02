@@ -1,0 +1,10 @@
+[package]
+name = "platform-winit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Desktop window and event integration."
+
+[lints]
+workspace = true
+

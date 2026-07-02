@@ -1,0 +1,13 @@
+[package]
+name = "panea-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "panea"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+

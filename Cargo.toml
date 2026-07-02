@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = [
+    "apps/desktop",
+    "crates/assets",
+    "crates/config-core",
+    "crates/config-lua",
+    "crates/config-toml",
+    "crates/diagnostics",
+    "crates/font-system",
+    "crates/mux",
+    "crates/platform-core",
+    "crates/platform-winit",
+    "crates/render-core",
+    "crates/render-wgpu",
+    "crates/security",
+    "crates/semantics",
+    "crates/shell-integration",
+    "crates/term-core",
+    "crates/term-parser",
+    "crates/transport-core",
+    "crates/transport-pty",
+    "crates/transport-ssh",
+    "tools/xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "UNLICENSED"
+repository = "https://example.invalid/panea"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
