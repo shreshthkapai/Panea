@@ -21,10 +21,12 @@ platform-winit = { path = "../../crates/platform-winit" }
 pollster.workspace = true
 render-core = { path = "../../crates/render-core" }
 render-wgpu = { path = "../../crates/render-wgpu" }
+security = { path = "../../crates/security" }
 semantics = { path = "../../crates/semantics" }
 shell-integration = { path = "../../crates/shell-integration" }
 term-core = { path = "../../crates/term-core" }
 term-parser = { path = "../../crates/term-parser" }
 transport-core = { path = "../../crates/transport-core" }
 transport-pty = { path = "../../crates/transport-pty" }
+transport-ssh = { path = "../../crates/transport-ssh" }
 winit.workspace = true

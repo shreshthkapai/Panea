@@ -513,6 +513,16 @@ impl SessionSpec {
             startup_command: None,
         }
     }
+
+    #[must_use]
+    pub fn ssh(profile_name: impl Into<String>) -> Self {
+        Self {
+            profile_name: profile_name.into(),
+            transport: SessionTransportKind::Ssh,
+            working_directory: None,
+            startup_command: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1296,6 +1306,14 @@ mod tests {
             snapshot.workspaces[0].windows[0].tabs[0].panes[0].session_profile,
             "default"
         );
+    }
+
+    #[test]
+    fn ssh_sessions_are_first_class_mux_specs() {
+        let spec = SessionSpec::ssh("prod");
+
+        assert_eq!(spec.profile_name, "prod");
+        assert_eq!(spec.transport, SessionTransportKind::Ssh);
     }
 
     #[test]

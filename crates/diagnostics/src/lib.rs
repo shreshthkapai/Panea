@@ -120,6 +120,49 @@ pub fn evaluate_visual_budget(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteSessionSecurityState {
+    NotConnected,
+    HostKeyUnknown,
+    HostKeyTrusted,
+    HostKeyMismatch,
+    Authenticated,
+    AuthenticationFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteSessionDiagnostics {
+    pub profile_name: String,
+    pub host: String,
+    pub port: u16,
+    pub security_state: RemoteSessionSecurityState,
+    pub remote_pty_requested: bool,
+    pub bytes_received: usize,
+    pub disconnected: bool,
+    pub last_error: Option<String>,
+}
+
+impl RemoteSessionDiagnostics {
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let mut parts = vec![format!(
+            "ssh profile={} target={}:{} state={:?}",
+            self.profile_name, self.host, self.port, self.security_state
+        )];
+        if self.remote_pty_requested {
+            parts.push("remote_pty=requested".to_owned());
+        }
+        parts.push(format!("bytes_received={}", self.bytes_received));
+        if self.disconnected {
+            parts.push("disconnected=true".to_owned());
+        }
+        if let Some(error) = &self.last_error {
+            parts.push(format!("error={error}"));
+        }
+        parts.join(" ")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PerformanceWarningKind {
     FrameOverBudget,
@@ -470,6 +513,26 @@ mod tests {
                 .iter()
                 .any(|warning| warning.kind == VisualWarningKind::AnimatedRegionTooLarge)
         );
+    }
+
+    #[test]
+    fn remote_session_diagnostics_summarize_without_secrets() {
+        let report = RemoteSessionDiagnostics {
+            profile_name: "prod".to_owned(),
+            host: "example.com".to_owned(),
+            port: 22,
+            security_state: RemoteSessionSecurityState::HostKeyMismatch,
+            remote_pty_requested: true,
+            bytes_received: 128,
+            disconnected: true,
+            last_error: Some("host key mismatch".to_owned()),
+        };
+
+        let summary = report.summary();
+
+        assert!(summary.contains("profile=prod"));
+        assert!(summary.contains("state=HostKeyMismatch"));
+        assert!(!summary.contains("password"));
     }
 
     #[test]

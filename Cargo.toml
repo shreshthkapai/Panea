@@ -37,13 +37,17 @@ unsafe_code = "forbid"
 [workspace.dependencies]
 ab_glyph = "0.2"
 arboard = "3"
+base64 = "0.22"
 bytemuck = { version = "1", features = ["derive"] }
 fontdb = "0.23"
 pollster = "0.4"
 portable-pty = "0.9.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+ssh2 = "0.9"
 toml = "0.8"
 unicode-width = "0.2"
 wgpu = "0.20"
 winit = "0.29"
+zeroize = "1"

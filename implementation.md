@@ -104,6 +104,12 @@ If a task does not fit, redesign it before implementation.
   badges, semantic OSC feeding in the desktop app, basic semantic overlay
   generation from `SemanticTimelineStore`, visual budget diagnostics, and
   shipped example visual configs.
+- Implemented the Phase 12 SSH transport foundation: expanded portable SSH
+  profile config, added a security-layer host-key and secret contract,
+  implemented an `ssh2`-backed `TerminalTransport` with host-key verification,
+  agent/public-key/password authentication boundaries, remote PTY allocation,
+  read/write/resize/shutdown support, bounded best-effort drop behavior, SSH
+  mux session specs, and desktop config-to-transport profile mapping.
 
 ## Deferred By Design
 
@@ -165,3 +171,8 @@ If a task does not fit, redesign it before implementation.
   caching for animated assets, polished badge text rendering, collapse/expand
   long output UI, and real shell-driven command-block verification remain
   deferred until the renderer and desktop semantic runtime are hardened.
+- Phase 12 establishes secure SSH transport contracts and a real backend, but
+  interactive host-key approval UI, OS keychain-backed secret providers, proxy
+  jump, remote shell-integration install flows, reconnect UI/actions, and real
+  SSH server smoke tests across Windows/macOS/Linux remain unverified follow-up
+  work.

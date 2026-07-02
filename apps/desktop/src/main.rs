@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, error::Error, path::PathBuf, sync::Arc, time::D
 use config_core::{
     AppConfig, CommandBlockStyle, ConfigDiagnosticSeverity, DecorationStrategyConfig,
     LinuxBackendConfig, PasteConfig, PresentModePreference, PromptDecorationStyle, ShellProfile,
-    ShellProfileKind, WindowModeConfig,
+    ShellProfileKind, SshAuthMethod, SshKnownHostsPolicy, SshProfile, WindowModeConfig,
 };
 use diagnostics::{PerformanceBudget, PerformanceOverlay};
 use font_system::{CellMetrics, FontConfig as RuntimeFontConfig, FontSystem};
@@ -32,6 +32,7 @@ use term_core::{
 use term_parser::TerminalEmulator;
 use transport_core::{TerminalSize as TransportSize, TerminalTransport};
 use transport_pty::{LocalPtyTransport, LocalShellKind, LocalShellProfile};
+use transport_ssh::SshConnectionProfile;
 use winit::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
@@ -57,6 +58,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         );
     }
     let config = loaded_config.config;
+    let _ssh_session_profiles: Vec<SshConnectionProfile> = config
+        .ssh_profiles
+        .iter()
+        .map(ssh_connection_profile)
+        .collect();
     let event_loop = EventLoop::new()?;
     let desktop_window = DesktopWindow::create(&event_loop, &window_settings(&config))?;
     let window = desktop_window.window();
@@ -365,6 +371,36 @@ fn local_shell_profile(profile: &ShellProfile) -> LocalShellProfile {
         working_directory: profile.working_directory.as_ref().map(PathBuf::from),
         startup_command: profile.startup_command.clone(),
     }
+}
+
+fn ssh_connection_profile(profile: &SshProfile) -> SshConnectionProfile {
+    let mut connection = SshConnectionProfile::new(profile.name.clone(), profile.host.clone());
+    connection.port = profile.port;
+    connection.username = profile.username.clone();
+    connection.auth_method = match profile.auth_method {
+        SshAuthMethod::Agent => security::AuthMethod::Agent,
+        SshAuthMethod::PublicKey => security::AuthMethod::PublicKey,
+        SshAuthMethod::Password => security::AuthMethod::Password,
+        SshAuthMethod::KeyboardInteractive => security::AuthMethod::KeyboardInteractive,
+        SshAuthMethod::None => security::AuthMethod::None,
+    };
+    connection.identity_file = profile.identity_file.as_ref().map(PathBuf::from);
+    connection.known_hosts_policy = match &profile.known_hosts_policy {
+        SshKnownHostsPolicy::Ask => security::KnownHostsPolicy::Ask,
+        SshKnownHostsPolicy::RequireKnown => security::KnownHostsPolicy::RequireKnown,
+        SshKnownHostsPolicy::TrustOnFirstUse => security::KnownHostsPolicy::TrustOnFirstUse,
+        SshKnownHostsPolicy::PinFingerprint { sha256 } => {
+            security::KnownHostsPolicy::PinFingerprint {
+                sha256: sha256.clone(),
+            }
+        }
+    };
+    connection.remote_command = profile.remote_command.clone();
+    connection.remote_working_directory = profile.remote_working_directory.clone();
+    connection.shell_integration = profile.shell_integration;
+    connection.agent_forwarding = profile.agent_forwarding;
+    connection.proxy_jump = profile.proxy_jump.clone();
+    connection
 }
 
 fn terminal_size_for_window(cols: u16, rows: u16, metrics: CellMetrics) -> TransportSize {

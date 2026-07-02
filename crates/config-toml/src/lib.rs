@@ -491,6 +491,19 @@ fn known_paths() -> BTreeSet<&'static str> {
         "default_shell_profile",
         "shell_profiles",
         "ssh_profiles",
+        "ssh_profiles.name",
+        "ssh_profiles.host",
+        "ssh_profiles.port",
+        "ssh_profiles.username",
+        "ssh_profiles.user",
+        "ssh_profiles.auth_method",
+        "ssh_profiles.identity_file",
+        "ssh_profiles.known_hosts_policy",
+        "ssh_profiles.remote_command",
+        "ssh_profiles.remote_working_directory",
+        "ssh_profiles.shell_integration",
+        "ssh_profiles.agent_forwarding",
+        "ssh_profiles.proxy_jump",
         "mux",
         "mux.enabled",
         "mux.restore_sessions",
@@ -696,6 +709,35 @@ mod tests {
         let schema = schema_json().expect("schema should serialize");
         assert!(schema.contains("\"schema_version\""));
         assert!(schema.contains("font.family"));
+        assert!(schema.contains("ssh_profiles.known_hosts_policy"));
+    }
+
+    #[test]
+    fn ssh_profile_toml_parses_baseline_fields() {
+        let loaded = parse_str(
+            r#"
+            [[ssh_profiles]]
+            name = "prod"
+            host = "example.com"
+            port = 2222
+            username = "deploy"
+            auth_method = "public_key"
+            identity_file = "~/.ssh/id_ed25519"
+            known_hosts_policy = "require_known"
+            remote_working_directory = "/srv/app"
+            shell_integration = true
+            agent_forwarding = false
+            "#,
+            None,
+            ConfigPlatform::Unknown,
+        )
+        .expect("SSH profile should parse");
+
+        let profile = &loaded.config.ssh_profiles[0];
+        assert_eq!(profile.name, "prod");
+        assert_eq!(profile.host, "example.com");
+        assert_eq!(profile.port, 2222);
+        assert_eq!(profile.username.as_deref(), Some("deploy"));
     }
 
     #[test]

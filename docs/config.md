@@ -60,6 +60,39 @@ resurrection.
 The public key is `font`. `fonts` is accepted as an alias for compatibility
 while the static schema stabilizes.
 
+## SSH Profiles
+
+SSH profiles describe remote sessions; defining one does not automatically
+connect on startup.
+
+```toml
+[[ssh_profiles]]
+name = "prod"
+host = "example.com"
+port = 22
+username = "deploy"
+auth_method = "public_key"
+identity_file = "~/.ssh/id_ed25519"
+known_hosts_policy = "require_known"
+remote_working_directory = "/srv/app"
+shell_integration = true
+agent_forwarding = false
+```
+
+Supported `auth_method` values are `agent`, `public_key`, `password`,
+`keyboard_interactive`, and `none`. The current SSH backend does not support
+`none` authentication and fails clearly if selected.
+
+Supported `known_hosts_policy` values are `ask`, `require_known`,
+`trust_on_first_use`, and pinned fingerprints:
+
+```toml
+known_hosts_policy = { pin_fingerprint = { sha256 = "SHA256:..." } }
+```
+
+Host-key checks are security-sensitive. The default `ask` policy requires an
+explicit trust decision for unknown hosts; app UI for that decision is deferred.
+
 ## Visual Theme
 
 Visual features are overlays. They must not rewrite terminal text and they must

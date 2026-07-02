@@ -349,6 +349,61 @@ impl AppConfig {
                     "SSH port must be greater than zero",
                 );
             }
+            if let Some(username) = &profile.username
+                && username.trim().is_empty()
+            {
+                report.error(
+                    format!("ssh_profiles.{}", profile.name),
+                    "SSH username cannot be empty when provided",
+                );
+            }
+            if matches!(profile.auth_method, SshAuthMethod::PublicKey)
+                && profile
+                    .identity_file
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+            {
+                report.error(
+                    format!("ssh_profiles.{}", profile.name),
+                    "public key SSH auth requires identity_file",
+                );
+            }
+            if matches!(profile.auth_method, SshAuthMethod::None) {
+                report.warning(
+                    format!("ssh_profiles.{}", profile.name),
+                    "none SSH authentication is represented for portability but is not supported by the current backend",
+                );
+            }
+            if let Some(identity_file) = &profile.identity_file
+                && identity_file.trim().is_empty()
+            {
+                report.error(
+                    format!("ssh_profiles.{}", profile.name),
+                    "SSH identity_file cannot be empty when provided",
+                );
+            }
+            if let SshKnownHostsPolicy::PinFingerprint { sha256 } = &profile.known_hosts_policy
+                && !sha256.starts_with("SHA256:")
+            {
+                report.error(
+                    format!("ssh_profiles.{}", profile.name),
+                    "pinned SSH fingerprints must use the SHA256:<base64> form",
+                );
+            }
+            if profile.agent_forwarding {
+                report.warning(
+                    format!("ssh_profiles.{}", profile.name),
+                    "agent forwarding exposes local agent authority to the remote host; enable only for trusted hosts",
+                );
+            }
+            if profile.proxy_jump.is_some() {
+                report.warning(
+                    format!("ssh_profiles.{}", profile.name),
+                    "proxy_jump is reserved for a later SSH phase and is not active yet",
+                );
+            }
         }
     }
 
@@ -1067,9 +1122,17 @@ pub struct ShellProfileOverride {
 pub struct SshProfile {
     pub name: String,
     pub host: String,
-    pub user: Option<String>,
+    #[serde(alias = "user")]
+    pub username: Option<String>,
     pub port: u16,
+    pub auth_method: SshAuthMethod,
     pub identity_file: Option<String>,
+    pub known_hosts_policy: SshKnownHostsPolicy,
+    pub remote_command: Option<String>,
+    pub remote_working_directory: Option<String>,
+    pub shell_integration: bool,
+    pub agent_forwarding: bool,
+    pub proxy_jump: Option<String>,
 }
 
 impl Default for SshProfile {
@@ -1077,11 +1140,41 @@ impl Default for SshProfile {
         Self {
             name: String::new(),
             host: String::new(),
-            user: None,
+            username: None,
             port: 22,
+            auth_method: SshAuthMethod::Agent,
             identity_file: None,
+            known_hosts_policy: SshKnownHostsPolicy::Ask,
+            remote_command: None,
+            remote_working_directory: None,
+            shell_integration: true,
+            agent_forwarding: false,
+            proxy_jump: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SshAuthMethod {
+    #[default]
+    Agent,
+    PublicKey,
+    Password,
+    KeyboardInteractive,
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SshKnownHostsPolicy {
+    #[default]
+    Ask,
+    RequireKnown,
+    TrustOnFirstUse,
+    PinFingerprint {
+        sha256: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1949,6 +2042,60 @@ pub fn export_schema() -> ConfigSchema {
                 ],
             },
             ConfigSchemaSection {
+                name: "ssh_profiles",
+                fields: vec![
+                    field("ssh_profiles", "array<ssh_profile>", "[]", false, true),
+                    field("ssh_profiles.name", "string", "", false, true),
+                    field("ssh_profiles.host", "string", "", false, true),
+                    field("ssh_profiles.port", "integer", 22, false, true),
+                    field("ssh_profiles.username", "string?", "none", false, true),
+                    field(
+                        "ssh_profiles.auth_method",
+                        "ssh_auth_method",
+                        "agent",
+                        false,
+                        true,
+                    ),
+                    field("ssh_profiles.identity_file", "path?", "none", false, true),
+                    field(
+                        "ssh_profiles.known_hosts_policy",
+                        "ssh_known_hosts_policy",
+                        "ask",
+                        false,
+                        true,
+                    ),
+                    field(
+                        "ssh_profiles.remote_command",
+                        "string?",
+                        "none",
+                        false,
+                        true,
+                    ),
+                    field(
+                        "ssh_profiles.remote_working_directory",
+                        "path?",
+                        "none",
+                        false,
+                        true,
+                    ),
+                    field(
+                        "ssh_profiles.shell_integration",
+                        "boolean",
+                        true,
+                        false,
+                        true,
+                    ),
+                    field(
+                        "ssh_profiles.agent_forwarding",
+                        "boolean",
+                        false,
+                        false,
+                        true,
+                    ),
+                    field("ssh_profiles.proxy_jump", "string?", "later", false, true),
+                ],
+            },
+            ConfigSchemaSection {
                 name: "shell_integration",
                 fields: vec![
                     field(
@@ -2228,6 +2375,40 @@ mod tests {
     }
 
     #[test]
+    fn ssh_profile_validation_blocks_reckless_defaults() {
+        let mut config = AppConfig {
+            ssh_profiles: vec![SshProfile {
+                name: "prod".to_owned(),
+                host: "example.com".to_owned(),
+                auth_method: SshAuthMethod::PublicKey,
+                known_hosts_policy: SshKnownHostsPolicy::PinFingerprint {
+                    sha256: "bad".to_owned(),
+                },
+                ..SshProfile::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        let report = config.validate();
+        assert!(report.has_errors());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("public key SSH auth requires identity_file")
+        }));
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("pinned SSH fingerprints must use")
+        }));
+
+        config.ssh_profiles[0].identity_file = Some("~/.ssh/id_ed25519".to_owned());
+        config.ssh_profiles[0].known_hosts_policy = SshKnownHostsPolicy::RequireKnown;
+
+        assert!(!config.validate().has_errors());
+    }
+
+    #[test]
     fn schema_exports_machine_readable_fields() {
         let schema = export_schema();
 
@@ -2238,6 +2419,13 @@ mod tests {
                 .iter()
                 .flat_map(|section| section.fields.iter())
                 .any(|field| field.path == "font.family")
+        );
+        assert!(
+            schema
+                .sections
+                .iter()
+                .flat_map(|section| section.fields.iter())
+                .any(|field| field.path == "ssh_profiles.known_hosts_policy")
         );
     }
 

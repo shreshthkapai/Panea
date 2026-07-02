@@ -8,3 +8,7 @@ description = "SSH sessions, host keys, authentication, and remote PTY handling.
 [lints]
 workspace = true
 
+[dependencies]
+security = { path = "../security" }
+ssh2.workspace = true
+transport-core = { path = "../transport-core" }

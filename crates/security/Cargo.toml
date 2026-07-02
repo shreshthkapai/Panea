@@ -8,3 +8,9 @@ description = "Secret handling interfaces, key storage policy, and SSH security 
 [lints]
 workspace = true
 
+[dependencies]
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
