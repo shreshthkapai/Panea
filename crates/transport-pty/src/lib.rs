@@ -152,6 +152,13 @@ impl LocalShellProfile {
         let args = self.effective_args()?;
         command.args(args);
 
+        if !self.env.contains_key("TERM") {
+            command.env("TERM", "xterm-256color");
+        }
+        if !self.env.contains_key("COLORTERM") {
+            command.env("COLORTERM", "truecolor");
+        }
+
         for (key, value) in &self.env {
             command.env(key, value);
         }

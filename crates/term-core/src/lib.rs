@@ -4,6 +4,8 @@ pub const LAYER: &str = "core correctness";
 
 use std::{cmp::Ordering, collections::BTreeSet, error::Error, fmt};
 
+use unicode_width::UnicodeWidthChar;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalSize {
     pub cols: u16,
@@ -53,6 +55,7 @@ pub struct CellAttributes {
     pub foreground: Option<Color>,
     pub background: Option<Color>,
     pub bold: bool,
+    pub dim: bool,
     pub italic: bool,
     pub underline: bool,
     pub inverse: bool,
@@ -69,6 +72,8 @@ impl CellAttributes {
 pub struct Cell {
     pub text: String,
     pub attributes: CellAttributes,
+    pub width: u8,
+    pub wide_continuation: bool,
 }
 
 impl Cell {
@@ -77,20 +82,39 @@ impl Cell {
         Self {
             text: " ".to_owned(),
             attributes,
+            width: 1,
+            wide_continuation: false,
         }
     }
 
     #[must_use]
     pub fn text(text: impl Into<String>, attributes: CellAttributes) -> Self {
+        let text = text.into();
+        let width = display_width(&text).clamp(1, 2) as u8;
         Self {
-            text: text.into(),
+            text,
             attributes,
+            width,
+            wide_continuation: false,
         }
     }
 
     #[must_use]
     pub fn is_blank(&self) -> bool {
-        self.text == " " && self.attributes == CellAttributes::default()
+        self.text == " "
+            && self.attributes == CellAttributes::default()
+            && self.width == 1
+            && !self.wide_continuation
+    }
+
+    #[must_use]
+    pub fn wide_continuation(attributes: CellAttributes) -> Self {
+        Self {
+            text: " ".to_owned(),
+            attributes,
+            width: 0,
+            wide_continuation: true,
+        }
     }
 }
 
@@ -126,6 +150,7 @@ pub enum TerminalMode {
     MouseReporting,
     MouseCellMotion,
     MouseAllMotion,
+    SgrMouse,
     FocusEvents,
     Origin,
     Insert,
@@ -198,6 +223,7 @@ impl Line {
         self.cells
             .iter()
             .take(end)
+            .filter(|cell| !cell.wide_continuation)
             .map(|cell| cell.text.as_str())
             .collect()
     }
@@ -264,6 +290,7 @@ pub enum ClearMode {
 pub enum GraphicRendition {
     Reset,
     Bold,
+    Dim,
     NormalIntensity,
     Italic,
     NoItalic,
@@ -295,8 +322,15 @@ pub enum TerminalAction {
         col: u16,
     },
     SetCursorColumn(u16),
+    SaveCursor,
+    RestoreCursor,
     ClearScreen(ClearMode),
     ClearLine(ClearMode),
+    InsertLines(u16),
+    DeleteLines(u16),
+    InsertChars(u16),
+    DeleteChars(u16),
+    EraseChars(u16),
     SetGraphicRendition(Vec<GraphicRendition>),
     SetMode {
         mode: TerminalMode,
@@ -304,6 +338,11 @@ pub enum TerminalAction {
     },
     SetCursorVisible(bool),
     SetCursorShape(CursorShape),
+    SetTitle(String),
+    SetTabStop,
+    ClearTabStop,
+    ClearAllTabStops,
+    DeviceStatusReport(u16),
     SetScrollRegion {
         top: u16,
         bottom: u16,
@@ -322,6 +361,11 @@ pub struct TerminalState {
     cursor_blinking: bool,
     modes: BTreeSet<TerminalMode>,
     selection: Option<Selection>,
+    saved_cursor: Option<SavedCursor>,
+    tab_stops: BTreeSet<u16>,
+    tab_stops_modified: bool,
+    pending_output: Vec<u8>,
+    title: Option<String>,
 }
 
 impl TerminalState {
@@ -340,6 +384,11 @@ impl TerminalState {
             cursor_blinking: true,
             modes,
             selection: None,
+            saved_cursor: None,
+            tab_stops: default_tab_stops(size.cols),
+            tab_stops_modified: false,
+            pending_output: Vec::new(),
+            title: None,
         }
     }
 
@@ -357,12 +406,34 @@ impl TerminalState {
                 self.active_mut().set_cursor_position(row, col);
             }
             TerminalAction::SetCursorColumn(col) => self.active_mut().set_cursor_column(col),
+            TerminalAction::SaveCursor => self.save_cursor(),
+            TerminalAction::RestoreCursor => self.restore_cursor(),
             TerminalAction::ClearScreen(mode) => self.clear_screen(mode),
             TerminalAction::ClearLine(mode) => self.clear_line(mode),
+            TerminalAction::InsertLines(count) => self.insert_lines(count),
+            TerminalAction::DeleteLines(count) => self.delete_lines(count),
+            TerminalAction::InsertChars(count) => self.insert_chars(count),
+            TerminalAction::DeleteChars(count) => self.delete_chars(count),
+            TerminalAction::EraseChars(count) => self.erase_chars(count),
             TerminalAction::SetGraphicRendition(renditions) => self.apply_sgr(&renditions),
             TerminalAction::SetMode { mode, enabled } => self.set_mode(mode, enabled),
             TerminalAction::SetCursorVisible(visible) => self.cursor_visible = visible,
             TerminalAction::SetCursorShape(shape) => self.cursor_shape = shape,
+            TerminalAction::SetTitle(title) => self.title = Some(title),
+            TerminalAction::SetTabStop => {
+                self.tab_stops.insert(self.active().cursor_col as u16);
+                self.tab_stops_modified = true;
+            }
+            TerminalAction::ClearTabStop => {
+                let col = self.active().cursor_col as u16;
+                self.tab_stops.remove(&col);
+                self.tab_stops_modified = true;
+            }
+            TerminalAction::ClearAllTabStops => {
+                self.tab_stops.clear();
+                self.tab_stops_modified = true;
+            }
+            TerminalAction::DeviceStatusReport(report) => self.device_status_report(report),
             TerminalAction::SetScrollRegion { top, bottom } => {
                 self.active_mut().set_scroll_region(top, bottom);
             }
@@ -421,6 +492,20 @@ impl TerminalState {
         self.selection = None;
     }
 
+    #[must_use]
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    #[must_use]
+    pub fn pending_output(&self) -> &[u8] {
+        &self.pending_output
+    }
+
+    pub fn take_pending_output(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending_output)
+    }
+
     fn reset(&mut self) {
         let size = self.active().size;
         *self = Self::new(size);
@@ -455,10 +540,11 @@ impl TerminalState {
         }
 
         let autowrap = self.modes.contains(&TerminalMode::AutoWrap);
+        let insert = self.modes.contains(&TerminalMode::Insert);
         let attributes = self.attributes;
         let use_scrollback = self.active_is_primary();
         self.active_mut()
-            .print(ch, attributes, autowrap, use_scrollback);
+            .print(ch, attributes, autowrap, insert, use_scrollback);
         self.selection = None;
     }
 
@@ -468,10 +554,15 @@ impl TerminalState {
     }
 
     fn tab(&mut self) {
-        let current = self.active().cursor_col;
-        let next_tab = ((current / 8) + 1) * 8;
+        let current = self.active().cursor_col as u16;
+        let next_tab = self
+            .tab_stops
+            .iter()
+            .copied()
+            .find(|stop| *stop > current)
+            .unwrap_or(self.active().size.cols.saturating_sub(1));
         let max_col = usize::from(self.active().size.cols.saturating_sub(1));
-        self.active_mut().cursor_col = next_tab.min(max_col);
+        self.active_mut().cursor_col = usize::from(next_tab).min(max_col);
     }
 
     fn clear_screen(&mut self, mode: ClearMode) {
@@ -501,7 +592,11 @@ impl TerminalState {
             match *rendition {
                 GraphicRendition::Reset => self.attributes.reset(),
                 GraphicRendition::Bold => self.attributes.bold = true,
-                GraphicRendition::NormalIntensity => self.attributes.bold = false,
+                GraphicRendition::Dim => self.attributes.dim = true,
+                GraphicRendition::NormalIntensity => {
+                    self.attributes.bold = false;
+                    self.attributes.dim = false;
+                }
                 GraphicRendition::Italic => self.attributes.italic = true,
                 GraphicRendition::NoItalic => self.attributes.italic = false,
                 GraphicRendition::Underline => self.attributes.underline = true,
@@ -515,6 +610,67 @@ impl TerminalState {
                 GraphicRendition::DefaultForeground => self.attributes.foreground = None,
                 GraphicRendition::DefaultBackground => self.attributes.background = None,
             }
+        }
+    }
+
+    fn save_cursor(&mut self) {
+        self.saved_cursor = Some(SavedCursor {
+            row: self.active().cursor_row,
+            col: self.active().cursor_col,
+            attributes: self.attributes,
+            shape: self.cursor_shape,
+            visible: self.cursor_visible,
+        });
+    }
+
+    fn restore_cursor(&mut self) {
+        let Some(saved) = self.saved_cursor else {
+            return;
+        };
+
+        self.active_mut().cursor_row = saved.row;
+        self.active_mut().cursor_col = saved.col;
+        self.active_mut().clamp_cursor();
+        self.attributes = saved.attributes;
+        self.cursor_shape = saved.shape;
+        self.cursor_visible = saved.visible;
+    }
+
+    fn insert_lines(&mut self, count: u16) {
+        let attributes = self.attributes;
+        self.active_mut().insert_lines(count.max(1), attributes);
+    }
+
+    fn delete_lines(&mut self, count: u16) {
+        let attributes = self.attributes;
+        self.active_mut().delete_lines(count.max(1), attributes);
+    }
+
+    fn insert_chars(&mut self, count: u16) {
+        let attributes = self.attributes;
+        self.active_mut().insert_chars(count.max(1), attributes);
+    }
+
+    fn delete_chars(&mut self, count: u16) {
+        let attributes = self.attributes;
+        self.active_mut().delete_chars(count.max(1), attributes);
+    }
+
+    fn erase_chars(&mut self, count: u16) {
+        let attributes = self.attributes;
+        self.active_mut().erase_chars(count.max(1), attributes);
+    }
+
+    fn device_status_report(&mut self, report: u16) {
+        match report {
+            5 => self.pending_output.extend_from_slice(b"\x1b[0n"),
+            6 => {
+                let cursor = self.active().cursor_position();
+                self.pending_output.extend_from_slice(
+                    format!("\x1b[{};{}R", cursor.row + 1, cursor.col + 1).as_bytes(),
+                );
+            }
+            _ => {}
         }
     }
 
@@ -569,7 +725,9 @@ impl TerminalState {
             };
 
             for cell in &line.cells[from..=to] {
-                out.push_str(&cell.text);
+                if !cell.wide_continuation {
+                    out.push_str(&cell.text);
+                }
             }
 
             let should_join_wrapped =
@@ -605,6 +763,9 @@ impl TerminalCore for TerminalState {
 
         if let Some(alternate) = &mut self.alternate {
             alternate.resize_visible(size);
+        }
+        if !self.tab_stops_modified {
+            self.tab_stops = default_tab_stops(size.cols);
         }
 
         Ok(())
@@ -657,6 +818,15 @@ struct ScreenBuffer {
     scroll_bottom: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SavedCursor {
+    row: usize,
+    col: usize,
+    attributes: CellAttributes,
+    shape: CursorShape,
+    visible: bool,
+}
+
 impl ScreenBuffer {
     fn new(size: TerminalSize) -> Self {
         let size = size.normalized();
@@ -685,8 +855,15 @@ impl ScreenBuffer {
         ch: char,
         attributes: CellAttributes,
         autowrap: bool,
+        insert: bool,
         append_scrollback: bool,
     ) {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(1).min(2);
+        if width == 0 {
+            self.append_combining_char(ch);
+            return;
+        }
+
         let cols = usize::from(self.size.cols);
         if self.cursor_col >= cols {
             if autowrap {
@@ -696,6 +873,18 @@ impl ScreenBuffer {
             }
         }
 
+        if width == 2 && self.cursor_col + 1 >= cols && autowrap {
+            if let Some(line) = self.lines.get_mut(self.cursor_row) {
+                line.hard_wrapped = true;
+            }
+            self.wrap_line(append_scrollback);
+        }
+
+        if insert {
+            self.insert_chars(width as u16, attributes);
+        }
+
+        self.clear_wide_at(self.cursor_row, self.cursor_col);
         if let Some(cell) = self
             .lines
             .get_mut(self.cursor_row)
@@ -704,7 +893,17 @@ impl ScreenBuffer {
             *cell = Cell::text(ch.to_string(), attributes);
         }
 
-        if self.cursor_col + 1 >= cols {
+        if width == 2
+            && let Some(cell) = self
+                .lines
+                .get_mut(self.cursor_row)
+                .and_then(|line| line.cells.get_mut(self.cursor_col + 1))
+        {
+            *cell = Cell::wide_continuation(attributes);
+        }
+
+        let advance = width.max(1);
+        if self.cursor_col + advance >= cols {
             if autowrap {
                 if let Some(line) = self.lines.get_mut(self.cursor_row) {
                     line.hard_wrapped = true;
@@ -712,7 +911,29 @@ impl ScreenBuffer {
                 self.wrap_line(append_scrollback);
             }
         } else {
-            self.cursor_col += 1;
+            self.cursor_col += advance;
+        }
+    }
+
+    fn append_combining_char(&mut self, ch: char) {
+        let (row, col) = if self.cursor_col > 0 {
+            (self.cursor_row, self.cursor_col - 1)
+        } else if self.cursor_row > 0 {
+            (
+                self.cursor_row - 1,
+                usize::from(self.size.cols.saturating_sub(1)),
+            )
+        } else {
+            return;
+        };
+
+        if let Some(cell) = self
+            .lines
+            .get_mut(row)
+            .and_then(|line| line.cells.get_mut(col))
+            && !cell.wide_continuation
+        {
+            cell.text.push(ch);
         }
     }
 
@@ -809,6 +1030,91 @@ impl ScreenBuffer {
             line.cells[index] = Cell::blank(attributes);
         }
         line.hard_wrapped = false;
+    }
+
+    fn insert_lines(&mut self, count: u16, attributes: CellAttributes) {
+        if self.cursor_row < self.scroll_top || self.cursor_row > self.scroll_bottom {
+            return;
+        }
+
+        let count = usize::from(count).min(self.scroll_bottom - self.cursor_row + 1);
+        for _ in 0..count {
+            self.lines.insert(
+                self.cursor_row,
+                Line::blank_with_attributes(self.size.cols, attributes),
+            );
+            self.lines.remove(self.scroll_bottom + 1);
+        }
+    }
+
+    fn delete_lines(&mut self, count: u16, attributes: CellAttributes) {
+        if self.cursor_row < self.scroll_top || self.cursor_row > self.scroll_bottom {
+            return;
+        }
+
+        let count = usize::from(count).min(self.scroll_bottom - self.cursor_row + 1);
+        for _ in 0..count {
+            self.lines.remove(self.cursor_row);
+            self.lines.insert(
+                self.scroll_bottom,
+                Line::blank_with_attributes(self.size.cols, attributes),
+            );
+        }
+    }
+
+    fn insert_chars(&mut self, count: u16, attributes: CellAttributes) {
+        let Some(line) = self.lines.get_mut(self.cursor_row) else {
+            return;
+        };
+        let count = usize::from(count).min(line.cells.len().saturating_sub(self.cursor_col));
+        for _ in 0..count {
+            line.cells.insert(self.cursor_col, Cell::blank(attributes));
+            line.cells.pop();
+        }
+        line.hard_wrapped = false;
+    }
+
+    fn delete_chars(&mut self, count: u16, attributes: CellAttributes) {
+        let Some(line) = self.lines.get_mut(self.cursor_row) else {
+            return;
+        };
+        let count = usize::from(count).min(line.cells.len().saturating_sub(self.cursor_col));
+        for _ in 0..count {
+            line.cells.remove(self.cursor_col);
+            line.cells.push(Cell::blank(attributes));
+        }
+        line.hard_wrapped = false;
+    }
+
+    fn erase_chars(&mut self, count: u16, attributes: CellAttributes) {
+        let Some(line) = self.lines.get_mut(self.cursor_row) else {
+            return;
+        };
+        let end = (self.cursor_col + usize::from(count)).min(line.cells.len());
+        for cell in &mut line.cells[self.cursor_col..end] {
+            *cell = Cell::blank(attributes);
+        }
+    }
+
+    fn clear_wide_at(&mut self, row: usize, col: usize) {
+        let Some(line) = self.lines.get_mut(row) else {
+            return;
+        };
+
+        if line
+            .cells
+            .get(col)
+            .is_some_and(|cell| cell.wide_continuation)
+            && col > 0
+        {
+            line.cells[col - 1] = Cell::blank(CellAttributes::default());
+            line.cells[col] = Cell::blank(CellAttributes::default());
+            return;
+        }
+
+        if line.cells.get(col).is_some_and(|cell| cell.width > 1) && col + 1 < line.cells.len() {
+            line.cells[col + 1] = Cell::blank(CellAttributes::default());
+        }
     }
 
     fn set_scroll_region(&mut self, top: u16, bottom: u16) {
@@ -957,6 +1263,22 @@ fn trim_selection_text(mut text: String) -> String {
     text
 }
 
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(1))
+        .sum()
+}
+
+fn default_tab_stops(cols: u16) -> BTreeSet<u16> {
+    let mut stops = BTreeSet::new();
+    let mut col = 8;
+    while col < cols {
+        stops.insert(col);
+        col += 8;
+    }
+    stops
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalError {
     message: String,
@@ -1007,7 +1329,16 @@ mod tests {
         let manifest = include_str!("../Cargo.toml");
 
         assert!(
-            !manifest.contains("[dependencies]"),
+            manifest.contains("unicode-width.workspace = true"),
+            "term-core may use low-level Unicode utilities for terminal cell width"
+        );
+        assert!(
+            !manifest.contains("render-")
+                && !manifest.contains("platform-")
+                && !manifest.contains("transport-")
+                && !manifest.contains("config-")
+                && !manifest.contains("term-parser")
+                && !manifest.contains("mux"),
             "term-core must remain below parser, renderer, platform, transport, config, and mux"
         );
     }

@@ -56,6 +56,13 @@ If a task does not fit, redesign it before implementation.
   renderer-independent style fields, damage tracking, frame scheduling, CPU
   visual snapshot tests, and a desktop window path that feeds local PTY output
   through the terminal parser/core into the renderer.
+- Implemented the Phase 6 baseline compatibility foundation: expanded ANSI/VT
+  parser coverage for truecolor/indexed/style SGR, title OSC, save/restore
+  cursor, line/character insert/delete/erase, tab stop operations, DSR/CPR
+  pending responses, mouse/focus/bracketed-paste modes, TERM/COLORTERM local PTY
+  defaults, desktop forwarding for bracketed paste, focus, and SGR/legacy mouse
+  reports, URL hint detection with basic semantic overlays, and Unicode
+  wide/combining-cell groundwork.
 
 ## Deferred By Design
 
@@ -86,3 +93,10 @@ If a task does not fit, redesign it before implementation.
 - Phase 5 has build/test verification on the current Windows host. macOS,
   Linux X11, and Linux Wayland rendering remain unverified until run on those
   platforms.
+- Phase 6 establishes compatibility mechanics and lower-level golden coverage,
+  but app-level smoke testing for bash/zsh/fish/PowerShell/cmd/vim/less/TUI
+  apps/tmux/screen/zellij/SSH remains unverified until run on the relevant
+  host platforms.
+- Full grapheme cluster editing, emoji ZWJ behavior, primary selection, OSC 52
+  clipboard, application keypad output mapping, a custom terminfo entry, and a
+  configurable hint engine remain deferred compatibility work.

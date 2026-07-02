@@ -1,21 +1,26 @@
-use std::{error::Error, sync::Arc};
+use std::{collections::BTreeSet, error::Error, sync::Arc};
 
-use config_core::{AppConfig, DecorationStrategyConfig, LinuxBackendConfig, WindowModeConfig};
+use config_core::{
+    AppConfig, DecorationStrategyConfig, LinuxBackendConfig, PasteConfig, WindowModeConfig,
+};
 use font_system::{CellMetrics, FontConfig, FontSystem};
 use platform_core::{
-    DecorationMode, InputEvent, KeyEvent, KeyState, LinuxWindowBackend, WindowAction, WindowMode,
+    DecorationMode, InputEvent, KeyEvent, KeyModifiers, KeyState, LinuxWindowBackend, MouseButton,
+    MouseEvent, MouseEventKind, WindowAction, WindowMode,
 };
 use platform_winit::{
     ClipboardBridge, DesktopWindow, InputTranslator, WindowSettings, apply_window_mode,
     platform_capabilities,
 };
 use render_core::{
-    CellPosition, CursorVisual, RenderCell, RenderCellStyle, RenderColor, RenderCursorShape,
-    RenderGrid, RenderScene,
+    CellPosition, CursorVisual, OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle,
+    RenderColor, RenderCursorShape, RenderGrid, RenderRect, RenderScene,
 };
 use render_wgpu::{FrameDecision, FrameScheduler, GpuTerminalRenderer, RendererOptions};
+use semantics::detect_url_hints;
 use term_core::{
-    CellAttributes, Color, CursorShape, TerminalCore, TerminalSize as CoreTerminalSize,
+    CellAttributes, Color, CursorShape, TerminalCore, TerminalMode,
+    TerminalSize as CoreTerminalSize,
 };
 use term_parser::TerminalEmulator;
 use transport_core::{TerminalSize as TransportSize, TerminalTransport};
@@ -44,6 +49,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut input_translator = InputTranslator::new();
     let mut clipboard = ClipboardBridge::new();
     let mut current_window_mode = map_window_mode(config.window.mode);
+    let paste_config = config.paste.clone();
+    let mut mouse_protocol = MouseProtocolState::default();
 
     let mut fonts = FontSystem::new(FontConfig::default());
     let metrics = fonts.cell_metrics()?;
@@ -74,7 +81,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
                 WindowEvent::RedrawRequested => {
-                    let scene = scene_from_terminal(&terminal);
+                    let metrics = fonts.cell_metrics().ok();
+                    let scene = scene_from_terminal(&terminal, metrics);
                     if let Err(error) = renderer.render_scene(&scene, &mut fonts) {
                         eprintln!("render error: {error}");
                     }
@@ -111,9 +119,28 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 } else if let Some(transport) = transport.as_mut() {
                                     if is_paste_shortcut(&key) {
                                         if let Ok(text) = clipboard.paste_text() {
-                                            let _ = transport.write_input(text.as_bytes());
+                                            let bytes = paste_bytes(
+                                                &text,
+                                                &paste_config,
+                                                terminal
+                                                    .modes()
+                                                    .contains(&TerminalMode::BracketedPaste),
+                                            );
+                                            let _ = transport.write_input(&bytes);
                                         }
                                     } else if let Some(bytes) = input_bytes(&key) {
+                                        let _ = transport.write_input(&bytes);
+                                    }
+                                }
+                            }
+                            InputEvent::Mouse(mouse) => {
+                                if let Some(transport) = transport.as_mut()
+                                    && let Ok(metrics) = fonts.cell_metrics()
+                                {
+                                    let modes = terminal.modes();
+                                    if let Some(bytes) =
+                                        mouse_protocol.report_bytes(mouse, metrics, &modes)
+                                    {
                                         let _ = transport.write_input(&bytes);
                                     }
                                 }
@@ -121,6 +148,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                             InputEvent::Ime(platform_core::ImeEvent::Commit { text }) => {
                                 if let Some(transport) = transport.as_mut() {
                                     let _ = transport.write_input(text.as_bytes());
+                                }
+                            }
+                            InputEvent::Focused(focused) => {
+                                if terminal.modes().contains(&TerminalMode::FocusEvents)
+                                    && let Some(transport) = transport.as_mut()
+                                {
+                                    let bytes = if focused { b"\x1b[I" } else { b"\x1b[O" };
+                                    let _ = transport.write_input(bytes);
                                 }
                             }
                             InputEvent::WindowAction(action) => match action {
@@ -174,11 +209,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                             break;
                         }
 
-                        if contains_cpr_query(&output.bytes) {
-                            let _ = transport.write_input(b"\x1b[1;1R");
-                        }
                         if !output.bytes.is_empty() {
                             let _ = terminal.apply_bytes(&output.bytes);
+                            flush_terminal_responses(&mut terminal, transport);
                             content_changed = true;
                         }
                         if output.closed {
@@ -256,14 +289,40 @@ fn is_copy_shortcut(event: &KeyEvent) -> bool {
         && event.logical_key.eq_ignore_ascii_case("c")
 }
 
+fn paste_bytes(text: &str, config: &PasteConfig, bracketed_mode: bool) -> Vec<u8> {
+    let mut text = if config.normalize_newlines {
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        text.to_owned()
+    };
+
+    if config.strip_control_characters {
+        text.retain(|ch| ch == '\n' || ch == '\t' || !ch.is_control());
+    }
+
+    let mut bytes = Vec::new();
+    if bracketed_mode && config.bracketed_paste {
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+    } else {
+        bytes.extend_from_slice(text.as_bytes());
+    }
+
+    bytes
+}
+
 fn shutdown_transport(transport: Option<&mut LocalPtyTransport>) {
     if let Some(transport) = transport {
         let _ = transport.shutdown();
     }
 }
 
-fn contains_cpr_query(bytes: &[u8]) -> bool {
-    bytes.windows(4).any(|window| window == b"\x1b[6n")
+fn flush_terminal_responses(terminal: &mut TerminalEmulator, transport: &mut LocalPtyTransport) {
+    let responses = terminal.state_mut().take_pending_output();
+    if !responses.is_empty() {
+        let _ = transport.write_input(&responses);
+    }
 }
 
 fn window_settings(config: &AppConfig) -> WindowSettings {
@@ -326,7 +385,7 @@ impl DesktopDiagnosticsPlaceholder {
     }
 }
 
-fn scene_from_terminal(terminal: &TerminalEmulator) -> RenderScene {
+fn scene_from_terminal(terminal: &TerminalEmulator, metrics: Option<CellMetrics>) -> RenderScene {
     let visible = terminal.visible_grid();
     let cursor = terminal.cursor_state();
     let mut cells = Vec::with_capacity(visible.cells.len());
@@ -344,6 +403,10 @@ fn scene_from_terminal(terminal: &TerminalEmulator) -> RenderScene {
             style: style_for_attributes(cell.attributes),
         });
     }
+
+    let semantic_overlays = metrics.map_or_else(Vec::new, |metrics| {
+        url_hint_overlays(terminal, visible.viewport.size.rows, metrics)
+    });
 
     RenderScene {
         grid: RenderGrid {
@@ -364,8 +427,48 @@ fn scene_from_terminal(terminal: &TerminalEmulator) -> RenderScene {
             color: RenderColor::rgb(235, 235, 235),
             visible: cursor.visible,
         }),
+        semantic_overlays,
         ..RenderScene::default()
     }
+}
+
+fn url_hint_overlays(
+    terminal: &TerminalEmulator,
+    rows: u16,
+    metrics: CellMetrics,
+) -> Vec<OverlayPrimitive> {
+    let mut lines = Vec::new();
+    for row in 0..rows {
+        if let Some(line) = terminal.state().line(row) {
+            lines.push((i64::from(row), line.raw_text()));
+        }
+    }
+
+    let borrowed = lines
+        .iter()
+        .map(|(row, text)| (*row, text.as_str()))
+        .collect::<Vec<_>>();
+
+    detect_url_hints(borrowed)
+        .into_iter()
+        .map(|hint| OverlayPrimitive {
+            kind: OverlayKind::Semantic,
+            bounds: RenderRect {
+                x: (f32::from(hint.start.col) * metrics.cell_width).floor() as i32,
+                y: (hint.start.row.max(0) as f32 * metrics.cell_height).floor() as i32,
+                width: (f32::from(hint.end.col.saturating_sub(hint.start.col)) * metrics.cell_width)
+                    .ceil() as u32,
+                height: metrics.cell_height.ceil() as u32,
+            },
+            color: RenderColor {
+                red: 80,
+                green: 150,
+                blue: 255,
+                alpha: 64,
+            },
+            label: Some(hint.text),
+        })
+        .collect()
 }
 
 fn style_for_attributes(attributes: CellAttributes) -> RenderCellStyle {
@@ -394,6 +497,164 @@ fn color_or_default(color: Option<Color>, default: RenderColor) -> RenderColor {
         Some(Color::Indexed(index)) => ansi_color(index),
         Some(Color::DefaultForeground | Color::DefaultBackground) | None => default,
     }
+}
+
+#[derive(Debug, Default)]
+struct MouseProtocolState {
+    pressed_button: Option<MouseButton>,
+}
+
+impl MouseProtocolState {
+    fn report_bytes(
+        &mut self,
+        event: MouseEvent,
+        metrics: CellMetrics,
+        modes: &BTreeSet<TerminalMode>,
+    ) -> Option<Vec<u8>> {
+        let enabled = modes.contains(&TerminalMode::MouseReporting)
+            || modes.contains(&TerminalMode::MouseCellMotion)
+            || modes.contains(&TerminalMode::MouseAllMotion);
+        if !enabled {
+            return None;
+        }
+
+        let col = ((event.x / f64::from(metrics.cell_width)).floor() as u16).saturating_add(1);
+        let row = ((event.y / f64::from(metrics.cell_height)).floor() as u16).saturating_add(1);
+
+        let report = match event.kind {
+            MouseEventKind::Pressed(button) => {
+                self.pressed_button = Some(button);
+                MouseReport {
+                    button_code: mouse_button_code(button)?,
+                    pressed: true,
+                    motion: false,
+                    row,
+                    col,
+                    modifiers: event.modifiers,
+                }
+            }
+            MouseEventKind::Released(button) => {
+                self.pressed_button = None;
+                MouseReport {
+                    button_code: mouse_button_code(button)?,
+                    pressed: false,
+                    motion: false,
+                    row,
+                    col,
+                    modifiers: event.modifiers,
+                }
+            }
+            MouseEventKind::Moved => {
+                if modes.contains(&TerminalMode::MouseAllMotion) {
+                    MouseReport {
+                        button_code: self.pressed_button.and_then(mouse_button_code).unwrap_or(3),
+                        pressed: self.pressed_button.is_some(),
+                        motion: true,
+                        row,
+                        col,
+                        modifiers: event.modifiers,
+                    }
+                } else if modes.contains(&TerminalMode::MouseCellMotion)
+                    && self.pressed_button.is_some()
+                {
+                    MouseReport {
+                        button_code: self.pressed_button.and_then(mouse_button_code)?,
+                        pressed: true,
+                        motion: true,
+                        row,
+                        col,
+                        modifiers: event.modifiers,
+                    }
+                } else {
+                    return None;
+                }
+            }
+            MouseEventKind::Wheel { delta_x, delta_y } => {
+                let button_code = if delta_y > 0.0 {
+                    64
+                } else if delta_y < 0.0 {
+                    65
+                } else if delta_x > 0.0 {
+                    66
+                } else if delta_x < 0.0 {
+                    67
+                } else {
+                    return None;
+                };
+                MouseReport {
+                    button_code,
+                    pressed: true,
+                    motion: false,
+                    row,
+                    col,
+                    modifiers: event.modifiers,
+                }
+            }
+        };
+
+        Some(encode_mouse_report(
+            report,
+            modes.contains(&TerminalMode::SgrMouse),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MouseReport {
+    button_code: u16,
+    pressed: bool,
+    motion: bool,
+    row: u16,
+    col: u16,
+    modifiers: KeyModifiers,
+}
+
+fn mouse_button_code(button: MouseButton) -> Option<u16> {
+    match button {
+        MouseButton::Left => Some(0),
+        MouseButton::Middle => Some(1),
+        MouseButton::Right => Some(2),
+        MouseButton::Back | MouseButton::Forward | MouseButton::Other(_) => None,
+    }
+}
+
+fn encode_mouse_report(report: MouseReport, sgr: bool) -> Vec<u8> {
+    let mut button_code = report.button_code;
+    if report.motion {
+        button_code += 32;
+    }
+    if report.modifiers.shift {
+        button_code += 4;
+    }
+    if report.modifiers.alt {
+        button_code += 8;
+    }
+    if report.modifiers.ctrl {
+        button_code += 16;
+    }
+
+    if sgr {
+        let suffix = if report.pressed { 'M' } else { 'm' };
+        format!(
+            "\x1b[<{};{};{}{}",
+            button_code, report.col, report.row, suffix
+        )
+        .into_bytes()
+    } else {
+        let legacy_code = if report.pressed { button_code } else { 3 };
+        vec![
+            0x1b,
+            b'[',
+            b'M',
+            encode_legacy_mouse_coord(legacy_code),
+            encode_legacy_mouse_coord(report.col),
+            encode_legacy_mouse_coord(report.row),
+        ]
+    }
+}
+
+fn encode_legacy_mouse_coord(value: u16) -> u8 {
+    value.saturating_add(32).min(255) as u8
 }
 
 fn ansi_color(index: u8) -> RenderColor {

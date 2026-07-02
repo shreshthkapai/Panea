@@ -19,6 +19,7 @@ platform-winit = { path = "../../crates/platform-winit" }
 pollster.workspace = true
 render-core = { path = "../../crates/render-core" }
 render-wgpu = { path = "../../crates/render-wgpu" }
+semantics = { path = "../../crates/semantics" }
 term-core = { path = "../../crates/term-core" }
 term-parser = { path = "../../crates/term-parser" }
 transport-core = { path = "../../crates/transport-core" }

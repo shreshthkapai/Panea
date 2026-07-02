@@ -117,7 +117,24 @@ impl Parser {
                 },
                 ParserState::Escape => match *byte {
                     b'[' => self.state = ParserState::Csi(CsiState::default()),
-                    b']' => self.state = ParserState::Osc { escape_seen: false },
+                    b']' => {
+                        self.state = ParserState::Osc {
+                            escape_seen: false,
+                            content: Vec::new(),
+                        }
+                    }
+                    b'7' => {
+                        actions.push(TerminalAction::SaveCursor);
+                        self.state = ParserState::Ground;
+                    }
+                    b'8' => {
+                        actions.push(TerminalAction::RestoreCursor);
+                        self.state = ParserState::Ground;
+                    }
+                    b'H' => {
+                        actions.push(TerminalAction::SetTabStop);
+                        self.state = ParserState::Ground;
+                    }
                     b'c' => {
                         actions.push(TerminalAction::Reset);
                         self.state = ParserState::Ground;
@@ -131,11 +148,29 @@ impl Parser {
                         self.state = ParserState::Ground;
                     }
                 }
-                ParserState::Osc { escape_seen } => match (*byte, *escape_seen) {
-                    (0x07, _) => self.state = ParserState::Ground,
-                    (b'\\', true) => self.state = ParserState::Ground,
-                    (0x1b, _) => *escape_seen = true,
-                    (_, _) => *escape_seen = false,
+                ParserState::Osc {
+                    escape_seen,
+                    content,
+                } => match (*byte, *escape_seen) {
+                    (0x07, _) => {
+                        actions.extend(dispatch_osc(content));
+                        self.state = ParserState::Ground;
+                    }
+                    (b'\\', true) => {
+                        if content.last() == Some(&0x1b) {
+                            content.pop();
+                        }
+                        actions.extend(dispatch_osc(content));
+                        self.state = ParserState::Ground;
+                    }
+                    (0x1b, _) => {
+                        content.push(*byte);
+                        *escape_seen = true;
+                    }
+                    (_, _) => {
+                        content.push(*byte);
+                        *escape_seen = false;
+                    }
                 },
             }
         }
@@ -163,7 +198,7 @@ enum ParserState {
     Ground,
     Escape,
     Csi(CsiState),
-    Osc { escape_seen: bool },
+    Osc { escape_seen: bool, content: Vec<u8> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -219,6 +254,7 @@ fn dispatch_csi(csi: &CsiState) -> Vec<TerminalAction> {
     };
 
     match final_byte {
+        b'@' => vec![TerminalAction::InsertChars(csi.param_or(0, 1))],
         b'A' => vec![move_cursor(csi, CursorDirection::Up)],
         b'B' => vec![move_cursor(csi, CursorDirection::Down)],
         b'C' => vec![move_cursor(csi, CursorDirection::Forward)],
@@ -232,9 +268,17 @@ fn dispatch_csi(csi: &CsiState) -> Vec<TerminalAction> {
         }],
         b'J' => vec![TerminalAction::ClearScreen(clear_mode(csi.param_or(0, 0)))],
         b'K' => vec![TerminalAction::ClearLine(clear_mode(csi.param_or(0, 0)))],
+        b'L' => vec![TerminalAction::InsertLines(csi.param_or(0, 1))],
+        b'M' => vec![TerminalAction::DeleteLines(csi.param_or(0, 1))],
+        b'P' => vec![TerminalAction::DeleteChars(csi.param_or(0, 1))],
+        b'X' => vec![TerminalAction::EraseChars(csi.param_or(0, 1))],
+        b'g' => tab_clear_action(csi),
         b'm' => vec![TerminalAction::SetGraphicRendition(parse_sgr(
             &csi.params(),
         ))],
+        b'n' => vec![TerminalAction::DeviceStatusReport(csi.param_or(0, 0))],
+        b's' => vec![TerminalAction::SaveCursor],
+        b'u' => vec![TerminalAction::RestoreCursor],
         b'h' | b'l' => mode_actions(csi, final_byte == b'h'),
         b'r' => scroll_region_action(csi),
         b'q' if csi.intermediate_space => cursor_shape_action(csi),
@@ -270,6 +314,7 @@ fn parse_sgr(params: &[u16]) -> Vec<GraphicRendition> {
         match params[index] {
             0 => out.push(GraphicRendition::Reset),
             1 => out.push(GraphicRendition::Bold),
+            2 => out.push(GraphicRendition::Dim),
             3 => out.push(GraphicRendition::Italic),
             4 => out.push(GraphicRendition::Underline),
             7 => out.push(GraphicRendition::Inverse),
@@ -338,28 +383,93 @@ fn color_rendition(foreground: bool, color: Color) -> GraphicRendition {
 
 fn mode_actions(csi: &CsiState, enabled: bool) -> Vec<TerminalAction> {
     if !csi.private {
-        return Vec::new();
+        return csi
+            .params()
+            .into_iter()
+            .filter_map(|mode| match mode {
+                4 => Some(TerminalAction::SetMode {
+                    mode: TerminalMode::Insert,
+                    enabled,
+                }),
+                _ => None,
+            })
+            .collect();
     }
 
-    csi.params()
-        .into_iter()
-        .filter_map(|mode| {
-            let mode = match mode {
-                1 => TerminalMode::ApplicationCursorKeys,
-                25 => return Some(TerminalAction::SetCursorVisible(enabled)),
-                66 => TerminalMode::ApplicationKeypad,
-                1000 => TerminalMode::MouseReporting,
-                1002 => TerminalMode::MouseCellMotion,
-                1003 => TerminalMode::MouseAllMotion,
-                1004 => TerminalMode::FocusEvents,
-                1047 | 1049 => TerminalMode::AlternateScreen,
-                2004 => TerminalMode::BracketedPaste,
-                _ => return None,
-            };
+    let mut actions = Vec::new();
+    for mode in csi.params() {
+        match mode {
+            1 => actions.push(TerminalAction::SetMode {
+                mode: TerminalMode::ApplicationCursorKeys,
+                enabled,
+            }),
+            25 => actions.push(TerminalAction::SetCursorVisible(enabled)),
+            66 => actions.push(TerminalAction::SetMode {
+                mode: TerminalMode::ApplicationKeypad,
+                enabled,
+            }),
+            1000 => actions.push(TerminalAction::SetMode {
+                mode: TerminalMode::MouseReporting,
+                enabled,
+            }),
+            1002 => actions.push(TerminalAction::SetMode {
+                mode: TerminalMode::MouseCellMotion,
+                enabled,
+            }),
+            1003 => actions.push(TerminalAction::SetMode {
+                mode: TerminalMode::MouseAllMotion,
+                enabled,
+            }),
+            1004 => actions.push(TerminalAction::SetMode {
+                mode: TerminalMode::FocusEvents,
+                enabled,
+            }),
+            1006 => actions.push(TerminalAction::SetMode {
+                mode: TerminalMode::SgrMouse,
+                enabled,
+            }),
+            1048 => {
+                if enabled {
+                    actions.push(TerminalAction::SaveCursor);
+                } else {
+                    actions.push(TerminalAction::RestoreCursor);
+                }
+            }
+            1047 => actions.push(TerminalAction::SetMode {
+                mode: TerminalMode::AlternateScreen,
+                enabled,
+            }),
+            1049 => {
+                if enabled {
+                    actions.push(TerminalAction::SaveCursor);
+                    actions.push(TerminalAction::SetMode {
+                        mode: TerminalMode::AlternateScreen,
+                        enabled: true,
+                    });
+                } else {
+                    actions.push(TerminalAction::SetMode {
+                        mode: TerminalMode::AlternateScreen,
+                        enabled: false,
+                    });
+                    actions.push(TerminalAction::RestoreCursor);
+                }
+            }
+            2004 => actions.push(TerminalAction::SetMode {
+                mode: TerminalMode::BracketedPaste,
+                enabled,
+            }),
+            _ => {}
+        }
+    }
 
-            Some(TerminalAction::SetMode { mode, enabled })
-        })
-        .collect()
+    actions
+}
+
+fn tab_clear_action(csi: &CsiState) -> Vec<TerminalAction> {
+    match csi.param_or(0, 0) {
+        3 => vec![TerminalAction::ClearAllTabStops],
+        _ => vec![TerminalAction::ClearTabStop],
+    }
 }
 
 fn scroll_region_action(csi: &CsiState) -> Vec<TerminalAction> {
@@ -382,6 +492,18 @@ fn cursor_shape_action(csi: &CsiState) -> Vec<TerminalAction> {
     };
 
     vec![TerminalAction::SetCursorShape(shape)]
+}
+
+fn dispatch_osc(content: &[u8]) -> Vec<TerminalAction> {
+    let text = String::from_utf8_lossy(content);
+    let Some((command, payload)) = text.split_once(';') else {
+        return Vec::new();
+    };
+
+    match command {
+        "0" | "2" => vec![TerminalAction::SetTitle(payload.to_owned())],
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -494,6 +616,82 @@ mod tests {
         assert!(terminal.modes().contains(&TerminalMode::BracketedPaste));
         assert!(!terminal.cursor_state().visible);
         assert_eq!(terminal.cursor_state().shape, CursorShape::Beam);
+    }
+
+    #[test]
+    fn golden_extended_sgr_truecolor_and_dim() {
+        let terminal = terminal(
+            TerminalSize::new(10, 2),
+            b"\x1b[2;3;4;9;38;2;1;2;3;48;5;42mA",
+        );
+
+        let attrs = terminal.state().cell(0, 0).unwrap().attributes;
+        assert!(attrs.dim);
+        assert!(attrs.italic);
+        assert!(attrs.underline);
+        assert!(attrs.strikethrough);
+        assert_eq!(
+            attrs.foreground,
+            Some(Color::Rgb {
+                red: 1,
+                green: 2,
+                blue: 3
+            })
+        );
+        assert_eq!(attrs.background, Some(Color::Indexed(42)));
+    }
+
+    #[test]
+    fn golden_title_save_restore_and_status_response() {
+        let mut terminal = terminal(
+            TerminalSize::new(20, 3),
+            b"abc\x1b[s\r\nnext\x1b[u!\x1b]2;Panea title\x07\x1b[6n",
+        );
+
+        assert_eq!(terminal.state().title(), Some("Panea title"));
+        assert_eq!(line_text(&terminal, 0), "abc!");
+        assert_eq!(
+            String::from_utf8(terminal.state_mut().take_pending_output()).unwrap(),
+            "\x1b[1;5R"
+        );
+    }
+
+    #[test]
+    fn golden_insert_delete_line_and_char_operations() {
+        let terminal = terminal(
+            TerminalSize::new(8, 4),
+            b"one\r\ntwo\r\nthree\x1b[2;1H\x1b[1Lnew\x1b[4;2H\x1b[2P",
+        );
+
+        assert_eq!(line_text(&terminal, 0), "one");
+        assert_eq!(line_text(&terminal, 1), "new");
+        assert_eq!(line_text(&terminal, 3), "tee");
+    }
+
+    #[test]
+    fn golden_tab_stops_can_be_set_and_cleared() {
+        let terminal = terminal(TerminalSize::new(20, 2), b"\x1b[9G\x1b[g\x1b[1GA\tB");
+
+        assert_eq!(terminal.cursor_state().position, GridPosition::new(0, 17));
+        assert_eq!(line_text(&terminal, 0), "A               B");
+    }
+
+    #[test]
+    fn golden_mouse_modes_are_tracked() {
+        let terminal = terminal(TerminalSize::new(10, 2), b"\x1b[?1000;1006;1004h");
+
+        assert!(terminal.modes().contains(&TerminalMode::MouseReporting));
+        assert!(terminal.modes().contains(&TerminalMode::SgrMouse));
+        assert!(terminal.modes().contains(&TerminalMode::FocusEvents));
+    }
+
+    #[test]
+    fn golden_unicode_wide_and_combining_cells() {
+        let terminal = terminal(TerminalSize::new(6, 2), "a界e\u{301}b".as_bytes());
+
+        assert_eq!(line_text(&terminal, 0), "a界e\u{301}b");
+        assert!(terminal.state().cell(0, 2).unwrap().wide_continuation);
+        assert_eq!(terminal.cursor_state().position, GridPosition::new(0, 5));
     }
 
     #[test]

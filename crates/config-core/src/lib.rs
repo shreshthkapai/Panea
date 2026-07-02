@@ -17,6 +17,7 @@ pub struct AppConfig {
     pub prompt_decorations: PromptDecorationsConfig,
     pub keyboard: KeyboardConfig,
     pub mouse: MouseConfig,
+    pub paste: PasteConfig,
     pub shell_profiles: Vec<ShellProfile>,
     pub ssh_profiles: Vec<SshProfile>,
     pub mux: MuxConfig,
@@ -258,6 +259,23 @@ pub struct MouseConfig {
 pub struct MouseBinding {
     pub gesture: String,
     pub action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PasteConfig {
+    pub bracketed_paste: bool,
+    pub normalize_newlines: bool,
+    pub strip_control_characters: bool,
+}
+
+impl Default for PasteConfig {
+    fn default() -> Self {
+        Self {
+            bracketed_paste: true,
+            normalize_newlines: true,
+            strip_control_characters: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

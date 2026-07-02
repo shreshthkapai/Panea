@@ -390,6 +390,14 @@ impl TerminalRasterizer {
             self.draw_cell(&mut frame, cell, fonts, metrics)?;
         }
 
+        for overlay in scene
+            .search_highlights
+            .iter()
+            .chain(scene.semantic_overlays.iter())
+        {
+            blend_rect(&mut frame, overlay.bounds, overlay.color);
+        }
+
         for selection in &scene.selections {
             for position in &selection.cells {
                 fill_rect(&mut frame, cell_region(*position, metrics), selection.color);
@@ -488,6 +496,20 @@ fn fill_rect(frame: &mut CpuFrame, rect: RenderRect, color: RenderColor) {
             frame.pixels[index + 1] = color.green;
             frame.pixels[index + 2] = color.blue;
             frame.pixels[index + 3] = color.alpha;
+        }
+    }
+}
+
+fn blend_rect(frame: &mut CpuFrame, rect: RenderRect, color: RenderColor) {
+    let x0 = rect.x.max(0) as u32;
+    let y0 = rect.y.max(0) as u32;
+    let x1 = (rect.x.max(0) as u32 + rect.width).min(frame.width);
+    let y1 = (rect.y.max(0) as u32 + rect.height).min(frame.height);
+
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let index = ((y * frame.width + x) * 4) as usize;
+            blend_pixel(&mut frame.pixels[index..index + 4], color, color.alpha);
         }
     }
 }

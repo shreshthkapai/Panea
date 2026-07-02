@@ -57,6 +57,28 @@ pub enum SemanticRegionKind {
     Command,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HintKind {
+    Url,
+    FilePath,
+    Custom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HintAction {
+    OpenUrl(String),
+    CopyText(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedHint {
+    pub kind: HintKind,
+    pub start: BufferPosition,
+    pub end: BufferPosition,
+    pub text: String,
+    pub action: HintAction,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticRegion {
     pub id: u64,
@@ -120,6 +142,48 @@ pub trait SemanticTimeline {
     fn command_finished(&mut self, exit_status: CommandStatus, duration: Duration);
 }
 
+#[must_use]
+pub fn detect_url_hints<'a>(lines: impl IntoIterator<Item = (i64, &'a str)>) -> Vec<DetectedHint> {
+    let mut hints = Vec::new();
+
+    for (row, text) in lines {
+        for prefix in ["https://", "http://"] {
+            let mut search_from = 0;
+            while let Some(relative_start) = text[search_from..].find(prefix) {
+                let start = search_from + relative_start;
+                let end = text[start..]
+                    .find(is_url_terminator)
+                    .map_or(text.len(), |relative_end| start + relative_end);
+                if end > start {
+                    let url = trim_url_suffix(&text[start..end]).to_owned();
+                    if !url.is_empty() {
+                        let col_start = text[..start].chars().count() as u16;
+                        let col_end = col_start + url.chars().count() as u16;
+                        hints.push(DetectedHint {
+                            kind: HintKind::Url,
+                            start: BufferPosition::new(row, col_start),
+                            end: BufferPosition::new(row, col_end),
+                            text: url.clone(),
+                            action: HintAction::OpenUrl(url),
+                        });
+                    }
+                }
+                search_from = end.max(start + prefix.len());
+            }
+        }
+    }
+
+    hints
+}
+
+fn is_url_terminator(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '"' | '\'' | '<' | '>' | '[' | ']' | '{' | '}')
+}
+
+fn trim_url_suffix(text: &str) -> &str {
+    text.trim_end_matches(['.', ',', ')', ';', ':'])
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -130,5 +194,14 @@ mod tests {
             !manifest.contains("[dependencies]"),
             "semantics must reference terminal positions without importing terminal, parser, or renderer crates"
         );
+    }
+
+    #[test]
+    fn detects_url_hints_without_owning_terminal_text() {
+        let hints = super::detect_url_hints([(4, "open https://example.test/path, now")]);
+
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].text, "https://example.test/path");
+        assert_eq!(hints[0].start, super::BufferPosition::new(4, 5));
     }
 }

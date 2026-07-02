@@ -8,3 +8,5 @@ description = "Platform-neutral terminal grid, cursor, modes, scrollback, select
 [lints]
 workspace = true
 
+[dependencies]
+unicode-width.workspace = true
