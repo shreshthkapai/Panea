@@ -64,7 +64,7 @@ The runner composes existing Panea verification tools:
 - doctor JSON diagnostics
 - Linux compositor diagnostics on Linux targets
 - SSH real-server smoke tests when explicitly configured
-- packaging smoke status through the packaging plan
+- package build/content verification and packaged `panea doctor --json` smoke
 
 SSH smoke tests run only when `--with-ssh` is passed or
 `PANEA_SSH_SMOKE_HOST` is set. The runner does not invent a fake SSH pass; it

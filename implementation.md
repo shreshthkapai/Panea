@@ -252,11 +252,20 @@ to more visible features before the dependencies they rely on are hardened.
   `cargo xtask verify-os <plan|run|report>` with platform targets for Windows,
   macOS, Linux X11, and Linux Wayland; composed architecture, unit, parser,
   Unicode, fuzz-smoke, renderer, config, clipboard, shell, PTY, screenshot,
-  compatibility, doctor, Linux compositor, SSH, and packaging-status checks
+  compatibility, doctor, Linux compositor, SSH, and package-smoke checks
   into bounded per-step execution with logs; generated markdown and JSON
   reports under `target/cross-os/<platform>`; added GitHub Actions jobs for all
   four target paths; and documented the verification contract in
   `docs/cross-os-verification.md`.
+- Completed next-pass Phase 20 packaging artifacts: added
+  `cargo xtask package <plan|build|smoke>`, staged platform-specific portable
+  package layouts for Windows, macOS, and Linux, included the Panea binary,
+  generated default config and schema, bundled config examples, shell
+  integration scripts, docs, README, license, install notes, desktop/icon
+  resources where applicable, and package manifests, wired package smoke into
+  `cargo xtask verify-os`, documented the package layouts in
+  `docs/packaging.md`, and verified the Windows dev portable package by running
+  the packaged `panea.exe doctor --json`.
 
 ## Deferred By Design
 
@@ -390,12 +399,17 @@ to more visible features before the dependencies they rely on are hardened.
   product behavior; reports still have to pass on actual targets and blocked
   evidence such as missing screenshot baselines must be resolved.
 - Phase 14 does not make Panea a daily-driver release by itself. Daily-driver
-  release status remains blocked until packaged artifacts exist and
-  manual/automated validation passes on macOS, Windows, Linux X11, and Linux
-  Wayland. OS keychain-backed secret providers, interactive SSH host-key
+  release status remains blocked until portable packages and installer-grade
+  artifacts pass manual/automated validation on macOS, Windows, Linux X11, and
+  Linux Wayland. Next-pass Phase 20 adds portable/staged package directories
+  and a packaged doctor smoke, with Windows dev portable smoke verified on the
+  current host. MSI/installer, Start menu/PATH integration, macOS DMG/zip,
+  signing/notarization, Linux AppImage/deb/rpm, terminfo installation strategy,
+  package shell-launch automation, and macOS/Linux package reports remain
+  follow-up work. OS keychain-backed secret providers, interactive SSH host-key
   approval UI, remote OSC 52 clipboard confirmation UI, real GPU device-loss
-  platform validation, cross-OS config reload validation, richer config error
-  UI, and installer automation remain release-hardening follow-up work.
+  platform validation, cross-OS config reload validation, and richer config
+  error UI also remain release-hardening follow-up work.
 - Phase 15 establishes a compileable iOS companion foundation around the shared
   engine, but it is not a native iOS app yet. UIKit/SwiftUI app lifecycle,
   native touch/keyboard/settings UI, iOS GPU surface implementation, iOS

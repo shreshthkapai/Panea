@@ -13,10 +13,12 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+assets = { path = "../../crates/assets" }
 config-toml = { path = "../../crates/config-toml" }
 diagnostics = { path = "../../crates/diagnostics" }
 render-wgpu = { path = "../../crates/render-wgpu" }
 security = { path = "../../crates/security" }
+shell-integration = { path = "../../crates/shell-integration" }
 transport-core = { path = "../../crates/transport-core" }
 transport-pty = { path = "../../crates/transport-pty" }
 transport-ssh = { path = "../../crates/transport-ssh" }

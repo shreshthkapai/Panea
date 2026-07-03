@@ -12,6 +12,7 @@ use security::{
     KnownHostsPolicy, Osc52ClipboardPolicy, Osc52ClipboardRequest, Osc52ClipboardTarget,
     SecretProvider, SecretRequest, SecretString, evaluate_osc52_clipboard_write,
 };
+use shell_integration::{ShellKind, script_for_shell};
 use transport_core::{TerminalSize, TerminalTransport, TransportLifecycleEvent, TransportState};
 use transport_pty::{LocalPtyDiagnostics, LocalPtyTransport, LocalShellProfile};
 use transport_ssh::{SshConnectionProfile, SshTransport};
@@ -20,7 +21,7 @@ fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("help") | None => {
             eprintln!(
-                "usage: cargo xtask <fmt|clippy|test|build|check|layer-check|ci|config-default|config-schema|bench|screenshot|fuzz-smoke|fuzz|doctor|bug-report|hardening|security-review|linux-compositor|compat|ssh-smoke|verify-os|package-plan|release-check|ios-readiness>"
+                "usage: cargo xtask <fmt|clippy|test|build|check|layer-check|ci|config-default|config-schema|bench|screenshot|fuzz-smoke|fuzz|doctor|bug-report|hardening|security-review|linux-compositor|compat|ssh-smoke|verify-os|package|package-plan|release-check|ios-readiness>"
             );
             ExitCode::SUCCESS
         }
@@ -44,6 +45,7 @@ fn main() -> ExitCode {
         Some("compat") => run_compat(),
         Some("ssh-smoke") => run_ssh_smoke(),
         Some("verify-os") => run_verify_os(),
+        Some("package") => run_package(),
         Some("package-plan") => run_package_plan(),
         Some("release-check") => run_release_check(),
         Some("ios-readiness") => run_ios_readiness(),
@@ -1891,11 +1893,19 @@ fn verify_os_steps(options: &VerifyOsOptions) -> Vec<VerifyStep> {
     }
 
     steps.push(xtask_step(
-        "packaging-smoke-plan",
+        "packaging-smoke",
         "packaging",
-        "packaging smoke status and plan",
-        false,
-        ["package-plan"],
+        "packaged artifact build and doctor smoke",
+        true,
+        [
+            "package",
+            "smoke",
+            "--profile",
+            "dev",
+            "--build",
+            "--timeout-ms",
+            "10000",
+        ],
         target,
     ));
 
@@ -2867,6 +2877,704 @@ fn run_package_plan() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn run_package() -> ExitCode {
+    let mut args = std::env::args().skip(2).collect::<Vec<_>>();
+    let command = args.first().map_or("plan", String::as_str);
+
+    match command {
+        "help" | "--help" | "-h" => {
+            print_package_help();
+            ExitCode::SUCCESS
+        }
+        "plan" => {
+            print_package_plan();
+            ExitCode::SUCCESS
+        }
+        "build" => {
+            args.remove(0);
+            let options = match PackageOptions::parse(&args) {
+                Ok(options) => options,
+                Err(error) => {
+                    eprintln!("{error}");
+                    print_package_help();
+                    return ExitCode::from(2);
+                }
+            };
+            build_package(&options)
+        }
+        "smoke" => {
+            args.remove(0);
+            let mut options = match PackageOptions::parse(&args) {
+                Ok(options) => options,
+                Err(error) => {
+                    eprintln!("{error}");
+                    print_package_help();
+                    return ExitCode::from(2);
+                }
+            };
+            options.build_before_smoke = options.build_before_smoke || options.smoke_build_flag;
+            smoke_package(&options)
+        }
+        other => {
+            eprintln!("unknown package command: {other}");
+            print_package_help();
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn print_package_help() {
+    eprintln!("usage: cargo xtask package <plan|build|smoke>");
+    eprintln!(
+        "usage: cargo xtask package build [--target-platform <windows|macos|linux-x11|linux-wayland>] [--profile <dev|release>] [--out-dir <path>] [--skip-cargo-build]"
+    );
+    eprintln!(
+        "usage: cargo xtask package smoke [--target-platform <windows|macos|linux-x11|linux-wayland>] [--profile <dev|release>] [--out-dir <path>] [--build] [--timeout-ms <ms>]"
+    );
+}
+
+fn print_package_plan() {
+    println!("{}", diagnostics::packaging_plan().render_text());
+    println!();
+    println!("Implemented package artifacts:");
+    println!("- windows: portable directory with panea.exe at the package root");
+    println!("- macos: Panea.app bundle directory with resources under Contents/Resources");
+    println!("- linux: portable directory with bin/, share/panea/, desktop file, and icon");
+    println!();
+    println!("Build on each target OS:");
+    println!("  cargo xtask package build --profile release");
+    println!("Smoke the packaged doctor command:");
+    println!("  cargo xtask package smoke --profile release --build");
+    println!();
+    println!(
+        "Installer, DMG, signing/notarization, AppImage, deb, and rpm builders remain later release-hardening work."
+    );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackageProfile {
+    Dev,
+    Release,
+}
+
+impl PackageProfile {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "dev" | "debug" => Some(Self::Dev),
+            "release" => Some(Self::Release),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Dev => "dev",
+            Self::Release => "release",
+        }
+    }
+
+    fn target_dir(self) -> &'static str {
+        match self {
+            Self::Dev => "debug",
+            Self::Release => "release",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PackageOptions {
+    target_platform: CompatPlatform,
+    profile: PackageProfile,
+    out_dir: PathBuf,
+    skip_cargo_build: bool,
+    build_before_smoke: bool,
+    smoke_build_flag: bool,
+    timeout: Duration,
+}
+
+impl PackageOptions {
+    fn default_for(target_platform: CompatPlatform) -> Self {
+        Self {
+            target_platform,
+            profile: PackageProfile::Release,
+            out_dir: PathBuf::from("target/packages"),
+            skip_cargo_build: false,
+            build_before_smoke: false,
+            smoke_build_flag: false,
+            timeout: Duration::from_secs(10),
+        }
+    }
+
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut options = Self::default_for(CompatPlatform::detect());
+        let mut index = 0;
+
+        while index < args.len() {
+            match args[index].as_str() {
+                "--target-platform" | "--platform" => {
+                    let value = required_arg(args, &mut index, "--target-platform")?;
+                    options.target_platform = CompatPlatform::parse_target(&value)
+                        .ok_or_else(|| format!("unsupported target platform: {value}"))?;
+                }
+                "--profile" => {
+                    let value = required_arg(args, &mut index, "--profile")?;
+                    options.profile = PackageProfile::parse(&value)
+                        .ok_or_else(|| format!("unsupported package profile: {value}"))?;
+                }
+                "--out-dir" => {
+                    options.out_dir = PathBuf::from(required_arg(args, &mut index, "--out-dir")?);
+                }
+                "--skip-cargo-build" => {
+                    options.skip_cargo_build = true;
+                }
+                "--build" => {
+                    options.smoke_build_flag = true;
+                }
+                "--timeout-ms" => {
+                    let value = required_arg(args, &mut index, "--timeout-ms")?;
+                    let millis = value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid --timeout-ms value: {value}"))?;
+                    if millis < 500 {
+                        return Err("--timeout-ms must be at least 500".to_owned());
+                    }
+                    options.timeout = Duration::from_millis(millis);
+                }
+                other => return Err(format!("unknown package option: {other}")),
+            }
+            index += 1;
+        }
+
+        Ok(options)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PackageLayout {
+    package_dir: PathBuf,
+    binary_path: PathBuf,
+    resource_dir: PathBuf,
+    manifest_path: PathBuf,
+}
+
+fn build_package(options: &PackageOptions) -> ExitCode {
+    if options.target_platform != CompatPlatform::detect() {
+        eprintln!(
+            "cannot build {} package on {} host; run this command on the target OS runner",
+            options.target_platform.label(),
+            CompatPlatform::detect().label()
+        );
+        return ExitCode::from(2);
+    }
+
+    if !options.skip_cargo_build {
+        let code = build_desktop_binary(options.profile);
+        if code != ExitCode::SUCCESS {
+            return code;
+        }
+    }
+
+    match stage_package(options) {
+        Ok(layout) => {
+            println!("wrote package artifact {}", layout.package_dir.display());
+            println!("binary {}", layout.binary_path.display());
+            println!("manifest {}", layout.manifest_path.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("package build failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn smoke_package(options: &PackageOptions) -> ExitCode {
+    if options.build_before_smoke {
+        let code = build_package(options);
+        if code != ExitCode::SUCCESS {
+            return code;
+        }
+    }
+
+    let layout = package_layout(options);
+    match verify_package_contents(&layout) {
+        Ok(()) => {}
+        Err(error) => {
+            eprintln!("package smoke failed before launch: {error}");
+            return ExitCode::from(1);
+        }
+    }
+
+    let smoke = run_packaged_doctor(&layout.binary_path, options.timeout);
+    if smoke.status != PackageSmokeStatus::Passed {
+        eprintln!("{}", smoke.render_line());
+        return ExitCode::from(1);
+    }
+
+    println!("{}", smoke.render_line());
+    println!(
+        "package shell launch remains a GUI/manual smoke: run {} from the package on the target OS and verify the default shell starts",
+        layout.binary_path.display()
+    );
+    ExitCode::SUCCESS
+}
+
+fn build_desktop_binary(profile: PackageProfile) -> ExitCode {
+    let mut args = vec!["build", "-p", "panea-desktop"];
+    if profile == PackageProfile::Release {
+        args.push("--release");
+    }
+    run("cargo", &args)
+}
+
+fn stage_package(options: &PackageOptions) -> Result<PackageLayout, String> {
+    let layout = package_layout(options);
+    fs::create_dir_all(&layout.resource_dir).map_err(|error| {
+        format!(
+            "failed to create {}: {error}",
+            layout.resource_dir.display()
+        )
+    })?;
+    if let Some(parent) = layout.binary_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    }
+
+    let built_binary = built_desktop_binary(options.profile);
+    fs::copy(&built_binary, &layout.binary_path).map_err(|error| {
+        format!(
+            "failed to copy binary {} to {}: {error}",
+            built_binary.display(),
+            layout.binary_path.display()
+        )
+    })?;
+
+    write_package_resources(options, &layout)?;
+    Ok(layout)
+}
+
+fn package_layout(options: &PackageOptions) -> PackageLayout {
+    let base_name = format!(
+        "panea-{}-{}-{}",
+        env!("CARGO_PKG_VERSION"),
+        package_platform_label(options.target_platform),
+        options.profile.label()
+    );
+    let package_dir = options.out_dir.join(base_name);
+
+    match options.target_platform {
+        CompatPlatform::Macos => {
+            let app_dir = package_dir.join("Panea.app");
+            let resource_dir = app_dir.join("Contents").join("Resources");
+            PackageLayout {
+                package_dir,
+                binary_path: app_dir.join("Contents").join("MacOS").join("panea"),
+                manifest_path: resource_dir.join("package-manifest.json"),
+                resource_dir,
+            }
+        }
+        CompatPlatform::LinuxX11 | CompatPlatform::LinuxWayland => {
+            let resource_dir = package_dir.join("share").join("panea");
+            PackageLayout {
+                binary_path: package_dir.join("bin").join("panea"),
+                manifest_path: resource_dir.join("package-manifest.json"),
+                resource_dir,
+                package_dir,
+            }
+        }
+        CompatPlatform::Windows | CompatPlatform::Any | CompatPlatform::Unix => {
+            let resource_dir = package_dir.join("share").join("panea");
+            PackageLayout {
+                binary_path: package_dir.join(package_binary_name(options.target_platform)),
+                manifest_path: resource_dir.join("package-manifest.json"),
+                resource_dir,
+                package_dir,
+            }
+        }
+    }
+}
+
+fn write_package_resources(options: &PackageOptions, layout: &PackageLayout) -> Result<(), String> {
+    write_file(
+        &layout.resource_dir.join("config").join("default.toml"),
+        &config_toml::default_config_toml().map_err(|error| error.to_string())?,
+    )?;
+    write_file(
+        &layout.resource_dir.join("config").join("schema.json"),
+        &config_toml::schema_json().map_err(|error| error.to_string())?,
+    )?;
+
+    for example in assets::CONFIG_EXAMPLES {
+        write_file(
+            &layout
+                .resource_dir
+                .join("config")
+                .join("examples")
+                .join(example.name),
+            example.contents,
+        )?;
+    }
+
+    for shell in [
+        ShellKind::Bash,
+        ShellKind::Zsh,
+        ShellKind::Fish,
+        ShellKind::PowerShell,
+    ] {
+        let script = script_for_shell(shell).expect("baseline shell script");
+        write_file(
+            &layout
+                .resource_dir
+                .join("shell-integration")
+                .join(script.file_name),
+            script.contents,
+        )?;
+    }
+
+    copy_repo_file("README.md", &layout.resource_dir.join("README.md"))?;
+    copy_repo_file("LICENSE", &layout.resource_dir.join("LICENSE"))?;
+    for doc in [
+        "docs/getting-started.md",
+        "docs/config.md",
+        "docs/doctor.md",
+        "docs/shell-integration.md",
+        "docs/platform-support.md",
+        "docs/troubleshooting.md",
+        "docs/packaging.md",
+    ] {
+        let file_name = Path::new(doc)
+            .file_name()
+            .ok_or_else(|| format!("invalid doc path: {doc}"))?;
+        copy_repo_file(doc, &layout.resource_dir.join("docs").join(file_name))?;
+    }
+
+    match options.target_platform {
+        CompatPlatform::Macos => write_macos_bundle_files(layout)?,
+        CompatPlatform::LinuxX11 | CompatPlatform::LinuxWayland => {
+            write_linux_package_files(layout)?
+        }
+        CompatPlatform::Windows | CompatPlatform::Any | CompatPlatform::Unix => {
+            write_windows_package_files(layout)?
+        }
+    }
+
+    write_file(
+        &layout.manifest_path,
+        &render_package_manifest(options, layout),
+    )?;
+    write_file(
+        &layout.resource_dir.join("INSTALL.md"),
+        &package_install_notes(options),
+    )?;
+    Ok(())
+}
+
+fn write_macos_bundle_files(layout: &PackageLayout) -> Result<(), String> {
+    let contents_dir = layout
+        .binary_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| "invalid macOS bundle layout".to_owned())?;
+    write_file(
+        &contents_dir.join("Info.plist"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key><string>panea</string>
+  <key>CFBundleIdentifier</key><string>dev.panea.terminal</string>
+  <key>CFBundleName</key><string>Panea</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>LSMinimumSystemVersion</key><string>12.0</string>
+</dict>
+</plist>
+"#,
+    )
+}
+
+fn write_linux_package_files(layout: &PackageLayout) -> Result<(), String> {
+    let share_dir = layout
+        .resource_dir
+        .parent()
+        .ok_or_else(|| "invalid Linux package layout".to_owned())?;
+    write_file(
+        &share_dir.join("applications").join("panea.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Panea\nComment=GPU-first cross-platform terminal\nExec=panea\nTerminal=false\nCategories=System;TerminalEmulator;\nIcon=panea\n",
+    )?;
+    write_file(
+        &share_dir
+            .join("icons")
+            .join("hicolor")
+            .join("scalable")
+            .join("apps")
+            .join("panea.svg"),
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect width="128" height="128" rx="18" fill="#101820"/>
+  <path d="M28 38l28 26-28 26" fill="none" stroke="#e6f0ff" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M66 90h34" stroke="#4dd4ac" stroke-width="10" stroke-linecap="round"/>
+</svg>
+"##,
+    )
+}
+
+fn write_windows_package_files(layout: &PackageLayout) -> Result<(), String> {
+    write_file(
+        &layout.resource_dir.join("WINDOWS.txt"),
+        "Panea Windows portable package.\n\nRun panea.exe from the package root or add the package root to PATH.\nInstaller, Start menu shortcuts, and PATH mutation are deferred to the installer phase.\n",
+    )
+}
+
+fn verify_package_contents(layout: &PackageLayout) -> Result<(), String> {
+    for path in [
+        &layout.binary_path,
+        &layout.manifest_path,
+        &layout.resource_dir.join("README.md"),
+        &layout.resource_dir.join("LICENSE"),
+        &layout.resource_dir.join("config").join("default.toml"),
+        &layout.resource_dir.join("config").join("schema.json"),
+        &layout
+            .resource_dir
+            .join("shell-integration")
+            .join("panea.bash"),
+        &layout
+            .resource_dir
+            .join("shell-integration")
+            .join("panea.zsh"),
+        &layout
+            .resource_dir
+            .join("shell-integration")
+            .join("panea.fish"),
+        &layout
+            .resource_dir
+            .join("shell-integration")
+            .join("panea.ps1"),
+    ] {
+        if !path.exists() {
+            return Err(format!("missing packaged file {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackageSmokeStatus {
+    Passed,
+    Failed,
+    TimedOut,
+}
+
+impl PackageSmokeStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PackageSmokeResult {
+    status: PackageSmokeStatus,
+    duration: Duration,
+    detail: String,
+}
+
+impl PackageSmokeResult {
+    fn render_line(&self) -> String {
+        format!(
+            "[{}] package doctor smoke duration_ms={} {}",
+            self.status.label(),
+            self.duration.as_millis(),
+            self.detail
+        )
+    }
+}
+
+fn run_packaged_doctor(binary_path: &Path, timeout: Duration) -> PackageSmokeResult {
+    let started = Instant::now();
+    let mut child = match Command::new(binary_path)
+        .args(["doctor", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return PackageSmokeResult {
+                status: PackageSmokeStatus::Failed,
+                duration: started.elapsed(),
+                detail: format!("failed to spawn {}: {error}", binary_path.display()),
+            };
+        }
+    };
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return PackageSmokeResult {
+                    status: PackageSmokeStatus::TimedOut,
+                    duration: started.elapsed(),
+                    detail: format!("{} doctor --json exceeded timeout", binary_path.display()),
+                };
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return PackageSmokeResult {
+                    status: PackageSmokeStatus::Failed,
+                    duration: started.elapsed(),
+                    detail: format!("failed while waiting for doctor smoke: {error}"),
+                };
+            }
+        }
+    }
+
+    match child.wait_with_output() {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.contains("\"name\":\"doctor\"")
+                && stdout.contains("\"topic\"")
+                && stdout.contains("\"lines\"")
+            {
+                PackageSmokeResult {
+                    status: PackageSmokeStatus::Passed,
+                    duration: started.elapsed(),
+                    detail: format!("{} doctor --json succeeded", binary_path.display()),
+                }
+            } else {
+                PackageSmokeResult {
+                    status: PackageSmokeStatus::Failed,
+                    duration: started.elapsed(),
+                    detail: "doctor output did not look like Panea diagnostics JSON".to_owned(),
+                }
+            }
+        }
+        Ok(output) => PackageSmokeResult {
+            status: PackageSmokeStatus::Failed,
+            duration: started.elapsed(),
+            detail: format!(
+                "doctor exited {:?}: {}",
+                output.status.code(),
+                preview_bytes(&output.stderr)
+            ),
+        },
+        Err(error) => PackageSmokeResult {
+            status: PackageSmokeStatus::Failed,
+            duration: started.elapsed(),
+            detail: format!("failed to collect doctor output: {error}"),
+        },
+    }
+}
+
+fn built_desktop_binary(profile: PackageProfile) -> PathBuf {
+    PathBuf::from("target")
+        .join(profile.target_dir())
+        .join(host_binary_name())
+}
+
+fn host_binary_name() -> &'static str {
+    if cfg!(windows) { "panea.exe" } else { "panea" }
+}
+
+fn package_binary_name(platform: CompatPlatform) -> &'static str {
+    match platform {
+        CompatPlatform::Windows => "panea.exe",
+        CompatPlatform::Macos
+        | CompatPlatform::LinuxX11
+        | CompatPlatform::LinuxWayland
+        | CompatPlatform::Any
+        | CompatPlatform::Unix => "panea",
+    }
+}
+
+fn package_platform_label(platform: CompatPlatform) -> &'static str {
+    match platform {
+        CompatPlatform::Windows => "windows-portable",
+        CompatPlatform::Macos => "macos-app",
+        CompatPlatform::LinuxX11 | CompatPlatform::LinuxWayland => "linux-portable",
+        CompatPlatform::Any => "unknown",
+        CompatPlatform::Unix => "unix",
+    }
+}
+
+fn render_package_manifest(options: &PackageOptions, layout: &PackageLayout) -> String {
+    format!(
+        concat!(
+            "{{\n",
+            "  \"name\": \"panea\",\n",
+            "  \"version\": \"{}\",\n",
+            "  \"target_platform\": \"{}\",\n",
+            "  \"artifact_kind\": \"{}\",\n",
+            "  \"profile\": \"{}\",\n",
+            "  \"binary\": \"{}\",\n",
+            "  \"resources\": \"{}\",\n",
+            "  \"doctor_smoke\": \"panea doctor --json\",\n",
+            "  \"shell_launch_smoke\": \"manual GUI smoke on target OS\",\n",
+            "  \"contains\": [\"binary\", \"default_config\", \"config_schema\", \"config_examples\", \"shell_integration_scripts\", \"doctor_command\", \"license\", \"readme\"]\n",
+            "}}\n"
+        ),
+        env!("CARGO_PKG_VERSION"),
+        json_escape(options.target_platform.label()).as_str(),
+        json_escape(package_platform_label(options.target_platform)).as_str(),
+        json_escape(options.profile.label()).as_str(),
+        json_escape(&relative_or_display(
+            &layout.package_dir,
+            &layout.binary_path
+        ))
+        .as_str(),
+        json_escape(&relative_or_display(
+            &layout.package_dir,
+            &layout.resource_dir
+        ))
+        .as_str(),
+    )
+}
+
+fn package_install_notes(options: &PackageOptions) -> String {
+    let common = "Panea package artifact\n\nRun `panea doctor --json` first to verify diagnostics. The default shell launch smoke is currently manual: launch the packaged app on the target OS and confirm the configured shell opens.\n\n";
+    match options.target_platform {
+        CompatPlatform::Windows => format!(
+            "{common}Windows portable behavior:\n- Run `panea.exe` from this directory.\n- Add this directory to PATH manually if desired.\n- Installer, Start menu integration, and automatic PATH changes are deferred.\n"
+        ),
+        CompatPlatform::Macos => format!(
+            "{common}macOS app behavior:\n- Open `Panea.app` or run `Panea.app/Contents/MacOS/panea doctor --json`.\n- Signing, notarization, DMG, and zip distribution are deferred.\n"
+        ),
+        CompatPlatform::LinuxX11 | CompatPlatform::LinuxWayland => format!(
+            "{common}Linux portable behavior:\n- Run `bin/panea` from this package.\n- A desktop file and SVG icon are staged under `share/`.\n- AppImage, deb, rpm, and terminfo installation strategy are deferred.\n"
+        ),
+        CompatPlatform::Any | CompatPlatform::Unix => common.to_owned(),
+    }
+}
+
+fn copy_repo_file(source: &str, dest: &Path) -> Result<(), String> {
+    let contents =
+        fs::read_to_string(source).map_err(|error| format!("failed to read {source}: {error}"))?;
+    write_file(dest, &contents)
+}
+
+fn write_file(path: &Path, contents: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    }
+    fs::write(path, contents)
+        .map_err(|error| format!("failed to write {}: {error}", path.display()))
+}
+
+fn relative_or_display(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+        .replace('\\', "/")
+}
+
 fn run_release_check() -> ExitCode {
     let input = match doctor_input() {
         Ok(input) => input,
@@ -3615,10 +4323,12 @@ fn dependency_rules() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         (
             "xtask",
             allowed([
+                "assets",
                 "config-toml",
                 "diagnostics",
                 "render-wgpu",
                 "security",
+                "shell-integration",
                 "transport-core",
                 "transport-pty",
                 "transport-ssh",
@@ -3945,6 +4655,11 @@ mod tests {
         assert!(steps.iter().any(|step| {
             step.key == "ssh-smoke" && matches!(step.kind, VerifyStepKind::Skipped { .. })
         }));
+        assert!(steps.iter().any(|step| {
+            step.key == "packaging-smoke"
+                && step.required
+                && matches!(step.kind, VerifyStepKind::Command { .. })
+        }));
     }
 
     #[test]
@@ -3987,5 +4702,76 @@ mod tests {
         assert!(json.contains("\"target_platform\": \"windows\""));
         assert!(json.contains("path C:\\\\panea\\nok"));
         assert!(!report.has_hard_failure());
+    }
+
+    #[test]
+    fn package_options_parse_target_profile_and_timeout() {
+        let options = PackageOptions::parse(&[
+            "--target-platform".to_owned(),
+            "macos".to_owned(),
+            "--profile".to_owned(),
+            "dev".to_owned(),
+            "--out-dir".to_owned(),
+            "target/custom-packages".to_owned(),
+            "--skip-cargo-build".to_owned(),
+            "--timeout-ms".to_owned(),
+            "750".to_owned(),
+        ])
+        .expect("package options");
+
+        assert_eq!(options.target_platform, CompatPlatform::Macos);
+        assert_eq!(options.profile, PackageProfile::Dev);
+        assert_eq!(options.out_dir, PathBuf::from("target/custom-packages"));
+        assert!(options.skip_cargo_build);
+        assert_eq!(options.timeout, Duration::from_millis(750));
+    }
+
+    #[test]
+    fn package_layouts_are_platform_specific() {
+        let mut options = PackageOptions::default_for(CompatPlatform::Windows);
+        options.profile = PackageProfile::Dev;
+        let windows = package_layout(&options);
+        assert!(
+            windows.binary_path.ends_with("panea.exe") || windows.binary_path.ends_with("panea")
+        );
+        assert!(
+            windows
+                .resource_dir
+                .ends_with(Path::new("share").join("panea"))
+        );
+
+        options.target_platform = CompatPlatform::Macos;
+        let macos = package_layout(&options);
+        assert!(
+            macos
+                .binary_path
+                .ends_with(Path::new("Contents").join("MacOS").join("panea"))
+        );
+        assert!(
+            macos
+                .resource_dir
+                .ends_with(Path::new("Contents").join("Resources"))
+        );
+
+        options.target_platform = CompatPlatform::LinuxWayland;
+        let linux = package_layout(&options);
+        assert!(linux.binary_path.ends_with(Path::new("bin").join("panea")));
+        assert!(
+            linux
+                .resource_dir
+                .ends_with(Path::new("share").join("panea"))
+        );
+    }
+
+    #[test]
+    fn package_manifest_lists_required_resources() {
+        let options = PackageOptions::default_for(CompatPlatform::Windows);
+        let layout = package_layout(&options);
+        let manifest = render_package_manifest(&options, &layout);
+
+        assert!(manifest.contains("\"default_config\""));
+        assert!(manifest.contains("\"shell_integration_scripts\""));
+        assert!(manifest.contains("\"doctor_command\""));
+        assert!(manifest.contains("\"license\""));
     }
 }

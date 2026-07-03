@@ -79,7 +79,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Doctor diagnostics | tested | implemented | implemented | implemented | Installed `panea doctor` and `cargo xtask doctor` share one diagnostics model with human-readable and JSON output; macOS/Linux runtime output still needs host verification. |
 | Bug-report snapshot | tested | implemented | implemented | implemented | Privacy-aware model exists; product export UX remains. |
 | Native notifications | planned | planned | planned | planned | Not implemented. |
-| Packaging artifacts | stubbed | stubbed | stubbed | stubbed | Plans/docs exist; real installers/packages do not. |
+| Packaging artifacts | tested | implemented | implemented | implemented | `cargo xtask package` builds portable/staged packages with binary, config template/schema/examples, shell integration scripts, docs, license, manifest, and packaged doctor smoke. Windows dev portable smoke passed on the current host; macOS app bundle and Linux portable package reports still need to be collected on those OSes. MSI/DMG/AppImage/deb/rpm remain later. |
 | Release validation suite | partial | partial | partial | partial | Reports/gates exist; full cross-OS suite is unimplemented. |
 
 ## Mobile Matrix
@@ -99,7 +99,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 
 | Platform | Overall status | Why |
 | --- | --- | --- |
-| Windows | partial | Current host build/test/lint, local PTY smoke, required compatibility runner smoke, SSH smoke harness compilation, installed doctor smoke, and cross-OS runner implementation have been verified, but renderer GUI, optional app matrix, a real SSH server report, packaging, and full daily-driver workflows are incomplete. |
+| Windows | partial | Current host build/test/lint, local PTY smoke, required compatibility runner smoke, SSH smoke harness compilation, installed doctor smoke, cross-OS runner implementation, and Windows portable package doctor smoke have been verified, but renderer GUI, optional app matrix, a real SSH server report, installer packaging, and full daily-driver workflows are incomplete. |
 | macOS | partial | Platform-neutral code and a macOS CI runner definition exist, but runtime behavior and verification reports are not yet collected. |
 | Linux X11 | partial | Platform-neutral code, X11 strategy, and a Linux X11 runner definition exist, but real X11 window manager/compositor behavior and reports are unverified. |
 | Linux Wayland | partial | Platform-neutral code, Wayland strategy, and a Linux Wayland runner definition exist, but real compositor behavior and reports are unverified. |

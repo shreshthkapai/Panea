@@ -67,7 +67,9 @@ The remaining high-level work is:
 - Collected cross-OS verification reports with unresolved blocked evidence
   fixed on Windows, macOS, Linux X11, and Linux Wayland.
 - Cross-OS validation of the installed doctor command output.
-- Packaging artifacts.
+- Installer/compressed packaging artifacts beyond the current portable/staged
+  package directories, plus collected package smoke reports on macOS, Linux
+  X11, and Linux Wayland.
 - Real GPU device-loss validation across sleep/wake, display changes, DPI
   changes, and backend failure scenarios.
 - Native iOS shell, iOS GPU surface, Keychain provider, device validation.
