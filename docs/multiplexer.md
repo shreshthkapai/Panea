@@ -25,7 +25,7 @@ Linux Wayland behavior: same config and runtime model; compositor behavior
 Fallback behavior: if mux.enabled is false, mux actions are ignored with a
   diagnostic; if a split/tab action fails, the current layout remains active.
 Diagnostics: action failures are printed through the current desktop diagnostic
-  surface; installed doctor/UI reporting remains later work.
+  surface; richer mux-specific doctor/UI reporting remains later work.
 Performance cost when disabled: near zero beyond checking keybinding actions.
 Performance cost when enabled: proportional to the number of panes polled and
   rendered; each pane is bounded to 64 output batches per event-loop tick.

@@ -1958,13 +1958,19 @@ fn run_release_check() -> ExitCode {
 }
 
 fn run_doctor() -> ExitCode {
-    let topic = std::env::args().nth(2).as_deref().map_or(
+    let args = std::env::args().skip(2).collect::<Vec<_>>();
+    let json = args.iter().any(|arg| arg == "--json");
+    let topic_arg = args
+        .iter()
+        .find(|arg| arg.as_str() != "--json")
+        .map(String::as_str);
+    let topic = topic_arg.map_or(
         Some(diagnostics::DoctorTopic::All),
         diagnostics::DoctorTopic::parse,
     );
     let Some(topic) = topic else {
         eprintln!(
-            "unknown doctor topic; expected renderer, config, platform, shell-integration, performance, ssh, or window"
+            "unknown doctor topic; expected renderer, config, platform, shell, performance, ssh, window, fonts, or clipboard"
         );
         return ExitCode::from(2);
     };
@@ -1977,10 +1983,12 @@ fn run_doctor() -> ExitCode {
         }
     };
 
-    println!(
-        "{}",
-        diagnostics::doctor_report(&input, topic).render_text()
-    );
+    let report = diagnostics::doctor_report(&input, topic);
+    if json {
+        println!("{}", report.render_json());
+    } else {
+        println!("{}", report.render_text());
+    }
     ExitCode::SUCCESS
 }
 
@@ -2008,6 +2016,7 @@ fn doctor_input() -> Result<diagnostics::DoctorInput, config_toml::ConfigTomlErr
         config: loaded.config,
         config_diagnostics: loaded.diagnostics,
         platform: diagnostics::PlatformSnapshot::detect(),
+        runtime: diagnostics::DoctorRuntimeSnapshot::default(),
         recent_errors: Vec::new(),
     })
 }

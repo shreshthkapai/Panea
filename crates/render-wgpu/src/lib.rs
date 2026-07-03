@@ -49,6 +49,45 @@ impl Default for RendererOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuAdapterProbe {
+    pub backend: String,
+    pub adapter: String,
+    pub device_type: String,
+    pub features: Vec<String>,
+}
+
+#[must_use]
+pub async fn probe_gpu_adapter() -> Option<GpuAdapterProbe> {
+    let instance = wgpu::Instance::default();
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })
+        .await?;
+    let info = adapter.get_info();
+    let features = adapter.features();
+    let feature_names = [
+        (wgpu::Features::TIMESTAMP_QUERY, "timestamp_query"),
+        (
+            wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+            "texture_adapter_specific_format_features",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(feature, name)| features.contains(feature).then_some(name.to_owned()))
+    .collect::<Vec<_>>();
+
+    Some(GpuAdapterProbe {
+        backend: format!("{:?}", info.backend),
+        adapter: info.name,
+        device_type: format!("{:?}", info.device_type),
+        features: feature_names,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RendererError {
     SurfaceCreation(String),
     AdapterUnavailable,

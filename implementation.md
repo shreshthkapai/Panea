@@ -241,6 +241,13 @@ to more visible features before the dependencies they rely on are hardened.
   while preserving host-key and auth policy, proved terminal bytes flow through
   the shared parser/core, added mobile render-frame sizing helpers, documented
   iOS lifecycle/security limits, and exposed `cargo xtask ios-readiness`.
+- Completed next-pass Phase 18 installed terminal doctor binary: added
+  `panea doctor` before desktop window startup, topic commands for window,
+  renderer, config, shell, SSH, fonts, and clipboard, machine-readable `--json`
+  output, bounded no-window probes for WGPU adapter status, font discovery,
+  clipboard provider state, keychain capability, PTY backend, and SSH provider
+  status, shared the same diagnostics model with `cargo xtask doctor`, and
+  documented the command in `docs/doctor.md`.
 
 ## Deferred By Design
 
@@ -363,12 +370,13 @@ to more visible features before the dependencies they rely on are hardened.
   remote shell-integration install flows, reconnect UI/actions, and collected
   real SSH server smoke reports across Windows/macOS/Linux remain unverified
   follow-up work.
-- Phase 13 adds the parity matrix and diagnostics command foundation, but it
-  does not magically verify macOS, Linux X11, or Linux Wayland from this Windows
-  host. Real platform labs/CI runners, compositor coverage, GPU backend
-  inventory, native notification support, remote OSC clipboard confirmation UI, and the final
-  installed `terminal doctor` binary remain follow-up work before platform
-  parity can be called product-complete.
+- Phase 13 adds the parity matrix and diagnostics command foundation, and
+  next-pass Phase 18 installs `panea doctor`, but neither step magically
+  verifies macOS, Linux X11, or Linux Wayland from this Windows host. Real
+  platform labs/CI runners, compositor coverage, GPU backend inventory, native
+  notification support, remote OSC clipboard confirmation UI, and collected
+  cross-OS doctor output remain follow-up work before platform parity can be
+  called product-complete.
 - Phase 14 does not make Panea a daily-driver release by itself. Daily-driver
   release status remains blocked until packaged artifacts exist and
   manual/automated validation passes on macOS, Windows, Linux X11, and Linux

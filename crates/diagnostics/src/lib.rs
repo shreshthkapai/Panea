@@ -554,6 +554,8 @@ pub enum DoctorTopic {
     Performance,
     Ssh,
     Window,
+    Fonts,
+    Clipboard,
 }
 
 impl DoctorTopic {
@@ -568,6 +570,8 @@ impl DoctorTopic {
             "performance" => Some(Self::Performance),
             "ssh" => Some(Self::Ssh),
             "window" => Some(Self::Window),
+            "fonts" | "font" => Some(Self::Fonts),
+            "clipboard" => Some(Self::Clipboard),
             _ => None,
         }
     }
@@ -583,6 +587,8 @@ impl DoctorTopic {
             Self::Performance => "doctor performance",
             Self::Ssh => "doctor ssh",
             Self::Window => "doctor window",
+            Self::Fonts => "doctor fonts",
+            Self::Clipboard => "doctor clipboard",
         }
     }
 }
@@ -648,7 +654,45 @@ pub struct DoctorInput {
     pub config: AppConfig,
     pub config_diagnostics: Vec<ConfigDiagnostic>,
     pub platform: PlatformSnapshot,
+    pub runtime: DoctorRuntimeSnapshot,
     pub recent_errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorRuntimeSnapshot {
+    pub renderer_backend: String,
+    pub gpu_adapter: Option<String>,
+    pub gpu_features: Vec<String>,
+    pub window_backend: Option<String>,
+    pub x11_wayland_status: Option<String>,
+    pub dpi_scale: Option<String>,
+    pub font_discovery: String,
+    pub config_parse_status: String,
+    pub shell_integration_status: String,
+    pub clipboard_provider: String,
+    pub keychain_provider: String,
+    pub pty_backend: String,
+    pub ssh_provider_status: String,
+}
+
+impl Default for DoctorRuntimeSnapshot {
+    fn default() -> Self {
+        Self {
+            renderer_backend: "not probed".to_owned(),
+            gpu_adapter: None,
+            gpu_features: Vec::new(),
+            window_backend: None,
+            x11_wayland_status: None,
+            dpi_scale: None,
+            font_discovery: "not probed".to_owned(),
+            config_parse_status: "loaded".to_owned(),
+            shell_integration_status: "runtime session not active during doctor".to_owned(),
+            clipboard_provider: "not probed".to_owned(),
+            keychain_provider: "not probed".to_owned(),
+            pty_backend: "not probed".to_owned(),
+            ssh_provider_status: "not probed".to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -698,6 +742,37 @@ impl DoctorReport {
         }
         output.join("\n")
     }
+
+    #[must_use]
+    pub fn render_json(&self) -> String {
+        let lines = self
+            .lines
+            .iter()
+            .map(|line| format!("\"{}\"", json_escape(line)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let findings = self
+            .findings
+            .iter()
+            .map(|finding| {
+                format!(
+                    "{{\"severity\":\"{}\",\"area\":\"{}\",\"message\":\"{}\"}}",
+                    finding.severity,
+                    json_escape(finding.area),
+                    json_escape(&finding.message)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+
+        format!(
+            "{{\"name\":\"{}\",\"topic\":\"{}\",\"lines\":[{}],\"findings\":[{}]}}",
+            json_escape(self.topic.name()),
+            json_escape(doctor_topic_key(self.topic)),
+            lines,
+            findings
+        )
+    }
 }
 
 #[must_use]
@@ -717,11 +792,17 @@ pub fn doctor_report(input: &DoctorInput, topic: DoctorTopic) -> DoctorReport {
     if matches!(topic, DoctorTopic::All | DoctorTopic::Renderer) {
         append_renderer_report(input, &mut report);
     }
+    if matches!(topic, DoctorTopic::All | DoctorTopic::Fonts) {
+        append_fonts_report(input, &mut report);
+    }
     if matches!(topic, DoctorTopic::All | DoctorTopic::Config) {
         append_config_report(input, &mut report);
     }
     if matches!(topic, DoctorTopic::All | DoctorTopic::ShellIntegration) {
         append_shell_integration_report(input, &mut report);
+    }
+    if matches!(topic, DoctorTopic::All | DoctorTopic::Clipboard) {
+        append_clipboard_report(input, &mut report);
     }
     if matches!(topic, DoctorTopic::All | DoctorTopic::Performance) {
         append_performance_report(input, &mut report);
@@ -793,6 +874,14 @@ fn append_platform_report(input: &DoctorInput, report: &mut DoctorReport) {
                 .unwrap_or("unknown")
         ),
         format!("  dpi_behavior={:?}", input.platform.dpi_behavior),
+        format!(
+            "  x11_wayland_status={}",
+            input.runtime.x11_wayland_status.as_deref().unwrap_or("n/a")
+        ),
+        format!(
+            "  dpi_scale={}",
+            input.runtime.dpi_scale.as_deref().unwrap_or("not measured")
+        ),
     ]);
 
     for fallback in &input.platform.known_fallbacks {
@@ -820,6 +909,14 @@ fn append_window_report(input: &DoctorInput, report: &mut DoctorReport) {
             input.config.window.linux_backend,
             input.config.window.decoration_strategy
         ),
+        format!(
+            "  provider_backend={}",
+            input
+                .runtime
+                .window_backend
+                .as_deref()
+                .unwrap_or("not initialized by doctor")
+        ),
     ]);
 
     if matches!(
@@ -844,9 +941,22 @@ fn append_renderer_report(input: &DoctorInput, report: &mut DoctorReport) {
             input.config.renderer.present_mode,
             input.config.renderer.damage_tracking
         ),
+        format!("  gpu_backend={}", input.runtime.renderer_backend),
         format!(
-            "  gpu_backend=runtime window detection required; configured preference is {:?}",
-            input.config.renderer.backend
+            "  gpu_adapter={}",
+            input
+                .runtime
+                .gpu_adapter
+                .as_deref()
+                .unwrap_or("not detected")
+        ),
+        format!(
+            "  gpu_features={}",
+            if input.runtime.gpu_features.is_empty() {
+                "not detected".to_owned()
+            } else {
+                input.runtime.gpu_features.join(", ")
+            }
         ),
         format!(
             "  font_family={} fallback_chain={}",
@@ -869,10 +979,39 @@ fn append_renderer_report(input: &DoctorInput, report: &mut DoctorReport) {
     }
 }
 
+fn append_fonts_report(input: &DoctorInput, report: &mut DoctorReport) {
+    report.lines.extend([
+        "fonts:".to_owned(),
+        format!(
+            "  configured_family={} size={} line_height={}",
+            input.config.font.family, input.config.font.size, input.config.font.line_height
+        ),
+        format!(
+            "  fallback_chain={}",
+            if input.config.font.fallback_families.is_empty() {
+                "system defaults".to_owned()
+            } else {
+                input.config.font.fallback_families.join(", ")
+            }
+        ),
+        format!("  discovery={}", input.runtime.font_discovery),
+    ]);
+
+    if input.runtime.font_discovery.contains("unresolved") {
+        report.findings.push(DoctorFinding {
+            severity: DoctorSeverity::Warning,
+            area: "fonts",
+            message: "one or more configured font families could not be resolved on this host"
+                .to_owned(),
+        });
+    }
+}
+
 fn append_config_report(input: &DoctorInput, report: &mut DoctorReport) {
     report.lines.extend([
         "config:".to_owned(),
         format!("  source={}", input.config_source),
+        format!("  parse_status={}", input.runtime.config_parse_status),
         format!(
             "  diagnostics={} platform_overrides macos={} windows={} linux={} x11={} wayland={}",
             input.config_diagnostics.len(),
@@ -910,6 +1049,10 @@ fn append_shell_integration_report(input: &DoctorInput, report: &mut DoctorRepor
             "  enabled_shells={}",
             input.config.shell_integration.enabled_shells.join(", ")
         ),
+        format!(
+            "  runtime_status={}",
+            input.runtime.shell_integration_status
+        ),
     ]);
 
     if !input.config.shell_integration.enabled {
@@ -917,6 +1060,38 @@ fn append_shell_integration_report(input: &DoctorInput, report: &mut DoctorRepor
             severity: DoctorSeverity::Info,
             area: "shell-integration",
             message: "semantic command features are disabled by config".to_owned(),
+        });
+    }
+}
+
+fn append_clipboard_report(input: &DoctorInput, report: &mut DoctorReport) {
+    report.lines.extend([
+        "clipboard:".to_owned(),
+        format!(
+            "  enabled={} copy_on_select={} paste_protection={} bracketed_paste={}",
+            input.config.clipboard.enabled,
+            input.config.clipboard.copy_on_select,
+            input.config.clipboard.paste_protection,
+            input.config.clipboard.bracketed_paste
+        ),
+        format!(
+            "  osc52 enabled={} allow_local={} allow_remote={} max_bytes={} confirm_remote={}",
+            input.config.clipboard.osc52.enabled,
+            input.config.clipboard.osc52.allow_local,
+            input.config.clipboard.osc52.allow_remote,
+            input.config.clipboard.osc52.max_bytes,
+            input.config.clipboard.osc52.confirm_remote_writes
+        ),
+        format!("  provider={}", input.runtime.clipboard_provider),
+    ]);
+
+    if input.config.clipboard.osc52.allow_remote
+        && !input.config.clipboard.osc52.confirm_remote_writes
+    {
+        report.findings.push(DoctorFinding {
+            severity: DoctorSeverity::Warning,
+            area: "clipboard",
+            message: "remote OSC 52 clipboard writes are allowed without confirmation".to_owned(),
         });
     }
 }
@@ -957,10 +1132,13 @@ fn append_ssh_report(input: &DoctorInput, report: &mut DoctorReport) {
     report.lines.extend([
         "ssh:".to_owned(),
         format!("  profiles={}", input.config.ssh_profiles.len()),
+        format!("  provider={}", input.runtime.ssh_provider_status),
+        format!("  keychain_provider={}", input.runtime.keychain_provider),
         "  credential_storage=credential/keychain provider boundary; plaintext config credentials unsupported"
             .to_owned(),
         "  host_trust=unknown hosts require explicit approval; changed keys are blocking"
             .to_owned(),
+        format!("  pty_backend={}", input.runtime.pty_backend),
     ]);
 
     for profile in &input.config.ssh_profiles {
@@ -1006,6 +1184,37 @@ fn append_ssh_report(input: &DoctorInput, report: &mut DoctorReport) {
             });
         }
     }
+}
+
+fn doctor_topic_key(topic: DoctorTopic) -> &'static str {
+    match topic {
+        DoctorTopic::All => "all",
+        DoctorTopic::Renderer => "renderer",
+        DoctorTopic::Config => "config",
+        DoctorTopic::Platform => "platform",
+        DoctorTopic::ShellIntegration => "shell-integration",
+        DoctorTopic::Performance => "performance",
+        DoctorTopic::Ssh => "ssh",
+        DoctorTopic::Window => "window",
+        DoctorTopic::Fonts => "fonts",
+        DoctorTopic::Clipboard => "clipboard",
+    }
+}
+
+fn json_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => escaped.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn known_hosts_policy_name(policy: &SshKnownHostsPolicy) -> &'static str {
@@ -2199,6 +2408,7 @@ mod tests {
                 dpi_behavior: DpiBehavior::PerMonitor,
                 known_fallbacks: Vec::new(),
             },
+            runtime: DoctorRuntimeSnapshot::default(),
             recent_errors: Vec::new(),
         };
 
@@ -2210,6 +2420,63 @@ mod tests {
     }
 
     #[test]
+    fn doctor_topics_cover_installed_command_aliases() {
+        assert_eq!(
+            DoctorTopic::parse("shell"),
+            Some(DoctorTopic::ShellIntegration)
+        );
+        assert_eq!(DoctorTopic::parse("fonts"), Some(DoctorTopic::Fonts));
+        assert_eq!(
+            DoctorTopic::parse("clipboard"),
+            Some(DoctorTopic::Clipboard)
+        );
+        assert!(DoctorTopic::parse("unknown").is_none());
+    }
+
+    #[test]
+    fn doctor_json_is_machine_readable_and_escaped() {
+        let report = DoctorReport {
+            topic: DoctorTopic::Clipboard,
+            lines: vec!["clipboard:".to_owned(), "value=\"quoted\"".to_owned()],
+            findings: vec![DoctorFinding {
+                severity: DoctorSeverity::Warning,
+                area: "clipboard",
+                message: "remote\nwrite".to_owned(),
+            }],
+        };
+
+        let json = report.render_json();
+
+        assert!(json.contains("\"topic\":\"clipboard\""));
+        assert!(json.contains("value=\\\"quoted\\\""));
+        assert!(json.contains("remote\\nwrite"));
+    }
+
+    #[test]
+    fn doctor_fonts_and_clipboard_reports_use_runtime_snapshot() {
+        let input = DoctorInput {
+            app_version: "0.1.0".to_owned(),
+            config_source: "default".to_owned(),
+            config: AppConfig::default(),
+            config_diagnostics: Vec::new(),
+            platform: PlatformSnapshot::detect(),
+            runtime: DoctorRuntimeSnapshot {
+                font_discovery: "primary:monospace=unresolved".to_owned(),
+                clipboard_provider: "system unavailable".to_owned(),
+                ..DoctorRuntimeSnapshot::default()
+            },
+            recent_errors: Vec::new(),
+        };
+
+        let fonts = doctor_report(&input, DoctorTopic::Fonts).render_text();
+        let clipboard = doctor_report(&input, DoctorTopic::Clipboard).render_text();
+
+        assert!(fonts.contains("discovery=primary:monospace=unresolved"));
+        assert!(fonts.contains("could not be resolved"));
+        assert!(clipboard.contains("provider=system unavailable"));
+    }
+
+    #[test]
     fn diagnostics_provider_exposes_doctor_and_privacy_snapshot() {
         let input = DoctorInput {
             app_version: "0.1.0".to_owned(),
@@ -2217,6 +2484,7 @@ mod tests {
             config: AppConfig::default(),
             config_diagnostics: Vec::new(),
             platform: PlatformSnapshot::detect(),
+            runtime: DoctorRuntimeSnapshot::default(),
             recent_errors: Vec::new(),
         };
         let provider = StaticDiagnosticsProvider::new(input);
@@ -2245,6 +2513,7 @@ mod tests {
                 dpi_behavior: DpiBehavior::FractionalScale,
                 known_fallbacks: Vec::new(),
             },
+            runtime: DoctorRuntimeSnapshot::default(),
             recent_errors: vec!["render surface lost".to_owned()],
         };
 
@@ -2263,6 +2532,7 @@ mod tests {
             config: AppConfig::default(),
             config_diagnostics: Vec::new(),
             platform: PlatformSnapshot::detect(),
+            runtime: DoctorRuntimeSnapshot::default(),
             recent_errors: Vec::new(),
         };
 
@@ -2281,6 +2551,7 @@ mod tests {
             config: AppConfig::default(),
             config_diagnostics: Vec::new(),
             platform: PlatformSnapshot::detect(),
+            runtime: DoctorRuntimeSnapshot::default(),
             recent_errors: Vec::new(),
         };
 
@@ -2309,6 +2580,7 @@ mod tests {
             config: AppConfig::default(),
             config_diagnostics: Vec::new(),
             platform: PlatformSnapshot::detect(),
+            runtime: DoctorRuntimeSnapshot::default(),
             recent_errors: Vec::new(),
         };
 

@@ -55,7 +55,7 @@ stated scope:
 | Linux compositor verification matrix | tested | Target matrix, fallback checklist, runtime environment snapshot, and `cargo xtask linux-compositor` exist; real Linux host verification remains open. |
 | Config model and TOML | tested | `AppConfig` defaults, TOML parsing, unknown/deprecated diagnostics, validation, platform overrides, default generation, schema export, reload impact classification, debounced file watching, safe live apply, and previous-config retention exist. |
 | Windows local transport | tested | Portable PTY/ConPTY lifecycle is bounded; Windows smoke tests were made non-hanging and observed output. |
-| Diagnostics foundations | tested | `cargo xtask doctor ...`, bug-report snapshots, release/security/hardening/package readiness reports, and iOS readiness reports exist through shared diagnostics models. |
+| Diagnostics foundations | tested | Installed `panea doctor ...`, `cargo xtask doctor ...`, JSON doctor output, bug-report snapshots, release/security/hardening/package readiness reports, and iOS readiness reports exist through shared diagnostics models. |
 | Performance harness foundation | tested | `cargo xtask bench ...` and `tools/bench` fixtures exist for repeatable local measurements. |
 | Performance instrumentation overlay | tested | Shared instrumentation now reports frame/CPU/GPU timing status, glyph cache and atlas occupancy, damage/draw counts, active animations, idle wakeups, PTY/parser throughput, and memory estimates; the desktop app can draw a developer overlay through renderer overlay primitives. |
 | Mux model | tested | Workspace, window, tab, pane, session, split tree, restore snapshot, and mux action models exist with unit coverage. |
@@ -76,7 +76,7 @@ These areas are real foundations but must not be called complete:
 
 | Area | Status | Missing before completion |
 | --- | --- | --- |
-| Desktop app runtime | partial | Full app lifecycle, polished UI chrome, complete mux integration, installed doctor command, packaging, and cross-OS manual validation. |
+| Desktop app runtime | partial | Full app lifecycle, polished UI chrome, complete mux integration, packaging, and cross-OS manual validation. |
 | Platform windowing | partial | Real macOS lifecycle, real Linux X11/Wayland compositor behavior, decoration negotiation, IME validation, native notifications, and platform-specific fallback verification. |
 | GPU renderer | tested | WGPU surface/device setup, glyph atlas/cache policy, damage-aware batch preparation, indexed background/glyph/decoration/selection/cursor batches, row-scoped atlas uploads, renderer benchmarks, recovery status/event contracts, WGPU device-lost callback detection, disposable WGPU backend recreation, GPU atlas invalidation after recovery, screenshot verification infrastructure, and GPU timestamp status plumbing exist; real GPU timing samples, sleep/wake/monitor-loss validation, macOS/Linux screenshot baselines, and cross-OS render validation remain. |
 | Font system | partial | Deeper shaping, full fallback validation across installed font sets, emoji fallback, and grapheme-aware metrics. |
@@ -100,7 +100,6 @@ These areas exist mostly as placeholders, contracts, or documentation:
 | `config-lua` | stubbed | Programmable config crate exists, but advanced scripting is intentionally deferred until static config is stable. |
 | `tools/conformance` | stubbed | Directory and README exist; full terminal conformance fixture suite is not built out. |
 | Packaging artifacts | stubbed | Packaging plans and diagnostics exist; macOS app bundle, Windows installer/portable build, and Linux AppImage generation are not implemented. |
-| Installed `terminal doctor` | stubbed | Diagnostics are exposed through `cargo xtask doctor`; the installed product binary command is not implemented. |
 | Native notifications | stubbed | Tracked in the platform matrix as not implemented. |
 | iOS app shell | stubbed | Rust shared-engine crate exists; no native mobile app host exists yet. |
 | Advanced config import/helpers | stubbed | Accepted by rollout rules, but no product implementation exists. |
@@ -134,7 +133,7 @@ The following major accepted features have no complete product behavior yet:
   tmux/screen/zellij, WSL, and SSH sessions.
 - Desktop SSH trust prompt UI, credential prompt UI, native OS keychain backend
   wiring, and collected real SSH server smoke reports on every target OS.
-- Installed doctor binary.
+- Cross-OS verification of the installed doctor command output.
 - Release packaging artifacts.
 - Native iOS SSH companion app.
 
@@ -150,10 +149,10 @@ The following major accepted features have no complete product behavior yet:
 | visual overlay | partial | Prompt and command block overlay projection, input/output grouping, metadata badges, alternate-screen suppression, renderer overlay glyph batching, and cursor animation quads exist; collapse/expand UI, full cursor image drawing, and cross-OS visual smoke remain. |
 | session transport | partial | Local and SSH transport foundations plus the SSH real-server smoke harness exist; non-Windows local smoke, collected SSH server reports, and app UX remain. |
 | multiplexer structure | partial | Model and local desktop runtime wiring exist; startup layouts, SSH panes, polished chrome, and cross-OS smoke remain. |
-| diagnostics | partial | Xtask diagnostics exist; installed doctor and live platform reports remain. |
+| diagnostics | partial | Installed and xtask doctor diagnostics exist; richer live platform reports and cross-OS doctor output verification remain. |
 | security | partial | SSH/security contracts, explicit host-trust decisions, keychain-backed secret-provider flow, platform keychain capability reporting, and OSC 52 policy exist; desktop trust/secret UI, native keychain backend wiring, and remote OSC 52 confirmation UI remain. |
 
 ## Immediate Next Slice
 
-After the performance instrumentation and in-window overlay foundation, the
-next dependency-ordered phase is the installed terminal doctor binary.
+After the installed terminal doctor binary, the next dependency-ordered phase
+is cross-OS verification runners.

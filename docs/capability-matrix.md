@@ -75,7 +75,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | SSH transport | partial | partial | partial | partial | Backend and `cargo xtask ssh-smoke` real-server harness exist; collected server reports remain unverified. |
 | SSH secret handling | tested | partial | partial | partial | Secret/keychain provider contracts, redaction, prompt persistence flow, and platform capability reporting exist; native OS backend wiring and prompts remain. |
 | SSH in mux | partial | partial | partial | partial | Session specs exist; direct SSH tab/pane runtime actions remain deferred until SSH trust/secret UI is ready. |
-| Doctor diagnostics | tested | implemented | implemented | implemented | Shared diagnostics and xtask commands exist; installed product command remains. |
+| Doctor diagnostics | tested | implemented | implemented | implemented | Installed `panea doctor` and `cargo xtask doctor` share one diagnostics model with human-readable and JSON output; macOS/Linux runtime output still needs host verification. |
 | Bug-report snapshot | tested | implemented | implemented | implemented | Privacy-aware model exists; product export UX remains. |
 | Native notifications | planned | planned | planned | planned | Not implemented. |
 | Packaging artifacts | stubbed | stubbed | stubbed | stubbed | Plans/docs exist; real installers/packages do not. |

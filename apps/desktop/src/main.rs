@@ -17,7 +17,7 @@ use config_core::{
     SshKnownHostsPolicy, SshProfile, WindowModeConfig,
 };
 use diagnostics::{PerformanceBudget, PerformanceOverlay};
-use font_system::{CellMetrics, FontConfig as RuntimeFontConfig, FontSystem};
+use font_system::{CellMetrics, FontConfig as RuntimeFontConfig, FontSource, FontSystem};
 use mux::{
     LogicalRect, MuxAction, MuxModel, PaneId, PaneLayout, SessionSpec, SessionStatus, SplitAxis,
     TerminalGridSize,
@@ -39,9 +39,10 @@ use render_wgpu::{
     CursorAnimationRuntime, CursorAnimationSettings, FrameDecision, FrameScheduler,
     GpuTerminalRenderer, PresentMode, RendererError, RendererOptions,
 };
+use security::KeychainProvider;
 use security::{
     Osc52ClipboardDecision, Osc52ClipboardPolicy, Osc52ClipboardRequest as SecurityOsc52Request,
-    Osc52ClipboardTarget, evaluate_osc52_clipboard_write,
+    Osc52ClipboardTarget, PlatformKeychainProvider, evaluate_osc52_clipboard_write,
 };
 use semantics::detect_url_hints;
 use semantics::{
@@ -67,10 +68,206 @@ use winit::{
 };
 
 fn main() {
+    if let Some(code) = run_cli() {
+        std::process::exit(code);
+    }
+
     if let Err(error) = run() {
         eprintln!("panea desktop failed: {error}");
         std::process::exit(1);
     }
+}
+
+fn run_cli() -> Option<i32> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let command = args.first()?;
+
+    match command.as_str() {
+        "doctor" => Some(run_doctor_cli(&args[1..])),
+        "help" | "--help" | "-h" => {
+            print_cli_help();
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
+fn print_cli_help() {
+    eprintln!("usage: panea doctor [window|renderer|config|shell|ssh|fonts|clipboard] [--json]");
+}
+
+fn run_doctor_cli(args: &[String]) -> i32 {
+    let json = args.iter().any(|arg| arg == "--json");
+    let topic_arg = args
+        .iter()
+        .find(|arg| arg.as_str() != "--json")
+        .map(String::as_str);
+    let topic = topic_arg.map_or(
+        Some(diagnostics::DoctorTopic::All),
+        diagnostics::DoctorTopic::parse,
+    );
+    let Some(topic) = topic else {
+        eprintln!(
+            "unknown doctor topic; expected window, renderer, config, shell, ssh, fonts, clipboard, platform, or performance"
+        );
+        return 2;
+    };
+
+    let input = doctor_input();
+    let report = diagnostics::doctor_report(&input, topic);
+    if json {
+        println!("{}", report.render_json());
+    } else {
+        println!("{}", report.render_text());
+    }
+    0
+}
+
+fn doctor_input() -> diagnostics::DoctorInput {
+    let config_load_options = config_toml::ConfigLoadOptions::default();
+    match config_toml::load(config_load_options) {
+        Ok(loaded) => {
+            let runtime = doctor_runtime_snapshot(&loaded.config, "loaded");
+            diagnostics::DoctorInput {
+                app_version: env!("CARGO_PKG_VERSION").to_owned(),
+                config_source: config_source_text(&loaded.source),
+                config: loaded.config,
+                config_diagnostics: loaded.diagnostics,
+                platform: diagnostics::PlatformSnapshot::detect(),
+                runtime,
+                recent_errors: Vec::new(),
+            }
+        }
+        Err(error) => {
+            let config = AppConfig::default();
+            let runtime = doctor_runtime_snapshot(&config, &error.to_string());
+            diagnostics::DoctorInput {
+                app_version: env!("CARGO_PKG_VERSION").to_owned(),
+                config_source: "unloaded".to_owned(),
+                config,
+                config_diagnostics: Vec::new(),
+                platform: diagnostics::PlatformSnapshot::detect(),
+                runtime,
+                recent_errors: vec![format!("config load failed: {error}")],
+            }
+        }
+    }
+}
+
+fn config_source_text(source: &config_toml::ConfigSource) -> String {
+    match source {
+        config_toml::ConfigSource::Default => "default".to_owned(),
+        config_toml::ConfigSource::File(path) => path.display().to_string(),
+        config_toml::ConfigSource::ExplicitFile(path) => {
+            format!("explicit:{}", path.display())
+        }
+    }
+}
+
+fn doctor_runtime_snapshot(
+    config: &AppConfig,
+    config_parse_status: &str,
+) -> diagnostics::DoctorRuntimeSnapshot {
+    let gpu_probe = pollster::block_on(render_wgpu::probe_gpu_adapter());
+    let clipboard = ClipboardBridge::new();
+    let clipboard_diagnostic = clipboard.last_diagnostic().clone();
+    let keychain = PlatformKeychainProvider::for_current_platform();
+    let keychain_capability = keychain.capability();
+
+    diagnostics::DoctorRuntimeSnapshot {
+        renderer_backend: gpu_probe.as_ref().map_or_else(
+            || "wgpu adapter not detected".to_owned(),
+            |probe| format!("wgpu {}", probe.backend),
+        ),
+        gpu_adapter: gpu_probe
+            .as_ref()
+            .map(|probe| format!("{} ({})", probe.adapter, probe.device_type)),
+        gpu_features: gpu_probe
+            .as_ref()
+            .map_or_else(Vec::new, |probe| probe.features.clone()),
+        window_backend: Some(window_backend_label()),
+        x11_wayland_status: Some(x11_wayland_status()),
+        dpi_scale: None,
+        font_discovery: font_discovery_label(config),
+        config_parse_status: config_parse_status.to_owned(),
+        shell_integration_status: "no active terminal session during doctor".to_owned(),
+        clipboard_provider: format!(
+            "arboard system clipboard {:?}: {}",
+            clipboard_diagnostic.availability,
+            clipboard_diagnostic
+                .message
+                .as_deref()
+                .unwrap_or("provider initialized")
+        ),
+        keychain_provider: format!(
+            "{:?} available={} secure={} persistent={} ({})",
+            keychain_capability.backend,
+            keychain_capability.available,
+            keychain_capability.secure_storage,
+            keychain_capability.persistent,
+            keychain_capability.message
+        ),
+        pty_backend: pty_backend_label(),
+        ssh_provider_status: "ssh2 transport backend configured; host trust is explicit".to_owned(),
+    }
+}
+
+fn window_backend_label() -> String {
+    if cfg!(windows) {
+        "winit/windows".to_owned()
+    } else if cfg!(target_os = "macos") {
+        "winit/macos".to_owned()
+    } else if cfg!(target_os = "linux") {
+        std::env::var("WINIT_UNIX_BACKEND")
+            .map(|backend| format!("winit/linux requested={backend}"))
+            .unwrap_or_else(|_| "winit/linux auto".to_owned())
+    } else {
+        "winit/unknown".to_owned()
+    }
+}
+
+fn x11_wayland_status() -> String {
+    if !cfg!(target_os = "linux") {
+        return "n/a on this platform".to_owned();
+    }
+
+    let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".to_owned());
+    let wayland = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "unset".to_owned());
+    let display = std::env::var("DISPLAY").unwrap_or_else(|_| "unset".to_owned());
+    format!("session={session} wayland_display={wayland} display={display}")
+}
+
+fn pty_backend_label() -> String {
+    if cfg!(windows) {
+        "portable-pty ConPTY".to_owned()
+    } else if cfg!(unix) {
+        "portable-pty Unix PTY".to_owned()
+    } else {
+        "portable-pty unknown backend".to_owned()
+    }
+}
+
+fn font_discovery_label(config: &AppConfig) -> String {
+    let fonts = FontSystem::new(font_config(&config.font));
+    let chain = fonts.resolve_fallback_chain();
+    let mut labels = Vec::new();
+    labels.push(format_font_descriptor("primary", &chain.primary));
+    labels.extend(
+        chain
+            .fallbacks
+            .iter()
+            .map(|fallback| format_font_descriptor("fallback", fallback)),
+    );
+    labels.join("; ")
+}
+
+fn format_font_descriptor(role: &str, descriptor: &font_system::FontDescriptor) -> String {
+    let source = match &descriptor.source {
+        FontSource::File(path) => format!("file:{}", path.display()),
+        FontSource::Memory => "memory".to_owned(),
+        FontSource::Unresolved => "unresolved".to_owned(),
+    };
+    format!("{role}:{}={source}", descriptor.family)
 }
 
 fn run() -> Result<(), Box<dyn Error>> {

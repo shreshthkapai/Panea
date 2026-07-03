@@ -65,7 +65,7 @@ The remaining high-level work is:
 - Collected real SSH server smoke reports across Windows, macOS, Linux X11,
   and Linux Wayland.
 - Real cross-OS verification runners.
-- Installed terminal doctor binary.
+- Cross-OS validation of the installed doctor command output.
 - Packaging artifacts.
 - Real GPU device-loss validation across sleep/wake, display changes, DPI
   changes, and backend failure scenarios.

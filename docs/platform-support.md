@@ -137,8 +137,8 @@ cargo xtask linux-compositor
 cargo xtask bug-report
 ```
 
-The future installed `terminal doctor` command should call the same diagnostics
-library rather than reimplementing these checks.
+The installed `panea doctor` command uses the same diagnostics library rather
+than reimplementing these checks.
 
 The privacy-aware bug-report snapshot intentionally excludes terminal contents,
 command output, environment variables, secrets, SSH keys, and clipboard contents
