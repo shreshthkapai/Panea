@@ -19,6 +19,21 @@ Config discovery:
 The desktop app loads TOML at startup, applies platform overrides, validates the
 result, and prints warnings to stderr.
 
+## Programmable Config
+
+The advanced frontend lives in `config-lua`. It is intentionally controlled:
+`config.panea` files use deterministic `panea.*` calls that compile into the
+same `AppConfig` before any renderer, input, PTY, or animation hot path can see
+the result.
+
+Static TOML remains supported and remains the simple default. Programmable
+config is loaded when `PANEA_CONFIG` points at a `.panea` or `.lua` file. If no
+static `config.toml` is discovered, the desktop app also checks for
+`config.panea` in the normal platform config directories.
+
+See [programmable-config.md](programmable-config.md) for the API and safety
+rules.
+
 Generate a default config:
 
 ```powershell
@@ -54,9 +69,9 @@ Baseline configurable sections:
 - `diagnostics`
 
 Mux settings include `enabled`, `restore_sessions`, `default_workspace`,
-`show_tab_bar`, `pane_resize_step`, and `remember_working_directory`. Session
-restore persists layout/profile identity only; it does not promise process
-resurrection.
+`show_tab_bar`, `tab_title_format`, `status_format`, `pane_resize_step`, and
+`remember_working_directory`. Session restore persists layout/profile identity
+only; it does not promise process resurrection.
 
 The public key is `font`. `fonts` is accepted as an alias for compatibility
 while the static schema stabilizes.

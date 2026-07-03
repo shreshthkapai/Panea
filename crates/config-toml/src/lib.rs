@@ -710,6 +710,8 @@ fn known_paths() -> BTreeSet<&'static str> {
         "mux.restore_sessions",
         "mux.default_workspace",
         "mux.show_tab_bar",
+        "mux.tab_title_format",
+        "mux.status_format",
         "mux.pane_resize_step",
         "mux.remember_working_directory",
         "performance",

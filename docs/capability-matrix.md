@@ -53,7 +53,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Config validation diagnostics | tested | implemented | implemented | implemented | Validation exists; runtime UX still needs product integration. |
 | Config live reload | tested | partial | partial | partial | Debounced TOML watcher, validation, live apply, and previous-config retention exist. Windows unit/desktop tests pass; macOS/Linux runtime validation remains open. |
 | Config schema export | tested | implemented | implemented | implemented | Xtask helper exists. |
-| Advanced programmable config | stubbed | stubbed | stubbed | stubbed | `config-lua` placeholder exists; implementation is deferred. |
+| Advanced programmable config | tested | implemented | implemented | implemented | Controlled `config-lua` frontend compiles deterministic `panea.*` programs into `AppConfig`, with platform conditionals, platform overrides, generated themes, keybindings, shell/SSH profiles, mux formatting, validation, and reload-plan tests. Automatic `.panea` runtime watching and non-Windows host reports remain open. |
 | Benchmark CLI | tested | implemented | implemented | implemented | Repeatable local command exists; CI/platform runners remain open. |
 | Renderer instrumentation | tested | implemented | implemented | implemented | CPU, submission, glyph/cache, atlas, PTY/parser throughput, memory estimate, and GPU timestamp status metrics exist; real timestamp samples need cross-OS backend validation. |
 | In-window performance overlay | tested | partial | partial | partial | Developer overlay projection exists through renderer overlay primitives; polished installed toggle/UX and cross-OS visual verification remain. |
@@ -79,7 +79,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Doctor diagnostics | tested | implemented | implemented | implemented | Installed `panea doctor` and `cargo xtask doctor` share one diagnostics model with human-readable and JSON output; macOS/Linux runtime output still needs host verification. |
 | Bug-report snapshot | tested | implemented | implemented | implemented | Privacy-aware model exists; product export UX remains. |
 | Native notifications | planned | planned | planned | planned | Not implemented. |
-| Packaging artifacts | tested | implemented | implemented | implemented | `cargo xtask package` builds portable/staged packages with binary, config template/schema/examples, shell integration scripts, docs, license, manifest, and packaged doctor smoke. Windows dev portable smoke passed on the current host; macOS app bundle and Linux portable package reports still need to be collected on those OSes. MSI/DMG/AppImage/deb/rpm remain later. |
+| Packaging artifacts | tested | implemented | implemented | implemented | `cargo xtask package` builds portable/staged packages with binary, config template/schema/examples, shell integration scripts, docs, license, manifest, packaged doctor smoke, and packaged headless shell-session smoke. Windows dev portable smoke passed on the current host; macOS app bundle and Linux portable package reports still need to be collected on those OSes. MSI/DMG/AppImage/deb/rpm remain later. |
 | Release validation suite | partial | partial | partial | partial | Reports/gates exist; full cross-OS suite is unimplemented. |
 
 ## Mobile Matrix

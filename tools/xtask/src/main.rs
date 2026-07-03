@@ -2945,6 +2945,8 @@ fn print_package_plan() {
     println!("  cargo xtask package build --profile release");
     println!("Smoke the packaged doctor command:");
     println!("  cargo xtask package smoke --profile release --build");
+    println!("The smoke also runs the packaged headless shell-session command:");
+    println!("  panea shell-smoke --json");
     println!();
     println!(
         "Installer, DMG, signing/notarization, AppImage, deb, and rpm builders remain later release-hardening work."
@@ -3105,17 +3107,21 @@ fn smoke_package(options: &PackageOptions) -> ExitCode {
         }
     }
 
-    let smoke = run_packaged_doctor(&layout.binary_path, options.timeout);
-    if smoke.status != PackageSmokeStatus::Passed {
-        eprintln!("{}", smoke.render_line());
+    let doctor_smoke = run_packaged_doctor(&layout.binary_path, options.timeout);
+    if doctor_smoke.status != PackageSmokeStatus::Passed {
+        eprintln!("{}", doctor_smoke.render_line());
         return ExitCode::from(1);
     }
 
-    println!("{}", smoke.render_line());
-    println!(
-        "package shell launch remains a GUI/manual smoke: run {} from the package on the target OS and verify the default shell starts",
-        layout.binary_path.display()
-    );
+    println!("{}", doctor_smoke.render_line());
+
+    let shell_smoke = run_packaged_shell_smoke(&layout.binary_path, options.timeout);
+    if shell_smoke.status != PackageSmokeStatus::Passed {
+        eprintln!("{}", shell_smoke.render_line());
+        return ExitCode::from(1);
+    }
+
+    println!("{}", shell_smoke.render_line());
     ExitCode::SUCCESS
 }
 
@@ -3214,6 +3220,16 @@ fn write_package_resources(options: &PackageOptions, layout: &PackageLayout) -> 
             example.contents,
         )?;
     }
+    for example in assets::PROGRAMMABLE_CONFIG_EXAMPLES {
+        write_file(
+            &layout
+                .resource_dir
+                .join("config")
+                .join("examples")
+                .join(example.name),
+            example.contents,
+        )?;
+    }
 
     for shell in [
         ShellKind::Bash,
@@ -3236,6 +3252,7 @@ fn write_package_resources(options: &PackageOptions, layout: &PackageLayout) -> 
     for doc in [
         "docs/getting-started.md",
         "docs/config.md",
+        "docs/programmable-config.md",
         "docs/doctor.md",
         "docs/shell-integration.md",
         "docs/platform-support.md",
@@ -3349,6 +3366,11 @@ fn verify_package_contents(layout: &PackageLayout) -> Result<(), String> {
             .resource_dir
             .join("shell-integration")
             .join("panea.ps1"),
+        &layout
+            .resource_dir
+            .join("config")
+            .join("examples")
+            .join("advanced.panea"),
     ] {
         if !path.exists() {
             return Err(format!("missing packaged file {}", path.display()));
@@ -3376,6 +3398,7 @@ impl PackageSmokeStatus {
 
 #[derive(Debug, Clone)]
 struct PackageSmokeResult {
+    name: &'static str,
     status: PackageSmokeStatus,
     duration: Duration,
     detail: String,
@@ -3384,8 +3407,9 @@ struct PackageSmokeResult {
 impl PackageSmokeResult {
     fn render_line(&self) -> String {
         format!(
-            "[{}] package doctor smoke duration_ms={} {}",
+            "[{}] package {} smoke duration_ms={} {}",
             self.status.label(),
+            self.name,
             self.duration.as_millis(),
             self.detail
         )
@@ -3403,6 +3427,7 @@ fn run_packaged_doctor(binary_path: &Path, timeout: Duration) -> PackageSmokeRes
         Ok(child) => child,
         Err(error) => {
             return PackageSmokeResult {
+                name: "doctor",
                 status: PackageSmokeStatus::Failed,
                 duration: started.elapsed(),
                 detail: format!("failed to spawn {}: {error}", binary_path.display()),
@@ -3417,6 +3442,7 @@ fn run_packaged_doctor(binary_path: &Path, timeout: Duration) -> PackageSmokeRes
                 let _ = child.kill();
                 let _ = child.wait();
                 return PackageSmokeResult {
+                    name: "doctor",
                     status: PackageSmokeStatus::TimedOut,
                     duration: started.elapsed(),
                     detail: format!("{} doctor --json exceeded timeout", binary_path.display()),
@@ -3427,6 +3453,7 @@ fn run_packaged_doctor(binary_path: &Path, timeout: Duration) -> PackageSmokeRes
                 let _ = child.kill();
                 let _ = child.wait();
                 return PackageSmokeResult {
+                    name: "doctor",
                     status: PackageSmokeStatus::Failed,
                     duration: started.elapsed(),
                     detail: format!("failed while waiting for doctor smoke: {error}"),
@@ -3443,12 +3470,14 @@ fn run_packaged_doctor(binary_path: &Path, timeout: Duration) -> PackageSmokeRes
                 && stdout.contains("\"lines\"")
             {
                 PackageSmokeResult {
+                    name: "doctor",
                     status: PackageSmokeStatus::Passed,
                     duration: started.elapsed(),
                     detail: format!("{} doctor --json succeeded", binary_path.display()),
                 }
             } else {
                 PackageSmokeResult {
+                    name: "doctor",
                     status: PackageSmokeStatus::Failed,
                     duration: started.elapsed(),
                     detail: "doctor output did not look like Panea diagnostics JSON".to_owned(),
@@ -3456,6 +3485,7 @@ fn run_packaged_doctor(binary_path: &Path, timeout: Duration) -> PackageSmokeRes
             }
         }
         Ok(output) => PackageSmokeResult {
+            name: "doctor",
             status: PackageSmokeStatus::Failed,
             duration: started.elapsed(),
             detail: format!(
@@ -3465,9 +3495,108 @@ fn run_packaged_doctor(binary_path: &Path, timeout: Duration) -> PackageSmokeRes
             ),
         },
         Err(error) => PackageSmokeResult {
+            name: "doctor",
             status: PackageSmokeStatus::Failed,
             duration: started.elapsed(),
             detail: format!("failed to collect doctor output: {error}"),
+        },
+    }
+}
+
+fn run_packaged_shell_smoke(binary_path: &Path, timeout: Duration) -> PackageSmokeResult {
+    let started = Instant::now();
+    let timeout_ms = timeout.as_millis().to_string();
+    let mut child = match Command::new(binary_path)
+        .args(["shell-smoke", "--json", "--timeout-ms", timeout_ms.as_str()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return PackageSmokeResult {
+                name: "shell-launch",
+                status: PackageSmokeStatus::Failed,
+                duration: started.elapsed(),
+                detail: format!(
+                    "failed to spawn {} shell-smoke: {error}",
+                    binary_path.display()
+                ),
+            };
+        }
+    };
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return PackageSmokeResult {
+                    name: "shell-launch",
+                    status: PackageSmokeStatus::TimedOut,
+                    duration: started.elapsed(),
+                    detail: format!("{} shell-smoke exceeded timeout", binary_path.display()),
+                };
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return PackageSmokeResult {
+                    name: "shell-launch",
+                    status: PackageSmokeStatus::Failed,
+                    duration: started.elapsed(),
+                    detail: format!("failed while waiting for shell smoke: {error}"),
+                };
+            }
+        }
+    }
+
+    match child.wait_with_output() {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.contains("\"name\":\"shell-smoke\"")
+                && stdout.contains("\"passed\":true")
+                && stdout.contains("\"marker_observed\":true")
+            {
+                PackageSmokeResult {
+                    name: "shell-launch",
+                    status: PackageSmokeStatus::Passed,
+                    duration: started.elapsed(),
+                    detail: format!(
+                        "{} shell-smoke observed a PTY marker",
+                        binary_path.display()
+                    ),
+                }
+            } else {
+                PackageSmokeResult {
+                    name: "shell-launch",
+                    status: PackageSmokeStatus::Failed,
+                    duration: started.elapsed(),
+                    detail: format!(
+                        "shell-smoke output did not report success: {}",
+                        preview_bytes(&output.stdout)
+                    ),
+                }
+            }
+        }
+        Ok(output) => PackageSmokeResult {
+            name: "shell-launch",
+            status: PackageSmokeStatus::Failed,
+            duration: started.elapsed(),
+            detail: format!(
+                "shell-smoke exited {:?}: stdout={} stderr={}",
+                output.status.code(),
+                preview_bytes(&output.stdout),
+                preview_bytes(&output.stderr)
+            ),
+        },
+        Err(error) => PackageSmokeResult {
+            name: "shell-launch",
+            status: PackageSmokeStatus::Failed,
+            duration: started.elapsed(),
+            detail: format!("failed to collect shell-smoke output: {error}"),
         },
     }
 }
@@ -3515,8 +3644,8 @@ fn render_package_manifest(options: &PackageOptions, layout: &PackageLayout) -> 
             "  \"binary\": \"{}\",\n",
             "  \"resources\": \"{}\",\n",
             "  \"doctor_smoke\": \"panea doctor --json\",\n",
-            "  \"shell_launch_smoke\": \"manual GUI smoke on target OS\",\n",
-            "  \"contains\": [\"binary\", \"default_config\", \"config_schema\", \"config_examples\", \"shell_integration_scripts\", \"doctor_command\", \"license\", \"readme\"]\n",
+            "  \"shell_launch_smoke\": \"panea shell-smoke --json\",\n",
+            "  \"contains\": [\"binary\", \"default_config\", \"config_schema\", \"config_examples\", \"programmable_config_examples\", \"shell_integration_scripts\", \"doctor_command\", \"shell_smoke_command\", \"license\", \"readme\"]\n",
             "}}\n"
         ),
         env!("CARGO_PKG_VERSION"),
@@ -3537,7 +3666,7 @@ fn render_package_manifest(options: &PackageOptions, layout: &PackageLayout) -> 
 }
 
 fn package_install_notes(options: &PackageOptions) -> String {
-    let common = "Panea package artifact\n\nRun `panea doctor --json` first to verify diagnostics. The default shell launch smoke is currently manual: launch the packaged app on the target OS and confirm the configured shell opens.\n\n";
+    let common = "Panea package artifact\n\nRun `panea doctor --json` first to verify diagnostics. Run `panea shell-smoke --json` to verify that the packaged binary can start a bounded local shell session through Panea's PTY transport.\n\n";
     match options.target_platform {
         CompatPlatform::Windows => format!(
             "{common}Windows portable behavior:\n- Run `panea.exe` from this directory.\n- Add this directory to PATH manually if desired.\n- Installer, Start menu integration, and automatic PATH changes are deferred.\n"
@@ -4272,6 +4401,7 @@ fn dependency_rules() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
             "panea-desktop",
             allowed([
                 "config-core",
+                "config-lua",
                 "config-toml",
                 "diagnostics",
                 "font-system",
@@ -4772,6 +4902,8 @@ mod tests {
         assert!(manifest.contains("\"default_config\""));
         assert!(manifest.contains("\"shell_integration_scripts\""));
         assert!(manifest.contains("\"doctor_command\""));
+        assert!(manifest.contains("\"shell_smoke_command\""));
+        assert!(manifest.contains("\"programmable_config_examples\""));
         assert!(manifest.contains("\"license\""));
     }
 }

@@ -399,6 +399,9 @@ dependencies = [
 [[package]]
 name = "config-lua"
 version = "0.1.0"
+dependencies = [
+ "config-core",
+]
 
 [[package]]
 name = "config-toml"
@@ -1460,6 +1463,7 @@ name = "panea-desktop"
 version = "0.1.0"
 dependencies = [
  "config-core",
+ "config-lua",
  "config-toml",
  "diagnostics",
  "font-system",

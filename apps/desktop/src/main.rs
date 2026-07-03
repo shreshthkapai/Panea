@@ -10,7 +10,7 @@ use std::{
 };
 
 use config_core::{
-    AppConfig, ClipboardConfig, CommandBlockStyle, ConfigDiagnosticSeverity,
+    AppConfig, ClipboardConfig, CommandBlockStyle, ConfigDiagnostic, ConfigDiagnosticSeverity,
     DecorationStrategyConfig, InputOutputGroupingStyle, LinuxBackendConfig, LogLevel, PasteConfig,
     PresentModePreference, PromptDecorationStyle, ReloadPlan, ReloadableSection,
     ShellIntegrationActivationConfig, ShellProfile, ShellProfileKind, SshAuthMethod,
@@ -59,7 +59,7 @@ use term_core::{
     TerminalMode, TerminalSize as CoreTerminalSize,
 };
 use term_parser::TerminalEmulator;
-use transport_core::{TerminalSize as TransportSize, TerminalTransport};
+use transport_core::{TerminalSize as TransportSize, TerminalTransport, TransportState};
 use transport_pty::{LocalPtyTransport, LocalShellKind, LocalShellProfile};
 use transport_ssh::SshConnectionProfile;
 use winit::{
@@ -84,6 +84,7 @@ fn run_cli() -> Option<i32> {
 
     match command.as_str() {
         "doctor" => Some(run_doctor_cli(&args[1..])),
+        "shell-smoke" => Some(run_shell_smoke_cli(&args[1..])),
         "help" | "--help" | "-h" => {
             print_cli_help();
             Some(0)
@@ -94,6 +95,7 @@ fn run_cli() -> Option<i32> {
 
 fn print_cli_help() {
     eprintln!("usage: panea doctor [window|renderer|config|shell|ssh|fonts|clipboard] [--json]");
+    eprintln!("usage: panea shell-smoke [--json] [--timeout-ms <ms>]");
 }
 
 fn run_doctor_cli(args: &[String]) -> i32 {
@@ -123,14 +125,384 @@ fn run_doctor_cli(args: &[String]) -> i32 {
     0
 }
 
+fn run_shell_smoke_cli(args: &[String]) -> i32 {
+    let json = args.iter().any(|arg| arg == "--json");
+    let mut timeout = Duration::from_secs(5);
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {}
+            "--timeout-ms" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    eprintln!("--timeout-ms requires a value");
+                    return 2;
+                };
+                let Ok(millis) = value.parse::<u64>() else {
+                    eprintln!("invalid --timeout-ms value: {value}");
+                    return 2;
+                };
+                if millis < 500 {
+                    eprintln!("--timeout-ms must be at least 500");
+                    return 2;
+                }
+                timeout = Duration::from_millis(millis);
+            }
+            other => {
+                eprintln!("unknown shell-smoke option: {other}");
+                return 2;
+            }
+        }
+        index += 1;
+    }
+
+    let started = Instant::now();
+    let result = match load_desktop_config() {
+        Ok(loaded) => run_headless_shell_smoke(&loaded.config, timeout),
+        Err(error) => ShellSmokeResult {
+            passed: false,
+            duration: started.elapsed(),
+            marker_observed: false,
+            bytes_received: 0,
+            preview: String::new(),
+            detail: format!("config load failed: {error}"),
+            diagnostics: Vec::new(),
+        },
+    };
+
+    if json {
+        println!("{}", result.render_json());
+    } else {
+        println!("{}", result.render_text());
+    }
+
+    if result.passed { 0 } else { 1 }
+}
+
+#[derive(Debug, Clone)]
+struct ShellSmokeResult {
+    passed: bool,
+    duration: Duration,
+    marker_observed: bool,
+    bytes_received: usize,
+    preview: String,
+    detail: String,
+    diagnostics: Vec<String>,
+}
+
+impl ShellSmokeResult {
+    fn render_text(&self) -> String {
+        format!(
+            "shell-smoke status={} duration_ms={} marker_observed={} bytes_received={} detail={}",
+            if self.passed { "passed" } else { "failed" },
+            self.duration.as_millis(),
+            self.marker_observed,
+            self.bytes_received,
+            self.detail
+        )
+    }
+
+    fn render_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"name\":\"shell-smoke\",",
+                "\"passed\":{},",
+                "\"duration_ms\":{},",
+                "\"marker_observed\":{},",
+                "\"bytes_received\":{},",
+                "\"preview\":\"{}\",",
+                "\"detail\":\"{}\",",
+                "\"diagnostics\":[{}]",
+                "}}"
+            ),
+            self.passed,
+            self.duration.as_millis(),
+            self.marker_observed,
+            self.bytes_received,
+            json_escape(&self.preview),
+            json_escape(&self.detail),
+            self.diagnostics
+                .iter()
+                .map(|diagnostic| format!("\"{}\"", json_escape(diagnostic)))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+}
+
+fn run_headless_shell_smoke(config: &AppConfig, timeout: Duration) -> ShellSmokeResult {
+    let started = Instant::now();
+    let marker = b"panea-package-shell-smoke";
+    let profile = shell_smoke_profile(config);
+    let mut transport =
+        match LocalPtyTransport::spawn(profile, TransportSize::new(80, 24, 640, 384)) {
+            Ok(transport) => transport,
+            Err(error) => {
+                return ShellSmokeResult {
+                    passed: false,
+                    duration: started.elapsed(),
+                    marker_observed: false,
+                    bytes_received: 0,
+                    preview: String::new(),
+                    detail: format!("failed to spawn shell smoke PTY: {error}"),
+                    diagnostics: Vec::new(),
+                };
+            }
+        };
+
+    let deadline = Instant::now() + timeout;
+    let mut output = Vec::new();
+    let mut saw_marker = false;
+
+    while Instant::now() < deadline {
+        match transport.poll_output() {
+            Ok(poll) => {
+                if poll
+                    .bytes
+                    .windows(b"\x1b[6n".len())
+                    .any(|window| window == b"\x1b[6n")
+                {
+                    let _ = transport.write_input(b"\x1b[1;1R");
+                }
+                output.extend(poll.bytes);
+                saw_marker =
+                    saw_marker || output.windows(marker.len()).any(|window| window == marker);
+                let closed =
+                    poll.closed || matches!(transport.state(), TransportState::Closed { .. });
+                if saw_marker && closed {
+                    break;
+                }
+            }
+            Err(error) => {
+                let diagnostics = format_local_pty_diagnostics(&transport.diagnostics());
+                let _ = transport.shutdown();
+                return ShellSmokeResult {
+                    passed: false,
+                    duration: started.elapsed(),
+                    marker_observed: saw_marker,
+                    bytes_received: output.len(),
+                    preview: preview_smoke_bytes(&output),
+                    detail: format!("poll failed: {error}"),
+                    diagnostics: vec![diagnostics],
+                };
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let before_shutdown = transport.diagnostics();
+    let shutdown_result = transport.shutdown();
+    let after_shutdown = transport.diagnostics();
+    let diagnostics = vec![
+        format_local_pty_diagnostics(&before_shutdown),
+        format_local_pty_diagnostics(&after_shutdown),
+    ];
+    let shutdown_ok = shutdown_result.is_ok() && !after_shutdown.shutdown_timed_out;
+
+    ShellSmokeResult {
+        passed: saw_marker && shutdown_ok,
+        duration: started.elapsed(),
+        marker_observed: saw_marker,
+        bytes_received: output.len(),
+        preview: preview_smoke_bytes(&output),
+        detail: if saw_marker && shutdown_ok {
+            "shell emitted marker and shut down cleanly".to_owned()
+        } else if !saw_marker {
+            format!(
+                "timed out before observing {}",
+                String::from_utf8_lossy(marker)
+            )
+        } else {
+            format!(
+                "marker observed but shutdown failed: {:?}",
+                shutdown_result.map_err(|error| error.to_string())
+            )
+        },
+        diagnostics,
+    }
+}
+
+fn shell_smoke_profile(config: &AppConfig) -> LocalShellProfile {
+    let mut profile = selected_shell_profile(config)
+        .map(local_shell_profile)
+        .unwrap_or_else(LocalShellProfile::default_for_platform);
+    profile.startup_command = None;
+    profile
+        .env
+        .insert("PANEA_SHELL_SMOKE".to_owned(), "1".to_owned());
+
+    match shell_kind_for_local_profile(&profile) {
+        ShellKind::Cmd => {
+            profile.kind = LocalShellKind::Cmd;
+            if profile.program.trim().is_empty() {
+                profile.program = "cmd.exe".to_owned();
+            }
+            profile.args = vec![
+                "/D".to_owned(),
+                "/C".to_owned(),
+                "echo panea-package-shell-smoke".to_owned(),
+            ];
+        }
+        ShellKind::PowerShell | ShellKind::Pwsh => {
+            profile.kind = LocalShellKind::PowerShell;
+            if profile.program.trim().is_empty() {
+                profile.program = "powershell.exe".to_owned();
+            }
+            profile.args = vec![
+                "-NoLogo".to_owned(),
+                "-NoProfile".to_owned(),
+                "-Command".to_owned(),
+                "Write-Output panea-package-shell-smoke".to_owned(),
+            ];
+        }
+        ShellKind::Bash
+        | ShellKind::Zsh
+        | ShellKind::Fish
+        | ShellKind::Nushell
+        | ShellKind::Unknown => {
+            if cfg!(windows) && matches!(profile.kind, LocalShellKind::Default) {
+                profile.kind = LocalShellKind::PowerShell;
+                profile.program = "powershell.exe".to_owned();
+                profile.args = vec![
+                    "-NoLogo".to_owned(),
+                    "-NoProfile".to_owned(),
+                    "-Command".to_owned(),
+                    "Write-Output panea-package-shell-smoke".to_owned(),
+                ];
+            } else {
+                if profile.program.trim().is_empty() {
+                    profile.program = "sh".to_owned();
+                }
+                profile.args = vec![
+                    "-lc".to_owned(),
+                    "printf '%s\\n' panea-package-shell-smoke".to_owned(),
+                ];
+            }
+        }
+    }
+
+    profile
+}
+
+fn preview_smoke_bytes(bytes: &[u8]) -> String {
+    const LIMIT: usize = 320;
+    let start = bytes.len().saturating_sub(LIMIT);
+    String::from_utf8_lossy(&bytes[start..])
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+}
+
+fn format_local_pty_diagnostics(diagnostics: &transport_pty::LocalPtyDiagnostics) -> String {
+    format!(
+        "command={} pid={:?} state={:?} bytes={} reads={} reader_started={} reader_stopped={} child_exited={} kill_attempted={} shutdown_timed_out={} reader_error={:?}",
+        diagnostics.command,
+        diagnostics.process_id,
+        diagnostics.state,
+        diagnostics.bytes_received,
+        diagnostics.read_events,
+        diagnostics.reader_started,
+        diagnostics.reader_stopped,
+        diagnostics.child_exited,
+        diagnostics.kill_attempted,
+        diagnostics.shutdown_timed_out,
+        diagnostics.reader_error
+    )
+}
+
+fn json_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+struct LoadedDesktopConfig {
+    config: AppConfig,
+    diagnostics: Vec<ConfigDiagnostic>,
+    source: String,
+    toml_watcher: Option<config_toml::ConfigWatcher>,
+}
+
+fn load_desktop_config() -> Result<LoadedDesktopConfig, Box<dyn Error>> {
+    let platform = config_core::ConfigPlatform::current();
+
+    if let Some(path) = std::env::var_os("PANEA_CONFIG").map(PathBuf::from) {
+        if config_lua::is_programmable_config_path(&path) {
+            let loaded = config_lua::load_path(path.clone(), true, platform)?;
+            return Ok(LoadedDesktopConfig {
+                config: loaded.config,
+                diagnostics: loaded.diagnostics,
+                source: format!("explicit:{}", path.display()),
+                toml_watcher: None,
+            });
+        }
+
+        let options = config_toml::ConfigLoadOptions {
+            explicit_path: Some(path),
+            platform,
+        };
+        let loaded = config_toml::load(options.clone())?;
+        return Ok(LoadedDesktopConfig {
+            source: config_source_text(&loaded.source),
+            config: loaded.config,
+            diagnostics: loaded.diagnostics,
+            toml_watcher: Some(config_toml::ConfigWatcher::new(options)),
+        });
+    }
+
+    let toml_exists = config_toml::candidate_paths_for_current_platform()
+        .iter()
+        .any(|path| path.exists());
+    if toml_exists {
+        let options = config_toml::ConfigLoadOptions {
+            explicit_path: None,
+            platform,
+        };
+        let loaded = config_toml::load(options.clone())?;
+        return Ok(LoadedDesktopConfig {
+            source: config_source_text(&loaded.source),
+            config: loaded.config,
+            diagnostics: loaded.diagnostics,
+            toml_watcher: Some(config_toml::ConfigWatcher::new(options)),
+        });
+    }
+
+    if let Some(path) = config_lua::candidate_paths_for_current_platform()
+        .into_iter()
+        .find(|path| path.exists())
+    {
+        let loaded = config_lua::load_path(path.clone(), false, platform)?;
+        return Ok(LoadedDesktopConfig {
+            config: loaded.config,
+            diagnostics: loaded.diagnostics,
+            source: path.display().to_string(),
+            toml_watcher: None,
+        });
+    }
+
+    let options = config_toml::ConfigLoadOptions {
+        explicit_path: None,
+        platform,
+    };
+    let loaded = config_toml::load(options.clone())?;
+    Ok(LoadedDesktopConfig {
+        source: config_source_text(&loaded.source),
+        config: loaded.config,
+        diagnostics: loaded.diagnostics,
+        toml_watcher: Some(config_toml::ConfigWatcher::new(options)),
+    })
+}
+
 fn doctor_input() -> diagnostics::DoctorInput {
-    let config_load_options = config_toml::ConfigLoadOptions::default();
-    match config_toml::load(config_load_options) {
+    match load_desktop_config() {
         Ok(loaded) => {
             let runtime = doctor_runtime_snapshot(&loaded.config, "loaded");
             diagnostics::DoctorInput {
                 app_version: env!("CARGO_PKG_VERSION").to_owned(),
-                config_source: config_source_text(&loaded.source),
+                config_source: loaded.source,
                 config: loaded.config,
                 config_diagnostics: loaded.diagnostics,
                 platform: diagnostics::PlatformSnapshot::detect(),
@@ -271,11 +643,10 @@ fn format_font_descriptor(role: &str, descriptor: &font_system::FontDescriptor) 
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let config_load_options = config_toml::ConfigLoadOptions::default();
-    let loaded_config = config_toml::load(config_load_options.clone())?;
+    let loaded_config = load_desktop_config()?;
     log_config_diagnostics(&loaded_config.diagnostics);
     let mut config = loaded_config.config;
-    let mut config_watcher = config_toml::ConfigWatcher::new(config_load_options);
+    let mut config_watcher = loaded_config.toml_watcher;
     let _ssh_session_profiles: Vec<SshConnectionProfile> = config
         .ssh_profiles
         .iter()
@@ -559,66 +930,73 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
             },
             Event::AboutToWait => {
-                match config_watcher.poll() {
-                    config_toml::ConfigWatchEvent::Unchanged => {}
-                    config_toml::ConfigWatchEvent::Pending { path } => {
-                        if matches!(config.diagnostics.log_level, LogLevel::Debug | LogLevel::Trace)
-                        {
+                if let Some(config_watcher) = config_watcher.as_mut() {
+                    match config_watcher.poll() {
+                        config_toml::ConfigWatchEvent::Unchanged => {}
+                        config_toml::ConfigWatchEvent::Pending { path } => {
+                            if matches!(
+                                config.diagnostics.log_level,
+                                LogLevel::Debug | LogLevel::Trace
+                            ) {
+                                eprintln!(
+                                    "config reload pending{}",
+                                    path.as_ref()
+                                        .map(|path| format!(" for {}", path.display()))
+                                        .unwrap_or_default()
+                                );
+                            }
+                        }
+                        config_toml::ConfigWatchEvent::Reloaded(loaded) => {
+                            let loaded = *loaded;
+                            log_config_diagnostics(&loaded.diagnostics);
+                            let plan = config.reload_plan_from(&loaded.config);
+                            log_reload_plan(&plan);
+                            match apply_live_config_reload(
+                                &mut config,
+                                loaded.config,
+                                &plan,
+                                &mut fonts,
+                                &mut clipboard_config,
+                                &mut paste_config,
+                                &mut osc52_policy,
+                                &mut performance_overlay,
+                                &mut performance_budget,
+                                &window,
+                            ) {
+                                Ok(reloaded) => {
+                                    request_cursor_image_if_enabled(
+                                        &mut cursor_image_cache,
+                                        &config,
+                                    );
+                                    cursor_image_status_reported = None;
+                                    if reloaded {
+                                        if let Ok(metrics) = fonts.cell_metrics() {
+                                            mux_runtime.resize_all(
+                                                surface_size.width,
+                                                surface_size.height,
+                                                metrics,
+                                                &config,
+                                            );
+                                        }
+                                        scheduler.terminal_content_changed();
+                                        window.request_redraw();
+                                    }
+                                }
+                                Err(message) => {
+                                    eprintln!(
+                                        "config reload rejected: {message}; keeping previous valid config"
+                                    );
+                                }
+                            }
+                        }
+                        config_toml::ConfigWatchEvent::Failed { path, error } => {
                             eprintln!(
-                                "config reload pending{}",
+                                "config reload failed{}: {error}; keeping previous valid config",
                                 path.as_ref()
                                     .map(|path| format!(" for {}", path.display()))
                                     .unwrap_or_default()
                             );
                         }
-                    }
-                    config_toml::ConfigWatchEvent::Reloaded(loaded) => {
-                        let loaded = *loaded;
-                        log_config_diagnostics(&loaded.diagnostics);
-                        let plan = config.reload_plan_from(&loaded.config);
-                        log_reload_plan(&plan);
-                        match apply_live_config_reload(
-                            &mut config,
-                            loaded.config,
-                            &plan,
-                            &mut fonts,
-                            &mut clipboard_config,
-                            &mut paste_config,
-                            &mut osc52_policy,
-                            &mut performance_overlay,
-                            &mut performance_budget,
-                            &window,
-                        ) {
-                            Ok(reloaded) => {
-                                request_cursor_image_if_enabled(&mut cursor_image_cache, &config);
-                                cursor_image_status_reported = None;
-                                if reloaded {
-                                    if let Ok(metrics) = fonts.cell_metrics() {
-                                        mux_runtime.resize_all(
-                                            surface_size.width,
-                                            surface_size.height,
-                                            metrics,
-                                            &config,
-                                        );
-                                    }
-                                    scheduler.terminal_content_changed();
-                                    window.request_redraw();
-                                }
-                            }
-                            Err(message) => {
-                                eprintln!(
-                                    "config reload rejected: {message}; keeping previous valid config"
-                                );
-                            }
-                        }
-                    }
-                    config_toml::ConfigWatchEvent::Failed { path, error } => {
-                        eprintln!(
-                            "config reload failed{}: {error}; keeping previous valid config",
-                            path.as_ref()
-                                .map(|path| format!(" for {}", path.display()))
-                                .unwrap_or_default()
-                        );
                     }
                 }
 

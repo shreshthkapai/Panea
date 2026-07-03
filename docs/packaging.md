@@ -21,11 +21,12 @@ Linux Wayland behavior: same Linux package layout as X11; backend behavior is
 selected and diagnosed at runtime
 Fallback behavior: MSI/DMG/AppImage/deb/rpm/signing/notarization are deferred;
 the portable/staged artifact remains inspectable
-Diagnostics: packaged `panea doctor --json` is smoke-tested
+Diagnostics: packaged `panea doctor --json` and `panea shell-smoke --json`
+are smoke-tested
 Performance cost when disabled: none; packaging is offline build tooling
 Performance cost when enabled: one desktop binary build plus filesystem staging
 Tests: xtask unit tests, package content verification, packaged doctor smoke,
-and cross-OS runner integration
+packaged headless shell-session smoke, and cross-OS runner integration
 
 ## Commands
 
@@ -52,11 +53,13 @@ The smoke command verifies required package contents and runs:
 
 ```text
 panea doctor --json
+panea shell-smoke --json
 ```
 
-Shell launch is still a manual package smoke because the current installed
-binary does not expose a headless shell-session command. On each target OS,
-launch the packaged app/binary and confirm that the default shell starts.
+`shell-smoke` starts a bounded local PTY session, runs a one-shot marker command
+through the selected/default shell profile, observes output, and shuts the
+transport down. Full GUI launch remains a manual release smoke on each target
+OS.
 
 ## Generated Layouts
 
@@ -122,3 +125,5 @@ panea-<version>-linux-portable-<profile>/
 - macOS zip/DMG, signing, and notarization.
 - Linux AppImage, deb, rpm, dependency policy, and terminfo installation.
 - Cross-OS collected package reports for macOS, Linux X11, and Linux Wayland.
+- Full GUI packaged launch smoke remains manual until an installed GUI runner
+  exists.

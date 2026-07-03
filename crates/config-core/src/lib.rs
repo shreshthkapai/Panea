@@ -515,6 +515,12 @@ impl AppConfig {
         if self.mux.default_workspace.trim().is_empty() {
             report.error("mux.default_workspace", "default workspace cannot be empty");
         }
+        if self.mux.tab_title_format.trim().is_empty() {
+            report.error("mux.tab_title_format", "tab title format cannot be empty");
+        }
+        if self.mux.status_format.trim().is_empty() {
+            report.error("mux.status_format", "status format cannot be empty");
+        }
         if !(0.01..=0.5).contains(&self.mux.pane_resize_step) {
             report.error(
                 "mux.pane_resize_step",
@@ -1376,6 +1382,8 @@ pub struct MuxConfig {
     pub restore_sessions: bool,
     pub default_workspace: String,
     pub show_tab_bar: bool,
+    pub tab_title_format: String,
+    pub status_format: String,
     pub pane_resize_step: f64,
     pub remember_working_directory: bool,
 }
@@ -1387,6 +1395,8 @@ impl Default for MuxConfig {
             restore_sessions: false,
             default_workspace: "default".to_owned(),
             show_tab_bar: true,
+            tab_title_format: "{index}: {title}".to_owned(),
+            status_format: "{workspace} {shell}".to_owned(),
             pane_resize_step: 0.05,
             remember_working_directory: true,
         }
@@ -2648,6 +2658,20 @@ pub fn export_schema() -> ConfigSchema {
                         "boolean",
                         default.mux.show_tab_bar,
                         false,
+                        false,
+                    ),
+                    field(
+                        "mux.tab_title_format",
+                        "string",
+                        &default.mux.tab_title_format,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "mux.status_format",
+                        "string",
+                        &default.mux.status_format,
+                        true,
                         false,
                     ),
                     field(

@@ -54,6 +54,7 @@ stated scope:
 | Screenshot verification runner | tested | Deterministic renderer fixtures, PPM capture, tolerance-based diffing, Windows baselines, and `cargo xtask screenshot verify --platform windows` exist. |
 | Linux compositor verification matrix | tested | Target matrix, fallback checklist, runtime environment snapshot, and `cargo xtask linux-compositor` exist; real Linux host verification remains open. |
 | Config model and TOML | tested | `AppConfig` defaults, TOML parsing, unknown/deprecated diagnostics, validation, platform overrides, default generation, schema export, reload impact classification, debounced file watching, safe live apply, and previous-config retention exist. |
+| Programmable config | tested | `config-lua` now provides a controlled deterministic `panea.*` frontend that compiles into `AppConfig`, supports generated themes, platform conditionals, explicit platform overrides, keybindings, shell/SSH profiles, cursor mode styles, mux formatting, validation, provider errors, and reload-plan comparison without running in hot paths. |
 | Windows local transport | tested | Portable PTY/ConPTY lifecycle is bounded; Windows smoke tests were made non-hanging and observed output. |
 | Diagnostics foundations | tested | Installed `panea doctor ...`, `cargo xtask doctor ...`, JSON doctor output, bug-report snapshots, release/security/hardening/package readiness reports, and iOS readiness reports exist through shared diagnostics models. |
 | Performance harness foundation | tested | `cargo xtask bench ...` and `tools/bench` fixtures exist for repeatable local measurements. |
@@ -69,7 +70,7 @@ stated scope:
 | SSH trust and secret contracts | tested | Unknown-host decisions, changed-host replacement actions, redacted secret prompts, keychain-backed secret lookup/prompt/store flow, and platform keychain capability reporting exist. |
 | SSH real-server smoke harness | tested | `cargo xtask ssh-smoke` uses the real `transport-ssh` backend, explicit trust providers, smoke-owned known-hosts storage, remote PTY output polling, resize, reconnect, changed-host detection, and remote OSC 52 policy checks. Real server reports still need to be collected per OS. |
 | Cross-OS verification runner | tested | `cargo xtask verify-os` composes architecture, unit, parser, Unicode, fuzz-smoke, renderer, config, clipboard, shell, PTY, screenshot, compatibility, doctor, Linux compositor, SSH, and package-smoke checks into platform-stamped markdown/JSON reports. GitHub Actions defines Windows, macOS, Linux X11, and Linux Wayland jobs. |
-| Packaging artifact runner | tested | `cargo xtask package` plans, builds, and smokes portable/staged desktop packages. The Windows dev portable package was staged on the current host and its packaged `panea.exe doctor --json` smoke passed. macOS/Linux package reports remain uncollected. |
+| Packaging artifact runner | tested | `cargo xtask package` plans, builds, and smokes portable/staged desktop packages. The Windows dev portable package was staged on the current host; packaged `panea.exe doctor --json` and packaged `panea shell-smoke --json` both passed. macOS/Linux package reports remain uncollected. |
 | iOS shared-engine foundation | tested | `apps/ios` reuses shared parser/core/config/transport/semantic/render contracts and models lifecycle, input, safe-area sizing, and mobile SSH session specs. |
 
 ## What Is Partial
@@ -99,7 +100,6 @@ These areas exist mostly as placeholders, contracts, or documentation:
 
 | Area | Status | Current shape |
 | --- | --- | --- |
-| `config-lua` | stubbed | Programmable config crate exists, but advanced scripting is intentionally deferred until static config is stable. |
 | `tools/conformance` | stubbed | Directory and README exist; full terminal conformance fixture suite is not built out. |
 | Packaging installers | stubbed | Portable/staged package directories exist; Windows installer, macOS DMG/zip/signing/notarization, Linux AppImage/deb/rpm, and terminfo installation remain unimplemented. |
 | Native notifications | stubbed | Tracked in the platform matrix as not implemented. |
@@ -126,7 +126,7 @@ The following major accepted features have no complete product behavior yet:
 - Real GPU device-loss validation for sleep/wake, monitor attach/detach, DPI
   changes, and backend failure simulation across desktop OSes.
 - Linux primary selection provider and remote OSC 52 confirmation UI.
-- Native OS config watcher backends and real macOS/Linux runtime reload validation.
+- Native OS config watcher backends, automatic programmable-config runtime watching, and real macOS/Linux runtime reload validation.
 - Product-complete desktop tabs/panes/sessions/workspaces runtime, including
   startup layouts, SSH panes, polished chrome, and cross-OS smoke tests.
 - Remote shell integration install flows and real bash/zsh/fish/macOS/Linux
@@ -150,7 +150,7 @@ The following major accepted features have no complete product behavior yet:
 | core correctness | partial | Strong baseline, Unicode cell hardening, fuzz harness, and app compatibility runner exist, but interactive app compatibility and conformance hardening remain. |
 | platform parity | partial | Capabilities, desktop window foundations, Linux compositor verification matrix, cross-OS verification runners, and portable package layouts exist; real macOS/Linux X11/Linux Wayland verification reports and compositor lab evidence remain open. |
 | render performance | partial | WGPU foundation, glyph cache, damage, scheduling, batched glyph/quad rendering, atlas uploads, benchmarks, renderer recovery foundation, screenshot verification infrastructure, GPU timestamp status plumbing, and a developer performance overlay exist; macOS/Linux screenshot baselines, real device-loss validation, real GPU timing validation, and cross-OS runtime validation remain. |
-| config portability | partial | Static config model, TOML loading, validation, platform overrides, schema export, and runtime live-reload foundation exist; advanced config and cross-OS reload validation remain. |
+| config portability | partial | Static config model, TOML loading, validation, platform overrides, schema export, runtime live-reload foundation, and controlled programmable config compilation exist; automatic programmable-config watching and cross-OS reload validation remain. |
 | semantic meaning | partial | Semantic events, timeline, runtime activation planning, desktop local hook injection, and Windows PowerShell semantic smoke exist; remote flows and non-Windows/bash/zsh/fish real verification remain. |
 | visual overlay | partial | Prompt and command block overlay projection, input/output grouping, metadata badges, alternate-screen suppression, renderer overlay glyph batching, and cursor animation quads exist; collapse/expand UI, full cursor image drawing, and cross-OS visual smoke remain. |
 | session transport | partial | Local and SSH transport foundations plus the SSH real-server smoke harness exist; non-Windows local smoke, collected SSH server reports, and app UX remain. |
@@ -160,5 +160,5 @@ The following major accepted features have no complete product behavior yet:
 
 ## Immediate Next Slice
 
-After packaging artifacts, the next dependency-ordered phase is advanced
-programmable config.
+After advanced programmable config, the next dependency-ordered phase is the
+native iOS SSH companion path.

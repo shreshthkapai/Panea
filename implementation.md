@@ -319,9 +319,13 @@ to more visible features before the dependencies they rely on are hardened.
   keeps the previous active config after parse, validation, or runtime apply
   failures. Native OS watcher backends, richer error UI, and macOS/Linux
   runtime validation remain deferred.
-- Programmable config remains deferred until the static TOML model has more
-  runtime mileage. It must compile into the same `AppConfig` and stay out of the
-  render hot path.
+- Next-pass Phase 21 adds a controlled programmable config frontend in
+  `config-lua`. `config.panea` scripts use deterministic `panea.*` calls,
+  compile into the same `AppConfig`, support generated themes, platform
+  conditionals, explicit platform overrides, advanced keybindings, shell/SSH
+  profiles, cursor mode styles, and mux label formats, and never run in
+  render/input/PTY hot paths. Automatic runtime watching for `.panea` files and
+  richer product UI around programmable config errors remain follow-up work.
 - Phase 8 uses CPU-side timing plus WGPU submission wall-clock timing, and
   next-pass Phase 17 adds GPU timestamp status plumbing plus a developer
   in-window overlay. Real hardware timestamp validation, polished overlay UX,
@@ -403,10 +407,12 @@ to more visible features before the dependencies they rely on are hardened.
   artifacts pass manual/automated validation on macOS, Windows, Linux X11, and
   Linux Wayland. Next-pass Phase 20 adds portable/staged package directories
   and a packaged doctor smoke, with Windows dev portable smoke verified on the
-  current host. MSI/installer, Start menu/PATH integration, macOS DMG/zip,
-  signing/notarization, Linux AppImage/deb/rpm, terminfo installation strategy,
-  package shell-launch automation, and macOS/Linux package reports remain
-  follow-up work. OS keychain-backed secret providers, interactive SSH host-key
+  current host. Next-pass Phase 21 adds a packaged `panea shell-smoke --json`
+  headless PTY marker check so package smoke no longer relies only on manual
+  shell-launch verification. MSI/installer, Start menu/PATH integration, macOS
+  DMG/zip, signing/notarization, Linux AppImage/deb/rpm, terminfo installation
+  strategy, GUI package launch automation, and macOS/Linux package reports
+  remain follow-up work. OS keychain-backed secret providers, interactive SSH host-key
   approval UI, remote OSC 52 clipboard confirmation UI, real GPU device-loss
   platform validation, cross-OS config reload validation, and richer config
   error UI also remain release-hardening follow-up work.

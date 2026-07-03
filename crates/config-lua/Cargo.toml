@@ -8,3 +8,5 @@ description = "Advanced programmable configuration frontend."
 [lints]
 workspace = true
 
+[dependencies]
+config-core = { path = "../config-core" }

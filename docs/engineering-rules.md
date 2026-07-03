@@ -48,7 +48,8 @@ The remaining high-level work is:
 - App compatibility tests now have a bounded runner; full interactive shells,
   editors, TUIs, tmux/screen/zellij, WSL, SSH, and cross-OS reports remain.
 - Runtime config watching/live reload cross-OS validation and richer error UI.
-- Advanced programmable config later.
+- Automatic runtime watching for programmable config, richer programmable
+  status/tab formatting integration, and cross-OS advanced config reports.
 - Real GPU timestamp validation, polished performance overlay UX, and
   benchmark regression gates.
 - Product-complete desktop mux runtime polish: startup layouts, SSH panes,

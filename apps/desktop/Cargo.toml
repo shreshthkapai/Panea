@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 config-core = { path = "../../crates/config-core" }
+config-lua = { path = "../../crates/config-lua" }
 config-toml = { path = "../../crates/config-toml" }
 diagnostics = { path = "../../crates/diagnostics" }
 font-system = { path = "../../crates/font-system" }

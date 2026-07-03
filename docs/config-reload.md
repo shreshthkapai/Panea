@@ -26,6 +26,11 @@ The current implementation uses a conservative polling watcher based on file met
 - deletion fallback to defaults for non-explicit discovered configs
 - explicit-path deletion as a reload failure
 
+Programmable `config.panea` files compile into the same `AppConfig` and can use
+the same reload-impact classifier in tests or explicit reload planning.
+Automatic runtime watching for programmable config is deferred until it can
+preserve the same previous-valid-config behavior on every supported desktop OS.
+
 ## Live-Applied Sections
 
 The desktop runtime applies these sections without restarting sessions:
@@ -56,6 +61,8 @@ These are diagnosed but not silently applied to the running app in this phase:
 ## Deferred
 
 - Native OS filesystem watcher backends may be added later if polling is not good enough, but they must preserve the same config contract.
+- Automatic runtime watching for programmable `config.panea` files is not wired
+  into the desktop app yet.
 - macOS, Linux X11, and Linux Wayland runtime validation has not been run.
 - User-facing error UI is still stderr/diagnostic text in the desktop runtime.
 - Existing sessions do not receive shell-profile or scrollback policy mutations live.

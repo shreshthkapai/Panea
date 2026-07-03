@@ -1,0 +1,18 @@
+-- Panea controlled programmable config example.
+-- Compiles into config_core::AppConfig before runtime hot paths.
+
+panea.theme("generated-night", "#101820", "#f4f7fb", "#4dd4ac")
+panea.set("font.family", "monospace")
+panea.set("font.size", 14)
+panea.set("font.fallback_families", ["Noto Color Emoji", "Segoe UI Emoji"])
+panea.set("command_blocks.enabled", true)
+panea.set("command_blocks.style", "card")
+panea.set("cursor.animations_enabled", true)
+panea.cursor_mode("insert", "beam")
+panea.key("Ctrl+Alt+T", "new_tab")
+panea.set("mux.default_workspace", "dev")
+panea.set("mux.tab_title_format", "{index}: {title}")
+panea.set("mux.status_format", "{workspace} {shell}")
+
+panea.platform_set("windows", "font.family", "Cascadia Mono")
+panea.platform_set("linux_wayland", "window.linux_backend", "wayland")
