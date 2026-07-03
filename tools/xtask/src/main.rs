@@ -9,7 +9,7 @@ fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("help") | None => {
             eprintln!(
-                "usage: cargo xtask <fmt|clippy|test|build|check|layer-check|ci|config-default|config-schema|bench|fuzz-smoke|fuzz|doctor|bug-report|hardening|security-review|package-plan|release-check|ios-readiness>"
+                "usage: cargo xtask <fmt|clippy|test|build|check|layer-check|ci|config-default|config-schema|bench|screenshot|fuzz-smoke|fuzz|doctor|bug-report|hardening|security-review|package-plan|release-check|ios-readiness>"
             );
             ExitCode::SUCCESS
         }
@@ -22,6 +22,7 @@ fn main() -> ExitCode {
         Some("config-default") => print_config_default(),
         Some("config-schema") => print_config_schema(),
         Some("bench") => run_bench(),
+        Some("screenshot") => run_screenshot(),
         Some("fuzz-smoke") => run_fuzz_smoke(),
         Some("fuzz") => run_fuzz(),
         Some("doctor") => run_doctor(),
@@ -177,6 +178,250 @@ fn run_bench() -> ExitCode {
     cargo_args.extend(args);
     let refs = cargo_args.iter().map(String::as_str).collect::<Vec<_>>();
     run("cargo", &refs)
+}
+
+fn run_screenshot() -> ExitCode {
+    let mut args = std::env::args().skip(2).collect::<Vec<_>>();
+    let command = args.first().map_or("help", String::as_str);
+
+    match command {
+        "help" | "--help" | "-h" => {
+            print_screenshot_help();
+            ExitCode::SUCCESS
+        }
+        "capture" => {
+            args.remove(0);
+            let options = match ScreenshotOptions::parse(&args) {
+                Ok(options) => options,
+                Err(error) => {
+                    eprintln!("{error}");
+                    return ExitCode::from(2);
+                }
+            };
+            capture_screenshot_baselines(&options)
+        }
+        "verify" => {
+            args.remove(0);
+            let options = match ScreenshotOptions::parse(&args) {
+                Ok(options) => options,
+                Err(error) => {
+                    eprintln!("{error}");
+                    return ExitCode::from(2);
+                }
+            };
+            verify_screenshot_baselines(&options)
+        }
+        "report" => {
+            print_screenshot_report();
+            ExitCode::SUCCESS
+        }
+        other => {
+            eprintln!("unknown screenshot command: {other}");
+            print_screenshot_help();
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn print_screenshot_help() {
+    eprintln!(
+        "usage: cargo xtask screenshot <capture|verify|report> [--platform <key>] [--baseline-dir <path>] [--report-dir <path>]"
+    );
+    eprintln!("platform keys: windows, macos, linux-x11, linux-wayland");
+}
+
+#[derive(Debug, Clone)]
+struct ScreenshotOptions {
+    platform_key: String,
+    baseline_root: PathBuf,
+    report_root: PathBuf,
+}
+
+impl ScreenshotOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut platform_key = render_wgpu::detect_screenshot_platform_key().to_owned();
+        let mut baseline_root = PathBuf::from("tools/conformance/screenshots/baselines");
+        let mut report_root = PathBuf::from("target/screenshots");
+        let mut index = 0;
+
+        while index < args.len() {
+            match args[index].as_str() {
+                "--platform" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("--platform requires a value".to_owned());
+                    };
+                    if !matches!(
+                        value.as_str(),
+                        "windows" | "macos" | "linux-x11" | "linux-wayland" | "linux"
+                    ) {
+                        return Err(format!("unsupported screenshot platform key: {value}"));
+                    }
+                    platform_key = value.clone();
+                }
+                "--baseline-dir" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("--baseline-dir requires a value".to_owned());
+                    };
+                    baseline_root = PathBuf::from(value);
+                }
+                "--report-dir" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("--report-dir requires a value".to_owned());
+                    };
+                    report_root = PathBuf::from(value);
+                }
+                other => return Err(format!("unknown screenshot option: {other}")),
+            }
+            index += 1;
+        }
+
+        Ok(Self {
+            platform_key,
+            baseline_root,
+            report_root,
+        })
+    }
+
+    fn baseline_dir(&self) -> PathBuf {
+        self.baseline_root.join(&self.platform_key)
+    }
+
+    fn report_dir(&self) -> PathBuf {
+        self.report_root.join(&self.platform_key)
+    }
+}
+
+fn capture_screenshot_baselines(options: &ScreenshotOptions) -> ExitCode {
+    let captures = match render_wgpu::capture_all_screenshot_fixtures() {
+        Ok(captures) => captures,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+    let baseline_dir = options.baseline_dir();
+    if let Err(error) = fs::create_dir_all(&baseline_dir) {
+        eprintln!(
+            "failed to create screenshot baseline directory {}: {error}",
+            baseline_dir.display()
+        );
+        return ExitCode::from(1);
+    }
+
+    for capture in &captures {
+        let path = baseline_dir.join(format!("{}.ppm", capture.fixture_name));
+        if let Err(error) = fs::write(&path, capture.frame.encode_ppm()) {
+            eprintln!("failed to write {}: {error}", path.display());
+            return ExitCode::from(1);
+        }
+        println!(
+            "captured fixture={} platform={} path={} hash={:016x}",
+            capture.fixture_name,
+            options.platform_key,
+            path.display(),
+            capture.frame.snapshot_hash()
+        );
+    }
+
+    ExitCode::SUCCESS
+}
+
+fn verify_screenshot_baselines(options: &ScreenshotOptions) -> ExitCode {
+    let baseline_dir = options.baseline_dir();
+    let report_dir = options.report_dir();
+    let captures = match render_wgpu::capture_all_screenshot_fixtures() {
+        Ok(captures) => captures,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(error) = fs::create_dir_all(&report_dir) {
+        eprintln!(
+            "failed to create screenshot report directory {}: {error}",
+            report_dir.display()
+        );
+        return ExitCode::from(1);
+    }
+
+    let mut diffs = BTreeMap::new();
+    let mut missing = Vec::new();
+    for capture in captures {
+        let baseline_path = baseline_dir.join(format!("{}.ppm", capture.fixture_name));
+        let expected = match fs::read(&baseline_path) {
+            Ok(bytes) => match render_wgpu::CpuFrame::decode_ppm(&bytes) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    eprintln!("failed to parse {}: {error}", baseline_path.display());
+                    return ExitCode::from(1);
+                }
+            },
+            Err(error) => {
+                missing.push(format!("{} ({error})", baseline_path.display()));
+                continue;
+            }
+        };
+        let diff = render_wgpu::compare_screenshots(
+            &expected,
+            &capture.frame,
+            render_wgpu::ScreenshotTolerance::default(),
+        );
+        println!("{}", diff.render_summary(&capture.fixture_name));
+        let actual_path = report_dir.join(format!("{}-actual.ppm", capture.fixture_name));
+        if let Err(error) = fs::write(&actual_path, capture.frame.encode_ppm()) {
+            eprintln!("failed to write {}: {error}", actual_path.display());
+            return ExitCode::from(1);
+        }
+        diffs.insert(capture.fixture_name, diff);
+    }
+
+    if !missing.is_empty() {
+        eprintln!("missing screenshot baselines:");
+        for path in missing {
+            eprintln!("  {path}");
+        }
+        eprintln!(
+            "run `cargo xtask screenshot capture --platform {}` on the target host to create baselines",
+            options.platform_key
+        );
+        return ExitCode::from(1);
+    }
+
+    let report = render_wgpu::ScreenshotReport {
+        platform_key: options.platform_key.clone(),
+        diffs,
+    };
+    let report_path = report_dir.join("report.md");
+    if let Err(error) = fs::write(&report_path, report.render_markdown()) {
+        eprintln!("failed to write {}: {error}", report_path.display());
+        return ExitCode::from(1);
+    }
+    println!("wrote screenshot report {}", report_path.display());
+
+    if report.passed() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+fn print_screenshot_report() {
+    let platform = render_wgpu::detect_screenshot_platform_key();
+    println!("Panea screenshot verification");
+    println!("current_platform={platform}");
+    println!("fixtures:");
+    for fixture in render_wgpu::screenshot_fixtures() {
+        println!(
+            "- {} kind={:?} description={}",
+            fixture.name, fixture.kind, fixture.description
+        );
+    }
+    println!("baseline_root=tools/conformance/screenshots/baselines/<platform>");
+    println!("report_root=target/screenshots/<platform>");
+    println!("verified_platforms=none until each platform runner captures and verifies baselines");
 }
 
 const FUZZ_TARGETS: &[&str] = &[
@@ -576,7 +821,10 @@ fn dependency_rules() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         ("transport-core", allowed([])),
         ("transport-pty", allowed(["transport-core"])),
         ("transport-ssh", allowed(["security", "transport-core"])),
-        ("xtask", allowed(["config-toml", "diagnostics"])),
+        (
+            "xtask",
+            allowed(["config-toml", "diagnostics", "render-wgpu"]),
+        ),
     ])
 }
 

@@ -78,7 +78,9 @@ repeatable measurements for regression detection and feature-cost review.
 
 ## Remaining Work
 
-- Cross-OS screenshot verification is Phase 6.
+- Screenshot verification infrastructure is documented in
+  [screenshot-verification.md](screenshot-verification.md); macOS, Linux X11,
+  and Linux Wayland baselines remain to be captured on their hosts.
 - Linux X11/Wayland compositor runtime verification is Phase 7.
 - GPU device-loss recovery foundation is documented in
   [renderer-device-recovery.md](renderer-device-recovery.md); real platform

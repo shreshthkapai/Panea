@@ -15,3 +15,4 @@ workspace = true
 [dependencies]
 config-toml = { path = "../../crates/config-toml" }
 diagnostics = { path = "../../crates/diagnostics" }
+render-wgpu = { path = "../../crates/render-wgpu" }

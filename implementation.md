@@ -105,6 +105,14 @@ to more visible features before the dependencies they rely on are hardened.
   glyph cache retention, desktop recovery handling, renderer recovery
   documentation, and tests proving recovery events preserve terminal state and
   cached glyphs are re-uploaded after atlas reset.
+- Completed next-pass Phase 6 cross-OS screenshot verification infrastructure:
+  added deterministic renderer fixtures for ASCII, truecolor, styles, CJK,
+  emoji, cursor states, selection, prompt decorations, command blocks, multiple
+  panes, and opacity overlays; added CPU screenshot capture to binary PPM,
+  PPM decode, tolerance-based image comparison, diff classes that distinguish
+  antialiasing drift from likely text/layout failures, markdown reports,
+  `cargo xtask screenshot <capture|verify|report>`, committed Windows
+  baselines, and verified the Windows baseline set on the current host.
 - Completed Phase 2 terminal core baseline: platform-neutral grid/cell storage,
   scrollback, line wrapping, scroll regions, alternate screen storage, resize
   reflow, cursor/mode metadata, raw selection extraction, ANSI/VT parser adapter,
@@ -238,8 +246,10 @@ to more visible features before the dependencies they rely on are hardened.
 - The renderer now submits GPU-facing background/glyph/decoration/selection/
   cursor batches, uploads only new glyph atlas rows, and has a GPU recovery
   path that rebuilds disposable WGPU resources while preserving terminal state.
-  Cross-OS screenshot automation, hardware GPU timestamp queries, real
-  sleep/wake and monitor-change device-loss validation, batch vector
+  Cross-OS screenshot automation now exists with a verified Windows baseline;
+  macOS, Linux X11, and Linux Wayland baseline capture/verification, hardware
+  GPU timestamp queries, real sleep/wake and monitor-change device-loss
+  validation, batch vector
   reuse/pooling, and deeper font fallback/shaping validation remain deferred
   render-performance work.
 - Phase 5 has build/test verification on the current Windows host. macOS,

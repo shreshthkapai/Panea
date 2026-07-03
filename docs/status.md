@@ -50,6 +50,7 @@ stated scope:
 | Unicode/grapheme cell model | tested | UTF-8 scalar buffering, grapheme clustering, combining marks, wide CJK cells, emoji modifiers, ZWJ emoji, variation selectors, selection, cursor movement, overwrite/delete/erase, resize, and scrollback tests exist in `term-core` and `term-parser`. |
 | Parser baseline | tested | ANSI/VT parser adapter handles printable text, common controls, SGR colors/styles, alternate screen, clears, insert/delete groundwork, tab stops, title OSC, mouse/focus/bracketed-paste mode state, and pending responses. |
 | Fuzzing harness | tested | `fuzz/` contains cargo-fuzz targets for parser, grid, resize, Unicode, selection, OSC/DCS, and shell markers; property smoke tests run through `cargo xtask fuzz-smoke` and scheduled CI. |
+| Screenshot verification runner | tested | Deterministic renderer fixtures, PPM capture, tolerance-based diffing, Windows baselines, and `cargo xtask screenshot verify --platform windows` exist. |
 | Config model and TOML | tested | `AppConfig` defaults, TOML parsing, unknown/deprecated diagnostics, validation, platform overrides, default generation, schema export, and reload impact classification exist. |
 | Windows local transport | tested | Portable PTY/ConPTY lifecycle is bounded; Windows smoke tests were made non-hanging and observed output. |
 | Diagnostics foundations | tested | `cargo xtask doctor ...`, bug-report snapshots, release/security/hardening/package readiness reports, and iOS readiness reports exist through shared diagnostics models. |
@@ -67,7 +68,7 @@ These areas are real foundations but must not be called complete:
 | --- | --- | --- |
 | Desktop app runtime | partial | Full app lifecycle, polished UI chrome, complete mux integration, runtime config reload, installed doctor command, packaging, and cross-OS manual validation. |
 | Platform windowing | partial | Real macOS lifecycle, real Linux X11/Wayland compositor behavior, decoration negotiation, IME validation, native notifications, and platform-specific fallback verification. |
-| GPU renderer | tested | WGPU surface/device setup, glyph atlas/cache policy, damage-aware batch preparation, indexed background/glyph/decoration/selection/cursor batches, row-scoped atlas uploads, renderer benchmarks, recovery status/event contracts, WGPU device-lost callback detection, disposable WGPU backend recreation, and GPU atlas invalidation after recovery exist; hardware timestamp queries, screenshot verification, real sleep/wake/monitor-loss validation, and cross-OS render validation remain. |
+| GPU renderer | tested | WGPU surface/device setup, glyph atlas/cache policy, damage-aware batch preparation, indexed background/glyph/decoration/selection/cursor batches, row-scoped atlas uploads, renderer benchmarks, recovery status/event contracts, WGPU device-lost callback detection, disposable WGPU backend recreation, GPU atlas invalidation after recovery, and screenshot verification infrastructure exist; hardware timestamp queries, real sleep/wake/monitor-loss validation, macOS/Linux screenshot baselines, and cross-OS render validation remain. |
 | Font system | partial | Deeper shaping, full fallback validation across installed font sets, emoji fallback, and grapheme-aware metrics. |
 | Unicode support | tested | Core/parser Unicode hardening is covered by automated tests; renderer font fallback, shaping, screenshot parity, and real app conformance remain later phases. |
 | Clipboard and selection | partial | Mouse-driven selection UX, primary selection on Linux, OSC 52 policy, permission/security prompts, and full copy/paste app compatibility coverage. |
@@ -105,11 +106,12 @@ The following major accepted features have no complete product behavior yet:
 - Long-running coverage-guided fuzz history and crash-regression backlog from
   real-world fuzz findings.
 - Unicode/font/render conformance beyond the core parser model, including
-  cross-OS font fallback and screenshot verification.
+  cross-OS font fallback and real app screenshot parity.
+- macOS, Linux X11, and Linux Wayland screenshot baseline capture and
+  verification.
 - Cross-OS runtime verification of the batched GPU glyph renderer.
 - Real GPU device-loss validation for sleep/wake, monitor attach/detach, DPI
   changes, and backend failure simulation across desktop OSes.
-- Cross-OS screenshot verification.
 - OSC 52 clipboard policy and permission model.
 - Runtime config file watching and safe live reload applier.
 - Full desktop tabs/panes/sessions/workspaces runtime.
@@ -128,7 +130,7 @@ The following major accepted features have no complete product behavior yet:
 | --- | --- | --- |
 | core correctness | partial | Strong baseline, Unicode cell hardening, and fuzz harness exist, but app compatibility and conformance hardening remain. |
 | platform parity | partial | Capabilities and desktop window foundations exist; real macOS/Linux X11/Linux Wayland verification remains open. |
-| render performance | partial | WGPU foundation, glyph cache, damage, scheduling, batched glyph/quad rendering, atlas uploads, benchmarks, and renderer recovery foundation exist; screenshot parity, real device-loss validation, and cross-OS runtime validation remain. |
+| render performance | partial | WGPU foundation, glyph cache, damage, scheduling, batched glyph/quad rendering, atlas uploads, benchmarks, renderer recovery foundation, and screenshot verification infrastructure exist; macOS/Linux screenshot baselines, real device-loss validation, and cross-OS runtime validation remain. |
 | config portability | partial | Static config model is useful; runtime reload and advanced config are deferred. |
 | semantic meaning | partial | Semantic events and timeline exist; runtime shell activation and real-shell verification remain. |
 | visual overlay | partial | Overlay contracts and basic generation exist; polished command blocks/cursor assets remain. |
@@ -139,5 +141,5 @@ The following major accepted features have no complete product behavior yet:
 
 ## Immediate Next Slice
 
-After GPU device-loss recovery hardening, the next dependency-ordered phase is
-cross-OS screenshot verification.
+After cross-OS screenshot verification infrastructure, the next
+dependency-ordered phase is Linux X11/Wayland compositor verification.

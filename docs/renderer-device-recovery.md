@@ -70,7 +70,8 @@ desktop product ready, run and record:
 
 ## Remaining Work
 
-- Cross-OS screenshot verification is Phase 6.
+- Screenshot verification infrastructure exists; macOS, Linux X11, and Linux
+  Wayland baselines remain to be captured on their hosts.
 - Linux X11/Wayland compositor runtime verification is Phase 7.
 - Hardware GPU timestamp queries and installed in-window overlay remain later
   performance instrumentation work.
