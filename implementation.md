@@ -248,6 +248,15 @@ to more visible features before the dependencies they rely on are hardened.
   clipboard provider state, keychain capability, PTY backend, and SSH provider
   status, shared the same diagnostics model with `cargo xtask doctor`, and
   documented the command in `docs/doctor.md`.
+- Completed next-pass Phase 19 real cross-OS verification runners: added
+  `cargo xtask verify-os <plan|run|report>` with platform targets for Windows,
+  macOS, Linux X11, and Linux Wayland; composed architecture, unit, parser,
+  Unicode, fuzz-smoke, renderer, config, clipboard, shell, PTY, screenshot,
+  compatibility, doctor, Linux compositor, SSH, and packaging-status checks
+  into bounded per-step execution with logs; generated markdown and JSON
+  reports under `target/cross-os/<platform>`; added GitHub Actions jobs for all
+  four target paths; and documented the verification contract in
+  `docs/cross-os-verification.md`.
 
 ## Deferred By Design
 
@@ -373,10 +382,13 @@ to more visible features before the dependencies they rely on are hardened.
 - Phase 13 adds the parity matrix and diagnostics command foundation, and
   next-pass Phase 18 installs `panea doctor`, but neither step magically
   verifies macOS, Linux X11, or Linux Wayland from this Windows host. Real
-  platform labs/CI runners, compositor coverage, GPU backend inventory, native
+  platform labs, compositor coverage, GPU backend inventory, native
   notification support, remote OSC clipboard confirmation UI, and collected
   cross-OS doctor output remain follow-up work before platform parity can be
-  called product-complete.
+  called product-complete. Next-pass Phase 19 adds CI runner definitions and
+  `cargo xtask verify-os`, but a runner definition is not the same as verified
+  product behavior; reports still have to pass on actual targets and blocked
+  evidence such as missing screenshot baselines must be resolved.
 - Phase 14 does not make Panea a daily-driver release by itself. Daily-driver
   release status remains blocked until packaged artifacts exist and
   manual/automated validation passes on macOS, Windows, Linux X11, and Linux

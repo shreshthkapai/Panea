@@ -68,6 +68,7 @@ stated scope:
 | SSH transport foundation | tested | SSH profile mapping, explicit host-trust contracts, host-key policy enforcement, secret/keychain-provider boundaries, SSH2 transport, remote PTY request, resize, and shutdown foundations exist. |
 | SSH trust and secret contracts | tested | Unknown-host decisions, changed-host replacement actions, redacted secret prompts, keychain-backed secret lookup/prompt/store flow, and platform keychain capability reporting exist. |
 | SSH real-server smoke harness | tested | `cargo xtask ssh-smoke` uses the real `transport-ssh` backend, explicit trust providers, smoke-owned known-hosts storage, remote PTY output polling, resize, reconnect, changed-host detection, and remote OSC 52 policy checks. Real server reports still need to be collected per OS. |
+| Cross-OS verification runner | tested | `cargo xtask verify-os` composes architecture, unit, parser, Unicode, fuzz-smoke, renderer, config, clipboard, shell, PTY, screenshot, compatibility, doctor, Linux compositor, SSH, and packaging-status checks into platform-stamped markdown/JSON reports. GitHub Actions defines Windows, macOS, Linux X11, and Linux Wayland jobs. |
 | iOS shared-engine foundation | tested | `apps/ios` reuses shared parser/core/config/transport/semantic/render contracts and models lifecycle, input, safe-area sizing, and mobile SSH session specs. |
 
 ## What Is Partial
@@ -108,8 +109,10 @@ These areas exist mostly as placeholders, contracts, or documentation:
 
 The following major accepted features have no complete product behavior yet:
 
-- Cross-OS verification runners for macOS, Linux X11, and Linux Wayland, plus
-  product-level Windows GUI/runtime verification beyond current host smoke.
+- Cross-OS verification reports still need to be collected and reviewed for
+  macOS, Linux X11, and Linux Wayland. The runners and CI jobs exist, but
+  product-level platform validation is not complete until those reports pass
+  on real target hosts and missing/blocked evidence is resolved.
 - Real Linux compositor verification runs for GNOME/Mutter, KDE/KWin,
   wlroots/Sway, Hyprland class, tiling window managers, and X11 window managers.
 - Long-running coverage-guided fuzz history and crash-regression backlog from
@@ -142,7 +145,7 @@ The following major accepted features have no complete product behavior yet:
 | Layer | Status | Notes |
 | --- | --- | --- |
 | core correctness | partial | Strong baseline, Unicode cell hardening, fuzz harness, and app compatibility runner exist, but interactive app compatibility and conformance hardening remain. |
-| platform parity | partial | Capabilities, desktop window foundations, and Linux compositor verification matrix exist; real macOS/Linux X11/Linux Wayland verification remains open. |
+| platform parity | partial | Capabilities, desktop window foundations, Linux compositor verification matrix, and cross-OS verification runners exist; real macOS/Linux X11/Linux Wayland verification reports and compositor lab evidence remain open. |
 | render performance | partial | WGPU foundation, glyph cache, damage, scheduling, batched glyph/quad rendering, atlas uploads, benchmarks, renderer recovery foundation, screenshot verification infrastructure, GPU timestamp status plumbing, and a developer performance overlay exist; macOS/Linux screenshot baselines, real device-loss validation, real GPU timing validation, and cross-OS runtime validation remain. |
 | config portability | partial | Static config model, TOML loading, validation, platform overrides, schema export, and runtime live-reload foundation exist; advanced config and cross-OS reload validation remain. |
 | semantic meaning | partial | Semantic events, timeline, runtime activation planning, desktop local hook injection, and Windows PowerShell semantic smoke exist; remote flows and non-Windows/bash/zsh/fish real verification remain. |
@@ -154,5 +157,5 @@ The following major accepted features have no complete product behavior yet:
 
 ## Immediate Next Slice
 
-After the installed terminal doctor binary, the next dependency-ordered phase
-is cross-OS verification runners.
+After the cross-OS verification runners, the next dependency-ordered phase is
+packaging artifacts.

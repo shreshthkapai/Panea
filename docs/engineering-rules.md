@@ -64,7 +64,8 @@ The remaining high-level work is:
   provider verification.
 - Collected real SSH server smoke reports across Windows, macOS, Linux X11,
   and Linux Wayland.
-- Real cross-OS verification runners.
+- Collected cross-OS verification reports with unresolved blocked evidence
+  fixed on Windows, macOS, Linux X11, and Linux Wayland.
 - Cross-OS validation of the installed doctor command output.
 - Packaging artifacts.
 - Real GPU device-loss validation across sleep/wake, display changes, DPI

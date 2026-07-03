@@ -20,7 +20,7 @@ fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("help") | None => {
             eprintln!(
-                "usage: cargo xtask <fmt|clippy|test|build|check|layer-check|ci|config-default|config-schema|bench|screenshot|fuzz-smoke|fuzz|doctor|bug-report|hardening|security-review|linux-compositor|compat|ssh-smoke|package-plan|release-check|ios-readiness>"
+                "usage: cargo xtask <fmt|clippy|test|build|check|layer-check|ci|config-default|config-schema|bench|screenshot|fuzz-smoke|fuzz|doctor|bug-report|hardening|security-review|linux-compositor|compat|ssh-smoke|verify-os|package-plan|release-check|ios-readiness>"
             );
             ExitCode::SUCCESS
         }
@@ -43,6 +43,7 @@ fn main() -> ExitCode {
         Some("linux-compositor") => run_linux_compositor(),
         Some("compat") => run_compat(),
         Some("ssh-smoke") => run_ssh_smoke(),
+        Some("verify-os") => run_verify_os(),
         Some("package-plan") => run_package_plan(),
         Some("release-check") => run_release_check(),
         Some("ios-readiness") => run_ios_readiness(),
@@ -1396,6 +1397,931 @@ impl CompatPlatform {
             Self::Unix => "macos/linux",
         }
     }
+
+    fn parse_target(value: &str) -> Option<Self> {
+        match value {
+            "windows" => Some(Self::Windows),
+            "macos" => Some(Self::Macos),
+            "linux-x11" => Some(Self::LinuxX11),
+            "linux-wayland" => Some(Self::LinuxWayland),
+            _ => None,
+        }
+    }
+
+    fn screenshot_key(self) -> &'static str {
+        match self {
+            Self::Windows => "windows",
+            Self::Macos => "macos",
+            Self::LinuxX11 => "linux-x11",
+            Self::LinuxWayland => "linux-wayland",
+            Self::Any | Self::Unix => "windows",
+        }
+    }
+
+    fn is_linux(self) -> bool {
+        matches!(self, Self::LinuxX11 | Self::LinuxWayland)
+    }
+}
+
+fn run_verify_os() -> ExitCode {
+    let mut args = std::env::args().skip(2).collect::<Vec<_>>();
+    let command = args.first().map_or("plan", String::as_str);
+
+    match command {
+        "help" | "--help" | "-h" => {
+            print_verify_os_help();
+            ExitCode::SUCCESS
+        }
+        "plan" => {
+            print_verify_os_plan();
+            ExitCode::SUCCESS
+        }
+        "run" => {
+            args.remove(0);
+            let options = match VerifyOsOptions::parse(&args) {
+                Ok(options) => options,
+                Err(error) => {
+                    eprintln!("{error}");
+                    print_verify_os_help();
+                    return ExitCode::from(2);
+                }
+            };
+            run_verify_os_suite(options)
+        }
+        "report" => {
+            print_verify_os_report_hint();
+            ExitCode::SUCCESS
+        }
+        other => {
+            eprintln!("unknown verify-os command: {other}");
+            print_verify_os_help();
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn print_verify_os_help() {
+    eprintln!("usage: cargo xtask verify-os <plan|run|report>");
+    eprintln!(
+        "usage: cargo xtask verify-os run [--target-platform <windows|macos|linux-x11|linux-wayland>] [--suite <smoke|ci|full>] [--report-dir <path>] [--timeout-ms <ms>] [--allow-missing-screenshot-baseline] [--with-ssh]"
+    );
+}
+
+fn print_verify_os_plan() {
+    println!("Panea real cross-OS verification runners");
+    println!("required runners:");
+    println!("- windows: native Windows runner");
+    println!("- macos: macOS runner");
+    println!("- linux-x11: Linux runner with XDG_SESSION_TYPE=x11");
+    println!("- linux-wayland: Linux runner with XDG_SESSION_TYPE=wayland");
+    println!("default report root: target/cross-os/<platform>/");
+    println!("runner command:");
+    println!("  cargo xtask verify-os run --target-platform <platform> --suite ci");
+    println!("step coverage:");
+    for step in verify_os_steps(&VerifyOsOptions::default_for(CompatPlatform::detect())) {
+        println!("- {} [{}]", step.key, step.category);
+    }
+    println!(
+        "SSH real-server tests run only when --with-ssh is passed or PANEA_SSH_SMOKE_HOST is set."
+    );
+}
+
+fn print_verify_os_report_hint() {
+    println!("Cross-OS verification reports are written by:");
+    println!("  cargo xtask verify-os run --target-platform <platform>");
+    println!("default markdown: target/cross-os/<platform>/report.md");
+    println!("default JSON:     target/cross-os/<platform>/report.json");
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifySuite {
+    Smoke,
+    Ci,
+    Full,
+}
+
+impl VerifySuite {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "smoke" => Some(Self::Smoke),
+            "ci" => Some(Self::Ci),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Smoke => "smoke",
+            Self::Ci => "ci",
+            Self::Full => "full",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VerifyOsOptions {
+    target_platform: CompatPlatform,
+    suite: VerifySuite,
+    report_root: PathBuf,
+    timeout: Duration,
+    allow_missing_screenshot_baseline: bool,
+    with_ssh: bool,
+}
+
+impl VerifyOsOptions {
+    fn default_for(target_platform: CompatPlatform) -> Self {
+        Self {
+            target_platform,
+            suite: VerifySuite::Smoke,
+            report_root: PathBuf::from("target/cross-os"),
+            timeout: Duration::from_secs(120),
+            allow_missing_screenshot_baseline: false,
+            with_ssh: std::env::var_os("PANEA_SSH_SMOKE_HOST").is_some(),
+        }
+    }
+
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut options = Self::default_for(CompatPlatform::detect());
+        let mut index = 0;
+
+        while index < args.len() {
+            match args[index].as_str() {
+                "--target-platform" | "--platform" => {
+                    let value = required_arg(args, &mut index, "--target-platform")?;
+                    options.target_platform = CompatPlatform::parse_target(&value)
+                        .ok_or_else(|| format!("unsupported target platform: {value}"))?;
+                }
+                "--suite" => {
+                    let value = required_arg(args, &mut index, "--suite")?;
+                    options.suite = VerifySuite::parse(&value)
+                        .ok_or_else(|| format!("unsupported verify suite: {value}"))?;
+                }
+                "--report-dir" => {
+                    options.report_root =
+                        PathBuf::from(required_arg(args, &mut index, "--report-dir")?);
+                }
+                "--timeout-ms" => {
+                    let value = required_arg(args, &mut index, "--timeout-ms")?;
+                    let millis = value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid --timeout-ms value: {value}"))?;
+                    if millis < 500 {
+                        return Err("--timeout-ms must be at least 500".to_owned());
+                    }
+                    options.timeout = Duration::from_millis(millis);
+                }
+                "--allow-missing-screenshot-baseline" => {
+                    options.allow_missing_screenshot_baseline = true;
+                }
+                "--with-ssh" => {
+                    options.with_ssh = true;
+                }
+                other => return Err(format!("unknown verify-os option: {other}")),
+            }
+            index += 1;
+        }
+
+        Ok(options)
+    }
+
+    fn report_dir(&self) -> PathBuf {
+        self.report_root.join(self.target_platform.label())
+    }
+}
+
+#[derive(Debug, Clone)]
+enum VerifyStepKind {
+    Command {
+        program: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+    },
+    Skipped {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct VerifyStep {
+    key: &'static str,
+    category: &'static str,
+    description: &'static str,
+    required: bool,
+    kind: VerifyStepKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifyStepStatus {
+    Passed,
+    Failed,
+    Skipped,
+    Blocked,
+    TimedOut,
+}
+
+impl VerifyStepStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+            Self::Blocked => "blocked",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VerifyStepResult {
+    key: String,
+    category: String,
+    description: String,
+    required: bool,
+    status: VerifyStepStatus,
+    duration: Duration,
+    exit_code: Option<i32>,
+    stdout_log: Option<PathBuf>,
+    stderr_log: Option<PathBuf>,
+    stdout_preview: String,
+    stderr_preview: String,
+    note: String,
+}
+
+fn run_verify_os_suite(options: VerifyOsOptions) -> ExitCode {
+    let report_dir = options.report_dir();
+    let logs_dir = report_dir.join("logs");
+    if let Err(error) = fs::create_dir_all(&logs_dir) {
+        eprintln!(
+            "failed to create cross-OS verification report directory {}: {error}",
+            logs_dir.display()
+        );
+        return ExitCode::from(1);
+    }
+
+    let started = Instant::now();
+    let steps = verify_os_steps(&options);
+    let mut results = Vec::new();
+    for step in &steps {
+        println!("verify-os: running {} ({})", step.key, step.category);
+        let result = run_verify_step(step, &options, &logs_dir);
+        println!(
+            "verify-os: {} -> {} ({:.2}s)",
+            result.key,
+            result.status.label(),
+            result.duration.as_secs_f64()
+        );
+        results.push(result);
+    }
+
+    let report = VerifyOsReport {
+        target_platform: options.target_platform,
+        detected_platform: CompatPlatform::detect(),
+        suite: options.suite,
+        started_duration: started.elapsed(),
+        results,
+    };
+
+    let markdown_path = report_dir.join("report.md");
+    let json_path = report_dir.join("report.json");
+    if let Err(error) = fs::write(&markdown_path, report.render_markdown()) {
+        eprintln!("failed to write {}: {error}", markdown_path.display());
+        return ExitCode::from(1);
+    }
+    if let Err(error) = fs::write(&json_path, report.render_json()) {
+        eprintln!("failed to write {}: {error}", json_path.display());
+        return ExitCode::from(1);
+    }
+    println!(
+        "wrote cross-OS verification report {}",
+        markdown_path.display()
+    );
+    println!("wrote cross-OS verification JSON {}", json_path.display());
+
+    if report.has_hard_failure() {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn verify_os_steps(options: &VerifyOsOptions) -> Vec<VerifyStep> {
+    let target = options.target_platform;
+    let mut steps = Vec::new();
+
+    if matches!(options.suite, VerifySuite::Ci | VerifySuite::Full) {
+        steps.push(command_step(
+            "format",
+            "unit",
+            "cargo formatting gate",
+            true,
+            "cargo",
+            ["fmt", "--all", "--check"],
+            target_env(target),
+        ));
+    }
+
+    steps.extend([
+        xtask_step(
+            "layer-boundaries",
+            "architecture",
+            "workspace dependency boundary validation",
+            true,
+            ["layer-check"],
+            target,
+        ),
+        command_step(
+            "unit-workspace",
+            "unit",
+            "workspace unit tests",
+            true,
+            "cargo",
+            ["test", "--workspace"],
+            target_env(target),
+        ),
+        command_step(
+            "parser-tests",
+            "parser",
+            "parser-focused tests",
+            true,
+            "cargo",
+            ["test", "-p", "term-parser"],
+            target_env(target),
+        ),
+        command_step(
+            "unicode-tests",
+            "unicode",
+            "terminal core Unicode and grapheme tests",
+            true,
+            "cargo",
+            ["test", "-p", "term-core", "unicode"],
+            target_env(target),
+        ),
+        xtask_step(
+            "fuzz-regressions",
+            "fuzz",
+            "fuzz regression/property smoke tests",
+            true,
+            ["fuzz-smoke"],
+            target,
+        ),
+        command_step(
+            "renderer-tests",
+            "renderer",
+            "renderer contract and WGPU tests",
+            true,
+            "cargo",
+            ["test", "-p", "render-core", "-p", "render-wgpu"],
+            target_env(target),
+        ),
+        command_step(
+            "config-tests",
+            "config",
+            "portable config and TOML tests",
+            true,
+            "cargo",
+            ["test", "-p", "config-core", "-p", "config-toml"],
+            target_env(target),
+        ),
+        command_step(
+            "clipboard-policy-tests",
+            "clipboard",
+            "clipboard and OSC 52 policy tests",
+            true,
+            "cargo",
+            ["test", "-p", "security", "osc52"],
+            target_env(target),
+        ),
+        command_step(
+            "shell-tests",
+            "shell",
+            "shell integration parser and activation tests",
+            true,
+            "cargo",
+            ["test", "-p", "shell-integration"],
+            target_env(target),
+        ),
+        command_step(
+            "pty-tests",
+            "pty",
+            "transport-core and local PTY tests",
+            true,
+            "cargo",
+            ["test", "-p", "transport-core", "-p", "transport-pty"],
+            target_env(target),
+        ),
+        xtask_step(
+            "screenshot-tests",
+            "screenshot",
+            "deterministic renderer screenshot verification",
+            true,
+            [
+                "screenshot",
+                "verify",
+                "--platform",
+                target.screenshot_key(),
+                "--report-dir",
+                "target/cross-os/screenshots",
+            ],
+            target,
+        ),
+        xtask_step(
+            "compat-required",
+            "compatibility",
+            "required shell and protocol compatibility smoke tests",
+            true,
+            [
+                "compat",
+                "run",
+                "--required-only",
+                "--report-dir",
+                "target/cross-os/compatibility",
+            ],
+            target,
+        ),
+        xtask_step(
+            "doctor-json",
+            "diagnostics",
+            "installed diagnostics model JSON smoke",
+            true,
+            ["doctor", "--json"],
+            target,
+        ),
+    ]);
+
+    if target.is_linux() {
+        steps.push(xtask_step(
+            "linux-compositor-diagnostics",
+            "platform",
+            "Linux X11/Wayland compositor diagnostics",
+            true,
+            ["linux-compositor"],
+            target,
+        ));
+    } else {
+        steps.push(skipped_step(
+            "linux-compositor-diagnostics",
+            "platform",
+            "Linux X11/Wayland compositor diagnostics",
+            "not a Linux target",
+        ));
+    }
+
+    if options.with_ssh {
+        steps.push(xtask_step(
+            "ssh-smoke",
+            "ssh",
+            "real SSH server smoke tests",
+            true,
+            [
+                "ssh-smoke",
+                "run",
+                "--report-dir",
+                "target/cross-os/ssh-smoke",
+            ],
+            target,
+        ));
+    } else {
+        steps.push(skipped_step(
+            "ssh-smoke",
+            "ssh",
+            "real SSH server smoke tests",
+            "PANEA_SSH_SMOKE_HOST is not configured and --with-ssh was not passed",
+        ));
+    }
+
+    steps.push(xtask_step(
+        "packaging-smoke-plan",
+        "packaging",
+        "packaging smoke status and plan",
+        false,
+        ["package-plan"],
+        target,
+    ));
+
+    if matches!(options.suite, VerifySuite::Full) {
+        steps.push(xtask_step(
+            "compat-optional",
+            "compatibility",
+            "optional app compatibility probes for installed tools",
+            false,
+            [
+                "compat",
+                "run",
+                "--report-dir",
+                "target/cross-os/compatibility-full",
+            ],
+            target,
+        ));
+    }
+
+    steps
+}
+
+fn command_step<const N: usize>(
+    key: &'static str,
+    category: &'static str,
+    description: &'static str,
+    required: bool,
+    program: &'static str,
+    args: [&'static str; N],
+    env: Vec<(String, String)>,
+) -> VerifyStep {
+    VerifyStep {
+        key,
+        category,
+        description,
+        required,
+        kind: VerifyStepKind::Command {
+            program: program.to_owned(),
+            args: args.into_iter().map(str::to_owned).collect(),
+            env,
+        },
+    }
+}
+
+fn xtask_step<const N: usize>(
+    key: &'static str,
+    category: &'static str,
+    description: &'static str,
+    required: bool,
+    args: [&'static str; N],
+    target: CompatPlatform,
+) -> VerifyStep {
+    let mut cargo_args = vec![
+        "run".to_owned(),
+        "-p".to_owned(),
+        "xtask".to_owned(),
+        "--".to_owned(),
+    ];
+    cargo_args.extend(args.into_iter().map(str::to_owned));
+    VerifyStep {
+        key,
+        category,
+        description,
+        required,
+        kind: VerifyStepKind::Command {
+            program: "cargo".to_owned(),
+            args: cargo_args,
+            env: target_env(target),
+        },
+    }
+}
+
+fn skipped_step(
+    key: &'static str,
+    category: &'static str,
+    description: &'static str,
+    reason: &'static str,
+) -> VerifyStep {
+    VerifyStep {
+        key,
+        category,
+        description,
+        required: false,
+        kind: VerifyStepKind::Skipped {
+            reason: reason.to_owned(),
+        },
+    }
+}
+
+fn target_env(target: CompatPlatform) -> Vec<(String, String)> {
+    match target {
+        CompatPlatform::LinuxX11 => vec![("XDG_SESSION_TYPE".to_owned(), "x11".to_owned())],
+        CompatPlatform::LinuxWayland => {
+            vec![("XDG_SESSION_TYPE".to_owned(), "wayland".to_owned())]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn run_verify_step(
+    step: &VerifyStep,
+    options: &VerifyOsOptions,
+    logs_dir: &Path,
+) -> VerifyStepResult {
+    let started = Instant::now();
+    match &step.kind {
+        VerifyStepKind::Skipped { reason } => VerifyStepResult {
+            key: step.key.to_owned(),
+            category: step.category.to_owned(),
+            description: step.description.to_owned(),
+            required: step.required,
+            status: VerifyStepStatus::Skipped,
+            duration: started.elapsed(),
+            exit_code: None,
+            stdout_log: None,
+            stderr_log: None,
+            stdout_preview: String::new(),
+            stderr_preview: String::new(),
+            note: reason.clone(),
+        },
+        VerifyStepKind::Command { program, args, env } => {
+            let stdout_log = logs_dir.join(format!("{}.stdout.log", step.key));
+            let stderr_log = logs_dir.join(format!("{}.stderr.log", step.key));
+            let stdout = match fs::File::create(&stdout_log) {
+                Ok(file) => file,
+                Err(error) => {
+                    return verify_spawn_failure(step, started.elapsed(), error.to_string());
+                }
+            };
+            let stderr = match fs::File::create(&stderr_log) {
+                Ok(file) => file,
+                Err(error) => {
+                    return verify_spawn_failure(step, started.elapsed(), error.to_string());
+                }
+            };
+
+            let mut command = Command::new(program);
+            command
+                .args(args)
+                .envs(env.iter().map(|(key, value)| (key, value)))
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::from(stderr));
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    return verify_spawn_failure(step, started.elapsed(), error.to_string());
+                }
+            };
+
+            let mut timed_out = false;
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Some(status),
+                    Ok(None) if started.elapsed() >= options.timeout => {
+                        timed_out = true;
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break None;
+                    }
+                    Ok(None) => thread::sleep(Duration::from_millis(50)),
+                    Err(error) => {
+                        return verify_spawn_failure(step, started.elapsed(), error.to_string());
+                    }
+                }
+            };
+
+            let stdout_preview = read_log_tail(&stdout_log);
+            let stderr_preview = read_log_tail(&stderr_log);
+            let exit_code = status.and_then(|status| status.code());
+            let mut verify_status = match status {
+                Some(status) if status.success() => VerifyStepStatus::Passed,
+                Some(_) => VerifyStepStatus::Failed,
+                None if timed_out => VerifyStepStatus::TimedOut,
+                None => VerifyStepStatus::Failed,
+            };
+            let mut note = if timed_out {
+                format!("step exceeded {} ms", options.timeout.as_millis())
+            } else {
+                format!("command: {} {}", program, args.join(" "))
+            };
+
+            if verify_status == VerifyStepStatus::Failed
+                && options.allow_missing_screenshot_baseline
+                && step.key == "screenshot-tests"
+                && stderr_preview.contains("missing screenshot baselines")
+            {
+                verify_status = VerifyStepStatus::Blocked;
+                note = "missing screenshot baseline on this platform; capture baselines on the target host before treating screenshot parity as verified".to_owned();
+            }
+
+            VerifyStepResult {
+                key: step.key.to_owned(),
+                category: step.category.to_owned(),
+                description: step.description.to_owned(),
+                required: step.required,
+                status: verify_status,
+                duration: started.elapsed(),
+                exit_code,
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
+                stdout_preview,
+                stderr_preview,
+                note,
+            }
+        }
+    }
+}
+
+fn verify_spawn_failure(
+    step: &VerifyStep,
+    duration: Duration,
+    message: String,
+) -> VerifyStepResult {
+    VerifyStepResult {
+        key: step.key.to_owned(),
+        category: step.category.to_owned(),
+        description: step.description.to_owned(),
+        required: step.required,
+        status: VerifyStepStatus::Failed,
+        duration,
+        exit_code: None,
+        stdout_log: None,
+        stderr_log: None,
+        stdout_preview: String::new(),
+        stderr_preview: String::new(),
+        note: message,
+    }
+}
+
+fn read_log_tail(path: &Path) -> String {
+    const LIMIT: usize = 4096;
+    let Ok(bytes) = fs::read(path) else {
+        return String::new();
+    };
+    let start = bytes.len().saturating_sub(LIMIT);
+    String::from_utf8_lossy(&bytes[start..])
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+}
+
+struct VerifyOsReport {
+    target_platform: CompatPlatform,
+    detected_platform: CompatPlatform,
+    suite: VerifySuite,
+    started_duration: Duration,
+    results: Vec<VerifyStepResult>,
+}
+
+impl VerifyOsReport {
+    fn has_hard_failure(&self) -> bool {
+        self.results.iter().any(|result| {
+            result.required
+                && matches!(
+                    result.status,
+                    VerifyStepStatus::Failed | VerifyStepStatus::TimedOut
+                )
+        })
+    }
+
+    fn render_markdown(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push("# Panea Cross-OS Verification Report".to_owned());
+        lines.push(String::new());
+        lines.push(format!(
+            "- Target platform: `{}`",
+            self.target_platform.label()
+        ));
+        lines.push(format!(
+            "- Detected host: `{}`",
+            self.detected_platform.label()
+        ));
+        lines.push(format!("- Suite: `{}`", self.suite.label()));
+        lines.push(format!(
+            "- Duration: `{:.2}s`",
+            self.started_duration.as_secs_f64()
+        ));
+        lines.push(format!(
+            "- Result: `{}`",
+            if self.has_hard_failure() {
+                "failed"
+            } else {
+                "completed"
+            }
+        ));
+        lines.push(String::new());
+        lines.push("| Step | Category | Required | Status | Seconds | Exit | Note |".to_owned());
+        lines.push("| --- | --- | --- | --- | ---: | ---: | --- |".to_owned());
+        for result in &self.results {
+            lines.push(format!(
+                "| `{}` | `{}` | {} | `{}` | {:.2} | {} | {} |",
+                result.key,
+                result.category,
+                result.required,
+                result.status.label(),
+                result.duration.as_secs_f64(),
+                result
+                    .exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                markdown_escape(&result.note)
+            ));
+        }
+        lines.push(String::new());
+        lines.push("## Failure Previews".to_owned());
+        lines.push(String::new());
+        let mut wrote_preview = false;
+        for result in &self.results {
+            if matches!(
+                result.status,
+                VerifyStepStatus::Failed | VerifyStepStatus::TimedOut | VerifyStepStatus::Blocked
+            ) {
+                wrote_preview = true;
+                lines.push(format!("### {}", result.key));
+                lines.push(String::new());
+                if let Some(path) = &result.stderr_log {
+                    lines.push(format!("- stderr log: `{}`", path.display()));
+                }
+                if let Some(path) = &result.stdout_log {
+                    lines.push(format!("- stdout log: `{}`", path.display()));
+                }
+                if !result.stderr_preview.is_empty() {
+                    lines.push(String::new());
+                    lines.push("```text".to_owned());
+                    lines.push(result.stderr_preview.clone());
+                    lines.push("```".to_owned());
+                }
+                if !result.stdout_preview.is_empty() {
+                    lines.push(String::new());
+                    lines.push("```text".to_owned());
+                    lines.push(result.stdout_preview.clone());
+                    lines.push("```".to_owned());
+                }
+                lines.push(String::new());
+            }
+        }
+        if !wrote_preview {
+            lines.push("No failed, timed-out, or blocked steps.".to_owned());
+            lines.push(String::new());
+        }
+        lines.join("\n")
+    }
+
+    fn render_json(&self) -> String {
+        let mut json = String::new();
+        json.push_str("{\n");
+        json.push_str(&format!(
+            "  \"target_platform\": \"{}\",\n",
+            json_escape(self.target_platform.label())
+        ));
+        json.push_str(&format!(
+            "  \"detected_platform\": \"{}\",\n",
+            json_escape(self.detected_platform.label())
+        ));
+        json.push_str(&format!(
+            "  \"suite\": \"{}\",\n",
+            json_escape(self.suite.label())
+        ));
+        json.push_str(&format!(
+            "  \"duration_ms\": {},\n",
+            self.started_duration.as_millis()
+        ));
+        json.push_str(&format!(
+            "  \"hard_failure\": {},\n",
+            self.has_hard_failure()
+        ));
+        json.push_str("  \"steps\": [\n");
+        for (index, result) in self.results.iter().enumerate() {
+            if index > 0 {
+                json.push_str(",\n");
+            }
+            json.push_str("    {\n");
+            json.push_str(&format!(
+                "      \"key\": \"{}\",\n",
+                json_escape(&result.key)
+            ));
+            json.push_str(&format!(
+                "      \"category\": \"{}\",\n",
+                json_escape(&result.category)
+            ));
+            json.push_str(&format!(
+                "      \"description\": \"{}\",\n",
+                json_escape(&result.description)
+            ));
+            json.push_str(&format!("      \"required\": {},\n", result.required));
+            json.push_str(&format!(
+                "      \"status\": \"{}\",\n",
+                json_escape(result.status.label())
+            ));
+            json.push_str(&format!(
+                "      \"duration_ms\": {},\n",
+                result.duration.as_millis()
+            ));
+            match result.exit_code {
+                Some(code) => json.push_str(&format!("      \"exit_code\": {},\n", code)),
+                None => json.push_str("      \"exit_code\": null,\n"),
+            }
+            json.push_str(&format!(
+                "      \"note\": \"{}\"",
+                json_escape(&result.note)
+            ));
+            json.push_str("\n    }");
+        }
+        json.push_str("\n  ]\n");
+        json.push_str("}\n");
+        json
+    }
+}
+
+fn markdown_escape(value: &str) -> String {
+    value.replace('|', "\\|").replace('\n', " ")
+}
+
+fn json_escape(value: &str) -> String {
+    let mut escaped = String::new();
+    for ch in value.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => escaped.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2971,5 +3897,95 @@ mod tests {
         assert_eq!(options.passphrase_env, "PASSPHRASE_ENV_NAME");
         assert_eq!(options.timeout, Duration::from_millis(750));
         assert_eq!(options.remote_kind, SshSmokeRemoteKind::Posix);
+    }
+
+    #[test]
+    fn verify_os_options_parse_target_suite_and_timeout() {
+        let options = VerifyOsOptions::parse(&[
+            "--target-platform".to_owned(),
+            "linux-wayland".to_owned(),
+            "--suite".to_owned(),
+            "ci".to_owned(),
+            "--report-dir".to_owned(),
+            "target/custom-cross-os".to_owned(),
+            "--timeout-ms".to_owned(),
+            "750".to_owned(),
+            "--allow-missing-screenshot-baseline".to_owned(),
+        ])
+        .expect("verify-os options");
+
+        assert_eq!(options.target_platform, CompatPlatform::LinuxWayland);
+        assert_eq!(options.suite, VerifySuite::Ci);
+        assert_eq!(options.report_root, PathBuf::from("target/custom-cross-os"));
+        assert_eq!(options.timeout, Duration::from_millis(750));
+        assert!(options.allow_missing_screenshot_baseline);
+    }
+
+    #[test]
+    fn verify_os_steps_cover_required_categories() {
+        let options = VerifyOsOptions {
+            target_platform: CompatPlatform::LinuxX11,
+            suite: VerifySuite::Ci,
+            report_root: PathBuf::from("target/cross-os"),
+            timeout: Duration::from_secs(1),
+            allow_missing_screenshot_baseline: true,
+            with_ssh: false,
+        };
+        let steps = verify_os_steps(&options);
+
+        assert!(steps.iter().any(|step| step.key == "format"));
+        assert!(steps.iter().any(|step| step.key == "parser-tests"));
+        assert!(steps.iter().any(|step| step.key == "unicode-tests"));
+        assert!(steps.iter().any(|step| step.key == "screenshot-tests"));
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.key == "linux-compositor-diagnostics" && step.required)
+        );
+        assert!(steps.iter().any(|step| {
+            step.key == "ssh-smoke" && matches!(step.kind, VerifyStepKind::Skipped { .. })
+        }));
+    }
+
+    #[test]
+    fn verify_os_target_env_marks_linux_backend() {
+        assert_eq!(
+            target_env(CompatPlatform::LinuxWayland),
+            vec![("XDG_SESSION_TYPE".to_owned(), "wayland".to_owned())]
+        );
+        assert_eq!(
+            target_env(CompatPlatform::LinuxX11),
+            vec![("XDG_SESSION_TYPE".to_owned(), "x11".to_owned())]
+        );
+        assert!(target_env(CompatPlatform::Windows).is_empty());
+    }
+
+    #[test]
+    fn verify_os_report_json_escapes_step_notes() {
+        let report = VerifyOsReport {
+            target_platform: CompatPlatform::Windows,
+            detected_platform: CompatPlatform::Windows,
+            suite: VerifySuite::Smoke,
+            started_duration: Duration::from_millis(12),
+            results: vec![VerifyStepResult {
+                key: "doctor-json".to_owned(),
+                category: "diagnostics".to_owned(),
+                description: "diagnostic report".to_owned(),
+                required: true,
+                status: VerifyStepStatus::Passed,
+                duration: Duration::from_millis(5),
+                exit_code: Some(0),
+                stdout_log: None,
+                stderr_log: None,
+                stdout_preview: String::new(),
+                stderr_preview: String::new(),
+                note: "path C:\\panea\nok".to_owned(),
+            }],
+        };
+
+        let json = report.render_json();
+        assert!(json.contains("\"target_platform\": \"windows\""));
+        assert!(json.contains("path C:\\\\panea\\nok"));
+        assert!(!report.has_hard_failure());
     }
 }

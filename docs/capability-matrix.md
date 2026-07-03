@@ -20,6 +20,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Capability | Windows | macOS | Linux X11 | Linux Wayland | Notes |
 | --- | --- | --- | --- | --- | --- |
 | Workspace build/test/lint | tested | partial | partial | partial | Verified on the current Windows host; other desktop OSes require runners. |
+| Cross-OS verification runner | tested | implemented | implemented | implemented | `cargo xtask verify-os` and GitHub Actions jobs exist for Windows, macOS, Linux X11, and Linux Wayland. Current host verification has run on Windows only; CI/platform reports must be collected before any platform becomes cross-OS verified. |
 | Terminal core grid/state | tested | implemented | implemented | implemented | Platform-neutral code exists; runtime app verification still needed off Windows. |
 | Parser baseline | tested | implemented | implemented | implemented | Lower-level tests and a compatibility smoke runner exist; full interactive app verification remains incomplete. |
 | Fuzz/property harness | tested | implemented | implemented | implemented | cargo-fuzz targets and proptest smoke tests exist; scheduled CI runs smoke properties, but long-running fuzz history has not accumulated yet. |
@@ -98,10 +99,10 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 
 | Platform | Overall status | Why |
 | --- | --- | --- |
-| Windows | partial | Current host build/test/lint, local PTY smoke, required compatibility runner smoke, and SSH smoke harness compilation have been verified, but renderer GUI, optional app matrix, a real SSH server report, packaging, and full daily-driver workflows are incomplete. |
-| macOS | partial | Platform-neutral code is implemented, but runtime behavior is unverified on macOS. |
-| Linux X11 | partial | Platform-neutral code and X11 strategy exist, but real X11 window manager/compositor behavior is unverified. |
-| Linux Wayland | partial | Platform-neutral code and Wayland strategy exist, but real compositor behavior is unverified. |
+| Windows | partial | Current host build/test/lint, local PTY smoke, required compatibility runner smoke, SSH smoke harness compilation, installed doctor smoke, and cross-OS runner implementation have been verified, but renderer GUI, optional app matrix, a real SSH server report, packaging, and full daily-driver workflows are incomplete. |
+| macOS | partial | Platform-neutral code and a macOS CI runner definition exist, but runtime behavior and verification reports are not yet collected. |
+| Linux X11 | partial | Platform-neutral code, X11 strategy, and a Linux X11 runner definition exist, but real X11 window manager/compositor behavior and reports are unverified. |
+| Linux Wayland | partial | Platform-neutral code, Wayland strategy, and a Linux Wayland runner definition exist, but real compositor behavior and reports are unverified. |
 
 ## Completion Rule
 

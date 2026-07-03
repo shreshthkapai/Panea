@@ -1,0 +1,49 @@
+name: cross-os-verification
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  verify:
+    name: verify (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows
+            os: windows-latest
+          - target: macos
+            os: macos-latest
+          - target: linux-x11
+            os: ubuntu-latest
+            session: x11
+          - target: linux-wayland
+            os: ubuntu-latest
+            session: wayland
+
+    env:
+      XDG_SESSION_TYPE: ${{ matrix.session }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Run Panea platform verification suite
+        run: >
+          cargo run -p xtask -- verify-os run
+          --target-platform ${{ matrix.target }}
+          --suite ci
+          --allow-missing-screenshot-baseline
+          --timeout-ms 300000
+      - name: Upload verification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-os-verification-${{ matrix.target }}
+          path: target/cross-os/${{ matrix.target }}/
