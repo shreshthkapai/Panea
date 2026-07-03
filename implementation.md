@@ -266,6 +266,22 @@ to more visible features before the dependencies they rely on are hardened.
   `cargo xtask verify-os`, documented the package layouts in
   `docs/packaging.md`, and verified the Windows dev portable package by running
   the packaged `panea.exe doctor --json`.
+- Completed next-pass Phase 21 advanced programmable config: added the
+  controlled deterministic `config-lua` frontend that compiles `panea.*`
+  programs into the same `AppConfig`, supports generated themes, platform
+  conditionals, explicit platform overrides, advanced keybindings, shell/SSH
+  profiles, cursor mode styles, mux label formats, validation errors, provider
+  errors, and reload-plan tests without running in render/input/PTY hot paths;
+  added `panea shell-smoke --json` and wired package smoke to run both packaged
+  doctor and headless shell-session checks.
+- Completed next-pass Phase 22 native iOS SSH companion path foundation:
+  extended `apps/ios` with native app bridge contracts, damage-driven iOS GPU
+  surface specs, SSH profile form validation, mobile connection planning,
+  host-trust prompt models that default to rejection, iOS Keychain capability
+  handoff, shared secret/keychain entry mapping, device validation checklist
+  cases, and updated readiness diagnostics/docs. This preserves the shared
+  engine path without claiming that a UIKit/SwiftUI host, native GPU backend,
+  Keychain provider, host-trust UI, or real device validation exists yet.
 
 ## Deferred By Design
 
@@ -416,9 +432,11 @@ to more visible features before the dependencies they rely on are hardened.
   approval UI, remote OSC 52 clipboard confirmation UI, real GPU device-loss
   platform validation, cross-OS config reload validation, and richer config
   error UI also remain release-hardening follow-up work.
-- Phase 15 establishes a compileable iOS companion foundation around the shared
-  engine, but it is not a native iOS app yet. UIKit/SwiftUI app lifecycle,
-  native touch/keyboard/settings UI, iOS GPU surface implementation, iOS
-  Keychain-backed `SecretProvider`, host-key approval UI, key import UX, remote
-  shell-integration activation, simulator/device validation, and App Store/Test
-  Flight packaging remain follow-up work.
+- Phase 15 and next-pass Phase 22 establish a compileable iOS companion path
+  around the shared engine, native bridge contracts, mobile SSH planning,
+  renderer surface specs, Keychain capability handoff, host-trust prompt models,
+  and a device checklist. It is still not a native iOS app yet. UIKit/SwiftUI
+  app lifecycle, native touch/keyboard/settings UI, iOS GPU surface
+  implementation, iOS Keychain-backed `SecretProvider`, host-key approval UI,
+  key import UX, remote shell-integration activation, simulator/device
+  validation, and App Store/TestFlight packaging remain follow-up work.

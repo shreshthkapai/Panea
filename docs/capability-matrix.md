@@ -89,11 +89,13 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Shared terminal engine reuse | tested | `apps/ios` proves shared parser/core flow in Rust tests. |
 | Mobile lifecycle model | tested | Foreground, background, reconnect, and no-indefinite-background-session policy exists. |
 | Touch/hardware/software keyboard contracts | partial | Rust-side model exists; native UIKit/SwiftUI integration is not implemented. |
-| iOS rendering surface | planned | No native GPU surface exists yet. |
+| iOS app shell bridge | partial | Rust-side native bridge traits exist for lifecycle, frame requests, diagnostics, host-key decisions, and secret prompts; UIKit/SwiftUI host is not implemented. |
+| iOS rendering surface | partial | `IosGpuSurfaceSpec` records backend readiness, damage-driven redraw policy, and idle redraw prohibition; no native GPU surface exists yet. |
 | iOS SSH profile mapping | tested | Portable SSH profile maps into a mobile session spec. |
-| iOS Keychain provider | planned | Not implemented. |
-| iOS host-key approval UI | planned | Not implemented. |
-| iOS simulator/device validation | planned | Not run. |
+| iOS SSH profile UI | partial | Profile form validation and connection planning exist; native editing UI and key import UX are not implemented. |
+| iOS Keychain provider | partial | iOS Keychain capability handoff exists and reports unavailable until native provider wiring is added. |
+| iOS host-key approval UI | partial | Trust prompt model defaults to reject and flags changed keys; native approval UI is not implemented. |
+| iOS simulator/device validation | planned | Device checklist exists; no simulator or physical-device run has been collected. |
 
 ## Current Cross-OS Verification Result
 

@@ -1647,21 +1647,28 @@ pub fn ios_companion_readiness_report() -> ReadinessReport {
                 area: "native app shell",
                 status: ReadinessStatus::Blocked,
                 message:
-                    "native iOS lifecycle, touch, keyboard, settings UI, and iPad multitasking host are modeled but not implemented in UIKit/SwiftUI"
+                    "Rust bridge contracts exist for lifecycle, frame requests, diagnostics, host-key decisions, and secret prompts; UIKit/SwiftUI host, settings UI, and iPad multitasking are not implemented"
                         .to_owned(),
             },
             ReadinessItem {
                 area: "iOS render surface",
                 status: ReadinessStatus::Blocked,
                 message:
-                    "render-core is reusable, but a native iOS GPU surface/backend has not been implemented or profiled"
+                    "render-core scene reuse and iOS GPU surface specs exist, but a native damage-driven iOS GPU backend has not been implemented or profiled"
                         .to_owned(),
             },
             ReadinessItem {
                 area: "SSH security",
                 status: ReadinessStatus::Warning,
                 message:
-                    "host-key and SSH profile policy are shared; iOS Keychain-backed SecretProvider and host-key approval UI are still required"
+                    "SSH profile validation, host-trust prompt modeling, and iOS Keychain capability handoff exist; native Keychain-backed SecretProvider and approval UI are still required"
+                        .to_owned(),
+            },
+            ReadinessItem {
+                area: "SSH profile UI",
+                status: ReadinessStatus::Warning,
+                message:
+                    "portable SSH profiles map to mobile connection plans with validation; native profile editing and key import UI remain required"
                         .to_owned(),
             },
             ReadinessItem {
@@ -1682,7 +1689,7 @@ pub fn ios_companion_readiness_report() -> ReadinessReport {
                 area: "real device validation",
                 status: ReadinessStatus::NotVerified,
                 message:
-                    "iPhone and iPad SSH, rendering, keyboard, secure storage, and lifecycle behavior have not been run on device or simulator"
+                    "iPhone/iPad/simulator checklist is documented, but SSH, rendering, keyboard, secure storage, touch selection, and reconnect behavior have not been run on device"
                         .to_owned(),
             },
         ],
@@ -2597,7 +2604,7 @@ mod tests {
 
         assert!(report.has_blockers());
         assert!(text.contains("shared engine"));
-        assert!(text.contains("native iOS"));
+        assert!(text.contains("UIKit/SwiftUI"));
         assert!(text.contains("GPU surface"));
     }
 }

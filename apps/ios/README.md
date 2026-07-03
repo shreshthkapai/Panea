@@ -14,6 +14,12 @@ It owns:
 - touch, software-keyboard, and hardware-keyboard input models
 - safe-area and keyboard-aware terminal sizing
 - iOS SSH session UX contracts
+- native app bridge contracts for host-key decisions, secret prompts,
+  diagnostics, and frame requests
+- SSH profile form validation and mobile connection planning
+- iOS GPU surface readiness specs
+- iOS Keychain capability handoff
+- device validation checklist cases
 - mobile readiness reporting helpers
 
 It must not import:

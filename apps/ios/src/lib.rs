@@ -7,7 +7,11 @@ use std::{path::PathBuf, time::Duration};
 use config_core::{AppConfig, SshAuthMethod, SshKnownHostsPolicy, SshProfile, VisualThemeConfig};
 use font_system::{CellMetrics, FontConfig as RuntimeFontConfig};
 use render_core::{DamageRegion, FrameRequest, FrameRequestReason, RenderScene};
-use security::{AuthMethod, KnownHostsPolicy};
+use security::{
+    AuthMethod, HostKeyTrustAction, HostKeyTrustRequest, KeychainEntry, KeychainProvider,
+    KeychainProviderCapability, KnownHostsPolicy, PlatformKeychainProvider, SecretRequest,
+    SecurityPlatform,
+};
 use semantics::{SemanticAction, SemanticTimelineStore};
 use term_core::{TerminalCore, TerminalResult, TerminalSize as CoreTerminalSize};
 use term_parser::TerminalEmulator;
@@ -147,6 +151,57 @@ impl IosRenderSurface {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IosRendererBackend {
+    SharedWgpu,
+    NativeMetal,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IosGpuSurfaceSpec {
+    pub backend: IosRendererBackend,
+    pub surface: IosRenderSurface,
+    pub damage_driven: bool,
+    pub idle_redraws_allowed: bool,
+    pub supports_gpu_timing: bool,
+    pub note: String,
+}
+
+impl IosGpuSurfaceSpec {
+    #[must_use]
+    pub fn planned_native_metal(surface: IosRenderSurface) -> Self {
+        Self {
+            backend: IosRendererBackend::NativeMetal,
+            surface,
+            damage_driven: true,
+            idle_redraws_allowed: false,
+            supports_gpu_timing: false,
+            note: "native iOS GPU surface must consume render-core scenes and preserve damage-driven redraws"
+                .to_owned(),
+        }
+    }
+
+    #[must_use]
+    pub fn unavailable(surface: IosRenderSurface, reason: impl Into<String>) -> Self {
+        Self {
+            backend: IosRendererBackend::Unavailable,
+            surface,
+            damage_driven: false,
+            idle_redraws_allowed: false,
+            supports_gpu_timing: false,
+            note: reason.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_release_ready(&self) -> bool {
+        !matches!(self.backend, IosRendererBackend::Unavailable)
+            && self.damage_driven
+            && !self.idle_redraws_allowed
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IosLifecycleState {
     Launching,
     ForegroundLive,
@@ -182,6 +237,26 @@ impl Default for IosLifecyclePolicy {
             pause_timeout: Duration::from_secs(5),
         }
     }
+}
+
+/// Native UIKit/SwiftUI host boundary.
+///
+/// This trait is intentionally small: the native app owns lifecycle, gestures,
+/// keyboard presentation, and modal UI, while the shared engine owns terminal
+/// bytes, render scenes, SSH profile shape, and security policy.
+pub trait IosAppShellBridge {
+    fn lifecycle_state(&self) -> IosLifecycleState;
+
+    fn present_host_key_decision(
+        &mut self,
+        request: HostKeyTrustRequest,
+    ) -> Option<HostKeyTrustAction>;
+
+    fn present_secret_prompt(&mut self, request: SecretRequest) -> Option<bool>;
+
+    fn request_frame(&mut self, request: FrameRequest);
+
+    fn show_diagnostic(&mut self, message: &str);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +341,89 @@ impl Default for IosSshUxPolicy {
             supports_reconnect: true,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IosSshProfileForm {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub auth_method: AuthMethod,
+    pub identity_file: Option<PathBuf>,
+    pub known_hosts_policy: KnownHostsPolicy,
+    pub shell_integration: bool,
+}
+
+impl IosSshProfileForm {
+    #[must_use]
+    pub fn from_profile(profile: &SshProfile) -> Self {
+        Self {
+            name: profile.name.clone(),
+            host: profile.host.clone(),
+            port: profile.port,
+            username: profile.username.clone(),
+            auth_method: map_auth_method(profile.auth_method),
+            identity_file: profile.identity_file.as_ref().map(PathBuf::from),
+            known_hosts_policy: map_known_hosts_policy(&profile.known_hosts_policy),
+            shell_integration: profile.shell_integration,
+        }
+    }
+
+    #[must_use]
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.name.trim().is_empty() {
+            errors.push("SSH profile name is required".to_owned());
+        }
+        if self.host.trim().is_empty() {
+            errors.push("SSH host is required".to_owned());
+        }
+        if self.port == 0 {
+            errors.push("SSH port must be greater than zero".to_owned());
+        }
+        if self.auth_method == AuthMethod::PublicKey && self.identity_file.is_none() {
+            errors.push("public-key SSH auth requires an identity file reference".to_owned());
+        }
+        errors
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IosTrustPromptModel {
+    pub title: String,
+    pub fingerprint: String,
+    pub changed_key: bool,
+    pub default_action: HostKeyTrustAction,
+    pub destructive: bool,
+}
+
+impl IosTrustPromptModel {
+    #[must_use]
+    pub fn from_request(request: &HostKeyTrustRequest) -> Self {
+        let changed_key = request.expected_fingerprint.is_some();
+        Self {
+            title: if changed_key {
+                "SSH host key changed".to_owned()
+            } else {
+                "Trust SSH host?".to_owned()
+            },
+            fingerprint: request.key.sha256_fingerprint.clone(),
+            changed_key,
+            default_action: HostKeyTrustAction::Reject,
+            destructive: changed_key,
+        }
+    }
+}
+
+#[must_use]
+pub fn ios_keychain_capability() -> KeychainProviderCapability {
+    PlatformKeychainProvider::for_platform(SecurityPlatform::Ios).capability()
+}
+
+#[must_use]
+pub fn ios_keychain_entry_for_secret(request: &SecretRequest) -> KeychainEntry {
+    request.keychain_entry()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -413,6 +571,58 @@ impl IosEngine {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IosConnectionPlanStatus {
+    Ready,
+    RequiresHostTrust,
+    RequiresSecret,
+    Blocked(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IosConnectionPlan {
+    pub session: IosSshSessionSpec,
+    pub status: IosConnectionPlanStatus,
+    pub requires_keychain: bool,
+    pub requires_native_ui: bool,
+}
+
+impl IosConnectionPlan {
+    #[must_use]
+    pub fn from_profile(profile: &SshProfile, keychain: KeychainProviderCapability) -> Self {
+        let form = IosSshProfileForm::from_profile(profile);
+        let validation = form.validate();
+        let session = IosSshSessionSpec::from_config_profile(profile);
+        if !validation.is_empty() {
+            return Self {
+                session,
+                status: IosConnectionPlanStatus::Blocked(validation.join("; ")),
+                requires_keychain: false,
+                requires_native_ui: true,
+            };
+        }
+
+        let requires_keychain = matches!(
+            form.auth_method,
+            AuthMethod::Password | AuthMethod::KeyboardInteractive | AuthMethod::PublicKey
+        );
+        let status = if requires_keychain && !keychain.secure_storage {
+            IosConnectionPlanStatus::RequiresSecret
+        } else if matches!(form.known_hosts_policy, KnownHostsPolicy::Ask) {
+            IosConnectionPlanStatus::RequiresHostTrust
+        } else {
+            IosConnectionPlanStatus::Ready
+        };
+
+        Self {
+            session,
+            status,
+            requires_keychain,
+            requires_native_ui: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IosUserAction {
     ConnectSshProfile(String),
     Disconnect,
@@ -426,6 +636,95 @@ pub enum IosUserAction {
     },
     ImportKeyReference(PathBuf),
     Semantic(SemanticAction),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IosDeviceClass {
+    Iphone,
+    Ipad,
+    Simulator,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IosDeviceTestCategory {
+    Ssh,
+    Rendering,
+    Keyboard,
+    Touch,
+    Lifecycle,
+    Security,
+    Semantics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IosDeviceTestCase {
+    pub id: &'static str,
+    pub category: IosDeviceTestCategory,
+    pub required_device: Option<IosDeviceClass>,
+    pub description: &'static str,
+    pub expected: &'static str,
+}
+
+#[must_use]
+pub fn ios_device_test_checklist() -> Vec<IosDeviceTestCase> {
+    vec![
+        IosDeviceTestCase {
+            id: "ios-ssh-known-host",
+            category: IosDeviceTestCategory::Ssh,
+            required_device: None,
+            description: "connect to a controlled SSH server after accepting the displayed host fingerprint",
+            expected: "remote PTY opens and the trusted host key is persisted through Keychain-backed storage policy",
+        },
+        IosDeviceTestCase {
+            id: "ios-ssh-changed-host-blocks",
+            category: IosDeviceTestCategory::Security,
+            required_device: None,
+            description: "connect after replacing the server host key in the controlled test host",
+            expected: "connection is blocked with a changed-key warning until the user explicitly resolves it",
+        },
+        IosDeviceTestCase {
+            id: "ios-render-output",
+            category: IosDeviceTestCategory::Rendering,
+            required_device: None,
+            description: "render ASCII, CJK, emoji, cursor, selection, and command-block fixtures",
+            expected: "terminal output uses shared render-core scenes without idle redraw loops",
+        },
+        IosDeviceTestCase {
+            id: "ios-software-keyboard-resize",
+            category: IosDeviceTestCategory::Keyboard,
+            required_device: Some(IosDeviceClass::Iphone),
+            description: "show and hide the software keyboard during an active SSH session",
+            expected: "remote PTY resizes from safe-area and keyboard-aware terminal dimensions",
+        },
+        IosDeviceTestCase {
+            id: "ios-hardware-keyboard",
+            category: IosDeviceTestCategory::Keyboard,
+            required_device: Some(IosDeviceClass::Ipad),
+            description: "type with a hardware keyboard, including control/meta-style terminal shortcuts",
+            expected: "input is delivered to the SSH transport without blocking rendering",
+        },
+        IosDeviceTestCase {
+            id: "ios-touch-selection",
+            category: IosDeviceTestCategory::Touch,
+            required_device: None,
+            description: "drag to select mixed ASCII, CJK, and emoji terminal output",
+            expected: "selection respects shared grapheme/cell boundaries and copies valid UTF-8",
+        },
+        IosDeviceTestCase {
+            id: "ios-background-reconnect",
+            category: IosDeviceTestCategory::Lifecycle,
+            required_device: None,
+            description: "send app to background past the pause timeout and return",
+            expected: "session disconnect/reconnect is explicit; app does not promise indefinite background SSH",
+        },
+        IosDeviceTestCase {
+            id: "ios-remote-semantics",
+            category: IosDeviceTestCategory::Semantics,
+            required_device: None,
+            description: "run shell integration on the remote host and emit prompt/input/output markers",
+            expected: "semantic command regions attach to shared terminal positions without rewriting terminal text",
+        },
+    ]
 }
 
 #[must_use]
@@ -470,6 +769,21 @@ pub fn ios_foundation_readiness() -> Vec<IosReadinessItem> {
             area: "SSH lifecycle",
             ready: true,
             note: "mobile lifecycle policy avoids indefinite background session promises",
+        },
+        IosReadinessItem {
+            area: "SSH profile UI",
+            ready: false,
+            note: "Rust-side profile form validation exists; native profile editing UI is not implemented",
+        },
+        IosReadinessItem {
+            area: "host trust UI",
+            ready: false,
+            note: "trust prompt model defaults to reject; native approval UI is not implemented",
+        },
+        IosReadinessItem {
+            area: "device validation checklist",
+            ready: true,
+            note: "required iPhone/iPad/simulator validation cases are enumerated for future runs",
         },
     ]
 }
@@ -518,7 +832,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shared_engine_list_covers_phase_15_components() {
+    fn shared_engine_list_covers_phase_22_components() {
         let components = shared_engine_components();
 
         for expected in [
@@ -609,6 +923,100 @@ mod tests {
                 sha256: "SHA256:abc".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn ssh_profile_form_rejects_missing_public_key_identity() {
+        let profile = SshProfile {
+            name: "prod".to_owned(),
+            host: "example.com".to_owned(),
+            auth_method: SshAuthMethod::PublicKey,
+            identity_file: None,
+            ..SshProfile::default()
+        };
+
+        let form = IosSshProfileForm::from_profile(&profile);
+
+        assert!(
+            form.validate()
+                .iter()
+                .any(|error| error.contains("identity file"))
+        );
+    }
+
+    #[test]
+    fn ios_connection_plan_requires_secure_secret_ui_for_password_auth() {
+        let profile = SshProfile {
+            name: "prod".to_owned(),
+            host: "example.com".to_owned(),
+            auth_method: SshAuthMethod::Password,
+            ..SshProfile::default()
+        };
+
+        let plan = IosConnectionPlan::from_profile(&profile, ios_keychain_capability());
+
+        assert!(plan.requires_keychain);
+        assert_eq!(plan.status, IosConnectionPlanStatus::RequiresSecret);
+    }
+
+    #[test]
+    fn trust_prompt_defaults_to_reject_and_flags_changed_keys() {
+        let key = security::HostKey::from_raw("example.com", 22, "ssh-ed25519", b"new-key");
+        let request = HostKeyTrustRequest::changed(key, "SHA256:old");
+
+        let prompt = IosTrustPromptModel::from_request(&request);
+
+        assert_eq!(prompt.default_action, HostKeyTrustAction::Reject);
+        assert!(prompt.changed_key);
+        assert!(prompt.destructive);
+    }
+
+    #[test]
+    fn ios_keychain_capability_points_at_ios_keychain_but_is_not_native_yet() {
+        let capability = ios_keychain_capability();
+
+        assert_eq!(capability.platform, SecurityPlatform::Ios);
+        assert_eq!(capability.backend, security::KeychainBackend::IosKeychain);
+        assert!(!capability.available);
+        assert!(!capability.secure_storage);
+    }
+
+    #[test]
+    fn gpu_surface_spec_requires_damage_driven_rendering() {
+        let surface = IosRenderSurface {
+            width_points: 1024.0,
+            height_points: 768.0,
+            scale_factor: 2.0,
+            safe_area: SafeAreaInsets::default(),
+            keyboard_height_points: 0.0,
+        };
+
+        let spec = IosGpuSurfaceSpec::planned_native_metal(surface);
+
+        assert_eq!(spec.backend, IosRendererBackend::NativeMetal);
+        assert!(spec.damage_driven);
+        assert!(!spec.idle_redraws_allowed);
+        assert!(spec.is_release_ready());
+    }
+
+    #[test]
+    fn device_checklist_covers_required_mobile_validation_surfaces() {
+        let checklist = ios_device_test_checklist();
+
+        for category in [
+            IosDeviceTestCategory::Ssh,
+            IosDeviceTestCategory::Rendering,
+            IosDeviceTestCategory::Keyboard,
+            IosDeviceTestCategory::Touch,
+            IosDeviceTestCategory::Lifecycle,
+            IosDeviceTestCategory::Security,
+            IosDeviceTestCategory::Semantics,
+        ] {
+            assert!(
+                checklist.iter().any(|case| case.category == category),
+                "{category:?} should be covered by the iOS device checklist"
+            );
+        }
     }
 
     #[test]

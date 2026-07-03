@@ -73,7 +73,9 @@ The remaining high-level work is:
   X11, and Linux Wayland.
 - Real GPU device-loss validation across sleep/wake, display changes, DPI
   changes, and backend failure scenarios.
-- Native iOS shell, iOS GPU surface, Keychain provider, device validation.
+- Native iOS runtime implementation beyond the shared-engine foundation:
+  UIKit/SwiftUI host, iOS GPU surface backend, Keychain provider, trust/profile
+  UI, key import UX, and simulator/device validation.
 
 This list must not be implemented randomly. It must be implemented in
 dependency order.
@@ -111,6 +113,11 @@ Phase 22 - Native iOS SSH companion path
 Do not skip ahead because a later phase is more visible. Each phase exists to
 make the following phases possible without weakening terminal correctness,
 platform parity, performance discipline, or security.
+
+The implementation pass through Phase 22 establishes the planned foundations.
+It does not make Panea product-complete; the remaining work is release
+hardening, native product UI/runtime implementation, and real cross-platform
+or device verification.
 
 ## 3. Review Checklist for Every Agent Diff
 

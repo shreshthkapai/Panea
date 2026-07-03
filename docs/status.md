@@ -71,7 +71,7 @@ stated scope:
 | SSH real-server smoke harness | tested | `cargo xtask ssh-smoke` uses the real `transport-ssh` backend, explicit trust providers, smoke-owned known-hosts storage, remote PTY output polling, resize, reconnect, changed-host detection, and remote OSC 52 policy checks. Real server reports still need to be collected per OS. |
 | Cross-OS verification runner | tested | `cargo xtask verify-os` composes architecture, unit, parser, Unicode, fuzz-smoke, renderer, config, clipboard, shell, PTY, screenshot, compatibility, doctor, Linux compositor, SSH, and package-smoke checks into platform-stamped markdown/JSON reports. GitHub Actions defines Windows, macOS, Linux X11, and Linux Wayland jobs. |
 | Packaging artifact runner | tested | `cargo xtask package` plans, builds, and smokes portable/staged desktop packages. The Windows dev portable package was staged on the current host; packaged `panea.exe doctor --json` and packaged `panea shell-smoke --json` both passed. macOS/Linux package reports remain uncollected. |
-| iOS shared-engine foundation | tested | `apps/ios` reuses shared parser/core/config/transport/semantic/render contracts and models lifecycle, input, safe-area sizing, and mobile SSH session specs. |
+| iOS shared-engine foundation | tested | `apps/ios` reuses shared parser/core/config/transport/semantic/render contracts and models lifecycle, input, safe-area sizing, mobile SSH session specs, native bridge contracts, SSH profile forms, trust prompt models, Keychain capability handoff, renderer surface specs, and device checklist cases. |
 
 ## What Is Partial
 
@@ -92,7 +92,7 @@ These areas are real foundations but must not be called complete:
 | SSH UX and security | partial | Provider contracts and real-server smoke harness exist, but desktop host-key approval UI, changed-host-key resolution UI, password/passphrase prompt UI, native OS keychain backend wiring, reconnect UI, proxy jump, and collected real-server reports remain. |
 | Performance reporting | partial | GPU timestamp query wiring and a developer in-window overlay exist, but real timestamp samples across hardware/backends, polished installed overlay UX, CI regression gates, and reproducible cross-machine benchmark reporting remain. |
 | Hardening/release readiness | partial | GPU recovery, crash-safe config reload, and portable/staged packaging foundations exist, but real device-loss platform validation, installer/AppImage/DMG artifacts, validation suite automation, and platform lab coverage remain. |
-| iOS companion | partial | Native UIKit/SwiftUI shell, iOS GPU surface, Keychain provider, host-key approval UI, key import UX, simulator/device validation, and packaging. |
+| iOS companion | partial | Shared-engine contracts, native bridge boundaries, mobile connection planning, renderer surface specs, and device checklist exist. Native UIKit/SwiftUI shell, iOS GPU surface implementation, Keychain provider backend, host-key approval UI, key import UX, simulator/device validation, and packaging remain. |
 
 ## What Is Stubbed
 
@@ -103,7 +103,7 @@ These areas exist mostly as placeholders, contracts, or documentation:
 | `tools/conformance` | stubbed | Directory and README exist; full terminal conformance fixture suite is not built out. |
 | Packaging installers | stubbed | Portable/staged package directories exist; Windows installer, macOS DMG/zip/signing/notarization, Linux AppImage/deb/rpm, and terminfo installation remain unimplemented. |
 | Native notifications | stubbed | Tracked in the platform matrix as not implemented. |
-| iOS app shell | stubbed | Rust shared-engine crate exists; no native mobile app host exists yet. |
+| iOS app shell | stubbed | Rust shared-engine crate and native bridge traits exist; no UIKit/SwiftUI mobile app host exists yet. |
 | Advanced config import/helpers | stubbed | Accepted by rollout rules, but no product implementation exists. |
 
 ## What Is Unimplemented
@@ -141,7 +141,7 @@ The following major accepted features have no complete product behavior yet:
   doctor smoke output.
 - Release installers and compressed distribution artifacts beyond the current
   portable/staged package directories.
-- Native iOS SSH companion app.
+- Native iOS SSH companion app runtime and device-verified release path.
 
 ## Layer Status Matrix
 
@@ -160,5 +160,6 @@ The following major accepted features have no complete product behavior yet:
 
 ## Immediate Next Slice
 
-After advanced programmable config, the next dependency-ordered phase is the
-native iOS SSH companion path.
+The dependency-ordered implementation pass through Phase 22 is now complete at
+foundation level. Remaining work is release hardening and real platform/device
+verification, not another roadmap phase.
