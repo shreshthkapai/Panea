@@ -50,6 +50,7 @@ stated scope:
 | Unicode/grapheme cell model | tested | UTF-8 scalar buffering, grapheme clustering, combining marks, wide CJK cells, emoji modifiers, ZWJ emoji, variation selectors, selection, cursor movement, overwrite/delete/erase, resize, and scrollback tests exist in `term-core` and `term-parser`. |
 | Parser baseline | tested | ANSI/VT parser adapter handles printable text, common controls, SGR colors/styles, alternate screen, clears, insert/delete groundwork, tab stops, title OSC, mouse/focus/bracketed-paste mode state, and pending responses. |
 | Fuzzing harness | tested | `fuzz/` contains cargo-fuzz targets for parser, grid, resize, Unicode, selection, OSC/DCS, and shell markers; property smoke tests run through `cargo xtask fuzz-smoke` and scheduled CI. |
+| App compatibility runner | tested | `cargo xtask compat` lists and runs bounded process/PTY compatibility probes, writes reports under `target/compatibility`, and the required Windows PowerShell/cmd/protocol subset passed on the current host. |
 | Screenshot verification runner | tested | Deterministic renderer fixtures, PPM capture, tolerance-based diffing, Windows baselines, and `cargo xtask screenshot verify --platform windows` exist. |
 | Linux compositor verification matrix | tested | Target matrix, fallback checklist, runtime environment snapshot, and `cargo xtask linux-compositor` exist; real Linux host verification remains open. |
 | Config model and TOML | tested | `AppConfig` defaults, TOML parsing, unknown/deprecated diagnostics, validation, platform overrides, default generation, schema export, reload impact classification, debounced file watching, safe live apply, and previous-config retention exist. |
@@ -78,7 +79,7 @@ These areas are real foundations but must not be called complete:
 | Font system | partial | Deeper shaping, full fallback validation across installed font sets, emoji fallback, and grapheme-aware metrics. |
 | Unicode support | tested | Core/parser Unicode hardening is covered by automated tests; renderer font fallback, shaping, screenshot parity, and real app conformance remain later phases. |
 | Clipboard and selection | partial | Raw selection extraction, keyboard copy/paste, paste protection, bracketed paste, middle-click paste guard, and OSC 52 policy exist; mouse-driven selection UX, Linux primary selection provider, remote confirmation UI, and full copy/paste app compatibility coverage remain. |
-| Baseline compatibility | partial | Real app smoke matrix for shells, editors, pagers, TUIs, tmux, screen, zellij, SSH, WSL, and command-line tools. |
+| Baseline compatibility | partial | App compatibility runner and required Windows smoke exist; full interactive verification for shells, editors, pagers, TUIs, tmux, screen, zellij, SSH, WSL, and command-line tools remains incomplete. |
 | Shell integration | partial | Local runtime activation planning and desktop injection exist for supported shells, with Windows PowerShell semantic smoke verified. Remote install flows, heuristic command detection, WSL-specific coverage, and real bash/zsh/fish/macOS/Linux session verification remain. |
 | Visual overlays | partial | Semantic command-block overlay projection, badge glyph batching, cursor animation quads, and image cursor metadata caching exist; collapse/expand behavior, polished interactive UI, full image cursor frame upload/draw, real shell-driven verification, and cross-OS visual verification remain. |
 | Native mux runtime | partial | Local tab/split runtime wiring exists, but startup workspaces, SSH panes, polished tab chrome, pane drag/move UI, and cross-OS GUI/runtime smoke tests remain. |
@@ -105,8 +106,8 @@ These areas exist mostly as placeholders, contracts, or documentation:
 
 The following major accepted features have no complete product behavior yet:
 
-- Cross-OS verification runners for Windows, macOS, Linux X11, and Linux
-  Wayland.
+- Cross-OS verification runners for macOS, Linux X11, and Linux Wayland, plus
+  product-level Windows GUI/runtime verification beyond current host smoke.
 - Real Linux compositor verification runs for GNOME/Mutter, KDE/KWin,
   wlroots/Sway, Hyprland class, tiling window managers, and X11 window managers.
 - Long-running coverage-guided fuzz history and crash-regression backlog from
@@ -126,6 +127,8 @@ The following major accepted features have no complete product behavior yet:
   shell verification.
 - Full animated image cursor pixel-frame decode/upload/draw path and cross-OS
   cursor animation visual smoke coverage.
+- Full interactive app compatibility automation for editors, pagers, TUIs,
+  tmux/screen/zellij, WSL, and SSH sessions.
 - Interactive SSH trust, secret prompts, keychain providers, and real SSH server
   smoke tests.
 - Installed doctor binary.
@@ -136,7 +139,7 @@ The following major accepted features have no complete product behavior yet:
 
 | Layer | Status | Notes |
 | --- | --- | --- |
-| core correctness | partial | Strong baseline, Unicode cell hardening, and fuzz harness exist, but app compatibility and conformance hardening remain. |
+| core correctness | partial | Strong baseline, Unicode cell hardening, fuzz harness, and app compatibility runner exist, but interactive app compatibility and conformance hardening remain. |
 | platform parity | partial | Capabilities, desktop window foundations, and Linux compositor verification matrix exist; real macOS/Linux X11/Linux Wayland verification remains open. |
 | render performance | partial | WGPU foundation, glyph cache, damage, scheduling, batched glyph/quad rendering, atlas uploads, benchmarks, renderer recovery foundation, and screenshot verification infrastructure exist; macOS/Linux screenshot baselines, real device-loss validation, and cross-OS runtime validation remain. |
 | config portability | partial | Static config model, TOML loading, validation, platform overrides, schema export, and runtime live-reload foundation exist; advanced config and cross-OS reload validation remain. |
@@ -149,5 +152,5 @@ The following major accepted features have no complete product behavior yet:
 
 ## Immediate Next Slice
 
-After cursor animation and animated image cursor pipeline, the next
-dependency-ordered phase is the app compatibility test suite.
+After the app compatibility test suite, the next dependency-ordered phase is
+SSH trust, secrets, and keychain providers.

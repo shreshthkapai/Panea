@@ -45,8 +45,8 @@ The remaining high-level work is:
   target matrix.
 - Mouse-driven selection UX, Linux primary selection provider, remote OSC 52
   confirmation UI, and real cross-OS clipboard smoke coverage.
-- Automated app compatibility tests: shells, editors, TUIs,
-  tmux/screen/zellij, SSH.
+- App compatibility tests now have a bounded runner; full interactive shells,
+  editors, TUIs, tmux/screen/zellij, WSL, SSH, and cross-OS reports remain.
 - Runtime config watching/live reload cross-OS validation and richer error UI.
 - Advanced programmable config later.
 - GPU timestamp queries and in-window performance overlay.

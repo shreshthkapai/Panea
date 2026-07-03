@@ -19,6 +19,7 @@ Local commands:
 ```powershell
 cargo xtask ci
 cargo xtask bench all
+cargo xtask compat run --timeout-ms 5000
 cargo xtask doctor
 cargo xtask hardening
 cargo xtask security-review

@@ -34,6 +34,8 @@ cargo xtask fuzz-smoke
 rustup toolchain install nightly
 cargo install cargo-fuzz
 cargo xtask fuzz parser_input -- -runs=100000
+cargo xtask compat plan
+cargo xtask compat run --required-only --timeout-ms 5000
 cargo xtask doctor
 cargo xtask bug-report
 cargo xtask hardening
@@ -80,3 +82,7 @@ Panea panes, but must not special-case or parse external mux internals.
 A release candidate is not daily-driver ready until `cargo xtask release-check`
 has no blockers and the platform matrix has been validated on macOS, Windows,
 Linux X11, and Linux Wayland. Local Windows success is not enough.
+
+App compatibility reports are generated with `cargo xtask compat`. A version or
+availability probe is not enough to mark an app compatible; full-screen editors,
+TUIs, external multiplexers, WSL, and SSH sessions need PTY/manual validation.

@@ -21,7 +21,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | --- | --- | --- | --- | --- | --- |
 | Workspace build/test/lint | tested | partial | partial | partial | Verified on the current Windows host; other desktop OSes require runners. |
 | Terminal core grid/state | tested | implemented | implemented | implemented | Platform-neutral code exists; runtime app verification still needed off Windows. |
-| Parser baseline | tested | implemented | implemented | implemented | Lower-level tests exist; app-level compatibility suite is not complete. |
+| Parser baseline | tested | implemented | implemented | implemented | Lower-level tests and a compatibility smoke runner exist; full interactive app verification remains incomplete. |
 | Fuzz/property harness | tested | implemented | implemented | implemented | cargo-fuzz targets and proptest smoke tests exist; scheduled CI runs smoke properties, but long-running fuzz history has not accumulated yet. |
 | Scrollback/alternate screen/resize | tested | implemented | implemented | implemented | Core behavior exists; full app smoke remains open per OS. |
 | Selection extraction | tested | implemented | implemented | implemented | Raw normal and rectangular extraction exists; mouse-driven selection UX remains partial. |
@@ -59,7 +59,8 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Native mux model | tested | implemented | implemented | implemented | Workspace/tab/pane/session/layout model exists. |
 | Native tabs runtime | partial | partial | partial | partial | Desktop runtime switching and basic tab chrome exist; real GUI smoke and polished tab UI remain. |
 | Native panes/splits runtime | partial | partial | partial | partial | Desktop split rendering, per-pane local transports, focus, resize, zoom, and close are wired; cross-OS smoke, SSH panes, and startup layouts remain. |
-| External tmux/screen/zellij compatibility | partial | partial | partial | partial | Architecture preserves compatibility; real app suite is not automated. |
+| External tmux/screen/zellij compatibility | partial | partial | partial | partial | Compatibility runner records binary availability; nested PTY behavior still needs manual or future automated checks. |
+| App compatibility runner | tested | partial | partial | partial | `cargo xtask compat` exists with required Windows PowerShell/cmd/protocol smoke passing on the current host. macOS, Linux X11, and Linux Wayland reports remain unverified. |
 | Semantic timeline | tested | implemented | implemented | implemented | Storage and command-region model exist. |
 | Semantic escape parser | tested | implemented | implemented | implemented | OSC 133, OSC 633, OSC 7, and private OSC 777 foundations exist. |
 | Shell integration activation | partial | partial | partial | partial | Activation plans, desktop hook injection, config modes, and ignored real-shell tests exist; Windows PowerShell smoke passed, while bash/zsh/fish, WSL, remote, macOS, and Linux verification remain. |
@@ -97,7 +98,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 
 | Platform | Overall status | Why |
 | --- | --- | --- |
-| Windows | partial | Current host build/test/lint and local PTY smoke have been verified, but renderer GUI, app compatibility, SSH server, packaging, and full daily-driver workflows are incomplete. |
+| Windows | partial | Current host build/test/lint, local PTY smoke, and required compatibility runner smoke have been verified, but renderer GUI, optional app matrix, SSH server, packaging, and full daily-driver workflows are incomplete. |
 | macOS | partial | Platform-neutral code is implemented, but runtime behavior is unverified on macOS. |
 | Linux X11 | partial | Platform-neutral code and X11 strategy exist, but real X11 window manager/compositor behavior is unverified. |
 | Linux Wayland | partial | Platform-neutral code and Wayland strategy exist, but real compositor behavior is unverified. |

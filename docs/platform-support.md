@@ -55,6 +55,7 @@ considered verified until that matrix has real X11 and Wayland host evidence.
 | SSH real-server smoke | Unverified | Unverified | Unverified | Unverified |
 | Shell integration real-session smoke | PowerShell verified on current host | Unverified | Unverified | Unverified |
 | Native mux runtime smoke | Unit-tested only | Unverified | Unverified | Unverified |
+| App compatibility required smoke | Verified on current host | Unverified | Unverified | Unverified |
 
 ## macOS Polish Checklist
 

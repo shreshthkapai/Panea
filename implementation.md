@@ -327,6 +327,12 @@ to more visible features before the dependencies they rely on are hardened.
   budget warnings. Full animated image pixel-frame decode/upload/draw,
   polished visual tuning, and macOS/Linux X11/Linux Wayland visual smoke
   verification remain deferred.
+- Next-pass Phase 14 adds `cargo xtask compat`, bounded real-process and
+  real-PTY compatibility probes, fixture scripts, report generation under
+  `target/compatibility`, and a manual app checklist. The required Windows
+  PowerShell/cmd/protocol subset passed on the current host. Optional app
+  probes, full interactive editor/TUI/multiplexer behavior, WSL, SSH server
+  sessions, and macOS/Linux X11/Linux Wayland reports remain follow-up work.
 - Phase 12 establishes secure SSH transport contracts and a real backend, but
   interactive host-key approval UI, OS keychain-backed secret providers, proxy
   jump, remote shell-integration install flows, reconnect UI/actions, and real

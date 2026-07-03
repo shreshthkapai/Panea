@@ -11,24 +11,26 @@ be called product-complete across all targets.
 
 | Application | Current status |
 | --- | --- |
-| bash | Not yet verified |
-| zsh | Not yet verified |
-| fish | Not yet verified |
-| PowerShell | Not yet verified in Phase 6 app suite |
-| cmd | Not yet verified in Phase 6 app suite |
-| vim/neovim | Not yet verified |
-| emacs terminal mode | Not yet verified |
-| less | Not yet verified |
-| man | Not yet verified |
-| htop/btop-style TUI | Not yet verified |
-| fzf | Not yet verified |
-| ripgrep output | Not yet verified |
-| git log/diff | Not yet verified |
-| tmux | Not yet verified |
-| screen | Not yet verified |
-| zellij | Not yet verified |
-| local SSH host | Not yet verified |
+| bash | Optional `cargo xtask compat` probe; host-dependent |
+| zsh | Optional `cargo xtask compat` probe; host-dependent |
+| fish | Optional `cargo xtask compat` probe; host-dependent |
+| PowerShell | Required Windows `cargo xtask compat` PTY smoke passed on current host |
+| cmd | Required Windows `cargo xtask compat` PTY smoke passed on current host |
+| vim/neovim | Optional version probe; full-screen behavior remains manual |
+| emacs terminal mode | Manual verification required |
+| less | Manual verification required |
+| man | Manual verification required |
+| htop/btop-style TUI | Optional version probe; interactive TUI behavior remains manual |
+| fzf | Optional version probe; interactive behavior remains manual |
+| ripgrep output | Manual or future fixture required |
+| git log/diff | Optional git probe; pager/diff behavior remains manual |
+| tmux | Optional version probe; nested session behavior remains manual |
+| screen | Optional version probe; nested session behavior remains manual |
+| zellij | Optional version probe; nested session behavior remains manual |
+| local SSH host | Manual verification required; real server smoke is a later phase |
 
 The current automated coverage is lower-level golden testing in `term-parser`
 and `term-core`, plus ignored real local PTY smoke tests in `transport-pty`.
-App-level smoke automation must run per platform before parity claims are made.
+App-level smoke automation now exists through `cargo xtask compat`, but it must
+run per platform before parity claims are made. Fixture scripts live under
+`tools/conformance/compat/`.

@@ -38,6 +38,26 @@ Implemented in the baseline compatibility layer:
 - Unicode cell storage for split UTF-8 input, combining marks, CJK width, emoji
   modifiers, ZWJ emoji, variation selectors, selection, cursor movement,
   resize, and scrollback
+- App compatibility smoke runner through `cargo xtask compat`, with bounded
+  PTY/process probes and generated reports under `target/compatibility`
+
+## App Compatibility Runner
+
+Run:
+
+```text
+cargo xtask compat plan
+cargo xtask compat run --required-only --timeout-ms 5000
+cargo xtask compat run --timeout-ms 5000
+```
+
+The required Windows subset currently covers PowerShell PTY output, cmd PTY
+output, bounded teardown, and an ANSI/OSC marker fixture. Optional app probes
+for editors, TUIs, multiplexers, WSL, SSH client availability, and other shells
+are recorded as pass, skip, fail, or manual-required.
+
+Details and manual compatibility checklists live in
+[App compatibility](app-compatibility.md).
 
 ## Deferred Compatibility Work
 
@@ -46,5 +66,7 @@ Implemented in the baseline compatibility layer:
 - Full configurable hint pattern engine
 - Application keypad output mapping
 - Full terminfo strategy and optional custom terminfo installation
-- Automated app-level compatibility runners across Windows, macOS, Linux X11,
-  and Linux Wayland
+- Full automated interactive app driving for editors, TUIs, tmux/screen/zellij,
+  WSL, and SSH
+- Cross-OS app compatibility reports across Windows, macOS, Linux X11, and
+  Linux Wayland

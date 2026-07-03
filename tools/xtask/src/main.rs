@@ -1,15 +1,20 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fmt, fs,
     path::{Path, PathBuf},
-    process::{Command, ExitCode},
+    process::{Command, ExitCode, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
+
+use transport_core::{TerminalSize, TerminalTransport, TransportLifecycleEvent, TransportState};
+use transport_pty::{LocalPtyDiagnostics, LocalPtyTransport, LocalShellProfile};
 
 fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("help") | None => {
             eprintln!(
-                "usage: cargo xtask <fmt|clippy|test|build|check|layer-check|ci|config-default|config-schema|bench|screenshot|fuzz-smoke|fuzz|doctor|bug-report|hardening|security-review|linux-compositor|package-plan|release-check|ios-readiness>"
+                "usage: cargo xtask <fmt|clippy|test|build|check|layer-check|ci|config-default|config-schema|bench|screenshot|fuzz-smoke|fuzz|doctor|bug-report|hardening|security-review|linux-compositor|compat|package-plan|release-check|ios-readiness>"
             );
             ExitCode::SUCCESS
         }
@@ -30,6 +35,7 @@ fn main() -> ExitCode {
         Some("hardening") => run_hardening(),
         Some("security-review") => run_security_review(),
         Some("linux-compositor") => run_linux_compositor(),
+        Some("compat") => run_compat(),
         Some("package-plan") => run_package_plan(),
         Some("release-check") => run_release_check(),
         Some("ios-readiness") => run_ios_readiness(),
@@ -55,6 +61,1057 @@ fn run_ios_readiness() -> ExitCode {
         diagnostics::ios_companion_readiness_report().render_text()
     );
     ExitCode::SUCCESS
+}
+
+fn run_compat() -> ExitCode {
+    let mut args = std::env::args().skip(2).collect::<Vec<_>>();
+    let command = args.first().map_or("plan", String::as_str);
+
+    match command {
+        "help" | "--help" | "-h" => {
+            print_compat_help();
+            ExitCode::SUCCESS
+        }
+        "plan" => {
+            print_compat_plan();
+            ExitCode::SUCCESS
+        }
+        "run" => {
+            args.remove(0);
+            let options = match CompatRunOptions::parse(&args) {
+                Ok(options) => options,
+                Err(error) => {
+                    eprintln!("{error}");
+                    print_compat_help();
+                    return ExitCode::from(2);
+                }
+            };
+            run_compat_cases(&options)
+        }
+        other => {
+            eprintln!("unknown compat command: {other}");
+            print_compat_help();
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn print_compat_help() {
+    eprintln!("usage: cargo xtask compat <plan|run>");
+    eprintln!(
+        "usage: cargo xtask compat run [--required-only] [--category <name>] [--case <key>] [--timeout-ms <ms>] [--report-dir <path>]"
+    );
+    eprintln!("categories: shells, editors, tuis, multiplexers, ssh, protocol");
+}
+
+fn print_compat_plan() {
+    println!("Panea app compatibility suite");
+    println!("host_platform={}", CompatPlatform::detect().label());
+    println!("runner=bounded real-process and real-PTY smoke checks");
+    println!("manual_checks=recorded separately; they are not treated as pass");
+    println!("cases:");
+    for case in compat_cases() {
+        println!(
+            "- {} category={} required={} platforms={} mode={} verifies={}",
+            case.key,
+            case.category,
+            case.required,
+            case.platforms.label(),
+            case.mode_label(),
+            case.verifies
+        );
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CompatRunOptions {
+    category: Option<CompatCategory>,
+    case_key: Option<String>,
+    required_only: bool,
+    timeout: Duration,
+    report_dir: PathBuf,
+}
+
+impl CompatRunOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut category = None;
+        let mut case_key = None;
+        let mut required_only = false;
+        let mut timeout = Duration::from_secs(5);
+        let mut report_dir = PathBuf::from("target/compatibility");
+        let mut index = 0;
+
+        while index < args.len() {
+            match args[index].as_str() {
+                "--category" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("--category requires a value".to_owned());
+                    };
+                    category = Some(
+                        CompatCategory::parse(value)
+                            .ok_or_else(|| format!("unknown compatibility category: {value}"))?,
+                    );
+                }
+                "--case" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("--case requires a value".to_owned());
+                    };
+                    case_key = Some(value.clone());
+                }
+                "--required-only" => required_only = true,
+                "--timeout-ms" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("--timeout-ms requires a value".to_owned());
+                    };
+                    let millis = value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid --timeout-ms value: {value}"))?;
+                    if millis < 100 {
+                        return Err("--timeout-ms must be at least 100".to_owned());
+                    }
+                    timeout = Duration::from_millis(millis);
+                }
+                "--report-dir" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("--report-dir requires a value".to_owned());
+                    };
+                    report_dir = PathBuf::from(value);
+                }
+                other => return Err(format!("unknown compat option: {other}")),
+            }
+            index += 1;
+        }
+
+        Ok(Self {
+            category,
+            case_key,
+            required_only,
+            timeout,
+            report_dir,
+        })
+    }
+}
+
+fn run_compat_cases(options: &CompatRunOptions) -> ExitCode {
+    let host = CompatPlatform::detect();
+    let cases = compat_cases();
+    let mut selected = cases
+        .iter()
+        .filter(|case| case.platforms.matches(host))
+        .filter(|case| {
+            options
+                .category
+                .is_none_or(|category| category == case.category)
+        })
+        .filter(|case| {
+            options
+                .case_key
+                .as_deref()
+                .is_none_or(|key| key == case.key)
+        })
+        .filter(|case| !options.required_only || case.required)
+        .collect::<Vec<_>>();
+
+    selected.sort_by_key(|case| (case.category.sort_key(), case.key));
+
+    if selected.is_empty() {
+        eprintln!("no compatibility cases matched current filters");
+        return ExitCode::from(2);
+    }
+
+    let mut results = Vec::new();
+    for case in selected {
+        let result = run_compat_case(case, options.timeout);
+        println!("{}", result.render_line());
+        results.push(result);
+    }
+
+    if let Err(error) = fs::create_dir_all(&options.report_dir) {
+        eprintln!(
+            "failed to create compatibility report directory {}: {error}",
+            options.report_dir.display()
+        );
+        return ExitCode::from(1);
+    }
+
+    let report_path = options.report_dir.join(format!("{}.md", host.label()));
+    if let Err(error) = fs::write(&report_path, render_compat_report(host, &results)) {
+        eprintln!("failed to write {}: {error}", report_path.display());
+        return ExitCode::from(1);
+    }
+    println!("wrote compatibility report {}", report_path.display());
+
+    if results
+        .iter()
+        .any(|result| result.status == CompatResultStatus::Fail)
+    {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn run_compat_case(case: &CompatCase, timeout: Duration) -> CompatResult {
+    let started = Instant::now();
+    let outcome = match &case.kind {
+        CompatCaseKind::Process {
+            program,
+            args,
+            marker,
+        } => run_process_compat(program, args, *marker, timeout),
+        CompatCaseKind::Pty { profile, marker } => run_pty_compat(profile.clone(), marker, timeout),
+        CompatCaseKind::Manual { instructions } => Ok(CompatExecution {
+            status: CompatResultStatus::Manual,
+            detail: instructions.to_string(),
+            bytes_received: 0,
+            preview: String::new(),
+            lifecycle: Vec::new(),
+            diagnostics: None,
+        }),
+    };
+
+    match outcome {
+        Ok(mut execution) => {
+            execution.detail = format!("{}; {}", execution.detail, case.verifies);
+            CompatResult {
+                key: case.key,
+                category: case.category,
+                required: case.required,
+                status: execution.status,
+                duration: started.elapsed(),
+                detail: execution.detail,
+                bytes_received: execution.bytes_received,
+                preview: execution.preview,
+                lifecycle: execution.lifecycle,
+                diagnostics: execution.diagnostics,
+            }
+        }
+        Err(error) => CompatResult {
+            key: case.key,
+            category: case.category,
+            required: case.required,
+            status: if error.missing_program {
+                if case.required {
+                    CompatResultStatus::Fail
+                } else {
+                    CompatResultStatus::Skip
+                }
+            } else {
+                CompatResultStatus::Fail
+            },
+            duration: started.elapsed(),
+            detail: error.message,
+            bytes_received: error.bytes_received,
+            preview: error.preview,
+            lifecycle: error.lifecycle,
+            diagnostics: error.diagnostics,
+        },
+    }
+}
+
+fn run_process_compat(
+    program: &str,
+    args: &[String],
+    marker: Option<&str>,
+    timeout: Duration,
+) -> Result<CompatExecution, CompatRunError> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            CompatRunError::missing_or_failed(
+                error.kind() == std::io::ErrorKind::NotFound,
+                format!("failed to spawn {program}: {error}"),
+            )
+        })?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let output = child.wait_with_output().map_err(|error| {
+                    CompatRunError::failed(format!("failed to read {program} output: {error}"))
+                })?;
+                let mut bytes = output.stdout;
+                bytes.extend_from_slice(&output.stderr);
+                let preview = preview_bytes(&bytes);
+
+                if !output.status.success() {
+                    return Err(CompatRunError {
+                        missing_program: false,
+                        message: format!("{program} exited with status {:?}", output.status.code()),
+                        bytes_received: bytes.len(),
+                        preview,
+                        lifecycle: Vec::new(),
+                        diagnostics: None,
+                    });
+                }
+
+                if let Some(marker) = marker
+                    && !preview.contains(marker)
+                    && !bytes
+                        .windows(marker.len())
+                        .any(|window| window == marker.as_bytes())
+                {
+                    return Err(CompatRunError {
+                        missing_program: false,
+                        message: format!("{program} did not emit marker {marker:?}"),
+                        bytes_received: bytes.len(),
+                        preview,
+                        lifecycle: Vec::new(),
+                        diagnostics: None,
+                    });
+                }
+
+                return Ok(CompatExecution {
+                    status: CompatResultStatus::Pass,
+                    detail: format!(
+                        "process command completed: {}",
+                        command_label(program, args)
+                    ),
+                    bytes_received: bytes.len(),
+                    preview,
+                    lifecycle: Vec::new(),
+                    diagnostics: None,
+                });
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CompatRunError::failed(format!(
+                    "timed out after {:?}: {}",
+                    timeout,
+                    command_label(program, args)
+                )));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CompatRunError::failed(format!(
+                    "failed while waiting for {program}: {error}"
+                )));
+            }
+        }
+    }
+}
+
+fn run_pty_compat(
+    profile: LocalShellProfile,
+    marker: &'static [u8],
+    timeout: Duration,
+) -> Result<CompatExecution, CompatRunError> {
+    let mut transport = LocalPtyTransport::spawn(profile, TerminalSize::new(80, 24, 640, 384))
+        .map_err(|error| {
+            CompatRunError::missing_or_failed(
+                error.to_string().contains("failed to spawn"),
+                format!("failed to spawn PTY case: {error}"),
+            )
+        })?;
+
+    let deadline = Instant::now() + timeout;
+    let mut output = Vec::new();
+    let mut lifecycle = Vec::new();
+    let mut saw_marker = false;
+
+    while Instant::now() < deadline {
+        match transport.poll_output() {
+            Ok(poll) => {
+                answer_terminal_queries(&mut transport, &poll.bytes)?;
+                lifecycle.extend(poll.lifecycle);
+                output.extend(poll.bytes);
+                saw_marker =
+                    saw_marker || output.windows(marker.len()).any(|window| window == marker);
+                let closed =
+                    poll.closed || matches!(transport.state(), TransportState::Closed { .. });
+                if saw_marker && closed {
+                    break;
+                }
+            }
+            Err(error) => {
+                let diagnostics = transport.diagnostics();
+                let _ = transport.shutdown();
+                return Err(CompatRunError {
+                    missing_program: false,
+                    message: format!("PTY poll failed: {error}"),
+                    bytes_received: output.len(),
+                    preview: preview_bytes(&output),
+                    lifecycle,
+                    diagnostics: Some(format_pty_diagnostics(&diagnostics)),
+                });
+            }
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let before_shutdown = transport.diagnostics();
+    let shutdown_result = transport.shutdown();
+    let after_shutdown = transport.diagnostics();
+    let diagnostics = format!(
+        "before_shutdown:\n{}\nafter_shutdown:\n{}",
+        format_pty_diagnostics(&before_shutdown),
+        format_pty_diagnostics(&after_shutdown)
+    );
+
+    if !saw_marker {
+        return Err(CompatRunError {
+            missing_program: false,
+            message: format!(
+                "PTY case did not observe marker {:?}; shutdown={:?}",
+                String::from_utf8_lossy(marker),
+                shutdown_result.map_err(|error| error.to_string())
+            ),
+            bytes_received: output.len(),
+            preview: preview_bytes(&output),
+            lifecycle,
+            diagnostics: Some(diagnostics),
+        });
+    }
+
+    if let Err(error) = shutdown_result {
+        return Err(CompatRunError {
+            missing_program: false,
+            message: format!("PTY marker observed, but bounded shutdown failed: {error}"),
+            bytes_received: output.len(),
+            preview: preview_bytes(&output),
+            lifecycle,
+            diagnostics: Some(diagnostics),
+        });
+    }
+
+    if after_shutdown.shutdown_timed_out {
+        return Err(CompatRunError {
+            missing_program: false,
+            message: "PTY marker observed, but shutdown timed out".to_owned(),
+            bytes_received: output.len(),
+            preview: preview_bytes(&output),
+            lifecycle,
+            diagnostics: Some(diagnostics),
+        });
+    }
+
+    Ok(CompatExecution {
+        status: CompatResultStatus::Pass,
+        detail: "PTY command emitted marker and shut down cleanly".to_owned(),
+        bytes_received: output.len(),
+        preview: preview_bytes(&output),
+        lifecycle,
+        diagnostics: Some(diagnostics),
+    })
+}
+
+fn answer_terminal_queries(
+    transport: &mut LocalPtyTransport,
+    bytes: &[u8],
+) -> Result<(), CompatRunError> {
+    if bytes
+        .windows(b"\x1b[6n".len())
+        .any(|window| window == b"\x1b[6n")
+    {
+        transport.write_input(b"\x1b[1;1R").map_err(|error| {
+            CompatRunError::failed(format!("failed to answer CPR query: {error}"))
+        })?;
+    }
+
+    Ok(())
+}
+
+fn command_label(program: &str, args: &[String]) -> String {
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn preview_bytes(bytes: &[u8]) -> String {
+    const LIMIT: usize = 320;
+    let start = bytes.len().saturating_sub(LIMIT);
+    String::from_utf8_lossy(&bytes[start..])
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+}
+
+fn format_pty_diagnostics(diagnostics: &LocalPtyDiagnostics) -> String {
+    [
+        format!("command={}", diagnostics.command),
+        format!("pid={:?}", diagnostics.process_id),
+        format!("state={:?}", diagnostics.state),
+        format!("bytes_received={}", diagnostics.bytes_received),
+        format!("read_events={}", diagnostics.read_events),
+        format!(
+            "last_reader_preview={:?}",
+            String::from_utf8_lossy(&diagnostics.last_bytes_preview)
+        ),
+        format!("reader_started={}", diagnostics.reader_started),
+        format!("reader_stopped={}", diagnostics.reader_stopped),
+        format!("reader_error={:?}", diagnostics.reader_error),
+        format!("child_exited={}", diagnostics.child_exited),
+        format!("kill_attempted={}", diagnostics.kill_attempted),
+        format!("shutdown_timed_out={}", diagnostics.shutdown_timed_out),
+    ]
+    .join("\n")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompatPlatform {
+    Windows,
+    Macos,
+    LinuxX11,
+    LinuxWayland,
+    Any,
+    Unix,
+}
+
+impl CompatPlatform {
+    fn detect() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::Macos
+        } else if cfg!(target_os = "linux") {
+            match std::env::var("XDG_SESSION_TYPE") {
+                Ok(value) if value.eq_ignore_ascii_case("wayland") => Self::LinuxWayland,
+                _ => Self::LinuxX11,
+            }
+        } else {
+            Self::Any
+        }
+    }
+
+    fn matches(self, host: Self) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Unix => !matches!(host, Self::Windows),
+            Self::LinuxX11 => host == Self::LinuxX11,
+            Self::LinuxWayland => host == Self::LinuxWayland,
+            Self::Windows => host == Self::Windows,
+            Self::Macos => host == Self::Macos,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Windows => "windows",
+            Self::Macos => "macos",
+            Self::LinuxX11 => "linux-x11",
+            Self::LinuxWayland => "linux-wayland",
+            Self::Any => "any",
+            Self::Unix => "macos/linux",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompatCategory {
+    Shells,
+    Editors,
+    Tuis,
+    Multiplexers,
+    Ssh,
+    Protocol,
+}
+
+impl fmt::Display for CompatCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Shells => "shells",
+            Self::Editors => "editors",
+            Self::Tuis => "tuis",
+            Self::Multiplexers => "multiplexers",
+            Self::Ssh => "ssh",
+            Self::Protocol => "protocol",
+        })
+    }
+}
+
+impl CompatCategory {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "shells" => Some(Self::Shells),
+            "editors" => Some(Self::Editors),
+            "tuis" => Some(Self::Tuis),
+            "multiplexers" => Some(Self::Multiplexers),
+            "ssh" => Some(Self::Ssh),
+            "protocol" => Some(Self::Protocol),
+            _ => None,
+        }
+    }
+
+    fn sort_key(self) -> u8 {
+        match self {
+            Self::Shells => 0,
+            Self::Editors => 1,
+            Self::Tuis => 2,
+            Self::Multiplexers => 3,
+            Self::Ssh => 4,
+            Self::Protocol => 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum CompatCaseKind {
+    Process {
+        program: &'static str,
+        args: Vec<String>,
+        marker: Option<&'static str>,
+    },
+    Pty {
+        profile: LocalShellProfile,
+        marker: &'static [u8],
+    },
+    Manual {
+        instructions: &'static str,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct CompatCase {
+    key: &'static str,
+    category: CompatCategory,
+    platforms: CompatPlatform,
+    required: bool,
+    kind: CompatCaseKind,
+    verifies: &'static str,
+}
+
+impl CompatCase {
+    fn mode_label(&self) -> &'static str {
+        match self.kind {
+            CompatCaseKind::Process { .. } => "process",
+            CompatCaseKind::Pty { .. } => "pty",
+            CompatCaseKind::Manual { .. } => "manual",
+        }
+    }
+}
+
+fn compat_cases() -> Vec<CompatCase> {
+    let mut cases = Vec::new();
+
+    cases.extend(shell_compat_cases());
+    cases.extend(process_compat_cases(
+        CompatCategory::Editors,
+        [
+            ("editor-vim", "vim", &["--version"][..]),
+            ("editor-neovim", "nvim", &["--version"][..]),
+            ("editor-nano", "nano", &["--version"][..]),
+            ("editor-helix", "hx", &["--version"][..]),
+        ],
+        "editor binary starts and reports a version; full-screen editing remains a manual PTY check",
+    ));
+    cases.extend(process_compat_cases(
+        CompatCategory::Tuis,
+        [
+            ("tui-htop", "htop", &["--version"][..]),
+            ("tui-btop", "btop", &["--version"][..]),
+            ("tui-lazygit", "lazygit", &["--version"][..]),
+            ("tui-fzf", "fzf", &["--version"][..]),
+            ("tool-git", "git", &["--version"][..]),
+            ("tool-cargo", "cargo", &["--version"][..]),
+            ("tool-node", "node", &["--version"][..]),
+            ("tool-npm", "npm", &["--version"][..]),
+            ("tool-pnpm", "pnpm", &["--version"][..]),
+            ("tool-yarn", "yarn", &["--version"][..]),
+            ("tool-python", "python", &["--version"][..]),
+        ],
+        "tool starts and reports version; interactive output protocol remains covered by manual checklist",
+    ));
+    cases.extend(process_compat_cases(
+        CompatCategory::Multiplexers,
+        [
+            ("mux-tmux", "tmux", &["-V"][..]),
+            ("mux-screen", "screen", &["-v"][..]),
+            ("mux-zellij", "zellij", &["--version"][..]),
+        ],
+        "external multiplexer binary starts; nested session behavior remains a manual PTY check",
+    ));
+
+    cases.push(process_case(ProcessCaseSpec {
+        key: "ssh-client",
+        category: CompatCategory::Ssh,
+        platforms: CompatPlatform::Any,
+        required: false,
+        program: "ssh",
+        args: &["-V"],
+        marker: None,
+        verifies: "SSH client exists; real SSH server smoke is deferred to the SSH server phase",
+    }));
+    cases.push(manual_case(
+        "ssh-local-server",
+        CompatCategory::Ssh,
+        CompatPlatform::Any,
+        false,
+        "start a controlled local SSH server, open remote PTY, resize, emit Unicode, test OSC 52 policy, then disconnect cleanly",
+        "remote PTY, resize, Unicode, clipboard policy, disconnect handling",
+    ));
+
+    cases.extend(protocol_compat_cases());
+    cases
+}
+
+fn shell_compat_cases() -> Vec<CompatCase> {
+    vec![
+        pty_case(
+            "shell-powershell",
+            CompatCategory::Shells,
+            CompatPlatform::Windows,
+            true,
+            LocalShellProfile::powershell().with_args([
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "Write-Output panea-compat-powershell",
+            ]),
+            b"panea-compat-powershell",
+            "PowerShell PTY output, lifecycle, and bounded teardown",
+        ),
+        pty_case(
+            "shell-cmd",
+            CompatCategory::Shells,
+            CompatPlatform::Windows,
+            true,
+            LocalShellProfile::cmd().with_args(["/D", "/C", "echo panea-compat-cmd"]),
+            b"panea-compat-cmd",
+            "cmd.exe PTY output, lifecycle, and bounded teardown",
+        ),
+        pty_case(
+            "shell-pwsh",
+            CompatCategory::Shells,
+            CompatPlatform::Any,
+            false,
+            LocalShellProfile::custom("pwsh", "pwsh").with_args([
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "Write-Output panea-compat-pwsh",
+            ]),
+            b"panea-compat-pwsh",
+            "PowerShell Core PTY output when installed",
+        ),
+        pty_case(
+            "shell-sh",
+            CompatCategory::Shells,
+            CompatPlatform::Unix,
+            true,
+            LocalShellProfile::custom("sh", "sh")
+                .with_args(["-lc", "printf '%s\\n' panea-compat-sh"]),
+            b"panea-compat-sh",
+            "POSIX shell PTY output, lifecycle, and bounded teardown",
+        ),
+        pty_case(
+            "shell-bash",
+            CompatCategory::Shells,
+            CompatPlatform::Any,
+            false,
+            LocalShellProfile::custom("bash", "bash")
+                .with_args(["-lc", "printf '%s\\n' panea-compat-bash"]),
+            b"panea-compat-bash",
+            "bash PTY output when installed",
+        ),
+        pty_case(
+            "shell-zsh",
+            CompatCategory::Shells,
+            CompatPlatform::Any,
+            false,
+            LocalShellProfile::custom("zsh", "zsh")
+                .with_args(["-lc", "printf '%s\\n' panea-compat-zsh"]),
+            b"panea-compat-zsh",
+            "zsh PTY output when installed",
+        ),
+        pty_case(
+            "shell-fish",
+            CompatCategory::Shells,
+            CompatPlatform::Any,
+            false,
+            LocalShellProfile::custom("fish", "fish").with_args(["-c", "echo panea-compat-fish"]),
+            b"panea-compat-fish",
+            "fish PTY output when installed",
+        ),
+        pty_case(
+            "shell-wsl",
+            CompatCategory::Shells,
+            CompatPlatform::Windows,
+            false,
+            LocalShellProfile::wsl(None).with_args([
+                "--exec",
+                "sh",
+                "-lc",
+                "printf '%s\\n' panea-compat-wsl",
+            ]),
+            b"panea-compat-wsl",
+            "WSL shell PTY output when WSL is installed",
+        ),
+    ]
+}
+
+fn protocol_compat_cases() -> Vec<CompatCase> {
+    if cfg!(windows) {
+        vec![pty_case(
+            "protocol-ansi-marker",
+            CompatCategory::Protocol,
+            CompatPlatform::Windows,
+            true,
+            LocalShellProfile::powershell().with_args([
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "$e=[char]27; $b=[char]7; Write-Output \"$e[38;2;255;0;0mpanea-compat-truecolor$e[0m\"; Write-Output \"$e]0;panea-title$b\"",
+            ]),
+            b"panea-compat-truecolor",
+            "truecolor SGR and OSC title bytes can traverse the PTY output path",
+        )]
+    } else {
+        vec![pty_case(
+            "protocol-ansi-marker",
+            CompatCategory::Protocol,
+            CompatPlatform::Unix,
+            true,
+            LocalShellProfile::custom("sh", "sh").with_args([
+                "-lc",
+                "printf '\\033[38;2;255;0;0mpanea-compat-truecolor\\033[0m\\n\\033]0;panea-title\\007\\n'",
+            ]),
+            b"panea-compat-truecolor",
+            "truecolor SGR and OSC title bytes can traverse the PTY output path",
+        )]
+    }
+}
+
+fn process_compat_cases<const N: usize>(
+    category: CompatCategory,
+    commands: [(&'static str, &'static str, &[&'static str]); N],
+    verifies: &'static str,
+) -> Vec<CompatCase> {
+    commands
+        .into_iter()
+        .map(|(key, program, args)| {
+            process_case(ProcessCaseSpec {
+                key,
+                category,
+                platforms: CompatPlatform::Any,
+                required: false,
+                program,
+                args,
+                marker: None,
+                verifies,
+            })
+        })
+        .collect()
+}
+
+fn pty_case(
+    key: &'static str,
+    category: CompatCategory,
+    platforms: CompatPlatform,
+    required: bool,
+    profile: LocalShellProfile,
+    marker: &'static [u8],
+    verifies: &'static str,
+) -> CompatCase {
+    CompatCase {
+        key,
+        category,
+        platforms,
+        required,
+        kind: CompatCaseKind::Pty { profile, marker },
+        verifies,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcessCaseSpec<'a> {
+    key: &'static str,
+    category: CompatCategory,
+    platforms: CompatPlatform,
+    required: bool,
+    program: &'static str,
+    args: &'a [&'static str],
+    marker: Option<&'static str>,
+    verifies: &'static str,
+}
+
+fn process_case(spec: ProcessCaseSpec<'_>) -> CompatCase {
+    CompatCase {
+        key: spec.key,
+        category: spec.category,
+        platforms: spec.platforms,
+        required: spec.required,
+        kind: CompatCaseKind::Process {
+            program: spec.program,
+            args: spec.args.iter().map(|arg| (*arg).to_owned()).collect(),
+            marker: spec.marker,
+        },
+        verifies: spec.verifies,
+    }
+}
+
+fn manual_case(
+    key: &'static str,
+    category: CompatCategory,
+    platforms: CompatPlatform,
+    required: bool,
+    instructions: &'static str,
+    verifies: &'static str,
+) -> CompatCase {
+    CompatCase {
+        key,
+        category,
+        platforms,
+        required,
+        kind: CompatCaseKind::Manual { instructions },
+        verifies,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompatResultStatus {
+    Pass,
+    Fail,
+    Skip,
+    Manual,
+}
+
+impl CompatResultStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Fail => "FAIL",
+            Self::Skip => "SKIP",
+            Self::Manual => "MANUAL",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CompatExecution {
+    status: CompatResultStatus,
+    detail: String,
+    bytes_received: usize,
+    preview: String,
+    lifecycle: Vec<TransportLifecycleEvent>,
+    diagnostics: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CompatRunError {
+    missing_program: bool,
+    message: String,
+    bytes_received: usize,
+    preview: String,
+    lifecycle: Vec<TransportLifecycleEvent>,
+    diagnostics: Option<String>,
+}
+
+impl CompatRunError {
+    fn failed(message: String) -> Self {
+        Self {
+            missing_program: false,
+            message,
+            bytes_received: 0,
+            preview: String::new(),
+            lifecycle: Vec::new(),
+            diagnostics: None,
+        }
+    }
+
+    fn missing_or_failed(missing_program: bool, message: String) -> Self {
+        Self {
+            missing_program,
+            message,
+            bytes_received: 0,
+            preview: String::new(),
+            lifecycle: Vec::new(),
+            diagnostics: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CompatResult {
+    key: &'static str,
+    category: CompatCategory,
+    required: bool,
+    status: CompatResultStatus,
+    duration: Duration,
+    detail: String,
+    bytes_received: usize,
+    preview: String,
+    lifecycle: Vec<TransportLifecycleEvent>,
+    diagnostics: Option<String>,
+}
+
+impl CompatResult {
+    fn render_line(&self) -> String {
+        format!(
+            "[{}] {} category={} required={} duration_ms={} bytes={} {}",
+            self.status.label(),
+            self.key,
+            self.category,
+            self.required,
+            self.duration.as_millis(),
+            self.bytes_received,
+            self.detail
+        )
+    }
+}
+
+fn render_compat_report(host: CompatPlatform, results: &[CompatResult]) -> String {
+    let mut lines = vec![
+        "# Panea Compatibility Report".to_owned(),
+        String::new(),
+        format!("- Host platform: {}", host.label()),
+        "- Scope: bounded app/process/PTY smoke checks; manual-required rows are not passes"
+            .to_owned(),
+        "- Cross-OS status: not cross-OS verified until Windows, macOS, Linux X11, and Linux Wayland reports exist"
+            .to_owned(),
+        String::new(),
+        "| Status | Case | Category | Required | Duration ms | Bytes | Detail |".to_owned(),
+        "| --- | --- | --- | --- | ---: | ---: | --- |".to_owned(),
+    ];
+
+    for result in results {
+        lines.push(format!(
+            "| {} | `{}` | {} | {} | {} | {} | {} |",
+            result.status.label(),
+            result.key,
+            result.category,
+            result.required,
+            result.duration.as_millis(),
+            result.bytes_received,
+            result.detail.replace('|', "\\|")
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push("## Output Preview And Diagnostics".to_owned());
+    for result in results {
+        lines.push(String::new());
+        lines.push(format!("### `{}`", result.key));
+        lines.push(format!("- status: {}", result.status.label()));
+        if !result.lifecycle.is_empty() {
+            lines.push(format!("- lifecycle: {:?}", result.lifecycle));
+        }
+        if !result.preview.is_empty() {
+            lines.push("- preview:".to_owned());
+            lines.push("```text".to_owned());
+            lines.push(result.preview.clone());
+            lines.push("```".to_owned());
+        }
+        if let Some(diagnostics) = &result.diagnostics {
+            lines.push("- diagnostics:".to_owned());
+            lines.push("```text".to_owned());
+            lines.push(diagnostics.clone());
+            lines.push("```".to_owned());
+        }
+    }
+
+    lines.join("\n")
 }
 
 fn run_hardening() -> ExitCode {
@@ -832,7 +1889,13 @@ fn dependency_rules() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         ("transport-ssh", allowed(["security", "transport-core"])),
         (
             "xtask",
-            allowed(["config-toml", "diagnostics", "render-wgpu"]),
+            allowed([
+                "config-toml",
+                "diagnostics",
+                "render-wgpu",
+                "transport-core",
+                "transport-pty",
+            ]),
         ),
     ])
 }
@@ -1036,5 +2099,42 @@ mod tests {
         );
 
         assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn compatibility_cases_cover_required_shell_and_protocol_smoke() {
+        let cases = compat_cases();
+
+        assert!(cases.iter().any(|case| case.key == "shell-powershell"
+            && case.required
+            && case.category == CompatCategory::Shells));
+        assert!(cases.iter().any(|case| case.key == "shell-cmd"
+            && case.required
+            && case.category == CompatCategory::Shells));
+        assert!(cases.iter().any(|case| case.key == "protocol-ansi-marker"
+            && case.required
+            && case.category == CompatCategory::Protocol));
+        assert!(cases.iter().any(|case| case.key == "mux-tmux"
+            && !case.required
+            && case.category == CompatCategory::Multiplexers));
+    }
+
+    #[test]
+    fn compatibility_options_parse_filters_and_timeout() {
+        let options = CompatRunOptions::parse(&[
+            "--required-only".to_owned(),
+            "--category".to_owned(),
+            "shells".to_owned(),
+            "--case".to_owned(),
+            "shell-cmd".to_owned(),
+            "--timeout-ms".to_owned(),
+            "250".to_owned(),
+        ])
+        .expect("compat options");
+
+        assert!(options.required_only);
+        assert_eq!(options.category, Some(CompatCategory::Shells));
+        assert_eq!(options.case_key.as_deref(), Some("shell-cmd"));
+        assert_eq!(options.timeout, Duration::from_millis(250));
     }
 }

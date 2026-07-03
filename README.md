@@ -56,6 +56,7 @@ cargo xtask fuzz-smoke
 - [Fuzzing](docs/fuzzing.md)
 - [Renderer batching](docs/renderer-batching.md)
 - [Renderer device recovery](docs/renderer-device-recovery.md)
+- [App compatibility](docs/app-compatibility.md)
 - [Configuration](docs/config.md)
 - [Themes](docs/themes.md)
 - [Cursor customization](docs/cursor-customization.md)
