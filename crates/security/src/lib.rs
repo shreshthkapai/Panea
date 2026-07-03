@@ -83,6 +83,88 @@ impl HostKeyDecision {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostKeyTrustReason {
+    UnknownHost,
+    ChangedHostKey,
+    PinnedFingerprintMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostKeyTrustRequest {
+    pub key: HostKey,
+    pub reason: HostKeyTrustReason,
+    pub expected_fingerprint: Option<String>,
+    pub message: String,
+}
+
+impl HostKeyTrustRequest {
+    #[must_use]
+    pub fn unknown(key: HostKey, message: impl Into<String>) -> Self {
+        Self {
+            key,
+            reason: HostKeyTrustReason::UnknownHost,
+            expected_fingerprint: None,
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn changed(key: HostKey, expected: impl Into<String>) -> Self {
+        let expected = expected.into();
+        Self {
+            message: format!(
+                "host key changed for {}:{}; expected {}, observed {}",
+                key.host, key.port, expected, key.sha256_fingerprint
+            ),
+            key,
+            reason: HostKeyTrustReason::ChangedHostKey,
+            expected_fingerprint: Some(expected),
+        }
+    }
+
+    #[must_use]
+    pub fn pinned_mismatch(key: HostKey, expected: impl Into<String>) -> Self {
+        let expected = expected.into();
+        Self {
+            message: format!(
+                "host key does not match pinned fingerprint for {}:{}; expected {}, observed {}",
+                key.host, key.port, expected, key.sha256_fingerprint
+            ),
+            key,
+            reason: HostKeyTrustReason::PinnedFingerprintMismatch,
+            expected_fingerprint: Some(expected),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostKeyTrustAction {
+    Reject,
+    TrustOnce,
+    TrustAndStore,
+    ReplaceStoredKey,
+}
+
+pub trait HostTrustProvider: Send {
+    fn decide_host_trust(
+        &mut self,
+        request: HostKeyTrustRequest,
+    ) -> SecurityResult<HostKeyTrustAction>;
+}
+
+#[derive(Debug, Default)]
+pub struct RejectingHostTrustProvider;
+
+impl HostTrustProvider for RejectingHostTrustProvider {
+    fn decide_host_trust(
+        &mut self,
+        _request: HostKeyTrustRequest,
+    ) -> SecurityResult<HostKeyTrustAction> {
+        Ok(HostKeyTrustAction::Reject)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KnownHostEntry {
     pub host: String,
@@ -241,16 +323,102 @@ impl fmt::Debug for SecretString {
 pub enum SecretRequest {
     SshPassword {
         profile: String,
+        host: String,
         username: String,
     },
     SshKeyPassphrase {
         profile: String,
+        host: String,
         identity_file: PathBuf,
     },
 }
 
+impl SecretRequest {
+    #[must_use]
+    pub fn keychain_entry(&self) -> KeychainEntry {
+        match self {
+            Self::SshPassword {
+                profile,
+                host,
+                username,
+            } => KeychainEntry::new(
+                "panea.ssh",
+                format!("{profile}:{username}@{host}"),
+                KeychainSecretKind::SshPassword,
+            ),
+            Self::SshKeyPassphrase {
+                profile,
+                host,
+                identity_file,
+            } => KeychainEntry::new(
+                "panea.ssh",
+                format!("{profile}:{host}:{}", identity_file.display()),
+                KeychainSecretKind::SshKeyPassphrase,
+            ),
+        }
+    }
+
+    #[must_use]
+    pub fn prompt_label(&self) -> String {
+        match self {
+            Self::SshPassword {
+                profile,
+                host,
+                username,
+            } => format!("SSH password for profile '{profile}' as {username}@{host}"),
+            Self::SshKeyPassphrase {
+                profile,
+                host,
+                identity_file,
+            } => format!(
+                "SSH key passphrase for profile '{profile}' on {host} ({})",
+                identity_file.display()
+            ),
+        }
+    }
+}
+
 pub trait SecretProvider: Send {
     fn request_secret(&mut self, request: SecretRequest) -> SecurityResult<Option<SecretString>>;
+}
+
+pub struct SecretPromptResponse {
+    pub secret: SecretString,
+    pub save_to_keychain: bool,
+}
+
+impl SecretPromptResponse {
+    #[must_use]
+    pub fn transient(secret: SecretString) -> Self {
+        Self {
+            secret,
+            save_to_keychain: false,
+        }
+    }
+
+    #[must_use]
+    pub fn persistent(secret: SecretString) -> Self {
+        Self {
+            secret,
+            save_to_keychain: true,
+        }
+    }
+}
+
+impl fmt::Debug for SecretPromptResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretPromptResponse")
+            .field("secret", &self.secret)
+            .field("save_to_keychain", &self.save_to_keychain)
+            .finish()
+    }
+}
+
+pub trait SecretPromptProvider: Send {
+    fn prompt_secret(
+        &mut self,
+        request: &SecretRequest,
+    ) -> SecurityResult<Option<SecretPromptResponse>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,13 +450,162 @@ impl KeychainEntry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityPlatform {
+    Windows,
+    MacOs,
+    Linux,
+    Ios,
+    Unknown,
+}
+
+impl SecurityPlatform {
+    #[must_use]
+    pub const fn current() -> Self {
+        if cfg!(target_os = "windows") {
+            Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else if cfg!(target_os = "linux") {
+            Self::Linux
+        } else if cfg!(target_os = "ios") {
+            Self::Ios
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeychainBackend {
+    WindowsCredentialManager,
+    MacOsKeychain,
+    LinuxSecretService,
+    IosKeychain,
+    MemoryOnly,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeychainProviderCapability {
+    pub platform: SecurityPlatform,
+    pub backend: KeychainBackend,
+    pub available: bool,
+    pub persistent: bool,
+    pub secure_storage: bool,
+    pub message: String,
+}
+
+impl KeychainProviderCapability {
+    #[must_use]
+    pub fn unavailable(platform: SecurityPlatform, backend: KeychainBackend) -> Self {
+        Self {
+            platform,
+            backend,
+            available: false,
+            persistent: false,
+            secure_storage: false,
+            message: "native keychain provider is not available in this build".to_owned(),
+        }
+    }
+}
+
 /// OS keychain boundary for future platform-backed secret storage providers.
 pub trait KeychainProvider: Send {
+    fn capability(&self) -> KeychainProviderCapability {
+        KeychainProviderCapability::unavailable(
+            SecurityPlatform::current(),
+            KeychainBackend::Unavailable,
+        )
+    }
+
     fn get_secret(&mut self, entry: &KeychainEntry) -> SecurityResult<Option<SecretString>>;
 
     fn set_secret(&mut self, entry: &KeychainEntry, secret: SecretString) -> SecurityResult<()>;
 
     fn delete_secret(&mut self, entry: &KeychainEntry) -> SecurityResult<()>;
+}
+
+pub struct KeychainBackedSecretProvider<K, P> {
+    pub keychain: K,
+    pub prompt_provider: P,
+}
+
+impl<K, P> KeychainBackedSecretProvider<K, P> {
+    #[must_use]
+    pub fn new(keychain: K, prompt_provider: P) -> Self {
+        Self {
+            keychain,
+            prompt_provider,
+        }
+    }
+}
+
+impl<K, P> SecretProvider for KeychainBackedSecretProvider<K, P>
+where
+    K: KeychainProvider,
+    P: SecretPromptProvider,
+{
+    fn request_secret(&mut self, request: SecretRequest) -> SecurityResult<Option<SecretString>> {
+        let entry = request.keychain_entry();
+        if let Some(secret) = self.keychain.get_secret(&entry)? {
+            return Ok(Some(secret));
+        }
+
+        let Some(response) = self.prompt_provider.prompt_secret(&request)? else {
+            return Ok(None);
+        };
+
+        if response.save_to_keychain {
+            self.keychain.set_secret(&entry, response.secret.clone())?;
+        }
+
+        Ok(Some(response.secret))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PlatformKeychainProvider {
+    capability: KeychainProviderCapability,
+}
+
+impl PlatformKeychainProvider {
+    #[must_use]
+    pub fn for_current_platform() -> Self {
+        Self::for_platform(SecurityPlatform::current())
+    }
+
+    #[must_use]
+    pub fn for_platform(platform: SecurityPlatform) -> Self {
+        let backend = match platform {
+            SecurityPlatform::Windows => KeychainBackend::WindowsCredentialManager,
+            SecurityPlatform::MacOs => KeychainBackend::MacOsKeychain,
+            SecurityPlatform::Linux => KeychainBackend::LinuxSecretService,
+            SecurityPlatform::Ios => KeychainBackend::IosKeychain,
+            SecurityPlatform::Unknown => KeychainBackend::Unavailable,
+        };
+        Self {
+            capability: KeychainProviderCapability::unavailable(platform, backend),
+        }
+    }
+}
+
+impl KeychainProvider for PlatformKeychainProvider {
+    fn capability(&self) -> KeychainProviderCapability {
+        self.capability.clone()
+    }
+
+    fn get_secret(&mut self, _entry: &KeychainEntry) -> SecurityResult<Option<SecretString>> {
+        Ok(None)
+    }
+
+    fn set_secret(&mut self, _entry: &KeychainEntry, _secret: SecretString) -> SecurityResult<()> {
+        Err(SecurityError::new(self.capability.message.clone()))
+    }
+
+    fn delete_secret(&mut self, _entry: &KeychainEntry) -> SecurityResult<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -428,6 +745,13 @@ impl SecretProvider for EmptySecretProvider {
 }
 
 impl KeychainProvider for EmptySecretProvider {
+    fn capability(&self) -> KeychainProviderCapability {
+        KeychainProviderCapability::unavailable(
+            SecurityPlatform::current(),
+            KeychainBackend::Unavailable,
+        )
+    }
+
     fn get_secret(&mut self, _entry: &KeychainEntry) -> SecurityResult<Option<SecretString>> {
         Ok(None)
     }
@@ -455,6 +779,17 @@ impl MemoryKeychainProvider {
 }
 
 impl KeychainProvider for MemoryKeychainProvider {
+    fn capability(&self) -> KeychainProviderCapability {
+        KeychainProviderCapability {
+            platform: SecurityPlatform::Unknown,
+            backend: KeychainBackend::MemoryOnly,
+            available: true,
+            persistent: false,
+            secure_storage: false,
+            message: "in-memory test keychain; not persistent and not secure storage".to_owned(),
+        }
+    }
+
     fn get_secret(&mut self, entry: &KeychainEntry) -> SecurityResult<Option<SecretString>> {
         Ok(self.entries.get(&Self::key(entry)).cloned())
     }
@@ -557,6 +892,74 @@ mod tests {
             .delete_secret(&entry)
             .expect("memory keychain delete should work");
         assert!(keychain.get_secret(&entry).unwrap().is_none());
+    }
+
+    #[derive(Default)]
+    struct RecordingPromptProvider {
+        calls: usize,
+        response: Option<SecretPromptResponse>,
+    }
+
+    impl SecretPromptProvider for RecordingPromptProvider {
+        fn prompt_secret(
+            &mut self,
+            _request: &SecretRequest,
+        ) -> SecurityResult<Option<SecretPromptResponse>> {
+            self.calls += 1;
+            Ok(self.response.take())
+        }
+    }
+
+    #[test]
+    fn keychain_backed_secret_provider_uses_prompt_then_stores_when_requested() {
+        let keychain = MemoryKeychainProvider::default();
+        let prompt_provider = RecordingPromptProvider {
+            response: Some(SecretPromptResponse::persistent(SecretString::new(
+                "passphrase",
+            ))),
+            ..RecordingPromptProvider::default()
+        };
+        let mut provider = KeychainBackedSecretProvider::new(keychain, prompt_provider);
+        let request = SecretRequest::SshKeyPassphrase {
+            profile: "prod".to_owned(),
+            host: "example.com".to_owned(),
+            identity_file: PathBuf::from("/keys/id_ed25519"),
+        };
+
+        let first = provider
+            .request_secret(request.clone())
+            .expect("prompted secret should be returned")
+            .expect("secret should exist");
+        let second = provider
+            .request_secret(request)
+            .expect("stored secret should be returned")
+            .expect("secret should exist");
+
+        assert_eq!(first.expose(), "passphrase");
+        assert_eq!(second.expose(), "passphrase");
+        assert_eq!(provider.prompt_provider.calls, 1);
+    }
+
+    #[test]
+    fn platform_keychain_reports_explicit_unavailable_capability() {
+        let keychain = PlatformKeychainProvider::for_platform(SecurityPlatform::Linux);
+        let capability = keychain.capability();
+
+        assert_eq!(capability.backend, KeychainBackend::LinuxSecretService);
+        assert!(!capability.available);
+        assert!(capability.message.contains("not available"));
+    }
+
+    #[test]
+    fn rejecting_host_trust_provider_never_silently_accepts_unknown_hosts() {
+        let key = HostKey::from_raw("example.com", 22, "ssh-ed25519", b"host-key");
+        let request = HostKeyTrustRequest::unknown(key, "unknown host");
+        let mut provider = RejectingHostTrustProvider;
+
+        assert_eq!(
+            provider.decide_host_trust(request).unwrap(),
+            HostKeyTrustAction::Reject
+        );
     }
 
     #[test]

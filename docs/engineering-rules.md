@@ -59,7 +59,8 @@ The remaining high-level work is:
   cross-OS visual overlay smoke coverage.
 - Full animated image cursor pixel-frame decode/upload/draw path and cross-OS
   cursor animation visual smoke coverage.
-- Interactive SSH trust/secret UI and OS keychain providers.
+- Desktop SSH trust/secret UI, native OS keychain backend wiring, and real
+  provider verification.
 - Real SSH server smoke tests.
 - Real cross-OS verification runners.
 - Installed terminal doctor binary.

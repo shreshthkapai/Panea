@@ -28,4 +28,12 @@ Recommended release posture:
   command output in diagnostics
 
 OS keychain-backed secret providers and interactive trust UI are not complete
-yet.
+yet as product UI, but the security layer now has explicit provider contracts:
+
+- `HostTrustProvider` for unknown-host and changed-host decisions
+- `SecretProvider` for password/passphrase requests
+- `KeychainProvider` for platform secret storage capability and persistence
+
+Until native providers and prompts are wired into the desktop app, unavailable
+secret storage must be reported as a fallback and must not become plaintext
+config.

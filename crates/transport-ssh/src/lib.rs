@@ -14,8 +14,9 @@ use std::{
 };
 
 use security::{
-    AuthMethod, EmptySecretProvider, HostKey, HostKeyDecision, KnownHosts, KnownHostsPolicy,
-    SecretProvider, SecretRequest,
+    AuthMethod, EmptySecretProvider, HostKey, HostKeyDecision, HostKeyTrustAction,
+    HostKeyTrustReason, HostKeyTrustRequest, HostTrustProvider, KnownHosts, KnownHostsPolicy,
+    RejectingHostTrustProvider, SecretProvider, SecretRequest,
 };
 use ssh2::{Channel, HostKeyType, Session};
 use transport_core::{
@@ -96,6 +97,23 @@ impl SshTransport {
         known_hosts_path: &Path,
         secret_provider: &mut dyn SecretProvider,
     ) -> TransportResult<Self> {
+        let mut trust_provider = RejectingHostTrustProvider;
+        Self::connect_with_security(
+            profile,
+            size,
+            known_hosts_path,
+            secret_provider,
+            &mut trust_provider,
+        )
+    }
+
+    pub fn connect_with_security(
+        profile: SshConnectionProfile,
+        size: TerminalSize,
+        known_hosts_path: &Path,
+        secret_provider: &mut dyn SecretProvider,
+        trust_provider: &mut dyn HostTrustProvider,
+    ) -> TransportResult<Self> {
         if profile.proxy_jump.is_some() {
             return Err(TransportError::new(
                 "SSH proxy_jump is configured but proxy jump transport is not implemented yet",
@@ -107,7 +125,7 @@ impl SshTransport {
         session.set_tcp_stream(tcp);
         session.handshake().map_err(transport_error)?;
 
-        verify_host_key(&session, &profile, known_hosts_path)?;
+        verify_host_key(&session, &profile, known_hosts_path, trust_provider)?;
         authenticate(&session, &profile, secret_provider)?;
 
         let mut channel = session.channel_session().map_err(transport_error)?;
@@ -312,6 +330,7 @@ fn verify_host_key(
     session: &Session,
     profile: &SshConnectionProfile,
     known_hosts_path: &Path,
+    trust_provider: &mut dyn HostTrustProvider,
 ) -> TransportResult<()> {
     let (bytes, algorithm) = session
         .host_key()
@@ -333,15 +352,87 @@ fn verify_host_key(
                 .save(known_hosts_path)
                 .map_err(|error| TransportError::new(error.to_string()))
         }
-        HostKeyDecision::Unknown { expected_decision } => Err(TransportError::new(format!(
-            "SSH host key for {}:{} is unknown: {expected_decision}",
-            profile.host, profile.port
-        ))),
-        HostKeyDecision::Mismatch { expected, actual } => Err(TransportError::new(format!(
-            "SSH host key mismatch for {}:{}: expected {expected}, got {actual}",
-            profile.host, profile.port
-        ))),
+        HostKeyDecision::Unknown { expected_decision }
+            if matches!(profile.known_hosts_policy, KnownHostsPolicy::Ask) =>
+        {
+            match trust_provider
+                .decide_host_trust(HostKeyTrustRequest::unknown(key.clone(), expected_decision))
+                .map_err(|error| TransportError::new(error.to_string()))?
+            {
+                HostKeyTrustAction::TrustOnce => Ok(()),
+                HostKeyTrustAction::TrustAndStore => {
+                    known_hosts.trust(&key);
+                    known_hosts
+                        .save(known_hosts_path)
+                        .map_err(|error| TransportError::new(error.to_string()))
+                }
+                HostKeyTrustAction::Reject | HostKeyTrustAction::ReplaceStoredKey => {
+                    Err(unknown_host_error(profile, &key))
+                }
+            }
+        }
+        HostKeyDecision::Unknown { .. } => Err(unknown_host_error(profile, &key)),
+        HostKeyDecision::Mismatch { expected, actual }
+            if !matches!(
+                profile.known_hosts_policy,
+                KnownHostsPolicy::PinFingerprint { .. }
+            ) =>
+        {
+            let request = HostKeyTrustRequest::changed(key.clone(), expected.clone());
+            match trust_provider
+                .decide_host_trust(request)
+                .map_err(|error| TransportError::new(error.to_string()))?
+            {
+                HostKeyTrustAction::ReplaceStoredKey => {
+                    known_hosts.trust(&key);
+                    known_hosts
+                        .save(known_hosts_path)
+                        .map_err(|error| TransportError::new(error.to_string()))
+                }
+                HostKeyTrustAction::Reject
+                | HostKeyTrustAction::TrustOnce
+                | HostKeyTrustAction::TrustAndStore => Err(changed_host_error(
+                    profile,
+                    &expected,
+                    &actual,
+                    HostKeyTrustReason::ChangedHostKey,
+                )),
+            }
+        }
+        HostKeyDecision::Mismatch { expected, actual } => {
+            let _request = HostKeyTrustRequest::pinned_mismatch(key, expected.clone());
+            Err(changed_host_error(
+                profile,
+                &expected,
+                &actual,
+                HostKeyTrustReason::PinnedFingerprintMismatch,
+            ))
+        }
     }
+}
+
+fn unknown_host_error(profile: &SshConnectionProfile, key: &HostKey) -> TransportError {
+    TransportError::new(format!(
+        "SSH host key for {}:{} is unknown and requires explicit trust: {} {}",
+        profile.host, profile.port, key.algorithm, key.sha256_fingerprint
+    ))
+}
+
+fn changed_host_error(
+    profile: &SshConnectionProfile,
+    expected: &str,
+    actual: &str,
+    reason: HostKeyTrustReason,
+) -> TransportError {
+    let detail = match reason {
+        HostKeyTrustReason::UnknownHost => "unknown host key",
+        HostKeyTrustReason::ChangedHostKey => "changed host key",
+        HostKeyTrustReason::PinnedFingerprintMismatch => "pinned fingerprint mismatch",
+    };
+    TransportError::new(format!(
+        "SSH {detail} for {}:{}: expected {expected}, got {actual}; connection blocked until explicitly resolved",
+        profile.host, profile.port
+    ))
 }
 
 fn authenticate(
@@ -365,6 +456,7 @@ fn authenticate(
             let passphrase = secret_provider
                 .request_secret(SecretRequest::SshKeyPassphrase {
                     profile: profile.name.clone(),
+                    host: profile.host.clone(),
                     identity_file: identity_file.to_owned(),
                 })
                 .map_err(|error| TransportError::new(error.to_string()))?;
@@ -383,6 +475,7 @@ fn authenticate(
             let secret = secret_provider
                 .request_secret(SecretRequest::SshPassword {
                     profile: profile.name.clone(),
+                    host: profile.host.clone(),
                     username: username.clone(),
                 })
                 .map_err(|error| TransportError::new(error.to_string()))?

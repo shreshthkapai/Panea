@@ -17,15 +17,23 @@ Supported policies:
 Changed host keys are blocking mismatches. The known-hosts store is JSON so it
 is inspectable and easy to audit during early development.
 
+Interactive trust decisions flow through `security::HostTrustProvider`.
+The default provider rejects unknown and changed host keys. App UI may expose
+explicit actions such as trust once, trust and store, or replace stored key,
+but those decisions must stay visible to the user.
+
 ## Secrets
 
 Passphrases and passwords flow through the `security::SecretProvider`
-interface. The default provider returns no secrets; UI or OS keychain-backed
-providers must be added at the app boundary. Secret debug output is redacted,
-and in-memory strings are zeroized on drop where practical.
+interface. The default provider returns no secrets. A
+`KeychainBackedSecretProvider` can read from a `KeychainProvider`, then delegate
+to app UI for a prompt, and write back only when the user explicitly chooses to
+save the secret. Secret debug output is redacted, and in-memory strings are
+zeroized on drop where practical.
 
-Deferred intentionally: OS secure storage integration, interactive host-key
-decision UI, and remote credential prompts are follow-up app lifecycle work.
+Platform keychain capability reporting exists for Windows, macOS, Linux, and
+iOS targets. Native OS secure-storage wiring and user-facing prompts are still
+follow-up app lifecycle work and must fail clearly while unavailable.
 
 ## Clipboard
 
@@ -67,7 +75,7 @@ cargo xtask security-review
 
 Current blockers for release security posture:
 
-- OS keychain-backed secret providers are not wired
+- Native OS keychain-backed secret providers are not wired into the app
 - remote OSC clipboard confirmation UI is not implemented
-- interactive SSH host-key approval UI is not complete
+- interactive SSH host-key approval and credential prompt UI is not complete
 - shell integration installer trust and update policy still need review

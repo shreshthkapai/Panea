@@ -333,10 +333,17 @@ to more visible features before the dependencies they rely on are hardened.
   PowerShell/cmd/protocol subset passed on the current host. Optional app
   probes, full interactive editor/TUI/multiplexer behavior, WSL, SSH server
   sessions, and macOS/Linux X11/Linux Wayland reports remain follow-up work.
+- Next-pass Phase 15 hardens SSH trust and secret contracts: unknown-host and
+  changed-host decisions now flow through explicit `HostTrustProvider`
+  actions, the default trust provider rejects rather than silently accepting,
+  passphrases/passwords can be backed by a `KeychainProvider` plus prompt flow,
+  platform keychain capability reporting exists for Windows, macOS, Linux, and
+  iOS targets, and docs/diagnostics explain that native provider wiring and
+  desktop UI remain follow-up work.
 - Phase 12 establishes secure SSH transport contracts and a real backend, but
-  interactive host-key approval UI, OS keychain-backed secret providers, proxy
-  jump, remote shell-integration install flows, reconnect UI/actions, and real
-  SSH server smoke tests across Windows/macOS/Linux remain unverified follow-up
+  desktop host-key approval UI, native OS keychain backend wiring, proxy jump,
+  remote shell-integration install flows, reconnect UI/actions, and real SSH
+  server smoke tests across Windows/macOS/Linux remain unverified follow-up
   work.
 - Phase 13 adds the parity matrix and diagnostics command foundation, but it
   does not magically verify macOS, Linux X11, or Linux Wayland from this Windows

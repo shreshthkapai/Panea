@@ -64,7 +64,8 @@ stated scope:
 | Command block visual overlay foundation | tested | Desktop scene projection now creates command-block backgrounds, input/output grouping overlays, status/duration/cwd/shell/host badges, conservative alternate-screen suppression, and renderer-batched overlay label glyphs without mutating terminal cells. |
 | Cursor animation foundation | tested | Opt-in cursor animation config, cursor-neighborhood animation damage, batched renderer animation quads, nonblocking image cursor asset metadata cache, and budget validation exist; full image frame decode/upload and cross-OS visual smoke remain open. |
 | Clipboard/OSC 52 policy | tested | Portable `clipboard` config, paste protection, bracketed paste forwarding, middle-click paste suppression during mouse reporting, parser pending OSC 52 requests, bounded security policy, local allow/default remote deny behavior, and TOML/security/parser/app tests exist. |
-| SSH transport foundation | tested | SSH profile mapping, host-key policy contracts, secret-provider boundaries, SSH2 transport, remote PTY request, resize, and shutdown foundations exist. |
+| SSH transport foundation | tested | SSH profile mapping, explicit host-trust contracts, host-key policy enforcement, secret/keychain-provider boundaries, SSH2 transport, remote PTY request, resize, and shutdown foundations exist. |
+| SSH trust and secret contracts | tested | Unknown-host decisions, changed-host replacement actions, redacted secret prompts, keychain-backed secret lookup/prompt/store flow, and platform keychain capability reporting exist. |
 | iOS shared-engine foundation | tested | `apps/ios` reuses shared parser/core/config/transport/semantic/render contracts and models lifecycle, input, safe-area sizing, and mobile SSH session specs. |
 
 ## What Is Partial
@@ -83,7 +84,7 @@ These areas are real foundations but must not be called complete:
 | Shell integration | partial | Local runtime activation planning and desktop injection exist for supported shells, with Windows PowerShell semantic smoke verified. Remote install flows, heuristic command detection, WSL-specific coverage, and real bash/zsh/fish/macOS/Linux session verification remain. |
 | Visual overlays | partial | Semantic command-block overlay projection, badge glyph batching, cursor animation quads, and image cursor metadata caching exist; collapse/expand behavior, polished interactive UI, full image cursor frame upload/draw, real shell-driven verification, and cross-OS visual verification remain. |
 | Native mux runtime | partial | Local tab/split runtime wiring exists, but startup workspaces, SSH panes, polished tab chrome, pane drag/move UI, and cross-OS GUI/runtime smoke tests remain. |
-| SSH UX and security | partial | Interactive host-key approval UI, changed-host-key resolution UI, password/passphrase prompts, OS keychain providers, reconnect UI, proxy jump, and real SSH server smoke tests. |
+| SSH UX and security | partial | Provider contracts exist, but desktop host-key approval UI, changed-host-key resolution UI, password/passphrase prompt UI, native OS keychain backend wiring, reconnect UI, proxy jump, and real SSH server smoke tests remain. |
 | Performance reporting | partial | Hardware GPU timings, installed in-window overlay, CI regression gates, and reproducible cross-machine benchmark reporting. |
 | Hardening/release readiness | partial | GPU recovery and crash-safe config reload foundations exist, but real device-loss platform validation, packaging artifacts, validation suite automation, and platform lab coverage remain. |
 | iOS companion | partial | Native UIKit/SwiftUI shell, iOS GPU surface, Keychain provider, host-key approval UI, key import UX, simulator/device validation, and packaging. |
@@ -129,8 +130,8 @@ The following major accepted features have no complete product behavior yet:
   cursor animation visual smoke coverage.
 - Full interactive app compatibility automation for editors, pagers, TUIs,
   tmux/screen/zellij, WSL, and SSH sessions.
-- Interactive SSH trust, secret prompts, keychain providers, and real SSH server
-  smoke tests.
+- Desktop SSH trust prompt UI, credential prompt UI, native OS keychain backend
+  wiring, and real SSH server smoke tests.
 - Installed doctor binary.
 - Release packaging artifacts.
 - Native iOS SSH companion app.
@@ -148,9 +149,9 @@ The following major accepted features have no complete product behavior yet:
 | session transport | partial | Local and SSH transport foundations exist; non-Windows local smoke, SSH real-server tests, and app UX remain. |
 | multiplexer structure | partial | Model and local desktop runtime wiring exist; startup layouts, SSH panes, polished chrome, and cross-OS smoke remain. |
 | diagnostics | partial | Xtask diagnostics exist; installed doctor and live platform reports remain. |
-| security | partial | SSH/security contracts and OSC 52 policy exist; keychain/secret UI and remote OSC 52 confirmation UI remain. |
+| security | partial | SSH/security contracts, explicit host-trust decisions, keychain-backed secret-provider flow, platform keychain capability reporting, and OSC 52 policy exist; desktop trust/secret UI, native keychain backend wiring, and remote OSC 52 confirmation UI remain. |
 
 ## Immediate Next Slice
 
-After the app compatibility test suite, the next dependency-ordered phase is
-SSH trust, secrets, and keychain providers.
+After SSH trust, secrets, and keychain provider contracts, the next
+dependency-ordered phase is real SSH server smoke tests.

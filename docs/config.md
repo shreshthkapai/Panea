@@ -141,7 +141,9 @@ known_hosts_policy = { pin_fingerprint = { sha256 = "SHA256:..." } }
 ```
 
 Host-key checks are security-sensitive. The default `ask` policy requires an
-explicit trust decision for unknown hosts; app UI for that decision is deferred.
+explicit trust decision for unknown hosts. Passwords, passphrases, and private
+key contents are never config fields; they flow through secret/keychain
+providers at the app boundary.
 
 ## Visual Theme
 

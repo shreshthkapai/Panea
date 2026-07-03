@@ -71,9 +71,9 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Cursor animations | tested | partial | partial | partial | Windows-host tests cover opt-in config, bounded cursor-neighborhood damage, desktop runtime wiring, and batched animation quads; cross-OS visual verification remains. |
 | Animated image cursor | partial | partial | partial | partial | Opt-in config, nonblocking asset read/header decode, metadata cache, and budget warnings exist; pixel-frame decode/upload/draw and cross-OS verification remain. |
 | SSH profile config | tested | implemented | implemented | implemented | Portable config model exists. |
-| SSH host-key policy | tested | implemented | implemented | implemented | Security contract exists; interactive UI remains. |
+| SSH host-key policy | tested | implemented | implemented | implemented | Security contract exists with explicit unknown/changed-host trust decisions; desktop UI remains. |
 | SSH transport | partial | partial | partial | partial | Backend exists; real server smoke tests are unverified. |
-| SSH secret handling | partial | partial | partial | partial | Secret-provider interface exists; OS keychain providers and prompts remain. |
+| SSH secret handling | tested | partial | partial | partial | Secret/keychain provider contracts, redaction, prompt persistence flow, and platform capability reporting exist; native OS backend wiring and prompts remain. |
 | SSH in mux | partial | partial | partial | partial | Session specs exist; direct SSH tab/pane runtime actions remain deferred until SSH trust/secret UI is ready. |
 | Doctor diagnostics | tested | implemented | implemented | implemented | Shared diagnostics and xtask commands exist; installed product command remains. |
 | Bug-report snapshot | tested | implemented | implemented | implemented | Privacy-aware model exists; product export UX remains. |

@@ -955,6 +955,10 @@ fn append_ssh_report(input: &DoctorInput, report: &mut DoctorReport) {
     report.lines.extend([
         "ssh:".to_owned(),
         format!("  profiles={}", input.config.ssh_profiles.len()),
+        "  credential_storage=credential/keychain provider boundary; plaintext config credentials unsupported"
+            .to_owned(),
+        "  host_trust=unknown hosts require explicit approval; changed keys are blocking"
+            .to_owned(),
     ]);
 
     for profile in &input.config.ssh_profiles {
@@ -1209,14 +1213,14 @@ pub fn security_review_report(input: &DoctorInput) -> ReadinessReport {
         area: "key storage",
         status: ReadinessStatus::Blocked,
         message:
-            "OS keychain-backed secret providers are not implemented; current default provider stores no secrets"
+            "keychain provider contracts and capability reporting exist; native OS providers still need app-boundary wiring and cross-OS verification"
                 .to_owned(),
     });
     items.push(ReadinessItem {
         area: "passphrases",
         status: ReadinessStatus::Warning,
         message:
-            "passphrases flow through redacted SecretProvider boundaries; interactive credential UX is still app work"
+            "passphrases flow through redacted SecretProvider boundaries and may be persisted only through a KeychainProvider; interactive credential UX is still app work"
                 .to_owned(),
     });
     items.push(ReadinessItem {
@@ -2214,7 +2218,7 @@ mod tests {
         let text = report.render_text();
 
         assert!(report.has_blockers());
-        assert!(text.contains("OS keychain"));
+        assert!(text.contains("keychain provider contracts"));
         assert!(text.contains("OSC 52"));
     }
 
