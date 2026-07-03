@@ -156,9 +156,31 @@ Baseline visual sections:
   animation flags
 - `prompt_decorations`: minimal separator, rounded box, and pill/header styles
 - `command_blocks`: command grouping style, status/duration badges, copy/jump
-  action flags, and output grouping groundwork
+  action flags, output grouping, and alternate-screen overlay policy
 - `performance`: animation FPS, cursor asset size, active animation, and
   animated-region budgets
+
+```toml
+[prompt_decorations]
+enabled = true
+style = "minimal_separator"
+allow_in_alternate_screen = false
+
+[command_blocks]
+enabled = true
+style = "subtle"
+separate_prompt_input_output = true
+show_duration = true
+show_exit_status = true
+show_current_directory = true
+show_shell_host = true
+allow_in_alternate_screen = false
+```
+
+The alternate-screen defaults protect full-screen TUIs. Setting either
+`allow_in_alternate_screen` key to `true` is portable, but validation emits a
+warning because overlays may obscure applications such as editors, pagers, or
+multiplexers.
 
 Shipped example configs live in `crates/assets/config-examples`:
 

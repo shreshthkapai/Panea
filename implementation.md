@@ -204,6 +204,14 @@ to more visible features before the dependencies they rely on are hardened.
   badges, semantic OSC feeding in the desktop app, basic semantic overlay
   generation from `SemanticTimelineStore`, visual budget diagnostics, and
   shipped example visual configs.
+- Completed next-pass Phase 12 command blocks and visual overlays: added
+  conservative alternate-screen policy config for prompt and command overlays,
+  desktop semantic projection for command-block backgrounds, input/output
+  grouping overlays, and status/duration/current-directory/shell/host badges,
+  renderer batch ordering that keeps command overlays behind terminal text,
+  overlay-label glyph batching for badges, and tests for disabled cost,
+  alternate-screen suppression, metadata badge generation, and renderer draw
+  ordering.
 - Implemented the Phase 12 SSH transport foundation: expanded portable SSH
   profile config, added a security-layer host-key and secret contract,
   implemented an `ssh2`-backed `TerminalTransport` with host-key verification,
@@ -308,11 +316,11 @@ to more visible features before the dependencies they rely on are hardened.
   X11, and Linux Wayland verification, plus heuristic command detection and
   remote install flows, remain follow-up work before command blocks can be
   considered product-complete.
-- Phase 11 establishes visual overlay contracts and basic semantic overlay
-  generation, but animated image cursors, off-render-thread decoding, GPU frame
-  caching for animated assets, polished badge text rendering, collapse/expand
-  long output UI, and real shell-driven command-block verification remain
-  deferred until the renderer and desktop semantic runtime are hardened.
+- Next-pass Phase 12 establishes command-block visual overlay projection and
+  badge glyph batching, but collapse/expand long output UI, command-block copy
+  mode UI, real shell-driven command-block verification beyond the Windows
+  PowerShell semantic smoke, and cross-OS visual smoke coverage remain deferred
+  until the app compatibility and cross-OS runner phases.
 - Phase 12 establishes secure SSH transport contracts and a real backend, but
   interactive host-key approval UI, OS keychain-backed secret providers, proxy
   jump, remote shell-integration install flows, reconnect UI/actions, and real

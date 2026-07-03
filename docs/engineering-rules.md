@@ -55,7 +55,8 @@ The remaining high-level work is:
 - Runtime shell integration activation exists for local desktop sessions; real
   bash/zsh/fish/macOS/Linux/WSL/remote verification and heuristic fallback
   hardening remain.
-- Product-complete command blocks/visual overlays.
+- Command-block collapse/copy UI, real shell-driven verification, and
+  cross-OS visual overlay smoke coverage.
 - Animated image cursor pipeline.
 - Interactive SSH trust/secret UI and OS keychain providers.
 - Real SSH server smoke tests.

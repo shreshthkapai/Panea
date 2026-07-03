@@ -64,8 +64,8 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Semantic escape parser | tested | implemented | implemented | implemented | OSC 133, OSC 633, OSC 7, and private OSC 777 foundations exist. |
 | Shell integration activation | partial | partial | partial | partial | Activation plans, desktop hook injection, config modes, and ignored real-shell tests exist; Windows PowerShell smoke passed, while bash/zsh/fish, WSL, remote, macOS, and Linux verification remain. |
 | Command navigation/copy actions | tested | implemented | implemented | implemented | Semantic actions exist; desktop UX integration remains partial. |
-| Prompt decorations | partial | partial | partial | partial | Overlay contracts and basic generation exist; polished UI remains. |
-| Command blocks | partial | partial | partial | partial | Semantic model and overlays exist; product-complete UI and real shell verification remain. |
+| Prompt decorations | partial | partial | partial | partial | Overlay projection, alternate-screen suppression, and config policy exist; cross-OS visual smoke and polished UI remain. |
+| Command blocks | tested | partial | partial | partial | Windows-host tests cover command-block backgrounds, input/output grouping, metadata badges, alternate-screen suppression, and renderer overlay glyph batching. Real shell-driven and cross-OS visual verification remain. |
 | Static cursor styles | partial | partial | partial | partial | Config/render contracts exist; visual polish needs renderer hardening. |
 | Cursor animations | partial | partial | partial | partial | Budget/config contracts exist; polished animation runtime remains. |
 | Animated image cursor | planned | planned | planned | planned | Not implemented; intentionally deferred. |

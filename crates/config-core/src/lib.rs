@@ -328,6 +328,18 @@ impl AppConfig {
                 "visual border width must be between 0 and 8 pixels",
             );
         }
+        if self.command_blocks.allow_in_alternate_screen {
+            report.warning(
+                "command_blocks.allow_in_alternate_screen",
+                "command block overlays in alternate screen applications can obscure TUIs",
+            );
+        }
+        if self.prompt_decorations.allow_in_alternate_screen {
+            report.warning(
+                "prompt_decorations.allow_in_alternate_screen",
+                "prompt overlays in alternate screen applications can obscure TUIs",
+            );
+        }
     }
 
     fn validate_shell_integration(&self, report: &mut ValidationReport) {
@@ -950,6 +962,7 @@ pub struct CommandBlocksConfig {
     pub show_exit_status: bool,
     pub show_current_directory: bool,
     pub show_shell_host: bool,
+    pub allow_in_alternate_screen: bool,
     pub copy_actions_enabled: bool,
     pub jump_actions_enabled: bool,
     pub collapse_long_output: bool,
@@ -965,6 +978,7 @@ impl Default for CommandBlocksConfig {
             show_exit_status: true,
             show_current_directory: true,
             show_shell_host: true,
+            allow_in_alternate_screen: false,
             copy_actions_enabled: true,
             jump_actions_enabled: true,
             collapse_long_output: false,
@@ -993,6 +1007,7 @@ pub struct PromptDecorationsConfig {
     pub show_remote_host: bool,
     pub show_admin_badge: bool,
     pub show_previous_status_accent: bool,
+    pub allow_in_alternate_screen: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1636,6 +1651,7 @@ pub struct CommandBlocksConfigPatch {
     pub show_exit_status: Option<bool>,
     pub show_current_directory: Option<bool>,
     pub show_shell_host: Option<bool>,
+    pub allow_in_alternate_screen: Option<bool>,
     pub copy_actions_enabled: Option<bool>,
     pub jump_actions_enabled: Option<bool>,
     pub collapse_long_output: Option<bool>,
@@ -1656,6 +1672,10 @@ impl CommandBlocksConfigPatch {
             &self.show_current_directory,
         );
         apply_opt(&mut config.show_shell_host, &self.show_shell_host);
+        apply_opt(
+            &mut config.allow_in_alternate_screen,
+            &self.allow_in_alternate_screen,
+        );
         apply_opt(&mut config.copy_actions_enabled, &self.copy_actions_enabled);
         apply_opt(&mut config.jump_actions_enabled, &self.jump_actions_enabled);
         apply_opt(&mut config.collapse_long_output, &self.collapse_long_output);
@@ -1672,6 +1692,7 @@ pub struct PromptDecorationsConfigPatch {
     pub show_remote_host: Option<bool>,
     pub show_admin_badge: Option<bool>,
     pub show_previous_status_accent: Option<bool>,
+    pub allow_in_alternate_screen: Option<bool>,
 }
 
 impl PromptDecorationsConfigPatch {
@@ -1688,6 +1709,10 @@ impl PromptDecorationsConfigPatch {
         apply_opt(
             &mut config.show_previous_status_accent,
             &self.show_previous_status_accent,
+        );
+        apply_opt(
+            &mut config.allow_in_alternate_screen,
+            &self.allow_in_alternate_screen,
         );
     }
 }
@@ -2224,6 +2249,20 @@ pub fn export_schema() -> ConfigSchema {
                         true,
                         false,
                     ),
+                    field(
+                        "command_blocks.allow_in_alternate_screen",
+                        "boolean",
+                        default.command_blocks.allow_in_alternate_screen,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "prompt_decorations.allow_in_alternate_screen",
+                        "boolean",
+                        default.prompt_decorations.allow_in_alternate_screen,
+                        true,
+                        false,
+                    ),
                 ],
             },
             ConfigSchemaSection {
@@ -2663,6 +2702,27 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains("keybinding conflict"))
         );
+    }
+
+    #[test]
+    fn alternate_screen_semantic_visuals_are_warned_not_defaulted() {
+        let mut config = AppConfig::default();
+        assert!(!config.command_blocks.allow_in_alternate_screen);
+        assert!(!config.prompt_decorations.allow_in_alternate_screen);
+
+        config.command_blocks.allow_in_alternate_screen = true;
+        config.prompt_decorations.allow_in_alternate_screen = true;
+        let report = config.validate();
+
+        assert!(!report.has_errors());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == "command_blocks.allow_in_alternate_screen"
+                && diagnostic.severity == ConfigDiagnosticSeverity::Warning
+        }));
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == "prompt_decorations.allow_in_alternate_screen"
+                && diagnostic.severity == ConfigDiagnosticSeverity::Warning
+        }));
     }
 
     #[test]

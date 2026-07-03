@@ -418,6 +418,14 @@ impl SemanticTimelineStore {
     }
 
     #[must_use]
+    pub fn command_metadata(&self, block: &CommandBlock) -> Option<&SemanticMetadata> {
+        self.regions
+            .iter()
+            .find(|region| region.id == block.region_id)
+            .map(|region| &region.metadata)
+    }
+
+    #[must_use]
     pub fn command_text(
         &self,
         block: &CommandBlock,

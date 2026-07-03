@@ -421,6 +421,7 @@ pub struct PreparedRenderBatches {
     pub damage_regions: Vec<DamageRegion>,
     pub background: QuadBatch,
     pub glyphs: GlyphBatch,
+    pub overlay_glyphs: GlyphBatch,
     pub decorations: QuadBatch,
     pub selections: QuadBatch,
     pub cursor: QuadBatch,
@@ -434,6 +435,7 @@ impl PreparedRenderBatches {
         [
             !self.background.is_empty(),
             !self.glyphs.is_empty(),
+            !self.overlay_glyphs.is_empty(),
             !self.decorations.is_empty(),
             !self.selections.is_empty(),
             !self.cursor.is_empty(),
@@ -514,6 +516,11 @@ impl RenderBatchPlanner {
             indices: Vec::new(),
             glyph_count: 0,
         };
+        let mut overlay_glyphs = GlyphBatch {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            glyph_count: 0,
+        };
         let mut decorations = QuadBatch::new(QuadBatchKind::Decoration);
         let mut selections = QuadBatch::new(QuadBatchKind::Selection);
         let mut cursor = QuadBatch::new(QuadBatchKind::Cursor);
@@ -552,10 +559,24 @@ impl RenderBatchPlanner {
 
         for overlay in overlays {
             if intersects_any(overlay.bounds, &damage_regions) {
-                push_solid_quad(&mut decorations, overlay.bounds, overlay.color);
+                let batch = if overlay_draws_behind_terminal_text(overlay.kind) {
+                    &mut background
+                } else {
+                    &mut decorations
+                };
+                push_solid_quad(batch, overlay.bounds, overlay.color);
                 if let Some(border_color) = overlay.border_color {
-                    push_stroke_quads(&mut decorations, overlay.bounds, border_color);
+                    push_stroke_quads(batch, overlay.bounds, border_color);
                 }
+                let mut glyph_context = GlyphBatchContext {
+                    atlas_uploads: &mut atlas_uploads,
+                    instrumentation: &mut instrumentation,
+                    fonts,
+                    font_id,
+                    metrics,
+                    rect: overlay_label_rect(overlay, metrics),
+                };
+                self.push_overlay_label_glyphs(&mut overlay_glyphs, overlay, &mut glyph_context)?;
             }
         }
 
@@ -586,6 +607,7 @@ impl RenderBatchPlanner {
         instrumentation.draw_call_count = count_non_empty_batches([
             !background.is_empty(),
             !glyphs.is_empty(),
+            !overlay_glyphs.is_empty(),
             !decorations.is_empty(),
             !selections.is_empty(),
             !cursor.is_empty(),
@@ -599,6 +621,7 @@ impl RenderBatchPlanner {
             damage_regions,
             background,
             glyphs,
+            overlay_glyphs,
             decorations,
             selections,
             cursor,
@@ -743,6 +766,34 @@ impl RenderBatchPlanner {
 
         Ok(())
     }
+
+    fn push_overlay_label_glyphs(
+        &mut self,
+        glyphs: &mut GlyphBatch,
+        overlay: &OverlayPrimitive,
+        context: &mut GlyphBatchContext<'_>,
+    ) -> Result<(), RendererError> {
+        let Some(label) = &overlay.label else {
+            return Ok(());
+        };
+        if label.trim().is_empty() {
+            return Ok(());
+        }
+
+        let cell = RenderCell {
+            position: CellPosition { row: 0, col: 0 },
+            text: label.clone(),
+            foreground: overlay_label_color(overlay.kind),
+            background: RenderColor {
+                red: 0,
+                green: 0,
+                blue: 0,
+                alpha: 0,
+            },
+            style: RenderCellStyle::default(),
+        };
+        self.push_glyphs(glyphs, &cell, context)
+    }
 }
 
 fn count_non_empty_batches<const N: usize>(batches: [bool; N]) -> u32 {
@@ -759,6 +810,37 @@ fn effective_damage_regions(scene: &RenderScene, metrics: CellMetrics) -> Vec<Da
 
 fn intersects_any(rect: RenderRect, regions: &[DamageRegion]) -> bool {
     regions.iter().any(|region| rects_intersect(rect, *region))
+}
+
+fn overlay_draws_behind_terminal_text(kind: OverlayKind) -> bool {
+    matches!(
+        kind,
+        OverlayKind::PromptDecoration | OverlayKind::CommandBlock | OverlayKind::InputOutputGroup
+    )
+}
+
+fn overlay_label_rect(overlay: &OverlayPrimitive, metrics: CellMetrics) -> RenderRect {
+    let padding_x = 4;
+    let label_height = metrics.cell_height.ceil().max(1.0) as u32;
+    RenderRect {
+        x: overlay.bounds.x + padding_x,
+        y: overlay.bounds.y + ((overlay.bounds.height.saturating_sub(label_height)) / 2) as i32,
+        width: overlay.bounds.width.saturating_sub((padding_x * 2) as u32),
+        height: label_height,
+    }
+}
+
+fn overlay_label_color(kind: OverlayKind) -> RenderColor {
+    match kind {
+        OverlayKind::Badge => RenderColor::rgb(245, 248, 252),
+        OverlayKind::PromptDecoration
+        | OverlayKind::CommandBlock
+        | OverlayKind::InputOutputGroup => RenderColor::rgb(214, 222, 232),
+        OverlayKind::Selection
+        | OverlayKind::SearchHighlight
+        | OverlayKind::Semantic
+        | OverlayKind::Decoration => RenderColor::rgb(230, 236, 244),
+    }
 }
 
 fn rects_intersect(a: RenderRect, b: RenderRect) -> bool {
@@ -1994,10 +2076,6 @@ impl TerminalRasterizer {
         );
         let mut instrumentation = batches.instrumentation;
 
-        for cell in &scene.grid.cells {
-            self.draw_cell(&mut frame, cell, fonts, metrics, &mut instrumentation)?;
-        }
-
         let mut overlays = scene
             .search_highlights
             .iter()
@@ -2005,7 +2083,14 @@ impl TerminalRasterizer {
             .collect::<Vec<_>>();
         overlays.sort_by_key(|overlay| overlay.z_index);
 
-        for overlay in overlays {
+        for cell in &scene.grid.cells {
+            draw_cell_background(&mut frame, cell, metrics);
+        }
+
+        for overlay in &overlays {
+            if !overlay_draws_behind_terminal_text(overlay.kind) {
+                continue;
+            }
             blend_rect(&mut frame, overlay.bounds, overlay.color);
             instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
             if let Some(border_color) = overlay.border_color {
@@ -2021,6 +2106,23 @@ impl TerminalRasterizer {
             }
         }
 
+        for cell in &scene.grid.cells {
+            self.draw_cell_foreground(&mut frame, cell, fonts, metrics, &mut instrumentation)?;
+        }
+
+        for overlay in overlays {
+            if overlay_draws_behind_terminal_text(overlay.kind) {
+                continue;
+            }
+            blend_rect(&mut frame, overlay.bounds, overlay.color);
+            instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
+            if let Some(border_color) = overlay.border_color {
+                stroke_rect(&mut frame, overlay.bounds, border_color);
+                instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
+            }
+            self.draw_overlay_label(&mut frame, overlay, fonts, metrics, &mut instrumentation)?;
+        }
+
         if let Some(cursor) = scene.cursor {
             draw_cursor(&mut frame, cursor, metrics);
         }
@@ -2034,7 +2136,7 @@ impl TerminalRasterizer {
         })
     }
 
-    fn draw_cell(
+    fn draw_cell_foreground(
         &mut self,
         frame: &mut CpuFrame,
         cell: &RenderCell,
@@ -2043,7 +2145,6 @@ impl TerminalRasterizer {
         _instrumentation: &mut RenderInstrumentation,
     ) -> Result<(), RendererError> {
         let rect = cell_region(cell.position, metrics);
-        fill_rect(frame, rect, cell.background);
 
         let font_id = fonts.primary_font()?.id();
         let mut pen_x = rect.x;
@@ -2104,6 +2205,68 @@ impl TerminalRasterizer {
 
         Ok(())
     }
+
+    fn draw_overlay_label(
+        &mut self,
+        frame: &mut CpuFrame,
+        overlay: &OverlayPrimitive,
+        fonts: &mut FontSystem,
+        metrics: CellMetrics,
+        instrumentation: &mut RenderInstrumentation,
+    ) -> Result<(), RendererError> {
+        let Some(label) = &overlay.label else {
+            return Ok(());
+        };
+        if label.trim().is_empty() {
+            return Ok(());
+        }
+
+        let cell = RenderCell {
+            position: CellPosition { row: 0, col: 0 },
+            text: label.clone(),
+            foreground: overlay_label_color(overlay.kind),
+            background: RenderColor {
+                red: 0,
+                green: 0,
+                blue: 0,
+                alpha: 0,
+            },
+            style: RenderCellStyle::default(),
+        };
+        let rect = overlay_label_rect(overlay, metrics);
+        let font_id = fonts.primary_font()?.id();
+        let mut pen_x = rect.x;
+
+        for ch in cell.text.chars() {
+            if ch == ' ' {
+                pen_x += (metrics.cell_width * 0.62).ceil() as i32;
+                continue;
+            }
+            let key = GlyphCacheKey::new(font_id, ch, metrics.font_size, false, false);
+            let bitmap = self.batch_planner.glyph_cache.get_or_insert_with(key, || {
+                fonts.rasterize_glyph(key).unwrap_or_else(|_| {
+                    GlyphBitmap::missing(metrics.cell_width, metrics.cell_height as u32)
+                })
+            });
+            draw_glyph(
+                frame,
+                pen_x + bitmap.offset_x,
+                rect.y + bitmap.offset_y,
+                bitmap.as_ref(),
+                cell.foreground,
+            );
+            pen_x += bitmap.advance_width.ceil() as i32;
+            if pen_x > rect.x + rect.width as i32 {
+                break;
+            }
+        }
+        instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
+        Ok(())
+    }
+}
+
+fn draw_cell_background(frame: &mut CpuFrame, cell: &RenderCell, metrics: CellMetrics) {
+    fill_rect(frame, cell_region(cell.position, metrics), cell.background);
 }
 
 #[repr(C)]
@@ -2769,6 +2932,10 @@ impl GpuBackend {
             self.make_buffers(&batches.selections.vertices, &batches.selections.indices);
         let cursor = self.make_buffers(&batches.cursor.vertices, &batches.cursor.indices);
         let glyphs = self.make_buffers(&batches.glyphs.vertices, &batches.glyphs.indices);
+        let overlay_glyphs = self.make_buffers(
+            &batches.overlay_glyphs.vertices,
+            &batches.overlay_glyphs.indices,
+        );
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2803,6 +2970,12 @@ impl GpuBackend {
 
             pass.set_pipeline(&self.quad_pipeline);
             draw_buffers(&mut pass, decorations.as_ref());
+            if let Some(glyph_bind_group) = &self.glyph_bind_group {
+                pass.set_pipeline(&self.glyph_pipeline);
+                pass.set_bind_group(0, glyph_bind_group, &[]);
+                draw_buffers(&mut pass, overlay_glyphs.as_ref());
+            }
+            pass.set_pipeline(&self.quad_pipeline);
             draw_buffers(&mut pass, cursor.as_ref());
         }
 
@@ -3088,6 +3261,67 @@ mod tests {
         assert_eq!(batches.glyphs.glyph_count, 3);
         assert!(batches.instrumentation.draw_call_count <= 3);
         assert!(batches.instrumentation.glyphs.atlas_uploads > 0);
+    }
+
+    #[test]
+    fn semantic_command_blocks_draw_behind_text_and_badges_get_overlay_glyphs() {
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let mut planner = RenderBatchPlanner::default();
+        let mut test_scene = scene_without_cursor(vec![cell(0, 0, "p"), cell(0, 1, "w")]);
+        test_scene.semantic_overlays = vec![
+            OverlayPrimitive {
+                kind: OverlayKind::CommandBlock,
+                bounds: RenderRect {
+                    x: 0,
+                    y: 0,
+                    width: 64,
+                    height: 32,
+                },
+                color: RenderColor {
+                    red: 40,
+                    green: 48,
+                    blue: 56,
+                    alpha: 96,
+                },
+                border_color: Some(RenderColor::rgb(43, 185, 115)),
+                corner_radius_px: 4,
+                z_index: 10,
+                label: None,
+            },
+            OverlayPrimitive {
+                kind: OverlayKind::Badge,
+                bounds: RenderRect {
+                    x: 16,
+                    y: 2,
+                    width: 16,
+                    height: 14,
+                },
+                color: RenderColor {
+                    red: 43,
+                    green: 185,
+                    blue: 115,
+                    alpha: 148,
+                },
+                border_color: None,
+                corner_radius_px: 3,
+                z_index: 30,
+                label: Some("ok".to_owned()),
+            },
+        ];
+
+        let Ok(batches) = planner.prepare_full(&test_scene, &mut fonts) else {
+            return;
+        };
+
+        assert!(
+            batches.background.quad_count() > test_scene.grid.cells.len(),
+            "command block overlay should be batched behind terminal glyphs"
+        );
+        assert!(
+            batches.decorations.quad_count() >= 1,
+            "badge rectangle should be an overlay decoration"
+        );
+        assert_eq!(batches.overlay_glyphs.glyph_count, 2);
     }
 
     #[test]

@@ -21,6 +21,7 @@ show_shell_badge = true
 show_current_directory = true
 show_remote_host = true
 show_previous_status_accent = true
+allow_in_alternate_screen = false
 
 [command_blocks]
 enabled = true
@@ -30,6 +31,7 @@ show_duration = true
 show_exit_status = true
 show_current_directory = true
 show_shell_host = true
+allow_in_alternate_screen = false
 copy_actions_enabled = true
 jump_actions_enabled = true
 
