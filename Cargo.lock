@@ -3166,8 +3166,10 @@ dependencies = [
  "config-toml",
  "diagnostics",
  "render-wgpu",
+ "security",
  "transport-core",
  "transport-pty",
+ "transport-ssh",
 ]
 
 [[package]]

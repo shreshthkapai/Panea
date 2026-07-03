@@ -340,11 +340,18 @@ to more visible features before the dependencies they rely on are hardened.
   platform keychain capability reporting exists for Windows, macOS, Linux, and
   iOS targets, and docs/diagnostics explain that native provider wiring and
   desktop UI remain follow-up work.
+- Next-pass Phase 16 adds `cargo xtask ssh-smoke`, a bounded real-server smoke
+  harness that uses Panea's `transport-ssh` backend, explicit trust providers,
+  smoke-owned known-hosts storage, environment-backed secrets, remote PTY
+  output polling, resize, reconnect, changed-host detection, Unicode/large
+  output markers, and remote OSC 52 default-deny policy checks. Real server
+  reports still need to be collected on Windows, macOS, Linux X11, and Linux
+  Wayland before SSH transport can be called cross-OS verified.
 - Phase 12 establishes secure SSH transport contracts and a real backend, but
   desktop host-key approval UI, native OS keychain backend wiring, proxy jump,
-  remote shell-integration install flows, reconnect UI/actions, and real SSH
-  server smoke tests across Windows/macOS/Linux remain unverified follow-up
-  work.
+  remote shell-integration install flows, reconnect UI/actions, and collected
+  real SSH server smoke reports across Windows/macOS/Linux remain unverified
+  follow-up work.
 - Phase 13 adds the parity matrix and diagnostics command foundation, but it
   does not magically verify macOS, Linux X11, or Linux Wayland from this Windows
   host. Real platform labs/CI runners, compositor coverage, GPU backend

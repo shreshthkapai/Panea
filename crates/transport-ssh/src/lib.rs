@@ -310,6 +310,12 @@ fn connect_tcp(profile: &SshConnectionProfile) -> TransportResult<TcpStream> {
                 stream
                     .set_nodelay(true)
                     .map_err(|error| TransportError::new(error.to_string()))?;
+                stream
+                    .set_read_timeout(Some(profile.connect_timeout))
+                    .map_err(|error| TransportError::new(error.to_string()))?;
+                stream
+                    .set_write_timeout(Some(profile.connect_timeout))
+                    .map_err(|error| TransportError::new(error.to_string()))?;
                 return Ok(stream);
             }
             Err(error) => last_error = Some(error),
@@ -501,17 +507,19 @@ fn authenticate(
 }
 
 fn start_remote(channel: &mut Channel, profile: &SshConnectionProfile) -> TransportResult<()> {
-    let command = match (&profile.remote_working_directory, &profile.remote_command) {
-        (Some(cwd), Some(command)) => Some(format!("cd {} && exec {}", shell_quote(cwd), command)),
-        (Some(cwd), None) => Some(format!("cd {} && exec ${{SHELL:-sh}}", shell_quote(cwd))),
-        (None, Some(command)) => Some(format!("exec {command}")),
-        (None, None) => None,
-    };
-
-    if let Some(command) = command {
+    if let Some(command) = remote_command_line(profile) {
         channel.exec(&command).map_err(transport_error)
     } else {
         channel.shell().map_err(transport_error)
+    }
+}
+
+fn remote_command_line(profile: &SshConnectionProfile) -> Option<String> {
+    match (&profile.remote_working_directory, &profile.remote_command) {
+        (Some(cwd), Some(command)) => Some(format!("cd {} && exec {}", shell_quote(cwd), command)),
+        (Some(cwd), None) => Some(format!("cd {} && exec ${{SHELL:-sh}}", shell_quote(cwd))),
+        (None, Some(command)) => Some(command.clone()),
+        (None, None) => None,
     }
 }
 
@@ -590,6 +598,14 @@ mod tests {
     #[test]
     fn quoted_remote_working_directory_is_shell_safe() {
         assert_eq!(shell_quote("/tmp/it's here"), "'/tmp/it'\\''s here'");
+    }
+
+    #[test]
+    fn remote_command_is_not_forced_through_posix_exec_without_cwd() {
+        let mut profile = SshConnectionProfile::new("prod", "example.com");
+        profile.remote_command = Some("echo panea".to_owned());
+
+        assert_eq!(remote_command_line(&profile).as_deref(), Some("echo panea"));
     }
 
     #[test]

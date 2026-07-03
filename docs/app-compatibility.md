@@ -62,7 +62,7 @@ The runner tracks:
 - editors: vim, neovim, nano, helix
 - TUIs/tools: htop, btop, lazygit, fzf, git, cargo, npm/pnpm/yarn, Python, Node
 - multiplexers: tmux, screen, zellij
-- SSH: local client probe plus manual local-server verification
+- SSH: local client probe plus the dedicated `cargo xtask ssh-smoke` real-server harness
 - protocol: ANSI/VT marker fixtures for truecolor and OSC title bytes
 
 ## Acceptance Status
@@ -87,7 +87,8 @@ and failure reproduction steps:
 - `tmux`, `screen`, `zellij`: nested resize, mouse mode, alternate screen
 - PowerShell, cmd, bash, zsh, fish: prompt, paste, Unicode, title changes
 - WSL shell: local PTY through WSL, Unicode, resize, clipboard policy
-- SSH local server: remote PTY, resize, Unicode, OSC 52 policy, disconnect
+- SSH local server: run `cargo xtask ssh-smoke run ...` for remote PTY,
+  resize, Unicode, OSC 52 policy, changed-host detection, and reconnect
 
 ## Failure Policy
 

@@ -166,7 +166,7 @@ pub fn feature_parity_matrix() -> Vec<PlatformFeatureStatus> {
             windows: Partial,
             linux_x11: Partial,
             linux_wayland: Partial,
-            notes: "secure transport backend exists; interactive trust UI and real server smoke tests remain open",
+            notes: "secure transport backend and real-server smoke harness exist; interactive trust UI and collected server reports remain open",
         },
         PlatformFeatureStatus {
             feature: "config reload",

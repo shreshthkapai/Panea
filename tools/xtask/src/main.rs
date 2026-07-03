@@ -7,14 +7,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+use security::{
+    AuthMethod, HostKey, HostKeyTrustAction, HostKeyTrustRequest, HostTrustProvider, KnownHosts,
+    KnownHostsPolicy, Osc52ClipboardPolicy, Osc52ClipboardRequest, Osc52ClipboardTarget,
+    SecretProvider, SecretRequest, SecretString, evaluate_osc52_clipboard_write,
+};
 use transport_core::{TerminalSize, TerminalTransport, TransportLifecycleEvent, TransportState};
 use transport_pty::{LocalPtyDiagnostics, LocalPtyTransport, LocalShellProfile};
+use transport_ssh::{SshConnectionProfile, SshTransport};
 
 fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("help") | None => {
             eprintln!(
-                "usage: cargo xtask <fmt|clippy|test|build|check|layer-check|ci|config-default|config-schema|bench|screenshot|fuzz-smoke|fuzz|doctor|bug-report|hardening|security-review|linux-compositor|compat|package-plan|release-check|ios-readiness>"
+                "usage: cargo xtask <fmt|clippy|test|build|check|layer-check|ci|config-default|config-schema|bench|screenshot|fuzz-smoke|fuzz|doctor|bug-report|hardening|security-review|linux-compositor|compat|ssh-smoke|package-plan|release-check|ios-readiness>"
             );
             ExitCode::SUCCESS
         }
@@ -36,6 +42,7 @@ fn main() -> ExitCode {
         Some("security-review") => run_security_review(),
         Some("linux-compositor") => run_linux_compositor(),
         Some("compat") => run_compat(),
+        Some("ssh-smoke") => run_ssh_smoke(),
         Some("package-plan") => run_package_plan(),
         Some("release-check") => run_release_check(),
         Some("ios-readiness") => run_ios_readiness(),
@@ -94,6 +101,789 @@ fn run_compat() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn run_ssh_smoke() -> ExitCode {
+    let mut args = std::env::args().skip(2).collect::<Vec<_>>();
+    let command = args.first().map_or("plan", String::as_str);
+
+    match command {
+        "help" | "--help" | "-h" => {
+            print_ssh_smoke_help();
+            ExitCode::SUCCESS
+        }
+        "plan" => {
+            print_ssh_smoke_plan();
+            ExitCode::SUCCESS
+        }
+        "run" => {
+            args.remove(0);
+            let options = match SshSmokeOptions::parse(&args) {
+                Ok(options) => options,
+                Err(error) => {
+                    eprintln!("{error}");
+                    print_ssh_smoke_help();
+                    return ExitCode::from(2);
+                }
+            };
+            run_ssh_smoke_cases(options)
+        }
+        other => {
+            eprintln!("unknown ssh-smoke command: {other}");
+            print_ssh_smoke_help();
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn print_ssh_smoke_help() {
+    eprintln!("usage: cargo xtask ssh-smoke <plan|run>");
+    eprintln!(
+        "usage: cargo xtask ssh-smoke run --host <host> [--port <port>] [--user <user>] [--auth <agent|public_key|password>] [--identity-file <path>] [--password-env <name>] [--passphrase-env <name>] [--timeout-ms <ms>] [--remote-kind <posix|powershell>] [--report-dir <path>]"
+    );
+    eprintln!(
+        "env fallback: PANEA_SSH_SMOKE_HOST, PANEA_SSH_SMOKE_PORT, PANEA_SSH_SMOKE_USER, PANEA_SSH_SMOKE_AUTH, PANEA_SSH_SMOKE_IDENTITY_FILE, PANEA_SSH_SMOKE_PASSWORD, PANEA_SSH_SMOKE_PASSPHRASE"
+    );
+}
+
+fn print_ssh_smoke_plan() {
+    println!("Panea SSH real-server smoke suite");
+    println!("host_platform={}", CompatPlatform::detect().label());
+    println!("runner=Panea transport-ssh backend with bounded polling and explicit trust provider");
+    println!(
+        "server=provide --host or PANEA_SSH_SMOKE_HOST; the runner does not create a privileged sshd"
+    );
+    println!("cases:");
+    for case in SSH_SMOKE_CASES {
+        println!("- {case}");
+    }
+    println!("report=target/ssh-smoke/<platform>.md by default");
+}
+
+const SSH_SMOKE_CASES: &[&str] = &[
+    "reject unknown host with default rejecting trust provider",
+    "accept and persist unknown host only through explicit trust action",
+    "authenticate and observe remote PTY output marker",
+    "resize remote PTY through TerminalTransport::resize",
+    "observe Unicode and large-output markers from the remote session",
+    "reconnect using require_known against the persisted smoke known-hosts file",
+    "detect changed host key from the smoke known-hosts file",
+    "enforce remote OSC 52 clipboard denial by default",
+];
+
+#[derive(Debug, Clone)]
+struct SshSmokeOptions {
+    host: Option<String>,
+    port: u16,
+    username: Option<String>,
+    auth_method: AuthMethod,
+    identity_file: Option<PathBuf>,
+    password_env: String,
+    passphrase_env: String,
+    timeout: Duration,
+    report_dir: PathBuf,
+    remote_kind: SshSmokeRemoteKind,
+}
+
+impl SshSmokeOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut options = Self {
+            host: std::env::var("PANEA_SSH_SMOKE_HOST").ok(),
+            port: parse_env_u16("PANEA_SSH_SMOKE_PORT")?.unwrap_or(22),
+            username: std::env::var("PANEA_SSH_SMOKE_USER").ok(),
+            auth_method: parse_auth_method(
+                &std::env::var("PANEA_SSH_SMOKE_AUTH").unwrap_or_else(|_| "agent".to_owned()),
+            )?,
+            identity_file: std::env::var_os("PANEA_SSH_SMOKE_IDENTITY_FILE").map(PathBuf::from),
+            password_env: "PANEA_SSH_SMOKE_PASSWORD".to_owned(),
+            passphrase_env: "PANEA_SSH_SMOKE_PASSPHRASE".to_owned(),
+            timeout: Duration::from_secs(5),
+            report_dir: PathBuf::from("target/ssh-smoke"),
+            remote_kind: SshSmokeRemoteKind::Posix,
+        };
+        let mut index = 0;
+
+        while index < args.len() {
+            match args[index].as_str() {
+                "--host" => options.host = Some(required_arg(args, &mut index, "--host")?),
+                "--port" => {
+                    let value = required_arg(args, &mut index, "--port")?;
+                    options.port = value
+                        .parse::<u16>()
+                        .map_err(|_| format!("invalid --port value: {value}"))?;
+                }
+                "--user" => options.username = Some(required_arg(args, &mut index, "--user")?),
+                "--auth" => {
+                    let value = required_arg(args, &mut index, "--auth")?;
+                    options.auth_method = parse_auth_method(&value)?;
+                }
+                "--identity-file" => {
+                    options.identity_file = Some(PathBuf::from(required_arg(
+                        args,
+                        &mut index,
+                        "--identity-file",
+                    )?));
+                }
+                "--password-env" => {
+                    options.password_env = required_arg(args, &mut index, "--password-env")?;
+                }
+                "--passphrase-env" => {
+                    options.passphrase_env = required_arg(args, &mut index, "--passphrase-env")?;
+                }
+                "--timeout-ms" => {
+                    let value = required_arg(args, &mut index, "--timeout-ms")?;
+                    let millis = value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid --timeout-ms value: {value}"))?;
+                    if millis < 500 {
+                        return Err("--timeout-ms must be at least 500".to_owned());
+                    }
+                    options.timeout = Duration::from_millis(millis);
+                }
+                "--remote-kind" => {
+                    let value = required_arg(args, &mut index, "--remote-kind")?;
+                    options.remote_kind = SshSmokeRemoteKind::parse(&value)
+                        .ok_or_else(|| format!("unknown --remote-kind value: {value}"))?;
+                }
+                "--report-dir" => {
+                    options.report_dir =
+                        PathBuf::from(required_arg(args, &mut index, "--report-dir")?);
+                }
+                other => return Err(format!("unknown ssh-smoke option: {other}")),
+            }
+            index += 1;
+        }
+
+        if matches!(options.auth_method, AuthMethod::PublicKey) && options.identity_file.is_none() {
+            return Err(
+                "--auth public_key requires --identity-file or PANEA_SSH_SMOKE_IDENTITY_FILE"
+                    .to_owned(),
+            );
+        }
+
+        Ok(options)
+    }
+
+    fn profile(&self, name: &str, policy: KnownHostsPolicy, marker: &str) -> SshConnectionProfile {
+        let mut profile =
+            SshConnectionProfile::new(name.to_owned(), self.host.clone().unwrap_or_default());
+        profile.port = self.port;
+        profile.username = self.username.clone();
+        profile.auth_method = self.auth_method.clone();
+        profile.identity_file = self.identity_file.clone();
+        profile.known_hosts_policy = policy;
+        profile.remote_command = Some(self.remote_kind.command(marker));
+        profile.shell_integration = false;
+        profile.agent_forwarding = false;
+        profile.connect_timeout = self.timeout;
+        profile
+    }
+}
+
+fn required_arg(args: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
+    *index += 1;
+    args.get(*index)
+        .cloned()
+        .ok_or_else(|| format!("{flag} requires a value"))
+}
+
+fn parse_env_u16(name: &str) -> Result<Option<u16>, String> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<u16>()
+            .map(Some)
+            .map_err(|_| format!("invalid {name} value: {value}")),
+        Err(_) => Ok(None),
+    }
+}
+
+fn parse_auth_method(value: &str) -> Result<AuthMethod, String> {
+    match value {
+        "agent" => Ok(AuthMethod::Agent),
+        "public_key" | "publickey" | "key" => Ok(AuthMethod::PublicKey),
+        "password" => Ok(AuthMethod::Password),
+        "keyboard_interactive" | "keyboard-interactive" => Ok(AuthMethod::KeyboardInteractive),
+        other => Err(format!("unknown auth method: {other}")),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SshSmokeRemoteKind {
+    Posix,
+    Powershell,
+}
+
+impl SshSmokeRemoteKind {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "posix" => Some(Self::Posix),
+            "powershell" | "pwsh" => Some(Self::Powershell),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Posix => "posix",
+            Self::Powershell => "powershell",
+        }
+    }
+
+    fn command(self, marker: &str) -> String {
+        match self {
+            Self::Posix => format!(
+                "sleep 0.2; printf '%s\\n' {marker}; printf 'unicode: caf\\303\\251 \\346\\274\\242\\345\\255\\227 \\360\\237\\230\\200\\n'; stty size 2>/dev/null || true; i=0; while [ $i -lt 128 ]; do printf 'panea-ssh-large-%03d\\n' \"$i\"; i=$((i+1)); done"
+            ),
+            Self::Powershell => format!(
+                "powershell -NoLogo -NoProfile -Command \"$u=[string]::Concat('unicode: caf',[char]0x00E9,' ',[char]0x6F22,[char]0x5B57,' ',[char]::ConvertFromUtf32(0x1F600)); Write-Output '{marker}'; Write-Output $u; 0..127 | ForEach-Object {{ Write-Output ('panea-ssh-large-' + $_.ToString('000')) }}\""
+            ),
+        }
+    }
+}
+
+fn run_ssh_smoke_cases(options: SshSmokeOptions) -> ExitCode {
+    let Some(host) = options
+        .host
+        .as_deref()
+        .filter(|host| !host.trim().is_empty())
+    else {
+        eprintln!("missing SSH smoke server: provide --host or PANEA_SSH_SMOKE_HOST");
+        return ExitCode::from(2);
+    };
+
+    if let Err(error) = fs::create_dir_all(&options.report_dir) {
+        eprintln!(
+            "failed to create SSH smoke report directory {}: {error}",
+            options.report_dir.display()
+        );
+        return ExitCode::from(1);
+    }
+
+    let known_hosts_path = options.report_dir.join(format!(
+        "known-hosts-{}.json",
+        CompatPlatform::detect().label()
+    ));
+    let _ = fs::remove_file(&known_hosts_path);
+
+    let results = vec![
+        run_ssh_reject_unknown_host_case(&options, &known_hosts_path),
+        run_ssh_accept_and_output_case(&options, &known_hosts_path),
+        run_ssh_reconnect_case(&options, &known_hosts_path),
+        run_ssh_changed_host_case(&options, &known_hosts_path),
+        run_ssh_remote_osc52_policy_case(),
+    ];
+
+    for result in &results {
+        println!("{}", result.render_line());
+    }
+
+    let report_path = options
+        .report_dir
+        .join(format!("{}.md", CompatPlatform::detect().label()));
+    if let Err(error) = fs::write(
+        &report_path,
+        render_ssh_smoke_report(host, &options, &known_hosts_path, &results),
+    ) {
+        eprintln!("failed to write {}: {error}", report_path.display());
+        return ExitCode::from(1);
+    }
+    println!("wrote SSH smoke report {}", report_path.display());
+
+    if results
+        .iter()
+        .any(|result| result.status == SshSmokeStatus::Fail)
+    {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn run_ssh_reject_unknown_host_case(
+    options: &SshSmokeOptions,
+    known_hosts_path: &Path,
+) -> SshSmokeResult {
+    let started = Instant::now();
+    let mut profile = options.profile(
+        "ssh-smoke-reject-unknown",
+        KnownHostsPolicy::Ask,
+        "panea-ssh-reject",
+    );
+    profile.auth_method = AuthMethod::None;
+    let mut secrets = EnvSecretProvider::new(options);
+    let mut trust = ScriptedHostTrustProvider::reject();
+
+    match SshTransport::connect_with_security(
+        profile,
+        smoke_ssh_size(),
+        known_hosts_path,
+        &mut secrets,
+        &mut trust,
+    ) {
+        Ok(mut transport) => {
+            let _ = transport.shutdown();
+            SshSmokeResult::fail(
+                "reject-unknown-host",
+                started.elapsed(),
+                "unknown host unexpectedly connected".to_owned(),
+            )
+        }
+        Err(error)
+            if error.to_string().contains("unknown")
+                || error.to_string().contains("explicit trust") =>
+        {
+            SshSmokeResult::pass(
+                "reject-unknown-host",
+                started.elapsed(),
+                format!(
+                    "unknown host rejected before auth; trust_requests={}",
+                    trust.requests.len()
+                ),
+            )
+        }
+        Err(error) => SshSmokeResult::fail(
+            "reject-unknown-host",
+            started.elapsed(),
+            format!("expected unknown-host rejection, got: {error}"),
+        ),
+    }
+}
+
+fn run_ssh_accept_and_output_case(
+    options: &SshSmokeOptions,
+    known_hosts_path: &Path,
+) -> SshSmokeResult {
+    run_ssh_output_case(
+        "accept-store-output",
+        options,
+        known_hosts_path,
+        KnownHostsPolicy::Ask,
+        ScriptedHostTrustProvider::trust_and_store(),
+        "panea-ssh-smoke",
+    )
+}
+
+fn run_ssh_reconnect_case(options: &SshSmokeOptions, known_hosts_path: &Path) -> SshSmokeResult {
+    run_ssh_output_case(
+        "require-known-reconnect",
+        options,
+        known_hosts_path,
+        KnownHostsPolicy::RequireKnown,
+        ScriptedHostTrustProvider::reject(),
+        "panea-ssh-reconnect",
+    )
+}
+
+fn run_ssh_output_case(
+    name: &'static str,
+    options: &SshSmokeOptions,
+    known_hosts_path: &Path,
+    policy: KnownHostsPolicy,
+    mut trust_provider: ScriptedHostTrustProvider,
+    marker: &'static str,
+) -> SshSmokeResult {
+    let started = Instant::now();
+    let profile = options.profile(name, policy, marker);
+    let mut secrets = EnvSecretProvider::new(options);
+    let mut lifecycle = Vec::new();
+    let mut output = Vec::new();
+
+    let mut transport = match SshTransport::connect_with_security(
+        profile,
+        smoke_ssh_size(),
+        known_hosts_path,
+        &mut secrets,
+        &mut trust_provider,
+    ) {
+        Ok(transport) => transport,
+        Err(error) => {
+            return SshSmokeResult::fail(
+                name,
+                started.elapsed(),
+                format!("connect failed: {error}"),
+            );
+        }
+    };
+
+    let resize_result = transport.resize(TerminalSize::new(100, 40, 800, 640));
+    if let Err(error) = resize_result {
+        let _ = transport.shutdown();
+        return SshSmokeResult::fail(name, started.elapsed(), format!("resize failed: {error}"));
+    }
+
+    let deadline = Instant::now() + options.timeout;
+    let marker_bytes = marker.as_bytes();
+    let unicode_marker = b"unicode:";
+    let large_marker = b"panea-ssh-large-127";
+    let mut saw_marker = false;
+    let mut saw_unicode = false;
+    let mut saw_large = false;
+
+    while Instant::now() < deadline {
+        match transport.poll_output() {
+            Ok(poll) => {
+                lifecycle.extend(poll.lifecycle);
+                output.extend(poll.bytes);
+                saw_marker = saw_marker
+                    || output
+                        .windows(marker_bytes.len())
+                        .any(|w| w == marker_bytes);
+                saw_unicode = saw_unicode
+                    || output
+                        .windows(unicode_marker.len())
+                        .any(|w| w == unicode_marker);
+                saw_large = saw_large
+                    || output
+                        .windows(large_marker.len())
+                        .any(|w| w == large_marker);
+                if saw_marker && saw_unicode && saw_large && poll.closed {
+                    break;
+                }
+            }
+            Err(error) => {
+                let _ = transport.shutdown();
+                return SshSmokeResult {
+                    name,
+                    status: SshSmokeStatus::Fail,
+                    duration: started.elapsed(),
+                    detail: format!("poll failed: {error}"),
+                    bytes_received: output.len(),
+                    preview: preview_bytes(&output),
+                    lifecycle,
+                };
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let shutdown = transport.shutdown();
+    let persisted = KnownHosts::load(known_hosts_path)
+        .ok()
+        .and_then(|known_hosts| {
+            options
+                .host
+                .as_deref()
+                .and_then(|host| known_hosts.entry_for(host, options.port))
+                .cloned()
+        })
+        .is_some();
+
+    if !saw_marker || !saw_unicode || !saw_large {
+        return SshSmokeResult {
+            name,
+            status: SshSmokeStatus::Fail,
+            duration: started.elapsed(),
+            detail: format!(
+                "missing output marker(s): marker={saw_marker} unicode={saw_unicode} large={saw_large} shutdown={:?}",
+                shutdown.map_err(|error| error.to_string())
+            ),
+            bytes_received: output.len(),
+            preview: preview_bytes(&output),
+            lifecycle,
+        };
+    }
+
+    if let Err(error) = shutdown {
+        return SshSmokeResult {
+            name,
+            status: SshSmokeStatus::Fail,
+            duration: started.elapsed(),
+            detail: format!("output observed, but shutdown failed: {error}"),
+            bytes_received: output.len(),
+            preview: preview_bytes(&output),
+            lifecycle,
+        };
+    }
+
+    SshSmokeResult {
+        name,
+        status: SshSmokeStatus::Pass,
+        duration: started.elapsed(),
+        detail: format!(
+            "remote PTY output, Unicode marker, large-output marker, resize event, and shutdown passed; known_host_persisted={persisted}; trust_requests={}",
+            trust_provider.requests.len()
+        ),
+        bytes_received: output.len(),
+        preview: preview_bytes(&output),
+        lifecycle,
+    }
+}
+
+fn run_ssh_changed_host_case(options: &SshSmokeOptions, known_hosts_path: &Path) -> SshSmokeResult {
+    let started = Instant::now();
+    let Some(host) = options.host.clone() else {
+        return SshSmokeResult::fail(
+            "changed-host-key",
+            started.elapsed(),
+            "host is not configured".to_owned(),
+        );
+    };
+
+    let bogus_key = HostKey::from_raw(host, options.port, "panea-test-host-key", b"changed-key");
+    let mut known_hosts = KnownHosts::empty();
+    known_hosts.trust(&bogus_key);
+    if let Err(error) = known_hosts.save(known_hosts_path) {
+        return SshSmokeResult::fail(
+            "changed-host-key",
+            started.elapsed(),
+            format!("failed to write changed-host fixture: {error}"),
+        );
+    }
+
+    let mut profile = options.profile(
+        "ssh-smoke-changed-host",
+        KnownHostsPolicy::RequireKnown,
+        "panea-ssh-changed",
+    );
+    profile.auth_method = AuthMethod::None;
+    let mut secrets = EnvSecretProvider::new(options);
+    let mut trust = ScriptedHostTrustProvider::reject();
+
+    match SshTransport::connect_with_security(
+        profile,
+        smoke_ssh_size(),
+        known_hosts_path,
+        &mut secrets,
+        &mut trust,
+    ) {
+        Ok(mut transport) => {
+            let _ = transport.shutdown();
+            SshSmokeResult::fail(
+                "changed-host-key",
+                started.elapsed(),
+                "changed host key unexpectedly connected".to_owned(),
+            )
+        }
+        Err(error)
+            if error.to_string().contains("changed host key")
+                || error.to_string().contains("blocked") =>
+        {
+            SshSmokeResult::pass(
+                "changed-host-key",
+                started.elapsed(),
+                "changed host key was detected and blocked".to_owned(),
+            )
+        }
+        Err(error) => SshSmokeResult::fail(
+            "changed-host-key",
+            started.elapsed(),
+            format!("expected changed-host-key rejection, got: {error}"),
+        ),
+    }
+}
+
+fn run_ssh_remote_osc52_policy_case() -> SshSmokeResult {
+    let started = Instant::now();
+    let request = Osc52ClipboardRequest {
+        target: Osc52ClipboardTarget::Clipboard,
+        payload_base64: "cGFuZWE=".to_owned(),
+        remote: true,
+    };
+    let decision = evaluate_osc52_clipboard_write(&request, &Osc52ClipboardPolicy::default());
+    if decision.is_allowed() {
+        SshSmokeResult::fail(
+            "remote-osc52-policy",
+            started.elapsed(),
+            "remote OSC 52 write was allowed by default".to_owned(),
+        )
+    } else {
+        SshSmokeResult::pass(
+            "remote-osc52-policy",
+            started.elapsed(),
+            format!("remote OSC 52 write denied by default: {decision:?}"),
+        )
+    }
+}
+
+fn smoke_ssh_size() -> TerminalSize {
+    TerminalSize::new(80, 24, 640, 384)
+}
+
+#[derive(Debug)]
+struct EnvSecretProvider {
+    password_env: String,
+    passphrase_env: String,
+}
+
+impl EnvSecretProvider {
+    fn new(options: &SshSmokeOptions) -> Self {
+        Self {
+            password_env: options.password_env.clone(),
+            passphrase_env: options.passphrase_env.clone(),
+        }
+    }
+}
+
+impl SecretProvider for EnvSecretProvider {
+    fn request_secret(
+        &mut self,
+        request: SecretRequest,
+    ) -> security::SecurityResult<Option<SecretString>> {
+        let env_name = match request {
+            SecretRequest::SshPassword { .. } => &self.password_env,
+            SecretRequest::SshKeyPassphrase { .. } => &self.passphrase_env,
+        };
+        Ok(std::env::var(env_name).ok().map(SecretString::new))
+    }
+}
+
+#[derive(Debug)]
+struct ScriptedHostTrustProvider {
+    unknown_action: HostKeyTrustAction,
+    changed_action: HostKeyTrustAction,
+    requests: Vec<HostKeyTrustRequest>,
+}
+
+impl ScriptedHostTrustProvider {
+    fn reject() -> Self {
+        Self {
+            unknown_action: HostKeyTrustAction::Reject,
+            changed_action: HostKeyTrustAction::Reject,
+            requests: Vec::new(),
+        }
+    }
+
+    fn trust_and_store() -> Self {
+        Self {
+            unknown_action: HostKeyTrustAction::TrustAndStore,
+            changed_action: HostKeyTrustAction::Reject,
+            requests: Vec::new(),
+        }
+    }
+}
+
+impl HostTrustProvider for ScriptedHostTrustProvider {
+    fn decide_host_trust(
+        &mut self,
+        request: HostKeyTrustRequest,
+    ) -> security::SecurityResult<HostKeyTrustAction> {
+        let action = match request.reason {
+            security::HostKeyTrustReason::UnknownHost => self.unknown_action,
+            security::HostKeyTrustReason::ChangedHostKey
+            | security::HostKeyTrustReason::PinnedFingerprintMismatch => self.changed_action,
+        };
+        self.requests.push(request);
+        Ok(action)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SshSmokeStatus {
+    Pass,
+    Fail,
+}
+
+impl SshSmokeStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Fail => "FAIL",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SshSmokeResult {
+    name: &'static str,
+    status: SshSmokeStatus,
+    duration: Duration,
+    detail: String,
+    bytes_received: usize,
+    preview: String,
+    lifecycle: Vec<TransportLifecycleEvent>,
+}
+
+impl SshSmokeResult {
+    fn pass(name: &'static str, duration: Duration, detail: String) -> Self {
+        Self {
+            name,
+            status: SshSmokeStatus::Pass,
+            duration,
+            detail,
+            bytes_received: 0,
+            preview: String::new(),
+            lifecycle: Vec::new(),
+        }
+    }
+
+    fn fail(name: &'static str, duration: Duration, detail: String) -> Self {
+        Self {
+            name,
+            status: SshSmokeStatus::Fail,
+            duration,
+            detail,
+            bytes_received: 0,
+            preview: String::new(),
+            lifecycle: Vec::new(),
+        }
+    }
+
+    fn render_line(&self) -> String {
+        format!(
+            "[{}] {} duration_ms={} bytes={} {}",
+            self.status.label(),
+            self.name,
+            self.duration.as_millis(),
+            self.bytes_received,
+            self.detail
+        )
+    }
+}
+
+fn render_ssh_smoke_report(
+    host: &str,
+    options: &SshSmokeOptions,
+    known_hosts_path: &Path,
+    results: &[SshSmokeResult],
+) -> String {
+    let mut lines = vec![
+        "# Panea SSH Smoke Report".to_owned(),
+        String::new(),
+        format!("- Host platform: {}", CompatPlatform::detect().label()),
+        format!("- SSH target: {}:{}", host, options.port),
+        format!("- Auth method: {:?}", options.auth_method),
+        format!("- Identity file configured: {}", options.identity_file.is_some()),
+        format!("- Remote command kind: {}", options.remote_kind.label()),
+        format!("- Timeout ms: {}", options.timeout.as_millis()),
+        format!("- Smoke known-hosts path: {}", known_hosts_path.display()),
+        "- Secrets are read only from named environment variables and are not written to this report"
+            .to_owned(),
+        "- Cross-OS status: this report verifies only the current host; macOS/Linux/Windows reports must be collected separately"
+            .to_owned(),
+        String::new(),
+        "| Status | Case | Duration ms | Bytes | Detail |".to_owned(),
+        "| --- | --- | ---: | ---: | --- |".to_owned(),
+    ];
+
+    for result in results {
+        lines.push(format!(
+            "| {} | `{}` | {} | {} | {} |",
+            result.status.label(),
+            result.name,
+            result.duration.as_millis(),
+            result.bytes_received,
+            result.detail.replace('|', "\\|")
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push("## Output Preview And Lifecycle".to_owned());
+    for result in results {
+        lines.push(String::new());
+        lines.push(format!("### `{}`", result.name));
+        lines.push(format!("- status: {}", result.status.label()));
+        if !result.lifecycle.is_empty() {
+            lines.push(format!("- lifecycle: {:?}", result.lifecycle));
+        }
+        if !result.preview.is_empty() {
+            lines.push("- preview:".to_owned());
+            lines.push("```text".to_owned());
+            lines.push(result.preview.clone());
+            lines.push("```".to_owned());
+        }
+    }
+
+    lines.join("\n")
 }
 
 fn print_compat_help() {
@@ -741,7 +1531,7 @@ fn compat_cases() -> Vec<CompatCase> {
         program: "ssh",
         args: &["-V"],
         marker: None,
-        verifies: "SSH client exists; real SSH server smoke is deferred to the SSH server phase",
+        verifies: "SSH client exists; Panea transport verification lives in cargo xtask ssh-smoke",
     }));
     cases.push(manual_case(
         "ssh-local-server",
@@ -1893,8 +2683,10 @@ fn dependency_rules() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
                 "config-toml",
                 "diagnostics",
                 "render-wgpu",
+                "security",
                 "transport-core",
                 "transport-pty",
+                "transport-ssh",
             ]),
         ),
     ])
@@ -2136,5 +2928,39 @@ mod tests {
         assert_eq!(options.category, Some(CompatCategory::Shells));
         assert_eq!(options.case_key.as_deref(), Some("shell-cmd"));
         assert_eq!(options.timeout, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn ssh_smoke_options_parse_without_secret_values() {
+        let options = SshSmokeOptions::parse(&[
+            "--host".to_owned(),
+            "127.0.0.1".to_owned(),
+            "--port".to_owned(),
+            "2222".to_owned(),
+            "--user".to_owned(),
+            "panea".to_owned(),
+            "--auth".to_owned(),
+            "public_key".to_owned(),
+            "--identity-file".to_owned(),
+            "target/test-id".to_owned(),
+            "--password-env".to_owned(),
+            "PASSWORD_ENV_NAME".to_owned(),
+            "--passphrase-env".to_owned(),
+            "PASSPHRASE_ENV_NAME".to_owned(),
+            "--timeout-ms".to_owned(),
+            "750".to_owned(),
+            "--remote-kind".to_owned(),
+            "posix".to_owned(),
+        ])
+        .expect("ssh smoke options");
+
+        assert_eq!(options.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(options.port, 2222);
+        assert_eq!(options.username.as_deref(), Some("panea"));
+        assert_eq!(options.auth_method, AuthMethod::PublicKey);
+        assert_eq!(options.password_env, "PASSWORD_ENV_NAME");
+        assert_eq!(options.passphrase_env, "PASSPHRASE_ENV_NAME");
+        assert_eq!(options.timeout, Duration::from_millis(750));
+        assert_eq!(options.remote_kind, SshSmokeRemoteKind::Posix);
     }
 }

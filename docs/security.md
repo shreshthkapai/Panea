@@ -73,6 +73,12 @@ Run:
 cargo xtask security-review
 ```
 
+Run real SSH transport smoke tests against a controlled server with:
+
+```powershell
+cargo xtask ssh-smoke run --host 127.0.0.1 --user panea --auth agent
+```
+
 Current blockers for release security posture:
 
 - Native OS keychain-backed secret providers are not wired into the app

@@ -27,7 +27,7 @@ be called product-complete across all targets.
 | tmux | Optional version probe; nested session behavior remains manual |
 | screen | Optional version probe; nested session behavior remains manual |
 | zellij | Optional version probe; nested session behavior remains manual |
-| local SSH host | Manual verification required; real server smoke is a later phase |
+| local SSH host | Use `cargo xtask ssh-smoke run ...`; collected platform reports remain required |
 
 The current automated coverage is lower-level golden testing in `term-parser`
 and `term-core`, plus ignored real local PTY smoke tests in `transport-pty`.

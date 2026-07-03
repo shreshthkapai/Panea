@@ -61,7 +61,8 @@ The remaining high-level work is:
   cursor animation visual smoke coverage.
 - Desktop SSH trust/secret UI, native OS keychain backend wiring, and real
   provider verification.
-- Real SSH server smoke tests.
+- Collected real SSH server smoke reports across Windows, macOS, Linux X11,
+  and Linux Wayland.
 - Real cross-OS verification runners.
 - Installed terminal doctor binary.
 - Packaging artifacts.

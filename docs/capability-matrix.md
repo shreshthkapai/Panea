@@ -72,7 +72,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Animated image cursor | partial | partial | partial | partial | Opt-in config, nonblocking asset read/header decode, metadata cache, and budget warnings exist; pixel-frame decode/upload/draw and cross-OS verification remain. |
 | SSH profile config | tested | implemented | implemented | implemented | Portable config model exists. |
 | SSH host-key policy | tested | implemented | implemented | implemented | Security contract exists with explicit unknown/changed-host trust decisions; desktop UI remains. |
-| SSH transport | partial | partial | partial | partial | Backend exists; real server smoke tests are unverified. |
+| SSH transport | partial | partial | partial | partial | Backend and `cargo xtask ssh-smoke` real-server harness exist; collected server reports remain unverified. |
 | SSH secret handling | tested | partial | partial | partial | Secret/keychain provider contracts, redaction, prompt persistence flow, and platform capability reporting exist; native OS backend wiring and prompts remain. |
 | SSH in mux | partial | partial | partial | partial | Session specs exist; direct SSH tab/pane runtime actions remain deferred until SSH trust/secret UI is ready. |
 | Doctor diagnostics | tested | implemented | implemented | implemented | Shared diagnostics and xtask commands exist; installed product command remains. |
@@ -98,7 +98,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 
 | Platform | Overall status | Why |
 | --- | --- | --- |
-| Windows | partial | Current host build/test/lint, local PTY smoke, and required compatibility runner smoke have been verified, but renderer GUI, optional app matrix, SSH server, packaging, and full daily-driver workflows are incomplete. |
+| Windows | partial | Current host build/test/lint, local PTY smoke, required compatibility runner smoke, and SSH smoke harness compilation have been verified, but renderer GUI, optional app matrix, a real SSH server report, packaging, and full daily-driver workflows are incomplete. |
 | macOS | partial | Platform-neutral code is implemented, but runtime behavior is unverified on macOS. |
 | Linux X11 | partial | Platform-neutral code and X11 strategy exist, but real X11 window manager/compositor behavior is unverified. |
 | Linux Wayland | partial | Platform-neutral code and Wayland strategy exist, but real compositor behavior is unverified. |

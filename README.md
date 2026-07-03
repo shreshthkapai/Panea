@@ -64,6 +64,7 @@ cargo xtask fuzz-smoke
 - [Shell integration](docs/shell-integration.md)
 - [SSH profiles](docs/ssh-profiles.md)
 - [SSH trust and secrets](docs/ssh-trust-and-secrets.md)
+- [SSH server smoke tests](docs/ssh-smoke-tests.md)
 - [Multiplexer usage](docs/multiplexer.md)
 - [iOS SSH companion](docs/ios-companion.md)
 - [Performance](docs/performance.md)

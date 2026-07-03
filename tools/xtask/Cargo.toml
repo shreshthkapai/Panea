@@ -16,5 +16,7 @@ workspace = true
 config-toml = { path = "../../crates/config-toml" }
 diagnostics = { path = "../../crates/diagnostics" }
 render-wgpu = { path = "../../crates/render-wgpu" }
+security = { path = "../../crates/security" }
 transport-core = { path = "../../crates/transport-core" }
 transport-pty = { path = "../../crates/transport-pty" }
+transport-ssh = { path = "../../crates/transport-ssh" }
