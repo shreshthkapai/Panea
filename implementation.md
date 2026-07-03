@@ -274,11 +274,10 @@ to more visible features before the dependencies they rely on are hardened.
   cursor batches, uploads only new glyph atlas rows, and has a GPU recovery
   path that rebuilds disposable WGPU resources while preserving terminal state.
   Cross-OS screenshot automation now exists with a verified Windows baseline;
-  macOS, Linux X11, and Linux Wayland baseline capture/verification, hardware
-  GPU timestamp queries, real sleep/wake and monitor-change device-loss
-  validation, batch vector
-  reuse/pooling, and deeper font fallback/shaping validation remain deferred
-  render-performance work.
+  macOS, Linux X11, and Linux Wayland baseline capture/verification, real GPU
+  timing validation, real sleep/wake and monitor-change device-loss validation,
+  batch vector reuse/pooling, and deeper font fallback/shaping validation
+  remain deferred render-performance work.
 - Phase 5 has build/test verification on the current Windows host. macOS,
   Linux X11, and Linux Wayland rendering remain unverified until run on those
   platforms.
@@ -298,9 +297,10 @@ to more visible features before the dependencies they rely on are hardened.
 - Programmable config remains deferred until the static TOML model has more
   runtime mileage. It must compile into the same `AppConfig` and stay out of the
   render hot path.
-- Phase 8 uses CPU-side timing plus WGPU submission wall-clock timing. Hardware
-  GPU timestamp queries and richer in-window overlay rendering remain deferred
-  until screenshot verification and stable overlay composition are in place.
+- Phase 8 uses CPU-side timing plus WGPU submission wall-clock timing, and
+  next-pass Phase 17 adds GPU timestamp status plumbing plus a developer
+  in-window overlay. Real hardware timestamp validation, polished overlay UX,
+  and CI regression gates remain follow-up work.
 - Next-pass Phase 10 wires the native mux model into the desktop app for local
   sessions: tabs, horizontal/vertical splits, focus, resize, close, zoom,
   per-pane terminal/semantic/PTY ownership, active-pane input routing,
@@ -347,6 +347,17 @@ to more visible features before the dependencies they rely on are hardened.
   output markers, and remote OSC 52 default-deny policy checks. Real server
   reports still need to be collected on Windows, macOS, Linux X11, and Linux
   Wayland before SSH transport can be called cross-OS verified.
+- Next-pass Phase 17 adds performance instrumentation and a developer
+  in-window overlay foundation: `RenderInstrumentation` now carries frame/CPU
+  timing, GPU timestamp status and duration where available, glyph cache and
+  atlas occupancy, damage/draw/animation/idle counts, PTY/parser throughput,
+  and memory estimates. `render-wgpu` can request WGPU timestamp queries through
+  `renderer.gpu_timestamps` and reports disabled/unsupported/pending/available
+  status without crashing. The desktop app projects the latest sample as
+  `OverlayKind::PerformanceOverlay` primitives when
+  `diagnostics.performance_overlay` is enabled. Real hardware timestamp
+  validation, polished installed overlay UX, and CI regression gates remain
+  follow-up work.
 - Phase 12 establishes secure SSH transport contracts and a real backend, but
   desktop host-key approval UI, native OS keychain backend wiring, proxy jump,
   remote shell-integration install flows, reconnect UI/actions, and collected

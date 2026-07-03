@@ -49,7 +49,8 @@ The remaining high-level work is:
   editors, TUIs, tmux/screen/zellij, WSL, SSH, and cross-OS reports remain.
 - Runtime config watching/live reload cross-OS validation and richer error UI.
 - Advanced programmable config later.
-- GPU timestamp queries and in-window performance overlay.
+- Real GPU timestamp validation, polished performance overlay UX, and
+  benchmark regression gates.
 - Product-complete desktop mux runtime polish: startup layouts, SSH panes,
   polished tab chrome, pane move/swap UI, and cross-OS GUI smoke.
 - Runtime shell integration activation exists for local desktop sessions; real

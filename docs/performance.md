@@ -38,6 +38,8 @@ Renderer batching details and the Phase 4 design note live in
 [renderer-batching.md](renderer-batching.md).
 Renderer device-loss recovery details and the Phase 5 design note live in
 [renderer-device-recovery.md](renderer-device-recovery.md).
+Performance instrumentation and the Phase 17 overlay design note live in
+[performance-instrumentation.md](performance-instrumentation.md).
 Cursor animation details and the Phase 13 design note live in
 [cursor-customization.md](cursor-customization.md).
 
@@ -62,6 +64,10 @@ Internal gates:
 - disabled features should not appear in hot-path profiles
 - cursor animations should redraw only cursor-neighborhood regions where possible
 - heavy visual settings should warn when budgets are exceeded
+- `diagnostics.performance_overlay = false` should retain near-zero runtime
+  cost; when enabled, it must report backend, frame pacing, GPU timing status,
+  glyph atlas/cache stats, damage/draw counts, PTY/parser throughput, and
+  memory estimates
 
 Do not claim the terminal is faster than another terminal until benchmarks are
 reproducible, fair, and documented.

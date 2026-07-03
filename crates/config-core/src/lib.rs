@@ -219,10 +219,11 @@ impl AppConfig {
         }
         if self.renderer.present_mode != next.renderer.present_mode
             || self.renderer.damage_tracking != next.renderer.damage_tracking
+            || self.renderer.gpu_timestamps != next.renderer.gpu_timestamps
         {
             plan.restart_required.push(RestartRequiredChange {
                 path: "renderer".to_owned(),
-                reason: "renderer scheduling and damage policy changes require renderer reinitialization"
+                reason: "renderer scheduling, damage policy, and GPU timestamp changes require renderer reinitialization"
                     .to_owned(),
             });
         }
@@ -679,6 +680,7 @@ pub struct RendererConfig {
     pub vsync: bool,
     pub damage_tracking: bool,
     pub present_mode: PresentModePreference,
+    pub gpu_timestamps: bool,
 }
 
 impl Default for RendererConfig {
@@ -688,6 +690,7 @@ impl Default for RendererConfig {
             vsync: true,
             damage_tracking: true,
             present_mode: PresentModePreference::Auto,
+            gpu_timestamps: false,
         }
     }
 }
@@ -1572,6 +1575,7 @@ pub struct RendererConfigPatch {
     pub vsync: Option<bool>,
     pub damage_tracking: Option<bool>,
     pub present_mode: Option<PresentModePreference>,
+    pub gpu_timestamps: Option<bool>,
 }
 
 impl RendererConfigPatch {
@@ -1580,6 +1584,7 @@ impl RendererConfigPatch {
         apply_opt(&mut config.vsync, &self.vsync);
         apply_opt(&mut config.damage_tracking, &self.damage_tracking);
         apply_opt(&mut config.present_mode, &self.present_mode);
+        apply_opt(&mut config.gpu_timestamps, &self.gpu_timestamps);
     }
 }
 
@@ -2561,6 +2566,13 @@ pub fn export_schema() -> ConfigSchema {
                         "renderer.damage_tracking",
                         "boolean",
                         default.renderer.damage_tracking,
+                        false,
+                        false,
+                    ),
+                    field(
+                        "renderer.gpu_timestamps",
+                        "boolean",
+                        default.renderer.gpu_timestamps,
                         false,
                         false,
                     ),

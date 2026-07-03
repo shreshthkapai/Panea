@@ -54,8 +54,8 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Config schema export | tested | implemented | implemented | implemented | Xtask helper exists. |
 | Advanced programmable config | stubbed | stubbed | stubbed | stubbed | `config-lua` placeholder exists; implementation is deferred. |
 | Benchmark CLI | tested | implemented | implemented | implemented | Repeatable local command exists; CI/platform runners remain open. |
-| Renderer instrumentation | tested | implemented | implemented | implemented | CPU and submission metrics exist; GPU timestamp queries remain. |
-| In-window performance overlay | partial | partial | partial | partial | Text/diagnostic overlay model exists; polished installed overlay remains. |
+| Renderer instrumentation | tested | implemented | implemented | implemented | CPU, submission, glyph/cache, atlas, PTY/parser throughput, memory estimate, and GPU timestamp status metrics exist; real timestamp samples need cross-OS backend validation. |
+| In-window performance overlay | tested | partial | partial | partial | Developer overlay projection exists through renderer overlay primitives; polished installed toggle/UX and cross-OS visual verification remain. |
 | Native mux model | tested | implemented | implemented | implemented | Workspace/tab/pane/session/layout model exists. |
 | Native tabs runtime | partial | partial | partial | partial | Desktop runtime switching and basic tab chrome exist; real GUI smoke and polished tab UI remain. |
 | Native panes/splits runtime | partial | partial | partial | partial | Desktop split rendering, per-pane local transports, focus, resize, zoom, and close are wired; cross-OS smoke, SSH panes, and startup layouts remain. |

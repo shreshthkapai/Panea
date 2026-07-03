@@ -32,7 +32,7 @@ use platform_winit::{
 };
 use render_core::{
     CellPosition, CursorVisual, OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle,
-    RenderColor, RenderCursorShape, RenderGrid, RenderRect, RenderScene,
+    RenderColor, RenderCursorShape, RenderGrid, RenderInstrumentation, RenderRect, RenderScene,
 };
 use render_wgpu::{
     AnimatedCursorImageCache, AnimatedCursorImageRequest, AnimatedCursorImageStatus,
@@ -124,12 +124,20 @@ fn run() -> Result<(), Box<dyn Error>> {
             Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
                 WindowEvent::RedrawRequested => {
                     let metrics = fonts.cell_metrics().ok();
-                    let scene = scene_from_mux(
+                    let mut scene = scene_from_mux(
                         &mux_runtime,
                         metrics,
                         &config,
                         Some(&mut cursor_animator),
                     );
+                    if let Some(metrics) = metrics {
+                        append_performance_overlay(
+                            &mut scene,
+                            &performance_overlay,
+                            performance_budget,
+                            metrics,
+                        );
+                    }
                     let idle_wakeups = scheduler.take_idle_wakeups();
                     match catch_unwind(AssertUnwindSafe(|| {
                         renderer.render_scene(&scene, &mut fonts)
@@ -137,8 +145,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                         Ok(Ok(())) => {
                             let mut instrumentation = renderer.last_instrumentation();
                             instrumentation.idle_wakeups = idle_wakeups;
+                            if performance_overlay.is_enabled() {
+                                mux_runtime.populate_performance_sample(&mut instrumentation);
+                            }
                             performance_overlay.record(instrumentation);
-                            if let Some(text) = performance_overlay.render_text(performance_budget)
+                            if matches!(config.diagnostics.log_level, LogLevel::Trace)
+                                && let Some(text) =
+                                    performance_overlay.render_text(performance_budget)
                             {
                                 eprintln!("performance {text}");
                             }
@@ -566,6 +579,7 @@ fn renderer_options(config: &AppConfig) -> RendererOptions {
             | PresentModePreference::Mailbox => PresentMode::Vsync,
         },
         damage_tracking: config.renderer.damage_tracking,
+        gpu_timestamps: config.renderer.gpu_timestamps,
     }
 }
 
@@ -1232,6 +1246,7 @@ struct MuxRuntime {
     panes: HashMap<PaneId, PaneRuntime>,
     surface_cols: u16,
     surface_rows: u16,
+    performance: RuntimePerformanceCounters,
 }
 
 impl MuxRuntime {
@@ -1258,6 +1273,7 @@ impl MuxRuntime {
             panes,
             surface_cols,
             surface_rows,
+            performance: RuntimePerformanceCounters::new(),
         };
         runtime.resize_all(width, height, metrics, config);
         runtime
@@ -1557,11 +1573,33 @@ impl MuxRuntime {
     ) -> bool {
         let mut content_changed = false;
         for pane in self.panes.values_mut() {
-            if pane.poll_output(clipboard, policy, clipboard_config) {
+            let poll = pane.poll_output(clipboard, policy, clipboard_config);
+            self.performance.record_pty_bytes(poll.pty_bytes);
+            self.performance.record_parser_bytes(poll.parser_bytes);
+            if poll.content_changed {
                 content_changed = true;
             }
         }
         content_changed
+    }
+
+    fn populate_performance_sample(&mut self, sample: &mut RenderInstrumentation) {
+        let throughput = self.performance.sample_throughput();
+        sample.pty_read_bytes_per_second = throughput.pty_read_bytes_per_second;
+        sample.parser_bytes_per_second = throughput.parser_bytes_per_second;
+        sample.scrollback_memory_bytes = self.scrollback_memory_bytes();
+        sample.memory_usage_bytes = Some(
+            sample
+                .scrollback_memory_bytes
+                .saturating_add(sample.glyphs.atlas_capacity_bytes),
+        );
+    }
+
+    fn scrollback_memory_bytes(&self) -> u64 {
+        self.panes
+            .values()
+            .map(PaneRuntime::scrollback_memory_bytes)
+            .sum()
     }
 
     fn active_selected_text(&self) -> Option<String> {
@@ -1602,6 +1640,73 @@ struct PaneRuntime {
     parse_semantic_events: bool,
     transport: Option<LocalPtyTransport>,
     mouse_protocol: MouseProtocolState,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PanePollStats {
+    content_changed: bool,
+    pty_bytes: u64,
+    parser_bytes: u64,
+}
+
+#[derive(Debug)]
+struct RuntimePerformanceCounters {
+    pty_read_bytes: u64,
+    parser_bytes: u64,
+    sample_started: Instant,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RuntimeThroughputSample {
+    pty_read_bytes_per_second: u64,
+    parser_bytes_per_second: u64,
+}
+
+impl RuntimePerformanceCounters {
+    fn new() -> Self {
+        Self {
+            pty_read_bytes: 0,
+            parser_bytes: 0,
+            sample_started: Instant::now(),
+        }
+    }
+
+    fn record_pty_bytes(&mut self, bytes: u64) {
+        self.pty_read_bytes = self.pty_read_bytes.saturating_add(bytes);
+    }
+
+    fn record_parser_bytes(&mut self, bytes: u64) {
+        self.parser_bytes = self.parser_bytes.saturating_add(bytes);
+    }
+
+    fn sample_throughput(&mut self) -> RuntimeThroughputSample {
+        let elapsed = self.sample_started.elapsed();
+        if elapsed.is_zero() {
+            return RuntimeThroughputSample::default();
+        }
+
+        let pty_read_bytes_per_second =
+            bytes_per_second(self.pty_read_bytes, elapsed).unwrap_or(u64::MAX);
+        let parser_bytes_per_second =
+            bytes_per_second(self.parser_bytes, elapsed).unwrap_or(u64::MAX);
+        self.pty_read_bytes = 0;
+        self.parser_bytes = 0;
+        self.sample_started = Instant::now();
+
+        RuntimeThroughputSample {
+            pty_read_bytes_per_second,
+            parser_bytes_per_second,
+        }
+    }
+}
+
+fn bytes_per_second(bytes: u64, elapsed: Duration) -> Option<u64> {
+    let nanos = elapsed.as_nanos();
+    if nanos == 0 {
+        return None;
+    }
+    let per_second = (u128::from(bytes) * 1_000_000_000) / nanos;
+    Some(u64::try_from(per_second).unwrap_or(u64::MAX))
 }
 
 impl PaneRuntime {
@@ -1657,12 +1762,12 @@ impl PaneRuntime {
         clipboard: &mut ClipboardBridge,
         policy: &Osc52ClipboardPolicy,
         clipboard_config: &ClipboardConfig,
-    ) -> bool {
+    ) -> PanePollStats {
         let Some(transport) = self.transport.as_mut() else {
-            return false;
+            return PanePollStats::default();
         };
 
-        let mut content_changed = false;
+        let mut stats = PanePollStats::default();
         for _ in 0..64 {
             let output = match catch_unwind(AssertUnwindSafe(|| transport.poll_output())) {
                 Ok(Ok(output)) => output,
@@ -1680,6 +1785,8 @@ impl PaneRuntime {
             }
 
             if !output.bytes.is_empty() {
+                let byte_count = u64::try_from(output.bytes.len()).unwrap_or(u64::MAX);
+                stats.pty_bytes = stats.pty_bytes.saturating_add(byte_count);
                 let cursor = self.terminal.cursor_state();
                 let semantic_position =
                     BufferPosition::new(cursor.position.row, cursor.position.col);
@@ -1694,6 +1801,7 @@ impl PaneRuntime {
                     eprintln!("terminal parser panic boundary: {}", panic_payload(panic));
                     break;
                 }
+                stats.parser_bytes = stats.parser_bytes.saturating_add(byte_count);
                 process_pending_clipboard_requests(
                     &mut self.terminal,
                     clipboard,
@@ -1702,18 +1810,31 @@ impl PaneRuntime {
                     false,
                 );
                 flush_terminal_responses(&mut self.terminal, transport);
-                content_changed = true;
+                stats.content_changed = true;
             }
             if output.closed {
-                content_changed = true;
+                stats.content_changed = true;
                 break;
             }
         }
-        content_changed
+        stats
     }
 
     fn shutdown(&mut self) {
         shutdown_transport(self.transport.as_mut());
+    }
+
+    fn scrollback_memory_bytes(&self) -> u64 {
+        self.terminal
+            .scrollback()
+            .lines
+            .iter()
+            .flat_map(|line| line.cells.iter())
+            .map(|cell| {
+                let text_bytes = u64::try_from(cell.text.len()).unwrap_or(u64::MAX);
+                text_bytes.saturating_add(16)
+            })
+            .sum()
     }
 }
 
@@ -1920,6 +2041,68 @@ fn append_pane_borders(
             });
         }
     }
+}
+
+fn append_performance_overlay(
+    scene: &mut RenderScene,
+    overlay: &PerformanceOverlay,
+    budget: PerformanceBudget,
+    metrics: CellMetrics,
+) {
+    let Some(lines) = overlay.render_lines(budget) else {
+        return;
+    };
+    let cols = scene.grid.columns.max(1);
+    let max_chars = usize::from(cols.saturating_sub(4).max(20));
+    let line_height = metrics.cell_height.ceil().max(14.0) as u32;
+    let padding = 6u32;
+    let panel_width = ((max_chars as f32 * metrics.cell_width).ceil() as u32)
+        .saturating_add(padding.saturating_mul(2));
+    let x = ((f32::from(cols) * metrics.cell_width).ceil() as i32)
+        .saturating_sub(panel_width as i32)
+        .saturating_sub(8)
+        .max(0);
+    let mut y = 8i32;
+
+    for line in lines.into_iter().take(4) {
+        let label = truncate_overlay_label(&line, max_chars);
+        scene.semantic_overlays.push(OverlayPrimitive {
+            kind: OverlayKind::PerformanceOverlay,
+            bounds: RenderRect {
+                x,
+                y,
+                width: panel_width,
+                height: line_height.saturating_add(4),
+            },
+            color: RenderColor {
+                red: 10,
+                green: 14,
+                blue: 20,
+                alpha: 210,
+            },
+            border_color: Some(RenderColor {
+                red: 90,
+                green: 104,
+                blue: 122,
+                alpha: 180,
+            }),
+            corner_radius_px: 4,
+            z_index: 1000,
+            label: Some(label),
+        });
+        y = y.saturating_add(line_height as i32 + 5);
+    }
+}
+
+fn truncate_overlay_label(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+
+    let keep = max_chars.saturating_sub(1);
+    let mut output = text.chars().take(keep).collect::<String>();
+    output.push('~');
+    output
 }
 
 fn rect_from_layout(rect: LogicalRect, metrics: CellMetrics) -> RenderRect {
@@ -2920,6 +3103,7 @@ mod tests {
             panes: HashMap::new(),
             surface_cols: 100,
             surface_rows: 30,
+            performance: RuntimePerformanceCounters::new(),
         };
 
         let layout = runtime.active_layouts(&config);
@@ -3129,6 +3313,56 @@ mod tests {
         let overlays = semantic_visual_overlays(&timeline, false, 10, 80, test_metrics(), &config);
 
         assert!(overlays.is_empty());
+    }
+
+    #[test]
+    fn disabled_performance_overlay_projects_no_scene_work() {
+        let mut scene = RenderScene::default();
+        scene.grid.columns = 80;
+        scene.grid.rows = 24;
+        let mut overlay = PerformanceOverlay::new(false, "test");
+        overlay.record(RenderInstrumentation {
+            frame_time: Duration::from_millis(16),
+            ..RenderInstrumentation::default()
+        });
+
+        append_performance_overlay(
+            &mut scene,
+            &overlay,
+            PerformanceBudget::default(),
+            test_metrics(),
+        );
+
+        assert!(scene.semantic_overlays.is_empty());
+    }
+
+    #[test]
+    fn enabled_performance_overlay_is_visual_only() {
+        let mut scene = RenderScene::default();
+        scene.grid.columns = 80;
+        scene.grid.rows = 24;
+        let mut overlay = PerformanceOverlay::new(true, "test");
+        overlay.record(RenderInstrumentation {
+            frame_time: Duration::from_millis(16),
+            cpu_prepare_time: Duration::from_millis(4),
+            draw_call_count: 3,
+            ..RenderInstrumentation::default()
+        });
+
+        append_performance_overlay(
+            &mut scene,
+            &overlay,
+            PerformanceBudget::default(),
+            test_metrics(),
+        );
+
+        assert!(
+            scene
+                .semantic_overlays
+                .iter()
+                .all(|overlay| overlay.kind == OverlayKind::PerformanceOverlay)
+        );
+        assert!(scene.grid.cells.is_empty());
     }
 
     #[test]

@@ -97,6 +97,7 @@ pub enum OverlayKind {
     CommandBlock,
     InputOutputGroup,
     Badge,
+    PerformanceOverlay,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,6 +199,8 @@ pub struct GlyphInstrumentation {
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub atlas_uploads: u64,
+    pub atlas_used_bytes: u64,
+    pub atlas_capacity_bytes: u64,
 }
 
 impl GlyphInstrumentation {
@@ -207,16 +210,32 @@ impl GlyphInstrumentation {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GpuTimingStatus {
+    #[default]
+    Disabled,
+    Unsupported,
+    Pending,
+    Available,
+    Failed,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderInstrumentation {
     pub frame_time: Duration,
     pub cpu_prepare_time: Duration,
     pub gpu_submit_time: Option<Duration>,
+    pub gpu_time: Option<Duration>,
+    pub gpu_timing_status: GpuTimingStatus,
     pub glyphs: GlyphInstrumentation,
     pub damage_region_count: usize,
     pub draw_call_count: u32,
     pub animated_region_count: usize,
     pub idle_wakeups: u64,
+    pub pty_read_bytes_per_second: u64,
+    pub parser_bytes_per_second: u64,
+    pub memory_usage_bytes: Option<u64>,
+    pub scrollback_memory_bytes: u64,
 }
 
 impl Default for RenderInstrumentation {
@@ -225,11 +244,17 @@ impl Default for RenderInstrumentation {
             frame_time: Duration::ZERO,
             cpu_prepare_time: Duration::ZERO,
             gpu_submit_time: None,
+            gpu_time: None,
+            gpu_timing_status: GpuTimingStatus::Disabled,
             glyphs: GlyphInstrumentation::default(),
             damage_region_count: 0,
             draw_call_count: 0,
             animated_region_count: 0,
             idle_wakeups: 0,
+            pty_read_bytes_per_second: 0,
+            parser_bytes_per_second: 0,
+            memory_usage_bytes: None,
+            scrollback_memory_bytes: 0,
         }
     }
 }

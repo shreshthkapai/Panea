@@ -16,7 +16,7 @@ Windows behavior: same render-core scene and render-wgpu batch planner; compile,
 Linux X11 behavior: same render-core scene and render-wgpu batch planner; X11 runtime validation remains unverified until run on Linux X11.
 Linux Wayland behavior: same render-core scene and render-wgpu batch planner; Wayland runtime validation remains unverified until run on Linux Wayland.
 Fallback behavior: CPU snapshot rasterization remains available for renderer tests and future screenshot fixtures; GPU surface errors still report through RendererError.
-Diagnostics: RenderInstrumentation reports frame time, CPU preparation time, glyph cache hits/misses, atlas uploads, damage region count, draw-call count, animated regions, and idle wakeups.
+Diagnostics: RenderInstrumentation reports frame time, CPU preparation time, GPU timing status, glyph cache hits/misses, atlas uploads/occupancy, damage region count, draw-call count, animated regions, idle wakeups, and runtime throughput fields.
 Performance cost when disabled: disabled visual features do not create animation batches or extra overlay batches.
 Performance cost when enabled: enabled overlays and cursor animation add bounded batches for their affected damage regions.
 Tests: render-wgpu unit tests for batch grouping, glyph cache/atlas reuse, cursor-only damage, atlas policy, damage tracking, frame scheduling, and CPU snapshots; panea-bench renderer commands for repeatable local measurement.
@@ -35,7 +35,7 @@ Does this run script/user code? No.
 Can it be cached? Glyph bitmaps, atlas entries, and text-to-glyph run keys are cached.
 Can it be disabled to near-zero cost? Optional visuals can produce no batches when disabled.
 Can the user budget it? Existing performance profiles and diagnostics carry the budget posture.
-Can diagnostics show its cost? Yes, through RenderInstrumentation and benchmark/overlay text.
+Can diagnostics show its cost? Yes, through RenderInstrumentation, benchmark output, and the developer performance overlay.
 ```
 
 ## Implementation Shape
@@ -85,7 +85,8 @@ repeatable measurements for regression detection and feature-cost review.
 - GPU device-loss recovery foundation is documented in
   [renderer-device-recovery.md](renderer-device-recovery.md); real platform
   event validation remains.
-- Hardware GPU timestamp queries and installed in-window overlay remain later
-  performance instrumentation work.
+- Performance instrumentation and the developer in-window overlay are
+  documented in [performance-instrumentation.md](performance-instrumentation.md);
+  real GPU timing validation and polished installed UX remain open.
 - Batch vector reuse/pooling and deeper shaping/fallback behavior remain future
   renderer/font hardening.

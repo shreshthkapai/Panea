@@ -73,6 +73,7 @@ desktop product ready, run and record:
 - Screenshot verification infrastructure exists; macOS, Linux X11, and Linux
   Wayland baselines remain to be captured on their hosts.
 - Linux X11/Wayland compositor runtime verification is Phase 7.
-- Hardware GPU timestamp queries and installed in-window overlay remain later
-  performance instrumentation work.
+- Performance instrumentation and the developer in-window overlay are
+  documented in [performance-instrumentation.md](performance-instrumentation.md);
+  real GPU timing validation and polished installed UX remain open.
 - Backend-specific device-loss simulation hooks remain future test tooling.

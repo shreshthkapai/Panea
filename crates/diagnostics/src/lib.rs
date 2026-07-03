@@ -9,7 +9,9 @@ use config_core::{
     SshKnownHostsPolicy, WindowModeConfig,
 };
 use platform_core::{DesktopPlatform, DpiBehavior};
-use render_core::{FeatureCostSample, OptionalFeatureCostMode, RenderInstrumentation};
+use render_core::{
+    FeatureCostSample, GpuTimingStatus, OptionalFeatureCostMode, RenderInstrumentation,
+};
 use semantics::{CommandBlockConfidence, IntegrationMode, SemanticDiagnostics, SemanticEventKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1870,7 +1872,7 @@ impl PerformanceOverlay {
     }
 
     #[must_use]
-    pub fn render_text(&self, budget: PerformanceBudget) -> Option<String> {
+    pub fn render_lines(&self, budget: PerformanceBudget) -> Option<Vec<String>> {
         if !self.enabled {
             return None;
         }
@@ -1882,27 +1884,94 @@ impl PerformanceOverlay {
             1.0 / latest.frame_time.as_secs_f64()
         };
         let gpu = latest
+            .gpu_time
+            .map_or_else(|| "n/a".to_owned(), format_duration_ms);
+        let submit = latest
             .gpu_submit_time
-            .map_or_else(|| "n/a".to_owned(), |duration| format!("{duration:?}"));
+            .map_or_else(|| "n/a".to_owned(), format_duration_ms);
         let warning = evaluate_performance_gate(latest, budget)
             .warnings
             .first()
             .map_or("ok".to_owned(), |warning| warning.message.clone());
 
-        Some(format!(
-            "fps={fps:.1} frame={:?} cpu={:?} gpu={} backend={} glyph_hits={} glyph_misses={} atlas_uploads={} damage_regions={} draw_calls={} animations={} idle_wakeups={} status={warning}",
-            latest.frame_time,
-            latest.cpu_prepare_time,
-            gpu,
-            self.backend,
-            latest.glyphs.cache_hits,
-            latest.glyphs.cache_misses,
-            latest.glyphs.atlas_uploads,
-            latest.damage_region_count,
-            latest.draw_call_count,
-            latest.animated_region_count,
-            latest.idle_wakeups,
-        ))
+        Some(vec![
+            format!(
+                "fps {fps:.1} frame {} cpu {} gpu {gpu} submit {submit}",
+                format_duration_ms(latest.frame_time),
+                format_duration_ms(latest.cpu_prepare_time),
+            ),
+            format!(
+                "backend {} timestamps {} draws {} damage {} anim {} idle {}",
+                self.backend,
+                gpu_timing_label(latest.gpu_timing_status),
+                latest.draw_call_count,
+                latest.damage_region_count,
+                latest.animated_region_count,
+                latest.idle_wakeups,
+            ),
+            format!(
+                "glyph hit {} miss {} uploads {} atlas {}",
+                latest.glyphs.cache_hits,
+                latest.glyphs.cache_misses,
+                latest.glyphs.atlas_uploads,
+                atlas_usage_label(
+                    latest.glyphs.atlas_used_bytes,
+                    latest.glyphs.atlas_capacity_bytes
+                ),
+            ),
+            format!(
+                "pty {}/s parser {}/s mem {} scrollback {} status {warning}",
+                format_bytes(latest.pty_read_bytes_per_second),
+                format_bytes(latest.parser_bytes_per_second),
+                latest
+                    .memory_usage_bytes
+                    .map_or_else(|| "n/a".to_owned(), format_bytes),
+                format_bytes(latest.scrollback_memory_bytes),
+            ),
+        ])
+    }
+
+    #[must_use]
+    pub fn render_text(&self, budget: PerformanceBudget) -> Option<String> {
+        self.render_lines(budget).map(|lines| lines.join(" | "))
+    }
+}
+
+#[must_use]
+fn format_duration_ms(duration: Duration) -> String {
+    format!("{:.2}ms", duration.as_secs_f64() * 1000.0)
+}
+
+#[must_use]
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 {
+        format!("{:.1}MiB", bytes as f64 / MIB)
+    } else if bytes >= 1024 {
+        format!("{:.1}KiB", bytes as f64 / KIB)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
+#[must_use]
+fn atlas_usage_label(used: u64, capacity: u64) -> String {
+    if capacity == 0 {
+        return "n/a".to_owned();
+    }
+    let percent = (used as f64 / capacity as f64) * 100.0;
+    format!("{used}/{capacity}B {percent:.1}%")
+}
+
+#[must_use]
+fn gpu_timing_label(status: GpuTimingStatus) -> &'static str {
+    match status {
+        GpuTimingStatus::Disabled => "disabled",
+        GpuTimingStatus::Unsupported => "unsupported",
+        GpuTimingStatus::Pending => "pending",
+        GpuTimingStatus::Available => "available",
+        GpuTimingStatus::Failed => "failed",
     }
 }
 
@@ -1942,8 +2011,9 @@ mod tests {
         let text = overlay
             .render_text(PerformanceBudget::default())
             .expect("overlay text");
-        assert!(text.contains("backend=test-backend"));
-        assert!(text.contains("draw_calls=3"));
+        assert!(text.contains("backend test-backend"));
+        assert!(text.contains("draws 3"));
+        assert!(text.contains("timestamps disabled"));
     }
 
     #[test]

@@ -162,6 +162,20 @@ Baseline visual sections:
 - `performance`: animation FPS, cursor asset size, active animation, and
   animated-region budgets
 
+Renderer diagnostics can optionally request GPU timestamp queries:
+
+```toml
+[renderer]
+gpu_timestamps = false
+
+[diagnostics]
+performance_overlay = false
+```
+
+`renderer.gpu_timestamps` is portable and defaults off. If a backend does not
+support timestamp queries, Panea reports the timing status as unsupported and
+continues rendering.
+
 ```toml
 [cursor]
 shape = "block"

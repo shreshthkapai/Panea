@@ -57,6 +57,7 @@ stated scope:
 | Windows local transport | tested | Portable PTY/ConPTY lifecycle is bounded; Windows smoke tests were made non-hanging and observed output. |
 | Diagnostics foundations | tested | `cargo xtask doctor ...`, bug-report snapshots, release/security/hardening/package readiness reports, and iOS readiness reports exist through shared diagnostics models. |
 | Performance harness foundation | tested | `cargo xtask bench ...` and `tools/bench` fixtures exist for repeatable local measurements. |
+| Performance instrumentation overlay | tested | Shared instrumentation now reports frame/CPU/GPU timing status, glyph cache and atlas occupancy, damage/draw counts, active animations, idle wakeups, PTY/parser throughput, and memory estimates; the desktop app can draw a developer overlay through renderer overlay primitives. |
 | Mux model | tested | Workspace, window, tab, pane, session, split tree, restore snapshot, and mux action models exist with unit coverage. |
 | Desktop mux runtime foundation | tested | The desktop app owns one terminal/semantic/transport runtime per native pane, routes focus/input/paste/mouse to the active pane, composes pane viewports into one render scene, draws basic tab chrome/borders, and resizes active pane PTYs from split layout. |
 | Semantic model | tested | Semantic regions, command blocks, OSC semantic parser support, navigation, copy actions, shell metadata, and diagnostics models exist. |
@@ -77,7 +78,7 @@ These areas are real foundations but must not be called complete:
 | --- | --- | --- |
 | Desktop app runtime | partial | Full app lifecycle, polished UI chrome, complete mux integration, installed doctor command, packaging, and cross-OS manual validation. |
 | Platform windowing | partial | Real macOS lifecycle, real Linux X11/Wayland compositor behavior, decoration negotiation, IME validation, native notifications, and platform-specific fallback verification. |
-| GPU renderer | tested | WGPU surface/device setup, glyph atlas/cache policy, damage-aware batch preparation, indexed background/glyph/decoration/selection/cursor batches, row-scoped atlas uploads, renderer benchmarks, recovery status/event contracts, WGPU device-lost callback detection, disposable WGPU backend recreation, GPU atlas invalidation after recovery, and screenshot verification infrastructure exist; hardware timestamp queries, real sleep/wake/monitor-loss validation, macOS/Linux screenshot baselines, and cross-OS render validation remain. |
+| GPU renderer | tested | WGPU surface/device setup, glyph atlas/cache policy, damage-aware batch preparation, indexed background/glyph/decoration/selection/cursor batches, row-scoped atlas uploads, renderer benchmarks, recovery status/event contracts, WGPU device-lost callback detection, disposable WGPU backend recreation, GPU atlas invalidation after recovery, screenshot verification infrastructure, and GPU timestamp status plumbing exist; real GPU timing samples, sleep/wake/monitor-loss validation, macOS/Linux screenshot baselines, and cross-OS render validation remain. |
 | Font system | partial | Deeper shaping, full fallback validation across installed font sets, emoji fallback, and grapheme-aware metrics. |
 | Unicode support | tested | Core/parser Unicode hardening is covered by automated tests; renderer font fallback, shaping, screenshot parity, and real app conformance remain later phases. |
 | Clipboard and selection | partial | Raw selection extraction, keyboard copy/paste, paste protection, bracketed paste, middle-click paste guard, and OSC 52 policy exist; mouse-driven selection UX, Linux primary selection provider, remote confirmation UI, and full copy/paste app compatibility coverage remain. |
@@ -86,7 +87,7 @@ These areas are real foundations but must not be called complete:
 | Visual overlays | partial | Semantic command-block overlay projection, badge glyph batching, cursor animation quads, and image cursor metadata caching exist; collapse/expand behavior, polished interactive UI, full image cursor frame upload/draw, real shell-driven verification, and cross-OS visual verification remain. |
 | Native mux runtime | partial | Local tab/split runtime wiring exists, but startup workspaces, SSH panes, polished tab chrome, pane drag/move UI, and cross-OS GUI/runtime smoke tests remain. |
 | SSH UX and security | partial | Provider contracts and real-server smoke harness exist, but desktop host-key approval UI, changed-host-key resolution UI, password/passphrase prompt UI, native OS keychain backend wiring, reconnect UI, proxy jump, and collected real-server reports remain. |
-| Performance reporting | partial | Hardware GPU timings, installed in-window overlay, CI regression gates, and reproducible cross-machine benchmark reporting. |
+| Performance reporting | partial | GPU timestamp query wiring and a developer in-window overlay exist, but real timestamp samples across hardware/backends, polished installed overlay UX, CI regression gates, and reproducible cross-machine benchmark reporting remain. |
 | Hardening/release readiness | partial | GPU recovery and crash-safe config reload foundations exist, but real device-loss platform validation, packaging artifacts, validation suite automation, and platform lab coverage remain. |
 | iOS companion | partial | Native UIKit/SwiftUI shell, iOS GPU surface, Keychain provider, host-key approval UI, key import UX, simulator/device validation, and packaging. |
 
@@ -143,7 +144,7 @@ The following major accepted features have no complete product behavior yet:
 | --- | --- | --- |
 | core correctness | partial | Strong baseline, Unicode cell hardening, fuzz harness, and app compatibility runner exist, but interactive app compatibility and conformance hardening remain. |
 | platform parity | partial | Capabilities, desktop window foundations, and Linux compositor verification matrix exist; real macOS/Linux X11/Linux Wayland verification remains open. |
-| render performance | partial | WGPU foundation, glyph cache, damage, scheduling, batched glyph/quad rendering, atlas uploads, benchmarks, renderer recovery foundation, and screenshot verification infrastructure exist; macOS/Linux screenshot baselines, real device-loss validation, and cross-OS runtime validation remain. |
+| render performance | partial | WGPU foundation, glyph cache, damage, scheduling, batched glyph/quad rendering, atlas uploads, benchmarks, renderer recovery foundation, screenshot verification infrastructure, GPU timestamp status plumbing, and a developer performance overlay exist; macOS/Linux screenshot baselines, real device-loss validation, real GPU timing validation, and cross-OS runtime validation remain. |
 | config portability | partial | Static config model, TOML loading, validation, platform overrides, schema export, and runtime live-reload foundation exist; advanced config and cross-OS reload validation remain. |
 | semantic meaning | partial | Semantic events, timeline, runtime activation planning, desktop local hook injection, and Windows PowerShell semantic smoke exist; remote flows and non-Windows/bash/zsh/fish real verification remain. |
 | visual overlay | partial | Prompt and command block overlay projection, input/output grouping, metadata badges, alternate-screen suppression, renderer overlay glyph batching, and cursor animation quads exist; collapse/expand UI, full cursor image drawing, and cross-OS visual smoke remain. |
@@ -154,5 +155,5 @@ The following major accepted features have no complete product behavior yet:
 
 ## Immediate Next Slice
 
-After the SSH real-server smoke harness, the next dependency-ordered phase is
-performance instrumentation and an in-window overlay.
+After the performance instrumentation and in-window overlay foundation, the
+next dependency-ordered phase is the installed terminal doctor binary.

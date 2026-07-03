@@ -17,9 +17,10 @@ use std::{
 use font_system::{CellMetrics, FontError, FontSystem, GlyphBitmap, GlyphCache, GlyphCacheKey};
 use render_core::{
     AnimationHandle, AnimationKind, CellPosition, CursorVisual, DamageRegion, FrameRequestReason,
-    OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle, RenderColor, RenderCursorShape,
-    RenderDecoration, RenderGrid, RenderInstrumentation, RenderRecoveryEvent, RenderRecoveryReason,
-    RenderRecoveryStatus, RenderRect, RenderScene, RenderSurfaceStatus, SelectionVisual,
+    GpuTimingStatus, OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle, RenderColor,
+    RenderCursorShape, RenderDecoration, RenderGrid, RenderInstrumentation, RenderRecoveryEvent,
+    RenderRecoveryReason, RenderRecoveryStatus, RenderRect, RenderScene, RenderSurfaceStatus,
+    SelectionVisual,
 };
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -34,6 +35,7 @@ pub enum PresentMode {
 pub struct RendererOptions {
     pub present_mode: PresentMode,
     pub damage_tracking: bool,
+    pub gpu_timestamps: bool,
 }
 
 impl Default for RendererOptions {
@@ -41,6 +43,7 @@ impl Default for RendererOptions {
         Self {
             present_mode: PresentMode::Vsync,
             damage_tracking: true,
+            gpu_timestamps: false,
         }
     }
 }
@@ -175,6 +178,19 @@ impl GlyphAtlas {
     #[must_use]
     pub const fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    #[must_use]
+    pub fn used_bytes(&self) -> u64 {
+        self.entries
+            .values()
+            .map(|entry| u64::from(entry.width) * u64::from(entry.height))
+            .sum()
+    }
+
+    #[must_use]
+    pub fn capacity_bytes(&self) -> u64 {
+        u64::from(self.width) * u64::from(self.height)
     }
 
     fn clear(&mut self) {
@@ -920,6 +936,8 @@ impl RenderBatchPlanner {
             animated_region_count: scene.animations.len(),
             ..RenderInstrumentation::default()
         };
+        instrumentation.glyphs.atlas_used_bytes = self.atlas.used_bytes();
+        instrumentation.glyphs.atlas_capacity_bytes = self.atlas.capacity_bytes();
 
         for cell in &scene.grid.cells {
             let rect = cell_region(cell.position, metrics);
@@ -1004,6 +1022,8 @@ impl RenderBatchPlanner {
             !selections.is_empty(),
             !cursor.is_empty(),
         ]);
+        instrumentation.glyphs.atlas_used_bytes = self.atlas.used_bytes();
+        instrumentation.glyphs.atlas_capacity_bytes = self.atlas.capacity_bytes();
         instrumentation.cpu_prepare_time = started.elapsed();
         instrumentation.frame_time = instrumentation.cpu_prepare_time;
 
@@ -1225,6 +1245,7 @@ fn overlay_label_rect(overlay: &OverlayPrimitive, metrics: CellMetrics) -> Rende
 fn overlay_label_color(kind: OverlayKind) -> RenderColor {
     match kind {
         OverlayKind::Badge => RenderColor::rgb(245, 248, 252),
+        OverlayKind::PerformanceOverlay => RenderColor::rgb(225, 232, 240),
         OverlayKind::PromptDecoration
         | OverlayKind::CommandBlock
         | OverlayKind::InputOutputGroup => RenderColor::rgb(214, 222, 232),
@@ -2929,12 +2950,178 @@ struct GpuBackend {
     glyph_atlas_size: Option<(u32, u32)>,
     glyph_bind_group: Option<wgpu::BindGroup>,
     device_loss_signal: Arc<Mutex<Option<DeviceLossSignal>>>,
+    gpu_timing: GpuTiming,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DeviceLossSignal {
     reason: RenderRecoveryReason,
     message: String,
+}
+
+struct GpuTiming {
+    query_set: Option<wgpu::QuerySet>,
+    resolve_buffer: Option<wgpu::Buffer>,
+    readback_buffer: Option<wgpu::Buffer>,
+    pending: Option<Receiver<Result<(), String>>>,
+    timestamp_period_ns: f32,
+    last_duration: Option<Duration>,
+    status: GpuTimingStatus,
+}
+
+impl GpuTiming {
+    const QUERY_COUNT: u32 = 2;
+    const BUFFER_SIZE: u64 = std::mem::size_of::<u64>() as u64 * Self::QUERY_COUNT as u64;
+
+    fn disabled() -> Self {
+        Self {
+            query_set: None,
+            resolve_buffer: None,
+            readback_buffer: None,
+            pending: None,
+            timestamp_period_ns: 0.0,
+            last_duration: None,
+            status: GpuTimingStatus::Disabled,
+        }
+    }
+
+    fn unsupported() -> Self {
+        Self {
+            status: GpuTimingStatus::Unsupported,
+            ..Self::disabled()
+        }
+    }
+
+    fn enabled(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("panea-gpu-timestamp-query"),
+            ty: wgpu::QueryType::Timestamp,
+            count: Self::QUERY_COUNT,
+        });
+        let resolve_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("panea-gpu-timestamp-resolve"),
+            size: Self::BUFFER_SIZE,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("panea-gpu-timestamp-readback"),
+            size: Self::BUFFER_SIZE,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            query_set: Some(query_set),
+            resolve_buffer: Some(resolve_buffer),
+            readback_buffer: Some(readback_buffer),
+            pending: None,
+            timestamp_period_ns: queue.get_timestamp_period(),
+            last_duration: None,
+            status: GpuTimingStatus::Pending,
+        }
+    }
+
+    fn timing_status(&self) -> GpuTimingStatus {
+        self.status
+    }
+
+    fn last_duration(&self) -> Option<Duration> {
+        self.last_duration
+    }
+
+    fn can_write_this_frame(&self) -> bool {
+        self.query_set.is_some() && self.pending.is_none()
+    }
+
+    fn render_pass_writes(&self) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        self.query_set
+            .as_ref()
+            .filter(|_| self.pending.is_none())
+            .map(|query_set| wgpu::RenderPassTimestampWrites {
+                query_set,
+                beginning_of_pass_write_index: Some(0),
+                end_of_pass_write_index: Some(1),
+            })
+    }
+
+    fn resolve_after_pass(&self, encoder: &mut wgpu::CommandEncoder) {
+        let (Some(query_set), Some(resolve_buffer), Some(readback_buffer)) = (
+            self.query_set.as_ref(),
+            self.resolve_buffer.as_ref(),
+            self.readback_buffer.as_ref(),
+        ) else {
+            return;
+        };
+
+        encoder.resolve_query_set(query_set, 0..Self::QUERY_COUNT, resolve_buffer, 0);
+        encoder.copy_buffer_to_buffer(resolve_buffer, 0, readback_buffer, 0, Self::BUFFER_SIZE);
+    }
+
+    fn start_readback(&mut self) {
+        if self.query_set.is_none() || self.pending.is_some() {
+            return;
+        }
+        let Some(readback_buffer) = self.readback_buffer.as_ref() else {
+            return;
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        readback_buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result.map_err(|error| error.to_string()));
+            });
+        self.pending = Some(receiver);
+        self.status = GpuTimingStatus::Pending;
+    }
+
+    fn poll(&mut self, device: &wgpu::Device) {
+        let Some(receiver) = self.pending.as_ref() else {
+            return;
+        };
+        device.poll(wgpu::Maintain::Poll);
+
+        let Ok(result) = receiver.try_recv() else {
+            self.status = GpuTimingStatus::Pending;
+            return;
+        };
+        self.pending = None;
+
+        let Some(readback_buffer) = self.readback_buffer.as_ref() else {
+            self.status = GpuTimingStatus::Failed;
+            self.last_duration = None;
+            return;
+        };
+
+        match result {
+            Ok(()) => {
+                let slice = readback_buffer.slice(..);
+                let mapped = slice.get_mapped_range();
+                if mapped.len() < Self::BUFFER_SIZE as usize {
+                    self.status = GpuTimingStatus::Failed;
+                    self.last_duration = None;
+                } else {
+                    let start =
+                        u64::from_le_bytes(mapped[0..8].try_into().expect("timestamp start width"));
+                    let end =
+                        u64::from_le_bytes(mapped[8..16].try_into().expect("timestamp end width"));
+                    let delta_ticks = end.saturating_sub(start);
+                    let nanos =
+                        (delta_ticks as f64 * f64::from(self.timestamp_period_ns)).max(0.0) as u64;
+                    self.last_duration = Some(Duration::from_nanos(nanos));
+                    self.status = GpuTimingStatus::Available;
+                }
+                drop(mapped);
+                readback_buffer.unmap();
+            }
+            Err(_) => {
+                self.status = GpuTimingStatus::Failed;
+                self.last_duration = None;
+                readback_buffer.unmap();
+            }
+        }
+    }
 }
 
 impl GpuTerminalRenderer {
@@ -2979,7 +3166,10 @@ impl GpuTerminalRenderer {
         }
 
         let frame_started = Instant::now();
+        backend.poll_gpu_timing();
         let mut batches = self.rasterizer.prepare_batches(scene, fonts)?;
+        batches.instrumentation.gpu_time = backend.gpu_timing.last_duration();
+        batches.instrumentation.gpu_timing_status = backend.gpu_timing.timing_status();
         let gpu_started = Instant::now();
         backend.upload_atlas(&self.rasterizer, &batches);
         let result = backend.present_batches(&batches);
@@ -3129,11 +3319,18 @@ impl GpuBackend {
             })
             .await
             .ok_or(RendererError::AdapterUnavailable)?;
+        let adapter_features = adapter.features();
+        let gpu_timestamps_supported = adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY);
+        let required_features = if options.gpu_timestamps && gpu_timestamps_supported {
+            wgpu::Features::TIMESTAMP_QUERY
+        } else {
+            wgpu::Features::empty()
+        };
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("panea-render-device"),
-                    required_features: wgpu::Features::empty(),
+                    required_features,
                     required_limits: wgpu::Limits::default(),
                 },
                 None,
@@ -3238,6 +3435,15 @@ impl GpuBackend {
             min_filter: wgpu::FilterMode::Linear,
             ..wgpu::SamplerDescriptor::default()
         });
+        let gpu_timing = if options.gpu_timestamps {
+            if gpu_timestamps_supported {
+                GpuTiming::enabled(&device, &queue)
+            } else {
+                GpuTiming::unsupported()
+            }
+        } else {
+            GpuTiming::disabled()
+        };
 
         Ok(Self {
             surface,
@@ -3252,6 +3458,7 @@ impl GpuBackend {
             glyph_atlas_size: None,
             glyph_bind_group: None,
             device_loss_signal,
+            gpu_timing,
         })
     }
 
@@ -3270,6 +3477,10 @@ impl GpuBackend {
             .lock()
             .ok()
             .and_then(|mut signal| signal.take())
+    }
+
+    fn poll_gpu_timing(&mut self) {
+        self.gpu_timing.poll(&self.device);
     }
 
     fn upload_atlas(&mut self, rasterizer: &TerminalRasterizer, batches: &PreparedRenderBatches) {
@@ -3397,6 +3608,8 @@ impl GpuBackend {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("panea-batch-encoder"),
             });
+        let timestamp_written = self.gpu_timing.can_write_this_frame();
+        let timestamp_writes = self.gpu_timing.render_pass_writes();
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3411,7 +3624,7 @@ impl GpuBackend {
                 })],
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
-                timestamp_writes: None,
+                timestamp_writes,
             });
 
             pass.set_pipeline(&self.quad_pipeline);
@@ -3435,7 +3648,13 @@ impl GpuBackend {
             draw_buffers(&mut pass, cursor.as_ref());
         }
 
+        if timestamp_written {
+            self.gpu_timing.resolve_after_pass(&mut encoder);
+        }
         self.queue.submit(Some(encoder.finish()));
+        if timestamp_written {
+            self.gpu_timing.start_readback();
+        }
         output.present();
         Ok(PresentOutcome::Submitted)
     }
