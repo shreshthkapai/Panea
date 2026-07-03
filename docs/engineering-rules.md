@@ -41,7 +41,8 @@ The remaining high-level work is:
   harness.
 - macOS, Linux X11, and Linux Wayland screenshot baseline capture plus
   accumulated runtime evidence for the batched GPU glyph renderer.
-- Real Linux X11/Wayland compositor verification.
+- Real Linux X11/Wayland compositor host verification using the committed
+  target matrix.
 - Full clipboard/selection/OSC clipboard policy.
 - Automated app compatibility tests: shells, editors, TUIs,
   tmux/screen/zellij, SSH.

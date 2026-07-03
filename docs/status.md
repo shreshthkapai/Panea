@@ -51,6 +51,7 @@ stated scope:
 | Parser baseline | tested | ANSI/VT parser adapter handles printable text, common controls, SGR colors/styles, alternate screen, clears, insert/delete groundwork, tab stops, title OSC, mouse/focus/bracketed-paste mode state, and pending responses. |
 | Fuzzing harness | tested | `fuzz/` contains cargo-fuzz targets for parser, grid, resize, Unicode, selection, OSC/DCS, and shell markers; property smoke tests run through `cargo xtask fuzz-smoke` and scheduled CI. |
 | Screenshot verification runner | tested | Deterministic renderer fixtures, PPM capture, tolerance-based diffing, Windows baselines, and `cargo xtask screenshot verify --platform windows` exist. |
+| Linux compositor verification matrix | tested | Target matrix, fallback checklist, runtime environment snapshot, and `cargo xtask linux-compositor` exist; real Linux host verification remains open. |
 | Config model and TOML | tested | `AppConfig` defaults, TOML parsing, unknown/deprecated diagnostics, validation, platform overrides, default generation, schema export, and reload impact classification exist. |
 | Windows local transport | tested | Portable PTY/ConPTY lifecycle is bounded; Windows smoke tests were made non-hanging and observed output. |
 | Diagnostics foundations | tested | `cargo xtask doctor ...`, bug-report snapshots, release/security/hardening/package readiness reports, and iOS readiness reports exist through shared diagnostics models. |
@@ -101,8 +102,8 @@ The following major accepted features have no complete product behavior yet:
 
 - Cross-OS verification runners for Windows, macOS, Linux X11, and Linux
   Wayland.
-- Real Linux compositor verification for GNOME/Mutter, KDE/KWin, wlroots/Sway,
-  Hyprland class, tiling window managers, and X11 window managers.
+- Real Linux compositor verification runs for GNOME/Mutter, KDE/KWin,
+  wlroots/Sway, Hyprland class, tiling window managers, and X11 window managers.
 - Long-running coverage-guided fuzz history and crash-regression backlog from
   real-world fuzz findings.
 - Unicode/font/render conformance beyond the core parser model, including
@@ -129,7 +130,7 @@ The following major accepted features have no complete product behavior yet:
 | Layer | Status | Notes |
 | --- | --- | --- |
 | core correctness | partial | Strong baseline, Unicode cell hardening, and fuzz harness exist, but app compatibility and conformance hardening remain. |
-| platform parity | partial | Capabilities and desktop window foundations exist; real macOS/Linux X11/Linux Wayland verification remains open. |
+| platform parity | partial | Capabilities, desktop window foundations, and Linux compositor verification matrix exist; real macOS/Linux X11/Linux Wayland verification remains open. |
 | render performance | partial | WGPU foundation, glyph cache, damage, scheduling, batched glyph/quad rendering, atlas uploads, benchmarks, renderer recovery foundation, and screenshot verification infrastructure exist; macOS/Linux screenshot baselines, real device-loss validation, and cross-OS runtime validation remain. |
 | config portability | partial | Static config model is useful; runtime reload and advanced config are deferred. |
 | semantic meaning | partial | Semantic events and timeline exist; runtime shell activation and real-shell verification remain. |
@@ -141,5 +142,5 @@ The following major accepted features have no complete product behavior yet:
 
 ## Immediate Next Slice
 
-After cross-OS screenshot verification infrastructure, the next
-dependency-ordered phase is Linux X11/Wayland compositor verification.
+After Linux X11/Wayland compositor verification infrastructure, the next
+dependency-ordered phase is clipboard, selection, and OSC clipboard policy.

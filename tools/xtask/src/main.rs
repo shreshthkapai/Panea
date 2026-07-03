@@ -9,7 +9,7 @@ fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("help") | None => {
             eprintln!(
-                "usage: cargo xtask <fmt|clippy|test|build|check|layer-check|ci|config-default|config-schema|bench|screenshot|fuzz-smoke|fuzz|doctor|bug-report|hardening|security-review|package-plan|release-check|ios-readiness>"
+                "usage: cargo xtask <fmt|clippy|test|build|check|layer-check|ci|config-default|config-schema|bench|screenshot|fuzz-smoke|fuzz|doctor|bug-report|hardening|security-review|linux-compositor|package-plan|release-check|ios-readiness>"
             );
             ExitCode::SUCCESS
         }
@@ -29,6 +29,7 @@ fn main() -> ExitCode {
         Some("bug-report") => run_bug_report(),
         Some("hardening") => run_hardening(),
         Some("security-review") => run_security_review(),
+        Some("linux-compositor") => run_linux_compositor(),
         Some("package-plan") => run_package_plan(),
         Some("release-check") => run_release_check(),
         Some("ios-readiness") => run_ios_readiness(),
@@ -38,6 +39,14 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn run_linux_compositor() -> ExitCode {
+    println!(
+        "{}",
+        diagnostics::linux_compositor_verification_report().render_text()
+    );
+    ExitCode::SUCCESS
 }
 
 fn run_ios_readiness() -> ExitCode {

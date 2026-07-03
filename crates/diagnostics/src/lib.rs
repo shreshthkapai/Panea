@@ -196,6 +196,353 @@ pub fn feature_parity_matrix() -> Vec<PlatformFeatureStatus> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxDisplayServer {
+    X11,
+    Wayland,
+}
+
+impl fmt::Display for LinuxDisplayServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::X11 => "X11",
+            Self::Wayland => "Wayland",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxCompositorTarget {
+    pub key: &'static str,
+    pub display_server: LinuxDisplayServer,
+    pub desktop_or_compositor: &'static str,
+    pub required: bool,
+    pub notes: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxWindowVerificationFeature {
+    pub feature: &'static str,
+    pub fallback_policy: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxCompositorRuntimeSnapshot {
+    pub os: String,
+    pub detected_backend: Option<DesktopPlatform>,
+    pub xdg_session_type: Option<String>,
+    pub xdg_current_desktop: Option<String>,
+    pub desktop_session: Option<String>,
+    pub wayland_display: Option<String>,
+    pub display: Option<String>,
+    pub winit_unix_backend: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+impl LinuxCompositorRuntimeSnapshot {
+    #[must_use]
+    pub fn detect() -> Self {
+        Self::from_env(
+            std::env::consts::OS,
+            std::env::var("XDG_SESSION_TYPE").ok(),
+            std::env::var("XDG_CURRENT_DESKTOP").ok(),
+            std::env::var("DESKTOP_SESSION").ok(),
+            std::env::var("WAYLAND_DISPLAY").ok(),
+            std::env::var("DISPLAY").ok(),
+            std::env::var("WINIT_UNIX_BACKEND").ok(),
+        )
+    }
+
+    #[must_use]
+    pub fn from_env(
+        os: impl Into<String>,
+        xdg_session_type: Option<String>,
+        xdg_current_desktop: Option<String>,
+        desktop_session: Option<String>,
+        wayland_display: Option<String>,
+        display: Option<String>,
+        winit_unix_backend: Option<String>,
+    ) -> Self {
+        let os = os.into();
+        let detected_backend = if os != "linux" {
+            None
+        } else if xdg_session_type
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("wayland"))
+            || wayland_display.is_some()
+        {
+            Some(DesktopPlatform::LinuxWayland)
+        } else if xdg_session_type
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("x11"))
+            || display.is_some()
+        {
+            Some(DesktopPlatform::LinuxX11)
+        } else {
+            Some(DesktopPlatform::Unknown)
+        };
+
+        let mut warnings = Vec::new();
+        if os != "linux" {
+            warnings.push(
+                "current host is not Linux; compositor behavior cannot be verified here".to_owned(),
+            );
+        } else if detected_backend == Some(DesktopPlatform::Unknown) {
+            warnings.push(
+                "Linux display backend could not be determined from XDG_SESSION_TYPE, WAYLAND_DISPLAY, or DISPLAY"
+                    .to_owned(),
+            );
+        }
+
+        if os == "linux" && xdg_current_desktop.is_none() && desktop_session.is_none() {
+            warnings.push(
+                "desktop/compositor name is unknown; report XDG_CURRENT_DESKTOP or DESKTOP_SESSION in manual verification"
+                    .to_owned(),
+            );
+        }
+
+        Self {
+            os,
+            detected_backend,
+            xdg_session_type,
+            xdg_current_desktop,
+            desktop_session,
+            wayland_display,
+            display,
+            winit_unix_backend,
+            warnings,
+        }
+    }
+
+    #[must_use]
+    pub fn compositor_label(&self) -> String {
+        self.xdg_current_desktop
+            .as_deref()
+            .or(self.desktop_session.as_deref())
+            .unwrap_or("unknown")
+            .to_owned()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxCompositorVerificationReport {
+    pub runtime: LinuxCompositorRuntimeSnapshot,
+    pub targets: Vec<LinuxCompositorTarget>,
+    pub features: Vec<LinuxWindowVerificationFeature>,
+}
+
+impl LinuxCompositorVerificationReport {
+    #[must_use]
+    pub fn render_text(&self) -> String {
+        let mut lines = vec!["Panea Linux compositor verification".to_owned()];
+        lines.extend([
+            format!("os={}", self.runtime.os),
+            format!(
+                "detected_backend={}",
+                self.runtime
+                    .detected_backend
+                    .map_or_else(|| "n/a".to_owned(), |backend| format!("{backend:?}"))
+            ),
+            format!(
+                "xdg_session_type={}",
+                self.runtime
+                    .xdg_session_type
+                    .as_deref()
+                    .unwrap_or("unknown")
+            ),
+            format!("compositor={}", self.runtime.compositor_label()),
+            format!(
+                "wayland_display={}",
+                self.runtime.wayland_display.as_deref().unwrap_or("unset")
+            ),
+            format!(
+                "display={}",
+                self.runtime.display.as_deref().unwrap_or("unset")
+            ),
+            format!(
+                "winit_unix_backend={}",
+                self.runtime
+                    .winit_unix_backend
+                    .as_deref()
+                    .unwrap_or("unset")
+            ),
+        ]);
+
+        if !self.runtime.warnings.is_empty() {
+            lines.push("warnings:".to_owned());
+            lines.extend(
+                self.runtime
+                    .warnings
+                    .iter()
+                    .map(|warning| format!("- {warning}")),
+            );
+        }
+
+        lines.push("required targets:".to_owned());
+        lines.extend(self.targets.iter().map(|target| {
+            format!(
+                "- [{}] {} {}: {}",
+                if target.required {
+                    "required"
+                } else {
+                    "optional"
+                },
+                target.display_server,
+                target.desktop_or_compositor,
+                target.notes
+            )
+        }));
+
+        lines.push("features to verify:".to_owned());
+        lines.extend(
+            self.features
+                .iter()
+                .map(|feature| format!("- {}: {}", feature.feature, feature.fallback_policy)),
+        );
+
+        lines.join("\n")
+    }
+}
+
+#[must_use]
+pub fn linux_compositor_targets() -> Vec<LinuxCompositorTarget> {
+    vec![
+        LinuxCompositorTarget {
+            key: "gnome-xorg",
+            display_server: LinuxDisplayServer::X11,
+            desktop_or_compositor: "GNOME Xorg",
+            required: true,
+            notes: "validate decorated window, fullscreen, DPI, clipboard, keyboard, mouse, and IME/dead-key behavior",
+        },
+        LinuxCompositorTarget {
+            key: "kde-x11",
+            display_server: LinuxDisplayServer::X11,
+            desktop_or_compositor: "KDE X11",
+            required: true,
+            notes: "validate KWin X11 decorations, fullscreen, scaling, and input behavior",
+        },
+        LinuxCompositorTarget {
+            key: "xfce",
+            display_server: LinuxDisplayServer::X11,
+            desktop_or_compositor: "XFCE",
+            required: true,
+            notes: "validate lightweight desktop behavior and clipboard availability",
+        },
+        LinuxCompositorTarget {
+            key: "i3",
+            display_server: LinuxDisplayServer::X11,
+            desktop_or_compositor: "i3",
+            required: true,
+            notes: "validate tiling WM resize/fullscreen behavior and decoration fallback",
+        },
+        LinuxCompositorTarget {
+            key: "openbox",
+            display_server: LinuxDisplayServer::X11,
+            desktop_or_compositor: "Openbox or similar",
+            required: true,
+            notes: "validate lightweight floating WM behavior and fallback diagnostics",
+        },
+        LinuxCompositorTarget {
+            key: "gnome-wayland",
+            display_server: LinuxDisplayServer::Wayland,
+            desktop_or_compositor: "GNOME/Mutter",
+            required: true,
+            notes: "validate Wayland decorations, fullscreen behavior, fractional scaling, clipboard, and IME",
+        },
+        LinuxCompositorTarget {
+            key: "kde-wayland",
+            display_server: LinuxDisplayServer::Wayland,
+            desktop_or_compositor: "KDE/KWin",
+            required: true,
+            notes: "validate decoration negotiation, fractional scaling, fullscreen, and input behavior",
+        },
+        LinuxCompositorTarget {
+            key: "sway",
+            display_server: LinuxDisplayServer::Wayland,
+            desktop_or_compositor: "Sway/wlroots",
+            required: true,
+            notes: "validate wlroots behavior, server/client decorations, clipboard, and tiling resize",
+        },
+        LinuxCompositorTarget {
+            key: "hyprland",
+            display_server: LinuxDisplayServer::Wayland,
+            desktop_or_compositor: "Hyprland",
+            required: true,
+            notes: "validate compositor-specific fullscreen, decorations, scaling, and input quirks",
+        },
+        LinuxCompositorTarget {
+            key: "cosmic",
+            display_server: LinuxDisplayServer::Wayland,
+            desktop_or_compositor: "COSMIC",
+            required: false,
+            notes: "verify when available; absence must be recorded rather than treated as a pass",
+        },
+    ]
+}
+
+#[must_use]
+pub fn linux_window_verification_features() -> Vec<LinuxWindowVerificationFeature> {
+    vec![
+        LinuxWindowVerificationFeature {
+            feature: "window creation",
+            fallback_policy: "failure is blocking; report backend, compositor, and window creation error",
+        },
+        LinuxWindowVerificationFeature {
+            feature: "resize",
+            fallback_policy: "resize events must update logical and physical dimensions without panics",
+        },
+        LinuxWindowVerificationFeature {
+            feature: "DPI/fractional scaling",
+            fallback_policy: "report scale factor and compositor when scaling differs from request",
+        },
+        LinuxWindowVerificationFeature {
+            feature: "clipboard",
+            fallback_policy: "report unavailable clipboard provider instead of silently dropping copy/paste",
+        },
+        LinuxWindowVerificationFeature {
+            feature: "fullscreen",
+            fallback_policy: "report requested/effective mode when exclusive fullscreen falls back",
+        },
+        LinuxWindowVerificationFeature {
+            feature: "borderless fullscreen",
+            fallback_policy: "report compositor-specific behavior and monitor selection",
+        },
+        LinuxWindowVerificationFeature {
+            feature: "frameless window mode",
+            fallback_policy: "fall back to decorated window if compositor blocks decoration removal",
+        },
+        LinuxWindowVerificationFeature {
+            feature: "custom titlebar mode",
+            fallback_policy: "fall back to native/fallback decorated mode until custom drag regions are verified",
+        },
+        LinuxWindowVerificationFeature {
+            feature: "decorations fallback",
+            fallback_policy: "always report requested and effective decoration strategies",
+        },
+        LinuxWindowVerificationFeature {
+            feature: "keyboard input",
+            fallback_policy: "record layout/modifier issues, especially AltGr and compositor shortcuts",
+        },
+        LinuxWindowVerificationFeature {
+            feature: "mouse input",
+            fallback_policy: "record button, wheel, motion, drag, and focus behavior per compositor",
+        },
+        LinuxWindowVerificationFeature {
+            feature: "IME/dead keys",
+            fallback_policy: "mark unsupported or partial when composed input cannot be verified",
+        },
+    ]
+}
+
+#[must_use]
+pub fn linux_compositor_verification_report() -> LinuxCompositorVerificationReport {
+    LinuxCompositorVerificationReport {
+        runtime: LinuxCompositorRuntimeSnapshot::detect(),
+        targets: linux_compositor_targets(),
+        features: linux_window_verification_features(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DoctorTopic {
     All,
     Renderer,
@@ -1686,6 +2033,66 @@ mod tests {
         assert!(matrix.iter().any(|row| row.feature == "SSH"));
         assert!(matrix.iter().any(|row| row.feature == "OSC clipboard"));
         assert!(matrix.iter().all(|row| !row.notes.is_empty()));
+    }
+
+    #[test]
+    fn linux_compositor_targets_cover_x11_and_wayland() {
+        let targets = linux_compositor_targets();
+
+        assert!(
+            targets.iter().any(|target| target.key == "gnome-xorg"
+                && target.display_server == LinuxDisplayServer::X11)
+        );
+        assert!(
+            targets.iter().any(|target| target.key == "sway"
+                && target.display_server == LinuxDisplayServer::Wayland)
+        );
+        assert!(targets.iter().any(|target| target.key == "hyprland"
+            && target.display_server == LinuxDisplayServer::Wayland));
+        assert!(targets.iter().all(|target| !target.notes.is_empty()));
+    }
+
+    #[test]
+    fn linux_runtime_snapshot_is_honest_off_linux() {
+        let snapshot =
+            LinuxCompositorRuntimeSnapshot::from_env("windows", None, None, None, None, None, None);
+
+        assert_eq!(snapshot.detected_backend, None);
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("not Linux"))
+        );
+    }
+
+    #[test]
+    fn linux_runtime_snapshot_detects_wayland_env() {
+        let snapshot = LinuxCompositorRuntimeSnapshot::from_env(
+            "linux",
+            Some("wayland".to_owned()),
+            Some("sway".to_owned()),
+            None,
+            Some("wayland-1".to_owned()),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            snapshot.detected_backend,
+            Some(DesktopPlatform::LinuxWayland)
+        );
+        assert_eq!(snapshot.compositor_label(), "sway");
+        assert!(snapshot.warnings.is_empty());
+    }
+
+    #[test]
+    fn linux_compositor_report_names_fallback_features() {
+        let report = linux_compositor_verification_report().render_text();
+
+        assert!(report.contains("Panea Linux compositor verification"));
+        assert!(report.contains("frameless window mode"));
+        assert!(report.contains("decorations fallback"));
     }
 
     #[test]

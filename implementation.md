@@ -113,6 +113,14 @@ to more visible features before the dependencies they rely on are hardened.
   antialiasing drift from likely text/layout failures, markdown reports,
   `cargo xtask screenshot <capture|verify|report>`, committed Windows
   baselines, and verified the Windows baseline set on the current host.
+- Completed next-pass Phase 7 Linux X11/Wayland compositor verification
+  infrastructure: added the Linux compositor target matrix for GNOME Xorg, KDE
+  X11, XFCE, i3, Openbox-class WMs, GNOME/Mutter, KDE/KWin, Sway/wlroots,
+  Hyprland, and COSMIC when available; added feature/fallback checklists,
+  runtime environment diagnostics, `cargo xtask linux-compositor`,
+  documentation for required manual evidence, and unit coverage for the target
+  matrix and Linux environment detection. Real Linux host runs remain required
+  before any compositor target can be marked verified.
 - Completed Phase 2 terminal core baseline: platform-neutral grid/cell storage,
   scrollback, line wrapping, scroll regions, alternate screen storage, resize
   reflow, cursor/mode metadata, raw selection extraction, ANSI/VT parser adapter,
@@ -232,10 +240,10 @@ to more visible features before the dependencies they rely on are hardened.
   events, but terminal mouse reporting, mouse-driven selection UI, focus escape
   reports, and application keypad/cursor encoding remain later compatibility
   work.
-- Phase 4 models Linux X11/Wayland backend and decoration preferences and emits
-  diagnostics, but compositor-specific fullscreen/frameless behavior still
-  needs real Linux X11/Wayland host verification before it can be called
-  complete.
+- Phase 4 models Linux X11/Wayland backend and decoration preferences, and
+  next-pass Phase 7 adds a concrete compositor verification matrix and xtask
+  report. Compositor-specific fullscreen/frameless behavior still needs real
+  Linux X11/Wayland host runs before it can be called complete.
 - Clipboard copy/paste has a platform bridge and diagnostics; OSC clipboard,
   primary selection, and full selection-driven copy behavior remain later
   platform/compatibility work.

@@ -32,6 +32,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Desktop window creation | partial | partial | partial | partial | Winit path exists; real OS/window manager behavior needs validation. |
 | Window modes | partial | partial | partial | partial | Windowed/maximized/fullscreen/frameless states are modeled; cross-OS behavior not verified. |
 | Linux backend selection | planned | planned | partial | partial | X11/Wayland preferences and diagnostics are modeled; real compositor verification is open. |
+| Linux compositor verification matrix | planned | planned | tested | tested | Target matrix, runtime environment snapshot, fallback checklist, and `cargo xtask linux-compositor` exist; actual Linux host runs remain unverified. |
 | Decoration strategy | partial | partial | partial | partial | Requested/effective diagnostics exist; Linux negotiation needs real tests. |
 | Emergency restore shortcuts | partial | partial | partial | partial | Actions/keybinding concepts exist; full titlebarless UX validation remains open. |
 | Keyboard input translation | partial | partial | partial | partial | Platform-neutral events exist; layout, AltGr, Command/Option, and IME testing remain. |

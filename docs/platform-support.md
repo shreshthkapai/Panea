@@ -6,6 +6,10 @@ Platform differences must be represented as capabilities, fallbacks, and
 diagnostics. A feature is not considered fully accepted until it has been tested
 on every desktop target or has an explicit platform limitation.
 
+Linux compositor coverage is tracked in
+[Linux compositor matrix](linux-compositor-matrix.md). Linux support is not
+considered verified until that matrix has real X11 and Wayland host evidence.
+
 ## Support Status Terms
 
 | Status | Meaning |
@@ -47,6 +51,7 @@ on every desktop target or has an explicit platform limitation.
 | Local PTY real-shell smoke | Verified on current host | Unverified | Unverified | Unverified |
 | Window creation/input translation | Build-verified on current host | Unverified | Unverified | Unverified |
 | GPU renderer window path | Build-verified on current host | Unverified | Unverified | Unverified |
+| Linux compositor matrix | Not applicable | Not applicable | Matrix exists, unverified | Matrix exists, unverified |
 | SSH real-server smoke | Unverified | Unverified | Unverified | Unverified |
 | Shell integration real-session smoke | Unverified | Unverified | Unverified | Unverified |
 | Native mux runtime smoke | Unverified | Unverified | Unverified | Unverified |
@@ -95,6 +100,7 @@ on every desktop target or has an explicit platform limitation.
 - Major window managers: unverified.
 - Tiling WM behavior: unverified.
 - Font fallback: configurable; distro font variance needs coverage.
+- Verification checklist: see [Linux compositor matrix](linux-compositor-matrix.md).
 
 ## Linux Wayland Polish Checklist
 
@@ -110,6 +116,7 @@ on every desktop target or has an explicit platform limitation.
 - IME: event contract exists; real composed-input coverage remains open.
 - Fallback diagnostics: backend/decorations fields exist and need real host
   coverage.
+- Verification checklist: see [Linux compositor matrix](linux-compositor-matrix.md).
 
 ## Doctor Commands
 
@@ -125,6 +132,7 @@ cargo xtask doctor shell-integration
 cargo xtask doctor performance
 cargo xtask doctor ssh
 cargo xtask doctor window
+cargo xtask linux-compositor
 cargo xtask bug-report
 ```
 
