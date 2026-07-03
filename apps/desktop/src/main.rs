@@ -6,7 +6,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use config_core::{
@@ -35,7 +35,9 @@ use render_core::{
     RenderColor, RenderCursorShape, RenderGrid, RenderRect, RenderScene,
 };
 use render_wgpu::{
-    FrameDecision, FrameScheduler, GpuTerminalRenderer, PresentMode, RendererError, RendererOptions,
+    AnimatedCursorImageCache, AnimatedCursorImageRequest, AnimatedCursorImageStatus,
+    CursorAnimationRuntime, CursorAnimationSettings, FrameDecision, FrameScheduler,
+    GpuTerminalRenderer, PresentMode, RendererError, RendererOptions,
 };
 use security::{
     Osc52ClipboardDecision, Osc52ClipboardPolicy, Osc52ClipboardRequest as SecurityOsc52Request,
@@ -105,6 +107,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut performance_overlay =
         PerformanceOverlay::new(config.diagnostics.performance_overlay, "wgpu");
     let mut performance_budget = performance_budget(&config);
+    let mut cursor_animator = CursorAnimationRuntime::new();
+    let mut cursor_image_cache = AnimatedCursorImageCache::new();
+    let mut cursor_image_status_reported: Option<String> = None;
+    request_cursor_image_if_enabled(&mut cursor_image_cache, &config);
     let mut surface_size = window.inner_size();
     let mut mux_runtime =
         MuxRuntime::new(&config, metrics, surface_size.width, surface_size.height);
@@ -118,7 +124,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
                 WindowEvent::RedrawRequested => {
                     let metrics = fonts.cell_metrics().ok();
-                    let scene = scene_from_mux(&mux_runtime, metrics, &config);
+                    let scene = scene_from_mux(
+                        &mux_runtime,
+                        metrics,
+                        &config,
+                        Some(&mut cursor_animator),
+                    );
                     let idle_wakeups = scheduler.take_idle_wakeups();
                     match catch_unwind(AssertUnwindSafe(|| {
                         renderer.render_scene(&scene, &mut fonts)
@@ -213,6 +224,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                                             if clipboard_config.enabled
                                                 && let Ok(text) = clipboard.paste_text()
                                             {
+                                                cursor_animator.record_typing();
                                                 mux_runtime.paste_into_active(
                                                     &text,
                                                     &clipboard_config,
@@ -273,6 +285,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                                         }
                                     }
                                 } else if let Some(bytes) = input_bytes(&key) {
+                                    cursor_animator.record_typing();
                                     mux_runtime.write_active(&bytes);
                                 }
                             }
@@ -289,6 +302,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                             InputEvent::Ime(platform_core::ImeEvent::Commit { text }) => {
+                                cursor_animator.record_typing();
                                 mux_runtime.write_active(text.as_bytes());
                             }
                             InputEvent::Focused(focused) => {
@@ -366,6 +380,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                             &window,
                         ) {
                             Ok(reloaded) => {
+                                request_cursor_image_if_enabled(&mut cursor_image_cache, &config);
+                                cursor_image_status_reported = None;
                                 if reloaded {
                                     if let Ok(metrics) = fonts.cell_metrics() {
                                         mux_runtime.resize_all(
@@ -398,6 +414,33 @@ fn run() -> Result<(), Box<dyn Error>> {
 
                 if mux_runtime.poll_outputs(&mut clipboard, &osc52_policy, &clipboard_config) {
                     scheduler.terminal_content_changed();
+                }
+
+                match cursor_image_cache.poll() {
+                    AnimatedCursorImageStatus::Ready(image) => {
+                        let key = format!("ready:{}", image.path.display());
+                        if cursor_image_status_reported.as_deref() != Some(&key) {
+                            for warning in image.warnings {
+                                eprintln!("cursor image warning: {warning}");
+                            }
+                            cursor_image_status_reported = Some(key);
+                        }
+                    }
+                    AnimatedCursorImageStatus::Failed { path, message } => {
+                        let key = format!("failed:{}:{message}", path.display());
+                        if cursor_image_status_reported.as_deref() != Some(&key) {
+                            eprintln!("cursor image {} failed: {message}", path.display());
+                            cursor_image_status_reported = Some(key);
+                        }
+                    }
+                    AnimatedCursorImageStatus::Disabled
+                    | AnimatedCursorImageStatus::Loading { .. } => {}
+                }
+
+                let cursor_settings = cursor_animation_settings(&config);
+                if let Some(delay) = cursor_animator.next_frame_after(cursor_settings) {
+                    scheduler.animation_changed();
+                    target.set_control_flow(ControlFlow::WaitUntil(Instant::now() + delay));
                 }
 
                 if matches!(scheduler.next_frame(), FrameDecision::FrameNeeded(_)) {
@@ -524,6 +567,33 @@ fn renderer_options(config: &AppConfig) -> RendererOptions {
         },
         damage_tracking: config.renderer.damage_tracking,
     }
+}
+
+fn cursor_animation_settings(config: &AppConfig) -> CursorAnimationSettings {
+    CursorAnimationSettings {
+        enabled: config.cursor.animations_enabled,
+        smooth_movement: config.cursor.smooth_movement,
+        typing_pulse: config.cursor.typing_pulse,
+        typing_stretch: config.cursor.typing_stretch,
+        trail: config.cursor.trail,
+        blink_easing: config.cursor.blink_easing,
+        short_lived_glow: config.cursor.short_lived_glow,
+        fps: config.performance.max_animation_fps,
+    }
+}
+
+fn request_cursor_image_if_enabled(cache: &mut AnimatedCursorImageCache, config: &AppConfig) {
+    if !config.cursor.image.enabled {
+        cache.disable();
+        return;
+    }
+
+    cache.request(AnimatedCursorImageRequest {
+        path: PathBuf::from(&config.cursor.image.path),
+        fps: config.cursor.image.fps,
+        max_size_kb: config.performance.max_cursor_asset_size_kb,
+        warn_if_expensive: config.cursor.image.warn_if_expensive,
+    });
 }
 
 fn performance_budget(config: &AppConfig) -> PerformanceBudget {
@@ -1704,6 +1774,7 @@ fn scene_from_mux(
     runtime: &MuxRuntime,
     metrics: Option<CellMetrics>,
     config: &AppConfig,
+    cursor_animator: Option<&mut CursorAnimationRuntime>,
 ) -> RenderScene {
     let mut scene = RenderScene {
         grid: RenderGrid {
@@ -1729,6 +1800,9 @@ fn scene_from_mux(
 
     if let Some(metrics) = metrics {
         append_pane_borders(&mut scene, runtime, tab_bar_rows, metrics, config);
+        if let Some(cursor_animator) = cursor_animator {
+            cursor_animator.populate_scene(&mut scene, metrics, cursor_animation_settings(config));
+        }
     }
 
     scene

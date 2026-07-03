@@ -6,16 +6,20 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     error::Error,
     fmt,
+    path::PathBuf,
+    sync::mpsc::{self, Receiver},
     sync::{Arc, Mutex},
+    thread,
+    time::Duration,
     time::Instant,
 };
 
 use font_system::{CellMetrics, FontError, FontSystem, GlyphBitmap, GlyphCache, GlyphCacheKey};
 use render_core::{
-    CellPosition, CursorVisual, DamageRegion, FrameRequestReason, OverlayKind, OverlayPrimitive,
-    RenderCell, RenderCellStyle, RenderColor, RenderCursorShape, RenderDecoration, RenderGrid,
-    RenderInstrumentation, RenderRecoveryEvent, RenderRecoveryReason, RenderRecoveryStatus,
-    RenderRect, RenderScene, RenderSurfaceStatus, SelectionVisual,
+    AnimationHandle, AnimationKind, CellPosition, CursorVisual, DamageRegion, FrameRequestReason,
+    OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle, RenderColor, RenderCursorShape,
+    RenderDecoration, RenderGrid, RenderInstrumentation, RenderRecoveryEvent, RenderRecoveryReason,
+    RenderRecoveryStatus, RenderRect, RenderScene, RenderSurfaceStatus, SelectionVisual,
 };
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -351,6 +355,392 @@ impl FrameScheduler {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorAnimationSettings {
+    pub enabled: bool,
+    pub smooth_movement: bool,
+    pub typing_pulse: bool,
+    pub typing_stretch: bool,
+    pub trail: bool,
+    pub blink_easing: bool,
+    pub short_lived_glow: bool,
+    pub fps: u16,
+}
+
+impl Default for CursorAnimationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            smooth_movement: false,
+            typing_pulse: false,
+            typing_stretch: false,
+            trail: false,
+            blink_easing: false,
+            short_lived_glow: false,
+            fps: 60,
+        }
+    }
+}
+
+impl CursorAnimationSettings {
+    #[must_use]
+    pub const fn any_effect_enabled(self) -> bool {
+        self.enabled
+            && (self.smooth_movement
+                || self.typing_pulse
+                || self.typing_stretch
+                || self.trail
+                || self.blink_easing
+                || self.short_lived_glow)
+    }
+
+    #[must_use]
+    pub fn frame_interval(self) -> Duration {
+        let fps = u64::from(self.fps.clamp(1, 240));
+        Duration::from_micros(1_000_000 / fps)
+    }
+}
+
+#[derive(Debug)]
+pub struct CursorAnimationRuntime {
+    previous_cursor: Option<CursorVisual>,
+    active: Vec<AnimationHandle>,
+    next_id: u64,
+    last_tick: Instant,
+    typing_requested: bool,
+}
+
+impl Default for CursorAnimationRuntime {
+    fn default() -> Self {
+        Self {
+            previous_cursor: None,
+            active: Vec::new(),
+            next_id: 1,
+            last_tick: Instant::now(),
+            typing_requested: false,
+        }
+    }
+}
+
+impl CursorAnimationRuntime {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record_typing(&mut self) {
+        self.typing_requested = true;
+    }
+
+    pub fn populate_scene(
+        &mut self,
+        scene: &mut RenderScene,
+        metrics: CellMetrics,
+        settings: CursorAnimationSettings,
+    ) {
+        if !settings.any_effect_enabled() {
+            self.previous_cursor = scene.cursor;
+            self.active.clear();
+            self.typing_requested = false;
+            return;
+        }
+
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_tick);
+        self.last_tick = now;
+        advance_animations(&mut self.active, elapsed);
+
+        let current = scene.cursor;
+        if let Some(cursor) = current {
+            let current_region = cursor_animation_region(cell_region(cursor.position, metrics));
+            if let Some(previous) = self.previous_cursor
+                && previous.position != cursor.position
+            {
+                let previous_region =
+                    cursor_animation_region(cell_region(previous.position, metrics));
+                if settings.smooth_movement {
+                    self.push_animation(
+                        AnimationKind::CursorSmoothMovement,
+                        union_region(previous_region, current_region),
+                        Duration::from_millis(120),
+                    );
+                }
+                if settings.trail {
+                    self.push_animation(
+                        AnimationKind::CursorTrail,
+                        union_region(previous_region, current_region),
+                        Duration::from_millis(180),
+                    );
+                }
+            }
+
+            if self.typing_requested {
+                if settings.typing_pulse {
+                    self.push_animation(
+                        AnimationKind::CursorTypingPulse,
+                        current_region,
+                        Duration::from_millis(140),
+                    );
+                }
+                if settings.typing_stretch {
+                    self.push_animation(
+                        AnimationKind::CursorTypingStretch,
+                        current_region,
+                        Duration::from_millis(100),
+                    );
+                }
+                if settings.short_lived_glow {
+                    self.push_animation(
+                        AnimationKind::CursorGlow,
+                        cursor_animation_region(current_region),
+                        Duration::from_millis(160),
+                    );
+                }
+            }
+
+            if settings.blink_easing
+                && self
+                    .previous_cursor
+                    .is_some_and(|previous| previous.visible != cursor.visible)
+            {
+                self.push_animation(
+                    AnimationKind::CursorBlinkEasing,
+                    current_region,
+                    settings.frame_interval().max(Duration::from_millis(16)),
+                );
+            }
+        }
+
+        self.previous_cursor = current;
+        self.typing_requested = false;
+        scene.damage_regions.extend(
+            self.active
+                .iter()
+                .map(|animation| animation.affected_region),
+        );
+        scene.animations.extend(self.active.iter().copied());
+    }
+
+    #[must_use]
+    pub fn needs_frame(&self) -> bool {
+        !self.active.is_empty()
+    }
+
+    #[must_use]
+    pub fn next_frame_after(&self, settings: CursorAnimationSettings) -> Option<Duration> {
+        self.needs_frame().then(|| settings.frame_interval())
+    }
+
+    fn push_animation(
+        &mut self,
+        kind: AnimationKind,
+        affected_region: RenderRect,
+        duration: Duration,
+    ) {
+        self.active.push(AnimationHandle {
+            id: self.next_id,
+            kind,
+            affected_region,
+            elapsed: Duration::ZERO,
+            remaining: Some(duration),
+        });
+        self.next_id = self.next_id.saturating_add(1);
+    }
+}
+
+fn advance_animations(animations: &mut Vec<AnimationHandle>, elapsed: Duration) {
+    for animation in animations.iter_mut() {
+        animation.elapsed = animation.elapsed.saturating_add(elapsed);
+        if let Some(remaining) = animation.remaining {
+            animation.remaining = Some(remaining.checked_sub(elapsed).unwrap_or(Duration::ZERO));
+        }
+    }
+    animations.retain(|animation| animation.remaining != Some(Duration::ZERO));
+}
+
+fn cursor_animation_region(rect: RenderRect) -> RenderRect {
+    expand_region(rect, 4)
+}
+
+fn expand_region(rect: RenderRect, amount: i32) -> RenderRect {
+    let amount_u32 = amount.max(0) as u32;
+    RenderRect {
+        x: rect.x - amount,
+        y: rect.y - amount,
+        width: rect.width.saturating_add(amount_u32.saturating_mul(2)),
+        height: rect.height.saturating_add(amount_u32.saturating_mul(2)),
+    }
+}
+
+fn union_region(a: RenderRect, b: RenderRect) -> RenderRect {
+    let x0 = a.x.min(b.x);
+    let y0 = a.y.min(b.y);
+    let x1 = (i64::from(a.x) + i64::from(a.width)).max(i64::from(b.x) + i64::from(b.width));
+    let y1 = (i64::from(a.y) + i64::from(a.height)).max(i64::from(b.y) + i64::from(b.height));
+    RenderRect {
+        x: x0,
+        y: y0,
+        width: u32::try_from(x1.saturating_sub(i64::from(x0))).unwrap_or(u32::MAX),
+        height: u32::try_from(y1.saturating_sub(i64::from(y0))).unwrap_or(u32::MAX),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnimatedCursorImageRequest {
+    pub path: PathBuf,
+    pub fps: u16,
+    pub max_size_kb: u32,
+    pub warn_if_expensive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedCursorImage {
+    pub path: PathBuf,
+    pub width: u32,
+    pub height: u32,
+    pub frame_count: u16,
+    pub fps: u16,
+    pub size_kb: u32,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnimatedCursorImageStatus {
+    Disabled,
+    Loading { path: PathBuf },
+    Ready(DecodedCursorImage),
+    Failed { path: PathBuf, message: String },
+}
+
+#[derive(Debug, Default)]
+pub struct AnimatedCursorImageCache {
+    current: Option<AnimatedCursorImageStatus>,
+    pending: Option<Receiver<AnimatedCursorImageStatus>>,
+}
+
+impl AnimatedCursorImageCache {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn disable(&mut self) {
+        self.current = Some(AnimatedCursorImageStatus::Disabled);
+        self.pending = None;
+    }
+
+    pub fn request(&mut self, request: AnimatedCursorImageRequest) {
+        if request.path.as_os_str().is_empty() {
+            self.current = Some(AnimatedCursorImageStatus::Failed {
+                path: request.path,
+                message: "cursor image path is empty".to_owned(),
+            });
+            self.pending = None;
+            return;
+        }
+
+        if matches!(
+            &self.current,
+            Some(AnimatedCursorImageStatus::Ready(image)) if image.path == request.path && image.fps == request.fps
+        ) {
+            return;
+        }
+
+        let path = request.path.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.current = Some(AnimatedCursorImageStatus::Loading { path: path.clone() });
+        self.pending = Some(receiver);
+        let spawn_result = thread::Builder::new()
+            .name("panea-cursor-image-decode".to_owned())
+            .spawn(move || {
+                let status = decode_cursor_image_request(request);
+                let _ = sender.send(status);
+            });
+        if let Err(error) = spawn_result {
+            self.current = Some(AnimatedCursorImageStatus::Failed {
+                path,
+                message: format!("failed to start cursor image decoder: {error}"),
+            });
+            self.pending = None;
+        }
+    }
+
+    pub fn poll(&mut self) -> AnimatedCursorImageStatus {
+        if let Some(receiver) = &self.pending
+            && let Ok(status) = receiver.try_recv()
+        {
+            self.current = Some(status);
+            self.pending = None;
+        }
+        self.current
+            .clone()
+            .unwrap_or(AnimatedCursorImageStatus::Disabled)
+    }
+}
+
+fn decode_cursor_image_request(request: AnimatedCursorImageRequest) -> AnimatedCursorImageStatus {
+    let path = request.path;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return AnimatedCursorImageStatus::Failed {
+                path,
+                message: format!("failed to read cursor image: {error}"),
+            };
+        }
+    };
+
+    let size_kb = u32::try_from(bytes.len().div_ceil(1024)).unwrap_or(u32::MAX);
+    let Some((width, height, frame_count)) = decode_cursor_image_header(&bytes) else {
+        return AnimatedCursorImageStatus::Failed {
+            path,
+            message: "cursor image must be GIF or PNG with a valid header".to_owned(),
+        };
+    };
+
+    let mut warnings = Vec::new();
+    if request.warn_if_expensive && size_kb > request.max_size_kb {
+        warnings.push(format!(
+            "cursor image {} KiB exceeds configured cap {} KiB",
+            size_kb, request.max_size_kb
+        ));
+    }
+    if request.warn_if_expensive && request.fps > 60 {
+        warnings.push(format!("cursor image FPS {} exceeds 60", request.fps));
+    }
+
+    AnimatedCursorImageStatus::Ready(DecodedCursorImage {
+        path,
+        width,
+        height,
+        frame_count,
+        fps: request.fps,
+        size_kb,
+        warnings,
+    })
+}
+
+fn decode_cursor_image_header(bytes: &[u8]) -> Option<(u32, u32, u16)> {
+    if bytes.len() >= 10 && (&bytes[0..6] == b"GIF87a" || &bytes[0..6] == b"GIF89a") {
+        let width = u16::from_le_bytes([bytes[6], bytes[7]]).into();
+        let height = u16::from_le_bytes([bytes[8], bytes[9]]).into();
+        let frames = bytes
+            .windows(2)
+            .filter(|window| *window == [0x21, 0xF9])
+            .count()
+            .max(1);
+        return Some((width, height, u16::try_from(frames).unwrap_or(u16::MAX)));
+    }
+
+    if bytes.len() >= 24 && &bytes[0..8] == b"\x89PNG\r\n\x1a\n" {
+        let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        return Some((width, height, 1));
+    }
+
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuadBatchKind {
     Background,
     Decoration,
@@ -597,6 +987,8 @@ impl RenderBatchPlanner {
                 }
             }
         }
+
+        push_animation_quads(&mut decorations, &scene.animations, &damage_regions);
 
         if let Some(cursor_visual) = scene.cursor
             && cursor_visual.visible
@@ -999,6 +1391,70 @@ fn push_text_decorations(
             },
             cell.foreground,
         );
+    }
+}
+
+fn push_animation_quads(
+    batch: &mut QuadBatch,
+    animations: &[AnimationHandle],
+    damage_regions: &[DamageRegion],
+) {
+    for animation in animations {
+        if !intersects_any(animation.affected_region, damage_regions) {
+            continue;
+        }
+        let color = animation_color(*animation);
+        match animation.kind {
+            AnimationKind::CursorTypingStretch => {
+                push_solid_quad(batch, stretch_region(animation.affected_region), color);
+            }
+            AnimationKind::CursorTrail
+            | AnimationKind::CursorTypingPulse
+            | AnimationKind::CursorSmoothMovement
+            | AnimationKind::CursorBlinkEasing
+            | AnimationKind::CursorGlow
+            | AnimationKind::OverlayTransition => {
+                push_solid_quad(batch, animation.affected_region, color);
+            }
+        }
+    }
+}
+
+fn animation_color(animation: AnimationHandle) -> RenderColor {
+    let base_alpha: u8 = match animation.kind {
+        AnimationKind::CursorSmoothMovement => 58,
+        AnimationKind::CursorTypingPulse => 78,
+        AnimationKind::CursorTypingStretch => 86,
+        AnimationKind::CursorTrail => 42,
+        AnimationKind::CursorBlinkEasing => 34,
+        AnimationKind::CursorGlow => 50,
+        AnimationKind::OverlayTransition => 48,
+    };
+    let alpha = if let Some(remaining) = animation.remaining {
+        let total = animation
+            .elapsed
+            .saturating_add(remaining)
+            .as_millis()
+            .max(1);
+        let remaining = remaining.as_millis().min(total);
+        ((u128::from(base_alpha) * remaining) / total) as u8
+    } else {
+        base_alpha
+    };
+    RenderColor {
+        red: 120,
+        green: 190,
+        blue: 255,
+        alpha,
+    }
+}
+
+fn stretch_region(rect: RenderRect) -> RenderRect {
+    RenderRect {
+        x: rect.x - 2,
+        y: rect.y,
+        width: rect.width.saturating_add(4),
+        height: rect.height,
     }
 }
 
@@ -3399,6 +3855,113 @@ mod tests {
         assert!(batches.background.quad_count() <= 1);
         assert_eq!(batches.cursor.quad_count(), 1);
         assert_eq!(batches.damage_regions.len(), 1);
+    }
+
+    #[test]
+    fn disabled_cursor_animations_add_no_scene_work() {
+        let mut runtime = CursorAnimationRuntime::new();
+        let mut test_scene = scene(vec![cell(0, 0, "a")]);
+
+        runtime.record_typing();
+        runtime.populate_scene(
+            &mut test_scene,
+            metrics(),
+            CursorAnimationSettings::default(),
+        );
+
+        assert!(test_scene.animations.is_empty());
+        assert!(test_scene.damage_regions.is_empty());
+        assert!(!runtime.needs_frame());
+    }
+
+    #[test]
+    fn cursor_animations_damage_only_cursor_regions() {
+        let mut runtime = CursorAnimationRuntime::new();
+        let settings = CursorAnimationSettings {
+            enabled: true,
+            smooth_movement: true,
+            typing_pulse: true,
+            typing_stretch: true,
+            trail: true,
+            blink_easing: false,
+            short_lived_glow: true,
+            fps: 60,
+        };
+        let mut first = scene(vec![cell(0, 0, "a")]);
+        runtime.populate_scene(&mut first, metrics(), settings);
+
+        let mut second = scene(vec![cell(0, 0, "a")]);
+        second.cursor = Some(CursorVisual {
+            position: CellPosition { row: 1, col: 1 },
+            shape: RenderCursorShape::Block,
+            color: RenderColor::rgb(255, 255, 255),
+            visible: true,
+            thickness_percent: 15,
+            corner_radius_px: 0,
+            inactive: false,
+        });
+        runtime.record_typing();
+        runtime.populate_scene(&mut second, metrics(), settings);
+
+        assert!(
+            second
+                .animations
+                .iter()
+                .any(|animation| animation.kind == AnimationKind::CursorSmoothMovement)
+        );
+        assert!(
+            second
+                .animations
+                .iter()
+                .any(|animation| animation.kind == AnimationKind::CursorTypingPulse)
+        );
+        assert!(second.damage_regions.iter().all(|region| {
+            region.width <= 32 && region.height <= 48 && region.x <= 12 && region.y <= 20
+        }));
+        assert!(runtime.needs_frame());
+    }
+
+    #[test]
+    fn cursor_animation_quads_are_batched_separately_from_cells() {
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let mut planner = RenderBatchPlanner::default();
+        let mut test_scene = scene(vec![cell(0, 0, "a")]);
+        let region = RenderRect {
+            x: 0,
+            y: 0,
+            width: 24,
+            height: 24,
+        };
+        test_scene.animations = vec![AnimationHandle {
+            id: 1,
+            kind: AnimationKind::CursorGlow,
+            affected_region: region,
+            elapsed: Duration::from_millis(20),
+            remaining: Some(Duration::from_millis(100)),
+        }];
+        test_scene.damage_regions = vec![region];
+
+        let Ok(batches) = planner.prepare(&test_scene, &mut fonts) else {
+            return;
+        };
+
+        assert!(batches.decorations.quad_count() >= 1);
+        assert_eq!(batches.instrumentation.animated_region_count, 1);
+    }
+
+    #[test]
+    fn animated_cursor_image_header_decode_is_bounded() {
+        let gif = [
+            b"GIF89a".as_slice(),
+            &[2, 0, 3, 0],
+            &[0x21, 0xF9, 0x04, 0, 0, 0, 0, 0],
+            &[0x21, 0xF9, 0x04, 0, 0, 0, 0, 0],
+        ]
+        .concat();
+
+        let decoded = decode_cursor_image_header(&gif).expect("valid GIF header");
+
+        assert_eq!(decoded, (2, 3, 2));
     }
 
     #[test]

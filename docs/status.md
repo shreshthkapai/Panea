@@ -61,6 +61,7 @@ stated scope:
 | Semantic model | tested | Semantic regions, command blocks, OSC semantic parser support, navigation, copy actions, shell metadata, and diagnostics models exist. |
 | Shell integration activation foundation | tested | Portable activation plans, config modes, desktop startup hook injection for bash/zsh/fish/PowerShell, disabled/manual/heuristic/off behavior, and ignored real-shell verification tests exist; PowerShell semantic smoke passed on the current Windows host. |
 | Command block visual overlay foundation | tested | Desktop scene projection now creates command-block backgrounds, input/output grouping overlays, status/duration/cwd/shell/host badges, conservative alternate-screen suppression, and renderer-batched overlay label glyphs without mutating terminal cells. |
+| Cursor animation foundation | tested | Opt-in cursor animation config, cursor-neighborhood animation damage, batched renderer animation quads, nonblocking image cursor asset metadata cache, and budget validation exist; full image frame decode/upload and cross-OS visual smoke remain open. |
 | Clipboard/OSC 52 policy | tested | Portable `clipboard` config, paste protection, bracketed paste forwarding, middle-click paste suppression during mouse reporting, parser pending OSC 52 requests, bounded security policy, local allow/default remote deny behavior, and TOML/security/parser/app tests exist. |
 | SSH transport foundation | tested | SSH profile mapping, host-key policy contracts, secret-provider boundaries, SSH2 transport, remote PTY request, resize, and shutdown foundations exist. |
 | iOS shared-engine foundation | tested | `apps/ios` reuses shared parser/core/config/transport/semantic/render contracts and models lifecycle, input, safe-area sizing, and mobile SSH session specs. |
@@ -79,7 +80,7 @@ These areas are real foundations but must not be called complete:
 | Clipboard and selection | partial | Raw selection extraction, keyboard copy/paste, paste protection, bracketed paste, middle-click paste guard, and OSC 52 policy exist; mouse-driven selection UX, Linux primary selection provider, remote confirmation UI, and full copy/paste app compatibility coverage remain. |
 | Baseline compatibility | partial | Real app smoke matrix for shells, editors, pagers, TUIs, tmux, screen, zellij, SSH, WSL, and command-line tools. |
 | Shell integration | partial | Local runtime activation planning and desktop injection exist for supported shells, with Windows PowerShell semantic smoke verified. Remote install flows, heuristic command detection, WSL-specific coverage, and real bash/zsh/fish/macOS/Linux session verification remain. |
-| Visual overlays | partial | Semantic command-block overlay projection and badge glyph batching exist; collapse/expand behavior, polished interactive UI, animated image cursor pipeline, real shell-driven verification, and cross-OS visual verification remain. |
+| Visual overlays | partial | Semantic command-block overlay projection, badge glyph batching, cursor animation quads, and image cursor metadata caching exist; collapse/expand behavior, polished interactive UI, full image cursor frame upload/draw, real shell-driven verification, and cross-OS visual verification remain. |
 | Native mux runtime | partial | Local tab/split runtime wiring exists, but startup workspaces, SSH panes, polished tab chrome, pane drag/move UI, and cross-OS GUI/runtime smoke tests remain. |
 | SSH UX and security | partial | Interactive host-key approval UI, changed-host-key resolution UI, password/passphrase prompts, OS keychain providers, reconnect UI, proxy jump, and real SSH server smoke tests. |
 | Performance reporting | partial | Hardware GPU timings, installed in-window overlay, CI regression gates, and reproducible cross-machine benchmark reporting. |
@@ -123,8 +124,8 @@ The following major accepted features have no complete product behavior yet:
   startup layouts, SSH panes, polished chrome, and cross-OS smoke tests.
 - Remote shell integration install flows and real bash/zsh/fish/macOS/Linux
   shell verification.
-- Cursor animation polish and animated image cursor asset pipeline.
-- Cursor animation polish and animated image cursor asset pipeline.
+- Full animated image cursor pixel-frame decode/upload/draw path and cross-OS
+  cursor animation visual smoke coverage.
 - Interactive SSH trust, secret prompts, keychain providers, and real SSH server
   smoke tests.
 - Installed doctor binary.
@@ -140,7 +141,7 @@ The following major accepted features have no complete product behavior yet:
 | render performance | partial | WGPU foundation, glyph cache, damage, scheduling, batched glyph/quad rendering, atlas uploads, benchmarks, renderer recovery foundation, and screenshot verification infrastructure exist; macOS/Linux screenshot baselines, real device-loss validation, and cross-OS runtime validation remain. |
 | config portability | partial | Static config model, TOML loading, validation, platform overrides, schema export, and runtime live-reload foundation exist; advanced config and cross-OS reload validation remain. |
 | semantic meaning | partial | Semantic events, timeline, runtime activation planning, desktop local hook injection, and Windows PowerShell semantic smoke exist; remote flows and non-Windows/bash/zsh/fish real verification remain. |
-| visual overlay | partial | Prompt and command block overlay projection, input/output grouping, metadata badges, alternate-screen suppression, and renderer overlay glyph batching exist; collapse/expand UI, cursor assets, and cross-OS visual smoke remain. |
+| visual overlay | partial | Prompt and command block overlay projection, input/output grouping, metadata badges, alternate-screen suppression, renderer overlay glyph batching, and cursor animation quads exist; collapse/expand UI, full cursor image drawing, and cross-OS visual smoke remain. |
 | session transport | partial | Local and SSH transport foundations exist; non-Windows local smoke, SSH real-server tests, and app UX remain. |
 | multiplexer structure | partial | Model and local desktop runtime wiring exist; startup layouts, SSH panes, polished chrome, and cross-OS smoke remain. |
 | diagnostics | partial | Xtask diagnostics exist; installed doctor and live platform reports remain. |
@@ -148,5 +149,5 @@ The following major accepted features have no complete product behavior yet:
 
 ## Immediate Next Slice
 
-After command blocks and visual overlays, the next dependency-ordered phase is
-cursor animation and animated image cursor pipeline.
+After cursor animation and animated image cursor pipeline, the next
+dependency-ordered phase is the app compatibility test suite.

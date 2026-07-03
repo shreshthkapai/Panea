@@ -158,7 +158,7 @@ pub fn feature_parity_matrix() -> Vec<PlatformFeatureStatus> {
             windows: Partial,
             linux_x11: Partial,
             linux_wayland: Partial,
-            notes: "config and budget contracts exist; polished animation runtime and asset pipeline are deferred",
+            notes: "opt-in config, bounded cursor-region animation runtime, and image asset metadata cache exist; cross-OS visual verification and full image cursor drawing remain open",
         },
         PlatformFeatureStatus {
             feature: "SSH",

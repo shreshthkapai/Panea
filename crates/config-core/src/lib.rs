@@ -129,6 +129,26 @@ impl AppConfig {
                 "cursor corner radius must be between 0.0 and 0.5 terminal cells",
             );
         }
+        if self.cursor.image.enabled {
+            if self.cursor.image.path.trim().is_empty() {
+                report.error(
+                    "cursor.image.path",
+                    "animated image cursors require a non-empty asset path",
+                );
+            }
+            if self.cursor.image.fps == 0 || self.cursor.image.fps > 60 {
+                report.error(
+                    "cursor.image.fps",
+                    "cursor image FPS must be between 1 and 60",
+                );
+            }
+            if self.cursor.image.fps > self.performance.max_animation_fps {
+                report.warning(
+                    "cursor.image.fps",
+                    "cursor image FPS exceeds the configured animation FPS budget",
+                );
+            }
+        }
 
         if self.scrollback.lines > 1_000_000 {
             report.warning(
@@ -912,6 +932,7 @@ pub struct CursorConfig {
     pub trail: bool,
     pub blink_easing: bool,
     pub short_lived_glow: bool,
+    pub image: CursorImageConfig,
 }
 
 impl Default for CursorConfig {
@@ -932,6 +953,27 @@ impl Default for CursorConfig {
             trail: false,
             blink_easing: false,
             short_lived_glow: false,
+            image: CursorImageConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CursorImageConfig {
+    pub enabled: bool,
+    pub path: String,
+    pub fps: u16,
+    pub warn_if_expensive: bool,
+}
+
+impl Default for CursorImageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: String::new(),
+            fps: 24,
+            warn_if_expensive: true,
         }
     }
 }
@@ -1617,6 +1659,7 @@ pub struct CursorConfigPatch {
     pub trail: Option<bool>,
     pub blink_easing: Option<bool>,
     pub short_lived_glow: Option<bool>,
+    pub image: Option<CursorImageConfigPatch>,
 }
 
 impl CursorConfigPatch {
@@ -1638,6 +1681,27 @@ impl CursorConfigPatch {
         apply_opt(&mut config.trail, &self.trail);
         apply_opt(&mut config.blink_easing, &self.blink_easing);
         apply_opt(&mut config.short_lived_glow, &self.short_lived_glow);
+        if let Some(image) = &self.image {
+            image.apply_to(&mut config.image);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CursorImageConfigPatch {
+    pub enabled: Option<bool>,
+    pub path: Option<String>,
+    pub fps: Option<u16>,
+    pub warn_if_expensive: Option<bool>,
+}
+
+impl CursorImageConfigPatch {
+    fn apply_to(&self, config: &mut CursorImageConfig) {
+        apply_opt(&mut config.enabled, &self.enabled);
+        apply_opt(&mut config.path, &self.path);
+        apply_opt(&mut config.fps, &self.fps);
+        apply_opt(&mut config.warn_if_expensive, &self.warn_if_expensive);
     }
 }
 
@@ -2216,6 +2280,34 @@ pub fn export_schema() -> ConfigSchema {
                         true,
                         false,
                     ),
+                    field(
+                        "cursor.image.enabled",
+                        "boolean",
+                        default.cursor.image.enabled,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "cursor.image.path",
+                        "string",
+                        &default.cursor.image.path,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "cursor.image.fps",
+                        "integer",
+                        default.cursor.image.fps,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "cursor.image.warn_if_expensive",
+                        "boolean",
+                        default.cursor.image.warn_if_expensive,
+                        true,
+                        false,
+                    ),
                 ],
             },
             ConfigSchemaSection {
@@ -2721,6 +2813,28 @@ mod tests {
         }));
         assert!(report.diagnostics.iter().any(|diagnostic| {
             diagnostic.path == "prompt_decorations.allow_in_alternate_screen"
+                && diagnostic.severity == ConfigDiagnosticSeverity::Warning
+        }));
+    }
+
+    #[test]
+    fn animated_cursor_image_is_opt_in_and_budgeted() {
+        let mut config = AppConfig::default();
+        assert!(!config.cursor.image.enabled);
+        assert_eq!(config.cursor.image.fps, 24);
+
+        config.cursor.image.enabled = true;
+        config.cursor.image.fps = 48;
+        config.performance.max_animation_fps = 24;
+        let report = config.validate();
+
+        assert!(report.has_errors());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == "cursor.image.path"
+                && diagnostic.severity == ConfigDiagnosticSeverity::Error
+        }));
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == "cursor.image.fps"
                 && diagnostic.severity == ConfigDiagnosticSeverity::Warning
         }));
     }

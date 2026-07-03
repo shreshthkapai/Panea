@@ -321,6 +321,12 @@ to more visible features before the dependencies they rely on are hardened.
   mode UI, real shell-driven command-block verification beyond the Windows
   PowerShell semantic smoke, and cross-OS visual smoke coverage remain deferred
   until the app compatibility and cross-OS runner phases.
+- Next-pass Phase 13 establishes opt-in cursor animation runtime wiring,
+  cursor-neighborhood damage regions, batched renderer animation quads,
+  `[cursor.image]` config, nonblocking GIF/PNG image metadata decode/cache, and
+  budget warnings. Full animated image pixel-frame decode/upload/draw,
+  polished visual tuning, and macOS/Linux X11/Linux Wayland visual smoke
+  verification remain deferred.
 - Phase 12 establishes secure SSH transport contracts and a real backend, but
   interactive host-key approval UI, OS keychain-backed secret providers, proxy
   jump, remote shell-integration install flows, reconnect UI/actions, and real

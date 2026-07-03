@@ -57,7 +57,8 @@ The remaining high-level work is:
   hardening remain.
 - Command-block collapse/copy UI, real shell-driven verification, and
   cross-OS visual overlay smoke coverage.
-- Animated image cursor pipeline.
+- Full animated image cursor pixel-frame decode/upload/draw path and cross-OS
+  cursor animation visual smoke coverage.
 - Interactive SSH trust/secret UI and OS keychain providers.
 - Real SSH server smoke tests.
 - Real cross-OS verification runners.

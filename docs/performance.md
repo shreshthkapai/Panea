@@ -38,6 +38,8 @@ Renderer batching details and the Phase 4 design note live in
 [renderer-batching.md](renderer-batching.md).
 Renderer device-loss recovery details and the Phase 5 design note live in
 [renderer-device-recovery.md](renderer-device-recovery.md).
+Cursor animation details and the Phase 13 design note live in
+[cursor-customization.md](cursor-customization.md).
 
 ## Profiles
 
@@ -58,7 +60,7 @@ Internal gates:
 - static cursors should be negligible
 - default mode should stay smooth under normal shell output
 - disabled features should not appear in hot-path profiles
-- animations should redraw only affected regions where possible
+- cursor animations should redraw only cursor-neighborhood regions where possible
 - heavy visual settings should warn when budgets are exceeded
 
 Do not claim the terminal is faster than another terminal until benchmarks are

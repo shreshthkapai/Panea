@@ -152,8 +152,8 @@ Baseline visual sections:
 
 - `visual_theme`: names the active theme/profile set, grouping style, spacing,
   borders, badges, and success/error accent colors
-- `cursor`: shape, thickness, corner radius, inactive style, and bounded
-  animation flags
+- `cursor`: shape, thickness, corner radius, inactive style, bounded animation
+  flags, and opt-in image cursor asset settings
 - `prompt_decorations`: minimal separator, rounded box, and pill/header styles
 - `command_blocks`: command grouping style, status/duration badges, copy/jump
   action flags, output grouping, and alternate-screen overlay policy
@@ -161,6 +161,23 @@ Baseline visual sections:
   animated-region budgets
 
 ```toml
+[cursor]
+shape = "block"
+blink = true
+animations_enabled = false
+smooth_movement = false
+typing_pulse = false
+typing_stretch = false
+trail = false
+blink_easing = false
+short_lived_glow = false
+
+[cursor.image]
+enabled = false
+path = ""
+fps = 24
+warn_if_expensive = true
+
 [prompt_decorations]
 enabled = true
 style = "minimal_separator"

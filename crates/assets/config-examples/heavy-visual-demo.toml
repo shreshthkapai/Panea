@@ -18,6 +18,12 @@ trail = true
 blink_easing = true
 short_lived_glow = true
 
+[cursor.image]
+enabled = false
+path = "cursor.gif"
+fps = 24
+warn_if_expensive = true
+
 [prompt_decorations]
 enabled = true
 style = "pill_header"

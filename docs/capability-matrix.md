@@ -67,8 +67,8 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Prompt decorations | partial | partial | partial | partial | Overlay projection, alternate-screen suppression, and config policy exist; cross-OS visual smoke and polished UI remain. |
 | Command blocks | tested | partial | partial | partial | Windows-host tests cover command-block backgrounds, input/output grouping, metadata badges, alternate-screen suppression, and renderer overlay glyph batching. Real shell-driven and cross-OS visual verification remain. |
 | Static cursor styles | partial | partial | partial | partial | Config/render contracts exist; visual polish needs renderer hardening. |
-| Cursor animations | partial | partial | partial | partial | Budget/config contracts exist; polished animation runtime remains. |
-| Animated image cursor | planned | planned | planned | planned | Not implemented; intentionally deferred. |
+| Cursor animations | tested | partial | partial | partial | Windows-host tests cover opt-in config, bounded cursor-neighborhood damage, desktop runtime wiring, and batched animation quads; cross-OS visual verification remains. |
+| Animated image cursor | partial | partial | partial | partial | Opt-in config, nonblocking asset read/header decode, metadata cache, and budget warnings exist; pixel-frame decode/upload/draw and cross-OS verification remain. |
 | SSH profile config | tested | implemented | implemented | implemented | Portable config model exists. |
 | SSH host-key policy | tested | implemented | implemented | implemented | Security contract exists; interactive UI remains. |
 | SSH transport | partial | partial | partial | partial | Backend exists; real server smoke tests are unverified. |
