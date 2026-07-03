@@ -282,9 +282,11 @@ to more visible features before the dependencies they rely on are hardened.
   application keypad output mapping, a custom terminfo entry, configurable hint
   patterns, and real app-level Unicode conformance remain deferred
   compatibility work.
-- Phase 7 classifies safe live-reload changes, but the file watcher and runtime
-  applier are deferred until the desktop lifecycle can apply changes without
-  destabilizing sessions or the renderer.
+- Next-pass Phase 9 adds a debounced TOML file watcher and desktop live-reload
+  applier. It applies safe sections, reports restart-required settings, and
+  keeps the previous active config after parse, validation, or runtime apply
+  failures. Native OS watcher backends, richer error UI, and macOS/Linux
+  runtime validation remain deferred.
 - Programmable config remains deferred until the static TOML model has more
   runtime mileage. It must compile into the same `AppConfig` and stay out of the
   render hot path.
@@ -321,8 +323,8 @@ to more visible features before the dependencies they rely on are hardened.
   manual/automated validation passes on macOS, Windows, Linux X11, and Linux
   Wayland. OS keychain-backed secret providers, interactive SSH host-key
   approval UI, remote OSC 52 clipboard confirmation UI, real GPU device-loss
-  platform validation, runtime crash-safe config reload, and installer
-  automation remain release-hardening follow-up work.
+  platform validation, cross-OS config reload validation, richer config error
+  UI, and installer automation remain release-hardening follow-up work.
 - Phase 15 establishes a compileable iOS companion foundation around the shared
   engine, but it is not a native iOS app yet. UIKit/SwiftUI app lifecycle,
   native touch/keyboard/settings UI, iOS GPU surface implementation, iOS

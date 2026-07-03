@@ -210,9 +210,16 @@ The deprecated spelling `battery_conscious` is still accepted as an alias.
 `config-core` can classify config changes into:
 
 - live-reloadable changes: colors, fonts, cursor, padding, keybindings, input,
-  diagnostics, and semantic visual settings
-- restart-required changes: GPU backend, major window backend, shell profile
-  startup settings, SSH profiles, and platform override changes
+  diagnostics, performance budgets, window title, mux settings, and semantic
+  visual settings
+- restart-required changes: GPU backend, renderer scheduling/damage policy,
+  major window settings/backend changes, shell profile startup settings, SSH
+  profiles, scrollback storage policy, and platform override changes
 
-A file watcher and runtime live-reload applier are intentionally deferred until
-the app lifecycle is ready to apply those changes safely.
+The desktop runtime watches the active TOML config path with a debounced
+portable polling watcher. Valid live-reloadable changes are applied without
+restarting the shell session. Invalid config or runtime apply failures keep the
+previous valid config active and report diagnostics.
+
+See [config-reload.md](config-reload.md) for the current live-reload contract
+and deferred cross-OS validation work.

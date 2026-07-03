@@ -10,9 +10,9 @@ use std::{
 
 use config_core::{
     AppConfig, ClipboardConfig, CommandBlockStyle, ConfigDiagnosticSeverity,
-    DecorationStrategyConfig, LinuxBackendConfig, PasteConfig, PresentModePreference,
-    PromptDecorationStyle, ShellProfile, ShellProfileKind, SshAuthMethod, SshKnownHostsPolicy,
-    SshProfile, WindowModeConfig,
+    DecorationStrategyConfig, LinuxBackendConfig, LogLevel, PasteConfig, PresentModePreference,
+    PromptDecorationStyle, ReloadPlan, ReloadableSection, ShellProfile, ShellProfileKind,
+    SshAuthMethod, SshKnownHostsPolicy, SshProfile, WindowModeConfig,
 };
 use diagnostics::{PerformanceBudget, PerformanceOverlay};
 use font_system::{CellMetrics, FontConfig as RuntimeFontConfig, FontSystem};
@@ -59,18 +59,11 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let loaded_config = config_toml::load(config_toml::ConfigLoadOptions::default())?;
-    for diagnostic in &loaded_config.diagnostics {
-        let level = match diagnostic.severity {
-            ConfigDiagnosticSeverity::Error => "error",
-            ConfigDiagnosticSeverity::Warning => "warning",
-        };
-        eprintln!(
-            "config {level} at {}: {}",
-            diagnostic.path, diagnostic.message
-        );
-    }
-    let config = loaded_config.config;
+    let config_load_options = config_toml::ConfigLoadOptions::default();
+    let loaded_config = config_toml::load(config_load_options.clone())?;
+    log_config_diagnostics(&loaded_config.diagnostics);
+    let mut config = loaded_config.config;
+    let mut config_watcher = config_toml::ConfigWatcher::new(config_load_options);
     let _ssh_session_profiles: Vec<SshConnectionProfile> = config
         .ssh_profiles
         .iter()
@@ -86,9 +79,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut input_translator = InputTranslator::new();
     let mut clipboard = ClipboardBridge::new();
     let mut current_window_mode = map_window_mode(config.window.mode);
-    let clipboard_config = config.clipboard.clone();
-    let paste_config = config.paste.clone();
-    let osc52_policy = osc52_policy(&clipboard_config);
+    let mut clipboard_config = config.clipboard.clone();
+    let mut paste_config = config.paste.clone();
+    let mut osc52_policy = osc52_policy(&clipboard_config);
     let session_is_remote = false;
     let mut mouse_protocol = MouseProtocolState::default();
 
@@ -108,7 +101,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut scheduler = FrameScheduler::new();
     let mut performance_overlay =
         PerformanceOverlay::new(config.diagnostics.performance_overlay, "wgpu");
-    let performance_budget = performance_budget(&config);
+    let mut performance_budget = performance_budget(&config);
     let mut transport = match spawn_initial_transport(&config, initial_size) {
         Ok(transport) => Some(transport),
         Err(error) => {
@@ -328,6 +321,59 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
             },
             Event::AboutToWait => {
+                match config_watcher.poll() {
+                    config_toml::ConfigWatchEvent::Unchanged => {}
+                    config_toml::ConfigWatchEvent::Pending { path } => {
+                        if matches!(config.diagnostics.log_level, LogLevel::Debug | LogLevel::Trace)
+                        {
+                            eprintln!(
+                                "config reload pending{}",
+                                path.as_ref()
+                                    .map(|path| format!(" for {}", path.display()))
+                                    .unwrap_or_default()
+                            );
+                        }
+                    }
+                    config_toml::ConfigWatchEvent::Reloaded(loaded) => {
+                        let loaded = *loaded;
+                        log_config_diagnostics(&loaded.diagnostics);
+                        let plan = config.reload_plan_from(&loaded.config);
+                        log_reload_plan(&plan);
+                        match apply_live_config_reload(
+                            &mut config,
+                            loaded.config,
+                            &plan,
+                            &mut fonts,
+                            &mut clipboard_config,
+                            &mut paste_config,
+                            &mut osc52_policy,
+                            &mut performance_overlay,
+                            &mut performance_budget,
+                            &window,
+                        ) {
+                            Ok(reloaded) => {
+                                if reloaded {
+                                    scheduler.terminal_content_changed();
+                                    window.request_redraw();
+                                }
+                            }
+                            Err(message) => {
+                                eprintln!(
+                                    "config reload rejected: {message}; keeping previous valid config"
+                                );
+                            }
+                        }
+                    }
+                    config_toml::ConfigWatchEvent::Failed { path, error } => {
+                        eprintln!(
+                            "config reload failed{}: {error}; keeping previous valid config",
+                            path.as_ref()
+                                .map(|path| format!(" for {}", path.display()))
+                                .unwrap_or_default()
+                        );
+                    }
+                }
+
                 if let Some(transport) = transport.as_mut() {
                     let mut content_changed = false;
                     for _ in 0..64 {
@@ -396,6 +442,100 @@ fn run() -> Result<(), Box<dyn Error>> {
     })?;
 
     Ok(())
+}
+
+fn log_config_diagnostics(diagnostics: &[config_core::ConfigDiagnostic]) {
+    for diagnostic in diagnostics {
+        let level = match diagnostic.severity {
+            ConfigDiagnosticSeverity::Error => "error",
+            ConfigDiagnosticSeverity::Warning => "warning",
+        };
+        eprintln!(
+            "config {level} at {}: {}",
+            diagnostic.path, diagnostic.message
+        );
+    }
+}
+
+fn log_reload_plan(plan: &ReloadPlan) {
+    if !plan.live.is_empty() {
+        eprintln!("config reload live sections: {:?}", plan.live);
+    }
+    for change in &plan.restart_required {
+        eprintln!(
+            "config reload restart required for {}: {}",
+            change.path, change.reason
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_live_config_reload(
+    current: &mut AppConfig,
+    next: AppConfig,
+    plan: &ReloadPlan,
+    fonts: &mut FontSystem,
+    clipboard_config: &mut ClipboardConfig,
+    paste_config: &mut PasteConfig,
+    runtime_osc52_policy: &mut Osc52ClipboardPolicy,
+    performance_overlay: &mut PerformanceOverlay,
+    runtime_performance_budget: &mut PerformanceBudget,
+    window: &winit::window::Window,
+) -> Result<bool, String> {
+    if plan.live.is_empty() {
+        return Ok(false);
+    }
+
+    if plan.live.contains(&ReloadableSection::Font) {
+        let mut reloaded_fonts = FontSystem::new(font_config(&next.font));
+        reloaded_fonts
+            .cell_metrics()
+            .map_err(|error| format!("font reload failed: {error}"))?;
+        *fonts = reloaded_fonts;
+    }
+
+    for section in &plan.live {
+        match section {
+            ReloadableSection::Colors => current.colors = next.colors.clone(),
+            ReloadableSection::Cursor => current.cursor = next.cursor.clone(),
+            ReloadableSection::Diagnostics => {
+                current.diagnostics = next.diagnostics.clone();
+                performance_overlay.set_enabled(current.diagnostics.performance_overlay);
+            }
+            ReloadableSection::Font => current.font = next.font.clone(),
+            ReloadableSection::Input => {
+                current.mouse = next.mouse.clone();
+                current.clipboard = next.clipboard.clone();
+                current.paste = next.paste.clone();
+                *clipboard_config = current.clipboard.clone();
+                *paste_config = current.paste.clone();
+                *runtime_osc52_policy = osc52_policy(clipboard_config);
+            }
+            ReloadableSection::Keybindings => current.keyboard = next.keyboard.clone(),
+            ReloadableSection::Mux => current.mux = next.mux.clone(),
+            ReloadableSection::Performance => {
+                current.performance = next.performance.clone();
+                *runtime_performance_budget = performance_budget(current);
+            }
+            ReloadableSection::VisualSemantics => {
+                current.visual_theme = next.visual_theme.clone();
+                current.command_blocks = next.command_blocks.clone();
+                current.prompt_decorations = next.prompt_decorations.clone();
+                current.shell_integration = next.shell_integration.clone();
+            }
+            ReloadableSection::WindowPadding => {
+                current.window.padding_x = next.window.padding_x;
+                current.window.padding_y = next.window.padding_y;
+            }
+            ReloadableSection::WindowTitle => {
+                current.window.title = next.window.title.clone();
+                window.set_title(&current.window.title);
+            }
+        }
+    }
+
+    eprintln!("config reload applied live sections without restarting sessions");
+    Ok(true)
 }
 
 fn font_config(config: &config_core::FontConfig) -> RuntimeFontConfig {

@@ -3,10 +3,13 @@
 pub const LAYER: &str = "config portability";
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     error::Error,
-    fmt, fs, io,
+    fmt, fs,
+    hash::{Hash, Hasher},
+    io,
     path::{Path, PathBuf},
+    time::{Duration, Instant, SystemTime},
 };
 
 use config_core::{
@@ -41,6 +44,127 @@ pub enum ConfigSource {
     Default,
     File(PathBuf),
     ExplicitFile(PathBuf),
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfigWatcher {
+    options: ConfigLoadOptions,
+    poll_interval: Duration,
+    debounce: Duration,
+    last_poll: Option<Instant>,
+    last_seen: Option<FileFingerprint>,
+    pending: Option<PendingReload>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfigWatchEvent {
+    Unchanged,
+    Pending {
+        path: Option<PathBuf>,
+    },
+    Reloaded(Box<LoadedConfig>),
+    Failed {
+        path: Option<PathBuf>,
+        error: ConfigTomlError,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingReload {
+    fingerprint: Option<FileFingerprint>,
+    first_seen: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    path: PathBuf,
+    exists: bool,
+    modified: Option<SystemTime>,
+    len: u64,
+    content_hash: Option<u64>,
+}
+
+impl ConfigWatcher {
+    #[must_use]
+    pub fn new(options: ConfigLoadOptions) -> Self {
+        let last_seen = current_fingerprint(&options).ok().flatten();
+        Self {
+            options,
+            poll_interval: Duration::from_millis(500),
+            debounce: Duration::from_millis(150),
+            last_poll: None,
+            last_seen,
+            pending: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_poll_interval(mut self, interval: Duration) -> Self {
+        self.poll_interval = interval;
+        self
+    }
+
+    #[must_use]
+    pub fn with_debounce(mut self, debounce: Duration) -> Self {
+        self.debounce = debounce;
+        self
+    }
+
+    pub fn poll(&mut self) -> ConfigWatchEvent {
+        let now = Instant::now();
+        if let Some(last_poll) = self.last_poll
+            && now.duration_since(last_poll) < self.poll_interval
+        {
+            return ConfigWatchEvent::Unchanged;
+        }
+        self.last_poll = Some(now);
+
+        let fingerprint = match current_fingerprint(&self.options) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                return ConfigWatchEvent::Failed { path: None, error };
+            }
+        };
+
+        if fingerprint == self.last_seen {
+            self.pending = None;
+            return ConfigWatchEvent::Unchanged;
+        }
+
+        let pending = self.pending.get_or_insert_with(|| PendingReload {
+            fingerprint: fingerprint.clone(),
+            first_seen: now,
+        });
+        if pending.fingerprint != fingerprint {
+            *pending = PendingReload {
+                fingerprint: fingerprint.clone(),
+                first_seen: now,
+            };
+        }
+
+        if now.duration_since(pending.first_seen) < self.debounce {
+            return ConfigWatchEvent::Pending {
+                path: fingerprint
+                    .as_ref()
+                    .map(|fingerprint| fingerprint.path.clone()),
+            };
+        }
+
+        self.pending = None;
+        match load(self.options.clone()) {
+            Ok(loaded) => {
+                self.last_seen = fingerprint;
+                ConfigWatchEvent::Reloaded(Box::new(loaded))
+            }
+            Err(error) => {
+                self.last_seen = fingerprint.clone();
+                ConfigWatchEvent::Failed {
+                    path: fingerprint.map(|fingerprint| fingerprint.path),
+                    error,
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +222,62 @@ impl fmt::Display for ConfigTomlError {
 }
 
 impl Error for ConfigTomlError {}
+
+fn current_fingerprint(
+    options: &ConfigLoadOptions,
+) -> Result<Option<FileFingerprint>, ConfigTomlError> {
+    if let Some(path) = &options.explicit_path {
+        return fingerprint_for_path(path).map(Some);
+    }
+
+    for path in candidate_paths_from_platform(options.platform) {
+        if path.exists() {
+            return fingerprint_for_path(&path).map(Some);
+        }
+    }
+
+    Ok(None)
+}
+
+fn candidate_paths_from_platform(platform: ConfigPlatform) -> Vec<PathBuf> {
+    candidate_paths_from_env(platform, |key| std::env::var_os(key))
+}
+
+fn fingerprint_for_path(path: &Path) -> Result<FileFingerprint, ConfigTomlError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(FileFingerprint {
+                path: path.to_path_buf(),
+                exists: false,
+                modified: None,
+                len: 0,
+                content_hash: None,
+            });
+        }
+        Err(error) => {
+            return Err(ConfigTomlError::Io {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            });
+        }
+    };
+
+    let contents = fs::read(path).map_err(|error| ConfigTomlError::Io {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let mut hasher = DefaultHasher::new();
+    contents.hash(&mut hasher);
+
+    Ok(FileFingerprint {
+        path: path.to_path_buf(),
+        exists: true,
+        modified: metadata.modified().ok(),
+        len: metadata.len(),
+        content_hash: Some(hasher.finish()),
+    })
+}
 
 pub fn load(options: ConfigLoadOptions) -> Result<LoadedConfig, ConfigTomlError> {
     if let Some(path) = options.explicit_path {
@@ -808,5 +988,69 @@ mod tests {
             parse_str(contents, None, ConfigPlatform::Unknown)
                 .unwrap_or_else(|error| panic!("{name} should parse: {error}"));
         }
+    }
+
+    #[test]
+    fn watcher_reloads_valid_file_changes() {
+        let path = temp_config_path("watcher-reloads-valid-file-changes");
+        fs::write(&path, "[window]\ntitle = \"Initial\"\n").expect("write initial config");
+        let options = ConfigLoadOptions {
+            explicit_path: Some(path.clone()),
+            platform: ConfigPlatform::Unknown,
+        };
+        let mut watcher = ConfigWatcher::new(options)
+            .with_poll_interval(Duration::ZERO)
+            .with_debounce(Duration::ZERO);
+
+        fs::write(&path, "[window]\ntitle = \"Reloaded\"\n").expect("write changed config");
+
+        let event = watcher.poll();
+        let ConfigWatchEvent::Reloaded(loaded) = event else {
+            panic!("expected reload, got {event:?}");
+        };
+        assert_eq!(loaded.config.window.title, "Reloaded");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn watcher_reports_invalid_file_without_repeating_until_change() {
+        let path = temp_config_path("watcher-reports-invalid-file");
+        fs::write(&path, "[window]\ntitle = \"Initial\"\n").expect("write initial config");
+        let options = ConfigLoadOptions {
+            explicit_path: Some(path.clone()),
+            platform: ConfigPlatform::Unknown,
+        };
+        let mut watcher = ConfigWatcher::new(options)
+            .with_poll_interval(Duration::ZERO)
+            .with_debounce(Duration::ZERO);
+
+        fs::write(&path, "[font]\nsize = 2.0\n").expect("write invalid config");
+        let event = watcher.poll();
+        assert!(matches!(
+            event,
+            ConfigWatchEvent::Failed {
+                error: ConfigTomlError::Validation { .. },
+                ..
+            }
+        ));
+        assert!(matches!(watcher.poll(), ConfigWatchEvent::Unchanged));
+
+        fs::write(&path, "[window]\ntitle = \"Recovered\"\n").expect("write recovered config");
+        let event = watcher.poll();
+        let ConfigWatchEvent::Reloaded(loaded) = event else {
+            panic!("expected recovered reload, got {event:?}");
+        };
+        assert_eq!(loaded.config.window.title, "Recovered");
+
+        let _ = fs::remove_file(path);
+    }
+
+    fn temp_config_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("panea-{name}-{}-{nanos}.toml", std::process::id()))
     }
 }

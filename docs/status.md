@@ -52,7 +52,7 @@ stated scope:
 | Fuzzing harness | tested | `fuzz/` contains cargo-fuzz targets for parser, grid, resize, Unicode, selection, OSC/DCS, and shell markers; property smoke tests run through `cargo xtask fuzz-smoke` and scheduled CI. |
 | Screenshot verification runner | tested | Deterministic renderer fixtures, PPM capture, tolerance-based diffing, Windows baselines, and `cargo xtask screenshot verify --platform windows` exist. |
 | Linux compositor verification matrix | tested | Target matrix, fallback checklist, runtime environment snapshot, and `cargo xtask linux-compositor` exist; real Linux host verification remains open. |
-| Config model and TOML | tested | `AppConfig` defaults, TOML parsing, unknown/deprecated diagnostics, validation, platform overrides, default generation, schema export, and reload impact classification exist. |
+| Config model and TOML | tested | `AppConfig` defaults, TOML parsing, unknown/deprecated diagnostics, validation, platform overrides, default generation, schema export, reload impact classification, debounced file watching, safe live apply, and previous-config retention exist. |
 | Windows local transport | tested | Portable PTY/ConPTY lifecycle is bounded; Windows smoke tests were made non-hanging and observed output. |
 | Diagnostics foundations | tested | `cargo xtask doctor ...`, bug-report snapshots, release/security/hardening/package readiness reports, and iOS readiness reports exist through shared diagnostics models. |
 | Performance harness foundation | tested | `cargo xtask bench ...` and `tools/bench` fixtures exist for repeatable local measurements. |
@@ -68,7 +68,7 @@ These areas are real foundations but must not be called complete:
 
 | Area | Status | Missing before completion |
 | --- | --- | --- |
-| Desktop app runtime | partial | Full app lifecycle, polished UI chrome, complete mux integration, runtime config reload, installed doctor command, packaging, and cross-OS manual validation. |
+| Desktop app runtime | partial | Full app lifecycle, polished UI chrome, complete mux integration, installed doctor command, packaging, and cross-OS manual validation. |
 | Platform windowing | partial | Real macOS lifecycle, real Linux X11/Wayland compositor behavior, decoration negotiation, IME validation, native notifications, and platform-specific fallback verification. |
 | GPU renderer | tested | WGPU surface/device setup, glyph atlas/cache policy, damage-aware batch preparation, indexed background/glyph/decoration/selection/cursor batches, row-scoped atlas uploads, renderer benchmarks, recovery status/event contracts, WGPU device-lost callback detection, disposable WGPU backend recreation, GPU atlas invalidation after recovery, and screenshot verification infrastructure exist; hardware timestamp queries, real sleep/wake/monitor-loss validation, macOS/Linux screenshot baselines, and cross-OS render validation remain. |
 | Font system | partial | Deeper shaping, full fallback validation across installed font sets, emoji fallback, and grapheme-aware metrics. |
@@ -80,7 +80,7 @@ These areas are real foundations but must not be called complete:
 | Native mux runtime | partial | Tab chrome, split rendering, per-pane transports, pane resize-to-PTY propagation, startup workspaces, and runtime smoke tests. |
 | SSH UX and security | partial | Interactive host-key approval UI, changed-host-key resolution UI, password/passphrase prompts, OS keychain providers, reconnect UI, proxy jump, and real SSH server smoke tests. |
 | Performance reporting | partial | Hardware GPU timings, installed in-window overlay, CI regression gates, and reproducible cross-machine benchmark reporting. |
-| Hardening/release readiness | partial | GPU recovery foundation exists, but real device-loss platform validation, crash-safe config reload, packaging artifacts, validation suite automation, and platform lab coverage remain. |
+| Hardening/release readiness | partial | GPU recovery and crash-safe config reload foundations exist, but real device-loss platform validation, packaging artifacts, validation suite automation, and platform lab coverage remain. |
 | iOS companion | partial | Native UIKit/SwiftUI shell, iOS GPU surface, Keychain provider, host-key approval UI, key import UX, simulator/device validation, and packaging. |
 
 ## What Is Stubbed
@@ -115,7 +115,7 @@ The following major accepted features have no complete product behavior yet:
 - Real GPU device-loss validation for sleep/wake, monitor attach/detach, DPI
   changes, and backend failure simulation across desktop OSes.
 - Linux primary selection provider and remote OSC 52 confirmation UI.
-- Runtime config file watching and safe live reload applier.
+- Native OS config watcher backends and real macOS/Linux runtime reload validation.
 - Full desktop tabs/panes/sessions/workspaces runtime.
 - Runtime shell integration activation and remote install flows.
 - Product-complete command blocks and semantic visual overlays.
@@ -133,7 +133,7 @@ The following major accepted features have no complete product behavior yet:
 | core correctness | partial | Strong baseline, Unicode cell hardening, and fuzz harness exist, but app compatibility and conformance hardening remain. |
 | platform parity | partial | Capabilities, desktop window foundations, and Linux compositor verification matrix exist; real macOS/Linux X11/Linux Wayland verification remains open. |
 | render performance | partial | WGPU foundation, glyph cache, damage, scheduling, batched glyph/quad rendering, atlas uploads, benchmarks, renderer recovery foundation, and screenshot verification infrastructure exist; macOS/Linux screenshot baselines, real device-loss validation, and cross-OS runtime validation remain. |
-| config portability | partial | Static config model is useful; runtime reload and advanced config are deferred. |
+| config portability | partial | Static config model, TOML loading, validation, platform overrides, schema export, and runtime live-reload foundation exist; advanced config and cross-OS reload validation remain. |
 | semantic meaning | partial | Semantic events and timeline exist; runtime shell activation and real-shell verification remain. |
 | visual overlay | partial | Overlay contracts and basic generation exist; polished command blocks/cursor assets remain. |
 | session transport | partial | Local and SSH transport foundations exist; non-Windows local smoke, SSH real-server tests, and app UX remain. |
@@ -143,5 +143,5 @@ The following major accepted features have no complete product behavior yet:
 
 ## Immediate Next Slice
 
-After clipboard, selection, and OSC clipboard policy, the next
-dependency-ordered phase is runtime config watching and live reload.
+After runtime config watching and live reload, the next
+dependency-ordered phase is desktop multiplexer runtime wiring.

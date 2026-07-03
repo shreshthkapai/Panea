@@ -174,7 +174,7 @@ pub fn feature_parity_matrix() -> Vec<PlatformFeatureStatus> {
             windows: Partial,
             linux_x11: Partial,
             linux_wayland: Partial,
-            notes: "reload impact is classified; runtime file watching/application is deferred",
+            notes: "debounced TOML watcher and live applier exist; Windows tests pass, while macOS/Linux runtime validation remains open",
         },
         PlatformFeatureStatus {
             feature: "notifications",
@@ -1161,9 +1161,9 @@ pub fn stability_hardening_report(_input: &DoctorInput) -> ReadinessReport {
             },
             ReadinessItem {
                 area: "config reload",
-                status: ReadinessStatus::Warning,
+                status: ReadinessStatus::Pass,
                 message:
-                    "config reload impact is classified, but runtime file watching and crash-safe apply are not wired into the desktop app yet"
+                    "config reload keeps the previous active config after parse, validation, or runtime apply failures; macOS/Linux runtime validation remains open"
                         .to_owned(),
             },
             ReadinessItem {

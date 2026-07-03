@@ -50,7 +50,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Static TOML config | tested | implemented | implemented | implemented | Portable model and parser exist; non-Windows file-location behavior needs runtime validation. |
 | Platform config overrides | tested | implemented | implemented | implemented | Model exists for macOS/Windows/Linux/X11/Wayland refinement. |
 | Config validation diagnostics | tested | implemented | implemented | implemented | Validation exists; runtime UX still needs product integration. |
-| Config live reload | partial | partial | partial | partial | Reload impact classification exists; file watcher/applier is unimplemented. |
+| Config live reload | tested | partial | partial | partial | Debounced TOML watcher, validation, live apply, and previous-config retention exist. Windows unit/desktop tests pass; macOS/Linux runtime validation remains open. |
 | Config schema export | tested | implemented | implemented | implemented | Xtask helper exists. |
 | Advanced programmable config | stubbed | stubbed | stubbed | stubbed | `config-lua` placeholder exists; implementation is deferred. |
 | Benchmark CLI | tested | implemented | implemented | implemented | Repeatable local command exists; CI/platform runners remain open. |

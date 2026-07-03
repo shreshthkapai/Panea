@@ -167,6 +167,9 @@ impl AppConfig {
         {
             plan.live.push(ReloadableSection::WindowPadding);
         }
+        if self.window.title != next.window.title {
+            plan.live.push(ReloadableSection::WindowTitle);
+        }
         if self.keyboard != next.keyboard {
             plan.live.push(ReloadableSection::Keybindings);
         }
@@ -184,6 +187,9 @@ impl AppConfig {
         if self.diagnostics != next.diagnostics {
             plan.live.push(ReloadableSection::Diagnostics);
         }
+        if self.performance != next.performance {
+            plan.live.push(ReloadableSection::Performance);
+        }
 
         if self.renderer.backend != next.renderer.backend {
             plan.restart_required.push(RestartRequiredChange {
@@ -191,10 +197,40 @@ impl AppConfig {
                 reason: "GPU backend changes require renderer reinitialization".to_owned(),
             });
         }
+        if self.renderer.present_mode != next.renderer.present_mode
+            || self.renderer.damage_tracking != next.renderer.damage_tracking
+        {
+            plan.restart_required.push(RestartRequiredChange {
+                path: "renderer".to_owned(),
+                reason: "renderer scheduling and damage policy changes require renderer reinitialization"
+                    .to_owned(),
+            });
+        }
+        if self.window.columns != next.window.columns
+            || self.window.rows != next.window.rows
+            || self.window.initial_width != next.window.initial_width
+            || self.window.initial_height != next.window.initial_height
+            || self.window.opacity != next.window.opacity
+            || self.window.mode != next.window.mode
+            || self.window.decoration_strategy != next.window.decoration_strategy
+        {
+            plan.restart_required.push(RestartRequiredChange {
+                path: "window".to_owned(),
+                reason: "window geometry, opacity, mode, and decoration changes require a window update or restart"
+                    .to_owned(),
+            });
+        }
         if self.window.linux_backend != next.window.linux_backend {
             plan.restart_required.push(RestartRequiredChange {
                 path: "window.linux_backend".to_owned(),
                 reason: "major window backend changes require a new event loop".to_owned(),
+            });
+        }
+        if self.scrollback != next.scrollback {
+            plan.restart_required.push(RestartRequiredChange {
+                path: "scrollback".to_owned(),
+                reason: "scrollback storage policy changes only affect new sessions in this phase"
+                    .to_owned(),
             });
         }
         if self.shell_profiles != next.shell_profiles
@@ -1918,8 +1954,10 @@ pub enum ReloadableSection {
     Input,
     Keybindings,
     Mux,
+    Performance,
     VisualSemantics,
     WindowPadding,
+    WindowTitle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2615,13 +2653,27 @@ mod tests {
     fn reload_plan_distinguishes_live_and_restart_changes() {
         let mut next = AppConfig::default();
         next.colors.background = RgbaColor::rgb(1, 2, 3);
+        next.performance.max_frame_time_ms = 20;
+        next.window.title = "Reloaded".to_owned();
+        next.window.mode = WindowModeConfig::Maximized;
         next.renderer.backend = RendererBackendPreference::Dx12;
 
         let plan = AppConfig::default().reload_plan_from(&next);
 
         assert!(plan.live.contains(&ReloadableSection::Colors));
+        assert!(plan.live.contains(&ReloadableSection::Performance));
+        assert!(plan.live.contains(&ReloadableSection::WindowTitle));
         assert!(plan.requires_restart());
-        assert_eq!(plan.restart_required[0].path, "renderer.backend");
+        assert!(
+            plan.restart_required
+                .iter()
+                .any(|change| change.path == "renderer.backend")
+        );
+        assert!(
+            plan.restart_required
+                .iter()
+                .any(|change| change.path == "window")
+        );
     }
 
     #[test]

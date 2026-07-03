@@ -39,7 +39,7 @@ considered verified until that matrix has real X11 and Wayland host evidence.
 | command blocks | partial | partial | partial | partial | Semantic storage and basic overlays exist; real shell-driven UI verification remains open. |
 | cursor animations | partial | partial | partial | partial | Config and budget contracts exist; polished animation runtime and asset pipeline are deferred. |
 | SSH | partial | partial | partial | partial | Secure transport backend exists; interactive trust UI and real server smoke tests remain open. |
-| config reload | partial | partial | partial | partial | Reload impact is classified; runtime file watching/application is deferred. |
+| config reload | partial | tested | partial | partial | Debounced TOML watcher and live applier exist; Windows unit/desktop tests pass, while macOS/Linux runtime validation remains open. |
 | notifications | not implemented yet | not implemented yet | not implemented yet | not implemented yet | Native notification surface has not been implemented. |
 | OSC clipboard | partial | partial | partial | partial | OSC 52 parser and security policy exist; remote confirmation UI and real app/platform smoke remain open. |
 
