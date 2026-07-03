@@ -58,6 +58,7 @@ stated scope:
 | Performance harness foundation | tested | `cargo xtask bench ...` and `tools/bench` fixtures exist for repeatable local measurements. |
 | Mux model | tested | Workspace, window, tab, pane, session, split tree, restore snapshot, and mux action models exist with unit coverage. |
 | Semantic model | tested | Semantic regions, command blocks, OSC semantic parser support, navigation, copy actions, shell metadata, and diagnostics models exist. |
+| Clipboard/OSC 52 policy | tested | Portable `clipboard` config, paste protection, bracketed paste forwarding, middle-click paste suppression during mouse reporting, parser pending OSC 52 requests, bounded security policy, local allow/default remote deny behavior, and TOML/security/parser/app tests exist. |
 | SSH transport foundation | tested | SSH profile mapping, host-key policy contracts, secret-provider boundaries, SSH2 transport, remote PTY request, resize, and shutdown foundations exist. |
 | iOS shared-engine foundation | tested | `apps/ios` reuses shared parser/core/config/transport/semantic/render contracts and models lifecycle, input, safe-area sizing, and mobile SSH session specs. |
 
@@ -72,7 +73,7 @@ These areas are real foundations but must not be called complete:
 | GPU renderer | tested | WGPU surface/device setup, glyph atlas/cache policy, damage-aware batch preparation, indexed background/glyph/decoration/selection/cursor batches, row-scoped atlas uploads, renderer benchmarks, recovery status/event contracts, WGPU device-lost callback detection, disposable WGPU backend recreation, GPU atlas invalidation after recovery, and screenshot verification infrastructure exist; hardware timestamp queries, real sleep/wake/monitor-loss validation, macOS/Linux screenshot baselines, and cross-OS render validation remain. |
 | Font system | partial | Deeper shaping, full fallback validation across installed font sets, emoji fallback, and grapheme-aware metrics. |
 | Unicode support | tested | Core/parser Unicode hardening is covered by automated tests; renderer font fallback, shaping, screenshot parity, and real app conformance remain later phases. |
-| Clipboard and selection | partial | Mouse-driven selection UX, primary selection on Linux, OSC 52 policy, permission/security prompts, and full copy/paste app compatibility coverage. |
+| Clipboard and selection | partial | Raw selection extraction, keyboard copy/paste, paste protection, bracketed paste, middle-click paste guard, and OSC 52 policy exist; mouse-driven selection UX, Linux primary selection provider, remote confirmation UI, and full copy/paste app compatibility coverage remain. |
 | Baseline compatibility | partial | Real app smoke matrix for shells, editors, pagers, TUIs, tmux, screen, zellij, SSH, WSL, and command-line tools. |
 | Shell integration | partial | Runtime activation/injection, remote install flows, heuristic fallback, and real bash/zsh/fish/PowerShell session verification. |
 | Visual overlays | partial | Product-complete prompt decorations, command blocks, badge text composition, collapse/expand behavior, animated image cursor pipeline, and cross-OS visual verification. |
@@ -113,7 +114,7 @@ The following major accepted features have no complete product behavior yet:
 - Cross-OS runtime verification of the batched GPU glyph renderer.
 - Real GPU device-loss validation for sleep/wake, monitor attach/detach, DPI
   changes, and backend failure simulation across desktop OSes.
-- OSC 52 clipboard policy and permission model.
+- Linux primary selection provider and remote OSC 52 confirmation UI.
 - Runtime config file watching and safe live reload applier.
 - Full desktop tabs/panes/sessions/workspaces runtime.
 - Runtime shell integration activation and remote install flows.
@@ -138,9 +139,9 @@ The following major accepted features have no complete product behavior yet:
 | session transport | partial | Local and SSH transport foundations exist; non-Windows local smoke, SSH real-server tests, and app UX remain. |
 | multiplexer structure | partial | Model exists; runtime desktop wiring remains. |
 | diagnostics | partial | Xtask diagnostics exist; installed doctor and live platform reports remain. |
-| security | partial | SSH/security contracts exist; keychain/secret UI/OSC clipboard policy remain. |
+| security | partial | SSH/security contracts and OSC 52 policy exist; keychain/secret UI and remote OSC 52 confirmation UI remain. |
 
 ## Immediate Next Slice
 
-After Linux X11/Wayland compositor verification infrastructure, the next
-dependency-ordered phase is clipboard, selection, and OSC clipboard policy.
+After clipboard, selection, and OSC clipboard policy, the next
+dependency-ordered phase is runtime config watching and live reload.

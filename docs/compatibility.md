@@ -31,6 +31,7 @@ Implemented in the baseline compatibility layer:
 - tab stop set/clear/reset behavior
 - DSR 5 and CPR/DSR 6 responses via terminal pending output
 - bracketed paste forwarding
+- OSC 52 clipboard requests as bounded pending events with security policy
 - focus in/out reporting
 - normal, drag, wheel, and SGR mouse report encoding
 - URL detection and basic semantic highlight overlays
@@ -40,7 +41,7 @@ Implemented in the baseline compatibility layer:
 
 ## Deferred Compatibility Work
 
-- Primary selection and OSC 52 clipboard behavior
+- Primary selection provider support and remote OSC 52 confirmation UI
 - Real app-level Unicode conformance across shells, editors, TUIs, and SSH
 - Full configurable hint pattern engine
 - Application keypad output mapping

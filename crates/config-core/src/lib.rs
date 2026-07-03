@@ -22,6 +22,7 @@ pub struct AppConfig {
     pub shell_integration: ShellIntegrationConfig,
     pub keyboard: KeyboardConfig,
     pub mouse: MouseConfig,
+    pub clipboard: ClipboardConfig,
     pub paste: PasteConfig,
     pub default_shell_profile: Option<String>,
     pub shell_profiles: Vec<ShellProfile>,
@@ -136,6 +137,7 @@ impl AppConfig {
             );
         }
 
+        self.validate_clipboard(&mut report);
         self.validate_keybindings(&mut report);
         self.validate_shell_integration(&mut report);
         self.validate_shell_profiles(&mut report);
@@ -168,7 +170,8 @@ impl AppConfig {
         if self.keyboard != next.keyboard {
             plan.live.push(ReloadableSection::Keybindings);
         }
-        if self.mouse != next.mouse || self.paste != next.paste {
+        if self.mouse != next.mouse || self.clipboard != next.clipboard || self.paste != next.paste
+        {
             plan.live.push(ReloadableSection::Input);
         }
         if self.visual_theme != next.visual_theme
@@ -241,6 +244,33 @@ impl AppConfig {
                     format!("keybinding conflict for {keys}: {previous_action} and {action}"),
                 );
             }
+        }
+    }
+
+    fn validate_clipboard(&self, report: &mut ValidationReport) {
+        if self.clipboard.osc52.max_bytes == 0 {
+            report.error(
+                "clipboard.osc52.max_bytes",
+                "OSC 52 clipboard byte cap must be greater than zero",
+            );
+        }
+        if self.clipboard.osc52.max_bytes > 16 * 1024 * 1024 {
+            report.warning(
+                "clipboard.osc52.max_bytes",
+                "large OSC 52 clipboard caps increase accidental clipboard-write risk",
+            );
+        }
+        if self.clipboard.osc52.allow_remote && !self.clipboard.osc52.confirm_remote_writes {
+            report.warning(
+                "clipboard.osc52.confirm_remote_writes",
+                "remote OSC 52 writes without confirmation should be used only for trusted hosts",
+            );
+        }
+        if self.clipboard.copy_on_select {
+            report.warning(
+                "clipboard.copy_on_select",
+                "copy_on_select can overwrite clipboard contents frequently",
+            );
         }
     }
 
@@ -1042,6 +1072,56 @@ pub struct MouseBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct ClipboardConfig {
+    pub enabled: bool,
+    pub copy_on_select: bool,
+    pub paste_protection: bool,
+    pub bracketed_paste: bool,
+    pub middle_click_paste: bool,
+    pub prefer_primary_selection_on_linux: bool,
+    pub log_operations: bool,
+    pub osc52: Osc52ClipboardConfig,
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            copy_on_select: false,
+            paste_protection: true,
+            bracketed_paste: true,
+            middle_click_paste: true,
+            prefer_primary_selection_on_linux: true,
+            log_operations: false,
+            osc52: Osc52ClipboardConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Osc52ClipboardConfig {
+    pub enabled: bool,
+    pub allow_local: bool,
+    pub allow_remote: bool,
+    pub max_bytes: usize,
+    pub confirm_remote_writes: bool,
+}
+
+impl Default for Osc52ClipboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_local: true,
+            allow_remote: false,
+            max_bytes: 1_048_576,
+            confirm_remote_writes: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PasteConfig {
     pub bracketed_paste: bool,
     pub normalize_newlines: bool,
@@ -1300,6 +1380,7 @@ pub struct PlatformOverride {
     pub command_blocks: Option<CommandBlocksConfigPatch>,
     pub prompt_decorations: Option<PromptDecorationsConfigPatch>,
     pub shell_integration: Option<ShellIntegrationConfigPatch>,
+    pub clipboard: Option<ClipboardConfigPatch>,
     pub performance: Option<PerformanceConfigPatch>,
     pub diagnostics: Option<DiagnosticsConfigPatch>,
 }
@@ -1332,6 +1413,9 @@ impl PlatformOverride {
         }
         if let Some(shell_integration) = &self.shell_integration {
             shell_integration.apply_to(&mut config.shell_integration);
+        }
+        if let Some(clipboard) = &self.clipboard {
+            clipboard.apply_to(&mut config.clipboard);
         }
         if let Some(performance) = &self.performance {
             performance.apply_to(&mut config.performance);
@@ -1578,6 +1662,60 @@ impl ShellIntegrationConfigPatch {
             &self.disabled_shell_profiles,
         );
         apply_opt(&mut config.remote_instructions, &self.remote_instructions);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ClipboardConfigPatch {
+    pub enabled: Option<bool>,
+    pub copy_on_select: Option<bool>,
+    pub paste_protection: Option<bool>,
+    pub bracketed_paste: Option<bool>,
+    pub middle_click_paste: Option<bool>,
+    pub prefer_primary_selection_on_linux: Option<bool>,
+    pub log_operations: Option<bool>,
+    pub osc52: Option<Osc52ClipboardConfigPatch>,
+}
+
+impl ClipboardConfigPatch {
+    fn apply_to(&self, config: &mut ClipboardConfig) {
+        apply_opt(&mut config.enabled, &self.enabled);
+        apply_opt(&mut config.copy_on_select, &self.copy_on_select);
+        apply_opt(&mut config.paste_protection, &self.paste_protection);
+        apply_opt(&mut config.bracketed_paste, &self.bracketed_paste);
+        apply_opt(&mut config.middle_click_paste, &self.middle_click_paste);
+        apply_opt(
+            &mut config.prefer_primary_selection_on_linux,
+            &self.prefer_primary_selection_on_linux,
+        );
+        apply_opt(&mut config.log_operations, &self.log_operations);
+        if let Some(osc52) = &self.osc52 {
+            osc52.apply_to(&mut config.osc52);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Osc52ClipboardConfigPatch {
+    pub enabled: Option<bool>,
+    pub allow_local: Option<bool>,
+    pub allow_remote: Option<bool>,
+    pub max_bytes: Option<usize>,
+    pub confirm_remote_writes: Option<bool>,
+}
+
+impl Osc52ClipboardConfigPatch {
+    fn apply_to(&self, config: &mut Osc52ClipboardConfig) {
+        apply_opt(&mut config.enabled, &self.enabled);
+        apply_opt(&mut config.allow_local, &self.allow_local);
+        apply_opt(&mut config.allow_remote, &self.allow_remote);
+        apply_opt(&mut config.max_bytes, &self.max_bytes);
+        apply_opt(
+            &mut config.confirm_remote_writes,
+            &self.confirm_remote_writes,
+        );
     }
 }
 
@@ -2143,6 +2281,81 @@ pub fn export_schema() -> ConfigSchema {
                 ],
             },
             ConfigSchemaSection {
+                name: "clipboard",
+                fields: vec![
+                    field(
+                        "clipboard.enabled",
+                        "boolean",
+                        default.clipboard.enabled,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "clipboard.copy_on_select",
+                        "boolean",
+                        default.clipboard.copy_on_select,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "clipboard.paste_protection",
+                        "boolean",
+                        default.clipboard.paste_protection,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "clipboard.bracketed_paste",
+                        "boolean",
+                        default.clipboard.bracketed_paste,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "clipboard.middle_click_paste",
+                        "boolean",
+                        default.clipboard.middle_click_paste,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "clipboard.osc52.enabled",
+                        "boolean",
+                        default.clipboard.osc52.enabled,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "clipboard.osc52.allow_local",
+                        "boolean",
+                        default.clipboard.osc52.allow_local,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "clipboard.osc52.allow_remote",
+                        "boolean",
+                        default.clipboard.osc52.allow_remote,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "clipboard.osc52.max_bytes",
+                        "integer",
+                        default.clipboard.osc52.max_bytes,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "clipboard.osc52.confirm_remote_writes",
+                        "boolean",
+                        default.clipboard.osc52.confirm_remote_writes,
+                        true,
+                        false,
+                    ),
+                ],
+            },
+            ConfigSchemaSection {
                 name: "renderer",
                 fields: vec![
                     field(
@@ -2446,6 +2659,57 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_policy_defaults_are_safe_for_remote_sessions() {
+        let config = AppConfig::default();
+
+        assert!(config.clipboard.enabled);
+        assert!(!config.clipboard.copy_on_select);
+        assert!(config.clipboard.paste_protection);
+        assert!(config.clipboard.bracketed_paste);
+        assert!(config.clipboard.osc52.enabled);
+        assert!(config.clipboard.osc52.allow_local);
+        assert!(!config.clipboard.osc52.allow_remote);
+        assert!(config.clipboard.osc52.confirm_remote_writes);
+        assert_eq!(config.clipboard.osc52.max_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn clipboard_validation_rejects_zero_osc52_cap() {
+        let mut config = AppConfig::default();
+        config.clipboard.osc52.max_bytes = 0;
+
+        let report = config.validate();
+
+        assert!(report.has_errors());
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path == "clipboard.osc52.max_bytes")
+        );
+    }
+
+    #[test]
+    fn platform_override_can_refine_clipboard_policy() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            [clipboard.osc52]
+            allow_remote = false
+
+            [platform.linux_wayland.clipboard.osc52]
+            allow_remote = true
+            confirm_remote_writes = true
+            "#,
+        )
+        .expect("config should deserialize");
+
+        let resolved = config.resolved_for_platform(ConfigPlatform::LinuxWayland);
+
+        assert!(resolved.clipboard.osc52.allow_remote);
+        assert!(resolved.clipboard.osc52.confirm_remote_writes);
+    }
+
+    #[test]
     fn schema_exports_machine_readable_fields() {
         let schema = export_schema();
 
@@ -2463,6 +2727,13 @@ mod tests {
                 .iter()
                 .flat_map(|section| section.fields.iter())
                 .any(|field| field.path == "ssh_profiles.known_hosts_policy")
+        );
+        assert!(
+            schema
+                .sections
+                .iter()
+                .flat_map(|section| section.fields.iter())
+                .any(|field| field.path == "clipboard.osc52.allow_remote")
         );
     }
 

@@ -43,7 +43,8 @@ The remaining high-level work is:
   accumulated runtime evidence for the batched GPU glyph renderer.
 - Real Linux X11/Wayland compositor host verification using the committed
   target matrix.
-- Full clipboard/selection/OSC clipboard policy.
+- Mouse-driven selection UX, Linux primary selection provider, remote OSC 52
+  confirmation UI, and real cross-OS clipboard smoke coverage.
 - Automated app compatibility tests: shells, editors, TUIs,
   tmux/screen/zellij, SSH.
 - Runtime config watching/live reload.

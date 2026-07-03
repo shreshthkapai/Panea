@@ -121,6 +121,16 @@ to more visible features before the dependencies they rely on are hardened.
   documentation for required manual evidence, and unit coverage for the target
   matrix and Linux environment detection. Real Linux host runs remain required
   before any compositor target can be marked verified.
+- Completed next-pass Phase 8 clipboard, selection, and OSC clipboard policy:
+  added portable `[clipboard]` and `[clipboard.osc52]` config with validation,
+  schema export, TOML discovery, and platform overrides; added parser/core
+  pending OSC 52 clipboard requests without platform dependencies; added a
+  security-layer OSC 52 evaluator that bounds payloads, denies remote writes by
+  default, and refuses unsupported clipboard reads; wired desktop keyboard
+  copy/paste, paste protection, bracketed paste, middle-click paste suppression
+  during mouse reporting, OSC 52 policy application, and optional clipboard
+  operation logging; documented current policy and remaining primary-selection
+  and remote-confirmation gaps.
 - Completed Phase 2 terminal core baseline: platform-neutral grid/cell storage,
   scrollback, line wrapping, scroll regions, alternate screen storage, resize
   reflow, cursor/mode metadata, raw selection extraction, ANSI/VT parser adapter,
@@ -244,9 +254,10 @@ to more visible features before the dependencies they rely on are hardened.
   next-pass Phase 7 adds a concrete compositor verification matrix and xtask
   report. Compositor-specific fullscreen/frameless behavior still needs real
   Linux X11/Wayland host runs before it can be called complete.
-- Clipboard copy/paste has a platform bridge and diagnostics; OSC clipboard,
-  primary selection, and full selection-driven copy behavior remain later
-  platform/compatibility work.
+- Clipboard copy/paste has a platform bridge and diagnostics; OSC 52 has a
+  bounded policy with safe remote defaults. Linux primary selection provider
+  support, remote OSC 52 confirmation UI, mouse-driven selection UX, and real
+  cross-OS clipboard smoke coverage remain later platform/compatibility work.
 - Real local transport smoke tests remain ignored by default because they spawn
   host shells. On the current Windows host, the one-shot, interactive, and
   event-loop smoke tests pass quickly. macOS and Linux smoke status is still
@@ -267,9 +278,10 @@ to more visible features before the dependencies they rely on are hardened.
   but app-level smoke testing for bash/zsh/fish/PowerShell/cmd/vim/less/TUI
   apps/tmux/screen/zellij/SSH remains unverified until run on the relevant
   host platforms.
-- Primary selection, OSC 52 clipboard, application keypad output mapping, a
-  custom terminfo entry, configurable hint patterns, and real app-level Unicode
-  conformance remain deferred compatibility work.
+- Primary selection provider support, remote OSC 52 confirmation UI,
+  application keypad output mapping, a custom terminfo entry, configurable hint
+  patterns, and real app-level Unicode conformance remain deferred
+  compatibility work.
 - Phase 7 classifies safe live-reload changes, but the file watcher and runtime
   applier are deferred until the desktop lifecycle can apply changes without
   destabilizing sessions or the renderer.
@@ -301,14 +313,14 @@ to more visible features before the dependencies they rely on are hardened.
 - Phase 13 adds the parity matrix and diagnostics command foundation, but it
   does not magically verify macOS, Linux X11, or Linux Wayland from this Windows
   host. Real platform labs/CI runners, compositor coverage, GPU backend
-  inventory, native notification support, OSC clipboard policy, and the final
+  inventory, native notification support, remote OSC clipboard confirmation UI, and the final
   installed `terminal doctor` binary remain follow-up work before platform
   parity can be called product-complete.
 - Phase 14 does not make Panea a daily-driver release by itself. Daily-driver
   release status remains blocked until packaged artifacts exist and
   manual/automated validation passes on macOS, Windows, Linux X11, and Linux
   Wayland. OS keychain-backed secret providers, interactive SSH host-key
-  approval UI, OSC 52 clipboard permission policy, real GPU device-loss
+  approval UI, remote OSC 52 clipboard confirmation UI, real GPU device-loss
   platform validation, runtime crash-safe config reload, and installer
   automation remain release-hardening follow-up work.
 - Phase 15 establishes a compileable iOS companion foundation around the shared

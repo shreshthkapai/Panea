@@ -9,9 +9,10 @@ use std::{
 };
 
 use config_core::{
-    AppConfig, CommandBlockStyle, ConfigDiagnosticSeverity, DecorationStrategyConfig,
-    LinuxBackendConfig, PasteConfig, PresentModePreference, PromptDecorationStyle, ShellProfile,
-    ShellProfileKind, SshAuthMethod, SshKnownHostsPolicy, SshProfile, WindowModeConfig,
+    AppConfig, ClipboardConfig, CommandBlockStyle, ConfigDiagnosticSeverity,
+    DecorationStrategyConfig, LinuxBackendConfig, PasteConfig, PresentModePreference,
+    PromptDecorationStyle, ShellProfile, ShellProfileKind, SshAuthMethod, SshKnownHostsPolicy,
+    SshProfile, WindowModeConfig,
 };
 use diagnostics::{PerformanceBudget, PerformanceOverlay};
 use font_system::{CellMetrics, FontConfig as RuntimeFontConfig, FontSystem};
@@ -30,12 +31,16 @@ use render_core::{
 use render_wgpu::{
     FrameDecision, FrameScheduler, GpuTerminalRenderer, PresentMode, RendererError, RendererOptions,
 };
+use security::{
+    Osc52ClipboardDecision, Osc52ClipboardPolicy, Osc52ClipboardRequest as SecurityOsc52Request,
+    Osc52ClipboardTarget, evaluate_osc52_clipboard_write,
+};
 use semantics::detect_url_hints;
 use semantics::{BufferPosition, CommandStatus, SemanticRegionKind, SemanticTimelineStore};
 use shell_integration::SemanticEscapeParser;
 use term_core::{
-    CellAttributes, Color, CursorShape, TerminalCore, TerminalMode,
-    TerminalSize as CoreTerminalSize,
+    CellAttributes, ClipboardTarget, Color, CursorShape, Osc52ClipboardRequest, TerminalCore,
+    TerminalMode, TerminalSize as CoreTerminalSize,
 };
 use term_parser::TerminalEmulator;
 use transport_core::{TerminalSize as TransportSize, TerminalTransport};
@@ -81,7 +86,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut input_translator = InputTranslator::new();
     let mut clipboard = ClipboardBridge::new();
     let mut current_window_mode = map_window_mode(config.window.mode);
+    let clipboard_config = config.clipboard.clone();
     let paste_config = config.paste.clone();
+    let osc52_policy = osc52_policy(&clipboard_config);
+    let session_is_remote = false;
     let mut mouse_protocol = MouseProtocolState::default();
 
     let mut fonts = FontSystem::new(font_config(&config.font));
@@ -211,14 +219,24 @@ fn run() -> Result<(), Box<dyn Error>> {
                             }
                             InputEvent::Key(key) => {
                                 if is_copy_shortcut(&key) {
-                                    if let Some(text) = terminal.state().selected_text() {
-                                        let _ = clipboard.copy_text(&text);
+                                    if clipboard_config.enabled
+                                        && let Some(text) = terminal.state().selected_text()
+                                    {
+                                        copy_text_with_diagnostics(
+                                            &mut clipboard,
+                                            &text,
+                                            &clipboard_config,
+                                            "selection copy",
+                                        );
                                     }
                                 } else if let Some(transport) = transport.as_mut() {
                                     if is_paste_shortcut(&key) {
-                                        if let Ok(text) = clipboard.paste_text() {
+                                        if clipboard_config.enabled
+                                            && let Ok(text) = clipboard.paste_text()
+                                        {
                                             let bytes = paste_bytes(
                                                 &text,
+                                                &clipboard_config,
                                                 &paste_config,
                                                 terminal
                                                     .modes()
@@ -239,6 +257,19 @@ fn run() -> Result<(), Box<dyn Error>> {
                                     if let Some(bytes) =
                                         mouse_protocol.report_bytes(mouse, metrics, &modes)
                                     {
+                                        write_transport_input(transport, &bytes);
+                                    } else if should_middle_click_paste(
+                                        &mouse,
+                                        &modes,
+                                        &clipboard_config,
+                                    ) && let Ok(text) = clipboard.paste_text()
+                                    {
+                                        let bytes = paste_bytes(
+                                            &text,
+                                            &clipboard_config,
+                                            &paste_config,
+                                            false,
+                                        );
                                         write_transport_input(transport, &bytes);
                                     }
                                 }
@@ -335,6 +366,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 );
                                 break;
                             }
+                            process_pending_clipboard_requests(
+                                &mut terminal,
+                                &mut clipboard,
+                                &osc52_policy,
+                                &clipboard_config,
+                                session_is_remote,
+                            );
                             flush_terminal_responses(&mut terminal, transport);
                             content_changed = true;
                         }
@@ -532,19 +570,24 @@ fn is_copy_shortcut(event: &KeyEvent) -> bool {
         && event.logical_key.eq_ignore_ascii_case("c")
 }
 
-fn paste_bytes(text: &str, config: &PasteConfig, bracketed_mode: bool) -> Vec<u8> {
-    let mut text = if config.normalize_newlines {
+fn paste_bytes(
+    text: &str,
+    clipboard: &ClipboardConfig,
+    legacy_paste: &PasteConfig,
+    bracketed_mode: bool,
+) -> Vec<u8> {
+    let mut text = if clipboard.paste_protection && legacy_paste.normalize_newlines {
         text.replace("\r\n", "\n").replace('\r', "\n")
     } else {
         text.to_owned()
     };
 
-    if config.strip_control_characters {
+    if clipboard.paste_protection && legacy_paste.strip_control_characters {
         text.retain(|ch| ch == '\n' || ch == '\t' || !ch.is_control());
     }
 
     let mut bytes = Vec::new();
-    if bracketed_mode && config.bracketed_paste {
+    if bracketed_mode && clipboard.bracketed_paste {
         bytes.extend_from_slice(b"\x1b[200~");
         bytes.extend_from_slice(text.as_bytes());
         bytes.extend_from_slice(b"\x1b[201~");
@@ -553,6 +596,109 @@ fn paste_bytes(text: &str, config: &PasteConfig, bracketed_mode: bool) -> Vec<u8
     }
 
     bytes
+}
+
+fn should_middle_click_paste(
+    mouse: &MouseEvent,
+    modes: &BTreeSet<TerminalMode>,
+    config: &ClipboardConfig,
+) -> bool {
+    config.enabled
+        && config.middle_click_paste
+        && !mouse_reporting_enabled(modes)
+        && matches!(mouse.kind, MouseEventKind::Pressed(MouseButton::Middle))
+}
+
+fn mouse_reporting_enabled(modes: &BTreeSet<TerminalMode>) -> bool {
+    modes.contains(&TerminalMode::MouseReporting)
+        || modes.contains(&TerminalMode::MouseCellMotion)
+        || modes.contains(&TerminalMode::MouseAllMotion)
+}
+
+fn copy_text_with_diagnostics(
+    clipboard: &mut ClipboardBridge,
+    text: &str,
+    config: &ClipboardConfig,
+    source: &str,
+) {
+    match clipboard.copy_text(text) {
+        Ok(()) if config.log_operations => {
+            eprintln!(
+                "clipboard {source}: wrote {} bytes to system clipboard",
+                text.len()
+            );
+        }
+        Ok(()) => {}
+        Err(diagnostic) => eprintln!("clipboard {source} failed: {diagnostic:?}"),
+    }
+}
+
+fn process_pending_clipboard_requests(
+    terminal: &mut TerminalEmulator,
+    clipboard: &mut ClipboardBridge,
+    policy: &Osc52ClipboardPolicy,
+    config: &ClipboardConfig,
+    session_is_remote: bool,
+) {
+    if !config.enabled {
+        let dropped = terminal.state_mut().take_pending_clipboard_requests();
+        if config.log_operations && !dropped.is_empty() {
+            eprintln!(
+                "clipboard osc52: dropped {} request(s) because clipboard is disabled",
+                dropped.len()
+            );
+        }
+        return;
+    }
+
+    for request in terminal.state_mut().take_pending_clipboard_requests() {
+        match evaluate_osc52_clipboard_write(
+            &security_osc52_request(request, session_is_remote),
+            policy,
+        ) {
+            Osc52ClipboardDecision::Allow { text, bytes } => {
+                copy_text_with_diagnostics(clipboard, &text, config, "OSC 52");
+                if config.log_operations {
+                    eprintln!("clipboard OSC 52: accepted {bytes} byte request");
+                }
+            }
+            Osc52ClipboardDecision::PromptRequired { reason } => {
+                eprintln!("clipboard OSC 52 blocked pending UI confirmation: {reason}");
+            }
+            Osc52ClipboardDecision::Deny { reason } => {
+                if config.log_operations {
+                    eprintln!("clipboard OSC 52 denied: {reason}");
+                }
+            }
+        }
+    }
+}
+
+fn security_osc52_request(request: Osc52ClipboardRequest, remote: bool) -> SecurityOsc52Request {
+    SecurityOsc52Request {
+        target: security_clipboard_target(request.target),
+        payload_base64: request.payload_base64,
+        remote,
+    }
+}
+
+fn security_clipboard_target(target: ClipboardTarget) -> Osc52ClipboardTarget {
+    match target {
+        ClipboardTarget::Clipboard => Osc52ClipboardTarget::Clipboard,
+        ClipboardTarget::PrimarySelection => Osc52ClipboardTarget::PrimarySelection,
+        ClipboardTarget::Select => Osc52ClipboardTarget::Select,
+        ClipboardTarget::Unknown(ch) => Osc52ClipboardTarget::Unknown(ch),
+    }
+}
+
+fn osc52_policy(config: &ClipboardConfig) -> Osc52ClipboardPolicy {
+    Osc52ClipboardPolicy {
+        enabled: config.osc52.enabled,
+        allow_local: config.osc52.allow_local,
+        allow_remote: config.osc52.allow_remote,
+        max_bytes: config.osc52.max_bytes,
+        confirm_remote_writes: config.osc52.confirm_remote_writes,
+    }
 }
 
 fn shutdown_transport(transport: Option<&mut LocalPtyTransport>) {
@@ -1211,4 +1357,73 @@ fn ansi_color(index: u8, config: &AppConfig) -> RenderColor {
         .map(render_color)
         .or_else(|| PALETTE.get(usize::from(index.min(15))).copied())
         .unwrap_or(PALETTE[7])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mouse_event(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            x: 0.0,
+            y: 0.0,
+            modifiers: KeyModifiers::default(),
+        }
+    }
+
+    #[test]
+    fn paste_protection_normalizes_and_strips_controls() {
+        let clipboard = ClipboardConfig::default();
+        let paste = PasteConfig::default();
+
+        let bytes = paste_bytes("a\r\nb\u{7}c", &clipboard, &paste, false);
+
+        assert_eq!(String::from_utf8(bytes).unwrap(), "a\nbc");
+    }
+
+    #[test]
+    fn bracketed_paste_wraps_only_when_terminal_mode_is_enabled() {
+        let clipboard = ClipboardConfig::default();
+        let paste = PasteConfig::default();
+
+        let bytes = paste_bytes("panea", &clipboard, &paste, true);
+
+        assert_eq!(bytes, b"\x1b[200~panea\x1b[201~");
+    }
+
+    #[test]
+    fn middle_click_paste_is_suppressed_when_mouse_reporting_is_active() {
+        let mouse = mouse_event(MouseEventKind::Pressed(MouseButton::Middle));
+        let mut modes = BTreeSet::new();
+
+        assert!(should_middle_click_paste(
+            &mouse,
+            &modes,
+            &ClipboardConfig::default()
+        ));
+
+        modes.insert(TerminalMode::MouseReporting);
+        assert!(!should_middle_click_paste(
+            &mouse,
+            &modes,
+            &ClipboardConfig::default()
+        ));
+    }
+
+    #[test]
+    fn osc52_policy_mapping_keeps_remote_denied_by_default() {
+        let policy = osc52_policy(&ClipboardConfig::default());
+        let request = SecurityOsc52Request {
+            target: Osc52ClipboardTarget::Clipboard,
+            payload_base64: "cGFuZWE=".to_owned(),
+            remote: true,
+        };
+
+        let decision = evaluate_osc52_clipboard_write(&request, &policy);
+
+        assert!(
+            matches!(decision, Osc52ClipboardDecision::Deny { reason } if reason.contains("remote"))
+        );
+    }
 }

@@ -44,6 +44,7 @@ Baseline configurable sections:
 - `scrollback`
 - `keyboard`
 - `mouse`
+- `clipboard`
 - `paste`
 - `shell_profiles`
 - `ssh_profiles`
@@ -59,6 +60,33 @@ resurrection.
 
 The public key is `font`. `fonts` is accepted as an alias for compatibility
 while the static schema stabilizes.
+
+## Clipboard
+
+Clipboard behavior is configured through `clipboard`. The older `paste`
+section remains available for low-level paste sanitization compatibility while
+the product-facing clipboard policy lives under `clipboard`.
+
+```toml
+[clipboard]
+enabled = true
+copy_on_select = false
+paste_protection = true
+bracketed_paste = true
+middle_click_paste = true
+prefer_primary_selection_on_linux = true
+log_operations = false
+
+[clipboard.osc52]
+enabled = true
+allow_local = true
+allow_remote = false
+max_bytes = 1048576
+confirm_remote_writes = true
+```
+
+Remote OSC 52 clipboard writes are denied by default. Large OSC 52 writes are
+capped before they can touch the system clipboard.
 
 ## SSH Profiles
 
@@ -159,6 +187,7 @@ Validation catches:
 - cursor blink/thickness ranges
 - keybinding conflicts
 - duplicate or missing shell/SSH profile references
+- clipboard and OSC 52 policy ranges
 - performance budget ranges
 - invalid platform override profile references
 

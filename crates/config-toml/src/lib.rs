@@ -484,6 +484,20 @@ fn known_paths() -> BTreeSet<&'static str> {
         "mouse.bindings",
         "mouse.copy_on_select",
         "mouse.hide_cursor_when_typing",
+        "clipboard",
+        "clipboard.enabled",
+        "clipboard.copy_on_select",
+        "clipboard.paste_protection",
+        "clipboard.bracketed_paste",
+        "clipboard.middle_click_paste",
+        "clipboard.prefer_primary_selection_on_linux",
+        "clipboard.log_operations",
+        "clipboard.osc52",
+        "clipboard.osc52.enabled",
+        "clipboard.osc52.allow_local",
+        "clipboard.osc52.allow_remote",
+        "clipboard.osc52.max_bytes",
+        "clipboard.osc52.confirm_remote_writes",
         "paste",
         "paste.bracketed_paste",
         "paste.normalize_newlines",
@@ -549,6 +563,7 @@ fn is_known_dynamic_path(path: &str) -> bool {
         "platform.linux_x11.",
         "platform.linux_wayland.",
         "platform_overrides.",
+        "clipboard.osc52.",
         "colors.palette.",
         "cursor.color.",
         "cursor.mode_specific_styles.",
@@ -673,6 +688,32 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.path == "font.size")
         );
+    }
+
+    #[test]
+    fn clipboard_config_paths_are_known_and_parsed() {
+        let loaded = parse_str(
+            r#"
+            [clipboard]
+            copy_on_select = false
+            paste_protection = true
+            bracketed_paste = true
+
+            [clipboard.osc52]
+            enabled = true
+            allow_local = true
+            allow_remote = false
+            max_bytes = 4096
+            confirm_remote_writes = true
+            "#,
+            None,
+            ConfigPlatform::Unknown,
+        )
+        .expect("clipboard config should parse");
+
+        assert!(!loaded.config.clipboard.copy_on_select);
+        assert_eq!(loaded.config.clipboard.osc52.max_bytes, 4096);
+        assert!(loaded.diagnostics.is_empty());
     }
 
     #[test]

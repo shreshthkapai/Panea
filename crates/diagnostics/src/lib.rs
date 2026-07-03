@@ -78,7 +78,7 @@ pub fn feature_parity_matrix() -> Vec<PlatformFeatureStatus> {
             windows: Partial,
             linux_x11: Partial,
             linux_wayland: Partial,
-            notes: "system clipboard bridge exists; primary selection and OSC clipboard remain later compatibility work",
+            notes: "system clipboard bridge, paste protection, and OSC 52 policy exist; primary selection and cross-OS smoke remain open",
         },
         PlatformFeatureStatus {
             feature: "IME",
@@ -186,11 +186,11 @@ pub fn feature_parity_matrix() -> Vec<PlatformFeatureStatus> {
         },
         PlatformFeatureStatus {
             feature: "OSC clipboard",
-            macos: NotImplementedYet,
-            windows: NotImplementedYet,
-            linux_x11: NotImplementedYet,
-            linux_wayland: NotImplementedYet,
-            notes: "OSC 52 policy and security prompts remain later compatibility/security work",
+            macos: Partial,
+            windows: Partial,
+            linux_x11: Partial,
+            linux_wayland: Partial,
+            notes: "OSC 52 parser and security policy exist; remote confirmation UI and real app/platform smoke remain open",
         },
     ]
 }
@@ -1223,14 +1223,14 @@ pub fn security_review_report(input: &DoctorInput) -> ReadinessReport {
         area: "clipboard",
         status: ReadinessStatus::Warning,
         message:
-            "system clipboard bridge exists with paste sanitization; primary selection and OSC clipboard policy remain separate work"
+            "system clipboard bridge, paste sanitization, and OSC 52 policy exist; primary selection and cross-OS smoke remain separate work"
                 .to_owned(),
     });
     items.push(ReadinessItem {
         area: "OSC clipboard",
-        status: ReadinessStatus::Blocked,
+        status: ReadinessStatus::Warning,
         message:
-            "OSC 52 clipboard behavior is intentionally not implemented until an explicit permission policy exists"
+            "OSC 52 local writes are policy-controlled and bounded; remote confirmation UI is not complete"
                 .to_owned(),
     });
     items.push(ReadinessItem {

@@ -36,4 +36,4 @@ Common current blockers:
 - macOS and Linux X11/Wayland smoke tests are not verified from this Windows host
 - packaged installers are not produced yet
 - OS keychain-backed secret storage is not wired
-- OSC 52 clipboard policy is intentionally deferred
+- remote OSC 52 clipboard confirmation UI is not wired

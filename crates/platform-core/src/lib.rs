@@ -198,6 +198,7 @@ pub struct PlatformFallback {
 pub enum ClipboardOperation {
     Copy,
     Paste,
+    Osc52Write,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

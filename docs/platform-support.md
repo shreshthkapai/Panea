@@ -27,7 +27,7 @@ considered verified until that matrix has real X11 and Wayland host evidence.
 | window modes | partial | partial | partial | partial | Windowed, maximized, borderless fullscreen, and frameless states are modeled; real compositor validation remains open. |
 | frameless modes | partial | partial | fallback | fallback | Implemented through winit decorations with Linux decoration negotiation still requiring compositor tests. |
 | fullscreen modes | partial | partial | partial | fallback | Exclusive fullscreen currently falls back to borderless fullscreen. |
-| clipboard | partial | partial | partial | partial | System clipboard bridge exists; primary selection and OSC clipboard remain later compatibility work. |
+| clipboard | partial | partial | partial | partial | System clipboard bridge, keyboard copy/paste, paste protection, and OSC 52 policy exist; primary selection and cross-OS smoke remain later compatibility work. |
 | IME | partial | partial | partial | partial | Platform-neutral IME events are represented; real composed-input validation is still required. |
 | DPI/fractional scaling | partial | partial | partial | partial | Monitor scale snapshots exist; fractional behavior needs real host verification. |
 | font fallback | partial | partial | partial | partial | Fallback chains are configurable; per-OS font availability validation is not automated yet. |
@@ -41,7 +41,7 @@ considered verified until that matrix has real X11 and Wayland host evidence.
 | SSH | partial | partial | partial | partial | Secure transport backend exists; interactive trust UI and real server smoke tests remain open. |
 | config reload | partial | partial | partial | partial | Reload impact is classified; runtime file watching/application is deferred. |
 | notifications | not implemented yet | not implemented yet | not implemented yet | not implemented yet | Native notification surface has not been implemented. |
-| OSC clipboard | not implemented yet | not implemented yet | not implemented yet | not implemented yet | OSC 52 policy and security prompts remain later compatibility/security work. |
+| OSC clipboard | partial | partial | partial | partial | OSC 52 parser and security policy exist; remote confirmation UI and real app/platform smoke remain open. |
 
 ## Current Verification Status
 

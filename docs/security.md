@@ -30,10 +30,29 @@ decision UI, and remote credential prompts are follow-up app lifecycle work.
 ## Clipboard
 
 System clipboard copy/paste exists through the platform bridge. Paste handling
-can normalize newlines and strip control characters.
+can normalize newlines and strip control characters when
+`clipboard.paste_protection` is enabled.
 
-OSC 52 clipboard access is intentionally not implemented yet. It needs a clear
-permission policy, diagnostics, and safe defaults before release.
+OSC 52 clipboard writes are parsed into pending terminal requests, decoded only
+after policy checks, bounded by `clipboard.osc52.max_bytes`, and denied for
+remote sessions by default. Local OSC 52 writes are allowed by default because
+they are common terminal behavior, but users can disable them with:
+
+```toml
+[clipboard.osc52]
+enabled = false
+```
+
+Remote sessions require explicit opt-in:
+
+```toml
+[clipboard.osc52]
+allow_remote = true
+confirm_remote_writes = true
+```
+
+The confirmation UI is not complete yet, so remote requests that require
+confirmation are blocked rather than silently accepted.
 
 ## Diagnostics and Logs
 
@@ -49,6 +68,6 @@ cargo xtask security-review
 Current blockers for release security posture:
 
 - OS keychain-backed secret providers are not wired
-- OSC clipboard policy is not implemented
+- remote OSC clipboard confirmation UI is not implemented
 - interactive SSH host-key approval UI is not complete
 - shell integration installer trust and update policy still need review

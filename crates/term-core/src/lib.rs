@@ -308,6 +308,32 @@ pub enum GraphicRendition {
     DefaultBackground,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardTarget {
+    Clipboard,
+    PrimarySelection,
+    Select,
+    Unknown(char),
+}
+
+impl ClipboardTarget {
+    #[must_use]
+    pub const fn from_osc52_selector(selector: char) -> Self {
+        match selector {
+            'c' | 'C' => Self::Clipboard,
+            'p' | 'P' => Self::PrimarySelection,
+            's' | 'S' => Self::Select,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Osc52ClipboardRequest {
+    pub target: ClipboardTarget,
+    pub payload_base64: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalAction {
     Print(char),
@@ -341,6 +367,7 @@ pub enum TerminalAction {
     SetCursorVisible(bool),
     SetCursorShape(CursorShape),
     SetTitle(String),
+    Osc52Clipboard(Osc52ClipboardRequest),
     SetTabStop,
     ClearTabStop,
     ClearAllTabStops,
@@ -367,6 +394,7 @@ pub struct TerminalState {
     tab_stops: BTreeSet<u16>,
     tab_stops_modified: bool,
     pending_output: Vec<u8>,
+    pending_clipboard_requests: Vec<Osc52ClipboardRequest>,
     title: Option<String>,
 }
 
@@ -390,6 +418,7 @@ impl TerminalState {
             tab_stops: default_tab_stops(size.cols),
             tab_stops_modified: false,
             pending_output: Vec::new(),
+            pending_clipboard_requests: Vec::new(),
             title: None,
         }
     }
@@ -422,6 +451,9 @@ impl TerminalState {
             TerminalAction::SetCursorVisible(visible) => self.cursor_visible = visible,
             TerminalAction::SetCursorShape(shape) => self.cursor_shape = shape,
             TerminalAction::SetTitle(title) => self.title = Some(title),
+            TerminalAction::Osc52Clipboard(request) => {
+                self.pending_clipboard_requests.push(request)
+            }
             TerminalAction::SetTabStop => {
                 self.tab_stops.insert(self.active().cursor_col as u16);
                 self.tab_stops_modified = true;
@@ -506,6 +538,15 @@ impl TerminalState {
 
     pub fn take_pending_output(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending_output)
+    }
+
+    #[must_use]
+    pub fn pending_clipboard_requests(&self) -> &[Osc52ClipboardRequest] {
+        &self.pending_clipboard_requests
+    }
+
+    pub fn take_pending_clipboard_requests(&mut self) -> Vec<Osc52ClipboardRequest> {
+        std::mem::take(&mut self.pending_clipboard_requests)
     }
 
     fn reset(&mut self) {

@@ -24,7 +24,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Parser baseline | tested | implemented | implemented | implemented | Lower-level tests exist; app-level compatibility suite is not complete. |
 | Fuzz/property harness | tested | implemented | implemented | implemented | cargo-fuzz targets and proptest smoke tests exist; scheduled CI runs smoke properties, but long-running fuzz history has not accumulated yet. |
 | Scrollback/alternate screen/resize | tested | implemented | implemented | implemented | Core behavior exists; full app smoke remains open per OS. |
-| Selection extraction | tested | implemented | implemented | implemented | Raw extraction exists; mouse-driven selection UX and platform clipboards remain partial. |
+| Selection extraction | tested | implemented | implemented | implemented | Raw normal and rectangular extraction exists; mouse-driven selection UX remains partial. |
 | Unicode/grapheme cell model | tested | implemented | implemented | implemented | Platform-neutral parser/core tests cover split UTF-8, combining marks, CJK width, emoji modifiers, ZWJ emoji, variation selectors, selection, cursor movement, resize, and scrollback; cross-OS renderer/font screenshots remain open. |
 | Local PTY transport | tested | partial | partial | partial | Windows ConPTY smoke passed; macOS/Linux real PTY smoke is unverified. |
 | Local PTY lifecycle contract | tested | implemented | implemented | implemented | Shared bounded lifecycle exists; non-Windows real shell validation remains open. |
@@ -38,8 +38,9 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Keyboard input translation | partial | partial | partial | partial | Platform-neutral events exist; layout, AltGr, Command/Option, and IME testing remain. |
 | Mouse input translation | partial | partial | partial | partial | Events and terminal reporting groundwork exist; selection UX and full protocol coverage remain. |
 | IME/composed text | partial | partial | partial | partial | Event contract exists; real composed-input verification is not complete. |
-| System clipboard | partial | partial | partial | partial | Clipboard bridge exists; primary selection, OSC 52, and security policy remain. |
-| OSC 52 clipboard | planned | planned | planned | planned | Not implemented. |
+| System clipboard | partial | partial | partial | partial | Clipboard bridge, keyboard copy/paste, paste protection, and middle-click paste guard exist; real OS clipboard smoke remains incomplete off Windows. |
+| Linux primary selection | planned | planned | partial | partial | Config preference and target modeling exist; provider support and real Linux verification remain open. |
+| OSC 52 clipboard policy | tested | implemented | implemented | implemented | Parser pending requests and bounded security policy exist; remote writes are denied by default. Remote confirmation UI and cross-OS app smoke remain open. |
 | GPU surface/device path | partial | partial | partial | partial | WGPU initialization and device-loss recovery foundation exist; sleep/wake, monitor-change, and backend validation remain. |
 | GPU glyph rendering | partial | partial | partial | partial | Damage-aware batched glyph/quad submission, atlas rebuild after recovery, and screenshot tooling exist; macOS/Linux baselines and cross-OS GPU validation remain open. |
 | Screenshot verification | tested | partial | partial | partial | Deterministic fixtures, PPM baselines, tolerance diffing, and reports exist. Windows baselines verify on the current host; macOS/Linux X11/Linux Wayland baselines remain uncaptured. |

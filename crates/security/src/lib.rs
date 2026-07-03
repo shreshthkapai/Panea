@@ -291,6 +291,133 @@ pub trait KeychainProvider: Send {
     fn delete_secret(&mut self, entry: &KeychainEntry) -> SecurityResult<()>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Osc52ClipboardTarget {
+    Clipboard,
+    PrimarySelection,
+    Select,
+    Unknown(char),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Osc52ClipboardPolicy {
+    pub enabled: bool,
+    pub allow_local: bool,
+    pub allow_remote: bool,
+    pub max_bytes: usize,
+    pub confirm_remote_writes: bool,
+}
+
+impl Default for Osc52ClipboardPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_local: true,
+            allow_remote: false,
+            max_bytes: 1_048_576,
+            confirm_remote_writes: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Osc52ClipboardRequest {
+    pub target: Osc52ClipboardTarget,
+    pub payload_base64: String,
+    pub remote: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Osc52ClipboardDecision {
+    Allow { text: String, bytes: usize },
+    PromptRequired { reason: String },
+    Deny { reason: String },
+}
+
+impl Osc52ClipboardDecision {
+    #[must_use]
+    pub const fn is_allowed(&self) -> bool {
+        matches!(self, Self::Allow { .. })
+    }
+}
+
+#[must_use]
+pub fn evaluate_osc52_clipboard_write(
+    request: &Osc52ClipboardRequest,
+    policy: &Osc52ClipboardPolicy,
+) -> Osc52ClipboardDecision {
+    if !policy.enabled {
+        return Osc52ClipboardDecision::Deny {
+            reason: "OSC 52 clipboard writes are disabled by policy".to_owned(),
+        };
+    }
+    if request.remote && !policy.allow_remote {
+        return Osc52ClipboardDecision::Deny {
+            reason: "remote OSC 52 clipboard writes are disabled by policy".to_owned(),
+        };
+    }
+    if !request.remote && !policy.allow_local {
+        return Osc52ClipboardDecision::Deny {
+            reason: "local OSC 52 clipboard writes are disabled by policy".to_owned(),
+        };
+    }
+    if request.remote && policy.confirm_remote_writes {
+        return Osc52ClipboardDecision::PromptRequired {
+            reason: "remote OSC 52 clipboard write requires explicit confirmation".to_owned(),
+        };
+    }
+    if matches!(request.target, Osc52ClipboardTarget::Unknown(_)) {
+        return Osc52ClipboardDecision::Deny {
+            reason: "OSC 52 requested an unknown clipboard target".to_owned(),
+        };
+    }
+    if request.payload_base64.trim() == "?" {
+        return Osc52ClipboardDecision::Deny {
+            reason: "OSC 52 clipboard read requests are not supported".to_owned(),
+        };
+    }
+
+    let max_encoded = policy.max_bytes.saturating_mul(4).saturating_div(3) + 8;
+    if request.payload_base64.len() > max_encoded {
+        return Osc52ClipboardDecision::Deny {
+            reason: format!(
+                "OSC 52 payload exceeds configured clipboard cap of {} bytes",
+                policy.max_bytes
+            ),
+        };
+    }
+
+    let decoded = match STANDARD.decode(request.payload_base64.as_bytes()) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            return Osc52ClipboardDecision::Deny {
+                reason: format!("OSC 52 payload is not valid base64: {error}"),
+            };
+        }
+    };
+
+    if decoded.len() > policy.max_bytes {
+        return Osc52ClipboardDecision::Deny {
+            reason: format!(
+                "OSC 52 decoded payload is {} bytes, above configured cap of {} bytes",
+                decoded.len(),
+                policy.max_bytes
+            ),
+        };
+    }
+
+    match String::from_utf8(decoded) {
+        Ok(text) => Osc52ClipboardDecision::Allow {
+            bytes: text.len(),
+            text,
+        },
+        Err(error) => Osc52ClipboardDecision::Deny {
+            reason: format!("OSC 52 decoded payload is not valid UTF-8: {error}"),
+        },
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct EmptySecretProvider;
 
@@ -430,5 +557,58 @@ mod tests {
             .delete_secret(&entry)
             .expect("memory keychain delete should work");
         assert!(keychain.get_secret(&entry).unwrap().is_none());
+    }
+
+    #[test]
+    fn osc52_allows_bounded_local_clipboard_write_by_default() {
+        let request = Osc52ClipboardRequest {
+            target: Osc52ClipboardTarget::Clipboard,
+            payload_base64: "cGFuZWE=".to_owned(),
+            remote: false,
+        };
+
+        let decision = evaluate_osc52_clipboard_write(&request, &Osc52ClipboardPolicy::default());
+
+        assert_eq!(
+            decision,
+            Osc52ClipboardDecision::Allow {
+                text: "panea".to_owned(),
+                bytes: 5
+            }
+        );
+    }
+
+    #[test]
+    fn osc52_denies_remote_clipboard_write_by_default() {
+        let request = Osc52ClipboardRequest {
+            target: Osc52ClipboardTarget::Clipboard,
+            payload_base64: "cGFuZWE=".to_owned(),
+            remote: true,
+        };
+
+        let decision = evaluate_osc52_clipboard_write(&request, &Osc52ClipboardPolicy::default());
+
+        assert!(
+            matches!(decision, Osc52ClipboardDecision::Deny { reason } if reason.contains("remote"))
+        );
+    }
+
+    #[test]
+    fn osc52_caps_large_clipboard_writes() {
+        let policy = Osc52ClipboardPolicy {
+            max_bytes: 4,
+            ..Osc52ClipboardPolicy::default()
+        };
+        let request = Osc52ClipboardRequest {
+            target: Osc52ClipboardTarget::Clipboard,
+            payload_base64: "cGFuZWE=".to_owned(),
+            remote: false,
+        };
+
+        let decision = evaluate_osc52_clipboard_write(&request, &policy);
+
+        assert!(
+            matches!(decision, Osc52ClipboardDecision::Deny { reason } if reason.contains("cap"))
+        );
     }
 }

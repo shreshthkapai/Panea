@@ -3,9 +3,9 @@
 pub const LAYER: &str = "core correctness";
 
 use term_core::{
-    ClearMode, Color, CursorDirection, CursorShape, CursorState, GraphicRendition, Scrollback,
-    SelectionRange, TerminalAction, TerminalCore, TerminalMode, TerminalResult, TerminalSize,
-    TerminalState, VisibleGrid,
+    ClearMode, ClipboardTarget, Color, CursorDirection, CursorShape, CursorState, GraphicRendition,
+    Osc52ClipboardRequest, Scrollback, SelectionRange, TerminalAction, TerminalCore, TerminalMode,
+    TerminalResult, TerminalSize, TerminalState, VisibleGrid,
 };
 
 const MAX_CSI_PARAM_BYTES: usize = 256;
@@ -553,8 +553,23 @@ fn dispatch_osc(content: &[u8]) -> Vec<TerminalAction> {
 
     match command {
         "0" | "2" => vec![TerminalAction::SetTitle(payload.to_owned())],
+        "52" => osc52_action(payload).into_iter().collect(),
         _ => Vec::new(),
     }
+}
+
+fn osc52_action(payload: &str) -> Option<TerminalAction> {
+    let (selector, payload_base64) = payload.split_once(';')?;
+    let target = selector
+        .chars()
+        .next()
+        .map(ClipboardTarget::from_osc52_selector)
+        .unwrap_or(ClipboardTarget::Clipboard);
+
+    Some(TerminalAction::Osc52Clipboard(Osc52ClipboardRequest {
+        target,
+        payload_base64: payload_base64.to_owned(),
+    }))
 }
 
 #[cfg(test)]
@@ -751,6 +766,18 @@ mod tests {
             String::from_utf8(terminal.state_mut().take_pending_output()).unwrap(),
             "\x1b[1;5R"
         );
+    }
+
+    #[test]
+    fn golden_osc52_is_reported_as_pending_clipboard_request() {
+        let mut terminal = terminal(TerminalSize::new(20, 3), b"\x1b]52;c;cGFuZWE=\x07");
+
+        let requests = terminal.state_mut().take_pending_clipboard_requests();
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].target, ClipboardTarget::Clipboard);
+        assert_eq!(requests[0].payload_base64, "cGFuZWE=");
+        assert_eq!(line_text(&terminal, 0), "");
     }
 
     #[test]
