@@ -16,6 +16,7 @@ config-core = { path = "../../crates/config-core" }
 config-toml = { path = "../../crates/config-toml" }
 diagnostics = { path = "../../crates/diagnostics" }
 font-system = { path = "../../crates/font-system" }
+mux = { path = "../../crates/mux" }
 platform-core = { path = "../../crates/platform-core" }
 platform-winit = { path = "../../crates/platform-winit" }
 pollster.workspace = true

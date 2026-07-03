@@ -50,8 +50,8 @@ The remaining high-level work is:
 - Runtime config watching/live reload cross-OS validation and richer error UI.
 - Advanced programmable config later.
 - GPU timestamp queries and in-window performance overlay.
-- Full desktop mux runtime wiring: split panes, tab chrome, per-pane
-  transports, PTY resizing.
+- Product-complete desktop mux runtime polish: startup layouts, SSH panes,
+  polished tab chrome, pane move/swap UI, and cross-OS GUI smoke.
 - Runtime shell integration activation and real shell verification.
 - Product-complete command blocks/visual overlays.
 - Animated image cursor pipeline.

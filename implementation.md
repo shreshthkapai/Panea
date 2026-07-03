@@ -293,10 +293,12 @@ to more visible features before the dependencies they rely on are hardened.
 - Phase 8 uses CPU-side timing plus WGPU submission wall-clock timing. Hardware
   GPU timestamp queries and richer in-window overlay rendering remain deferred
   until screenshot verification and stable overlay composition are in place.
-- Phase 9 establishes the native mux state model and action contract. Full
-  split-pane desktop rendering, tab chrome, per-pane transport orchestration,
-  and cross-OS native mux runtime smoke tests remain follow-up work on top of
-  the model.
+- Next-pass Phase 10 wires the native mux model into the desktop app for local
+  sessions: tabs, horizontal/vertical splits, focus, resize, close, zoom,
+  per-pane terminal/semantic/PTY ownership, active-pane input routing,
+  split-aware render scene composition, basic tab chrome, and pane borders now
+  exist. Declarative startup layouts, SSH panes, polished tab/move UI, and
+  cross-OS native mux GUI smoke tests remain follow-up work.
 - Phase 10 establishes semantic storage, parsers, scripts, config, and
   diagnostics. Desktop runtime injection/loading of shell integration scripts,
   remote installation flows, heuristic fallback, and cross-shell real-session

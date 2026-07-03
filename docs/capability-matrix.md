@@ -57,8 +57,8 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Renderer instrumentation | tested | implemented | implemented | implemented | CPU and submission metrics exist; GPU timestamp queries remain. |
 | In-window performance overlay | partial | partial | partial | partial | Text/diagnostic overlay model exists; polished installed overlay remains. |
 | Native mux model | tested | implemented | implemented | implemented | Workspace/tab/pane/session/layout model exists. |
-| Native tabs runtime | partial | partial | partial | partial | Model/actions exist; desktop tab chrome and runtime switching need completion. |
-| Native panes/splits runtime | partial | partial | partial | partial | Split tree exists; full rendering and per-pane transport orchestration are deferred. |
+| Native tabs runtime | partial | partial | partial | partial | Desktop runtime switching and basic tab chrome exist; real GUI smoke and polished tab UI remain. |
+| Native panes/splits runtime | partial | partial | partial | partial | Desktop split rendering, per-pane local transports, focus, resize, zoom, and close are wired; cross-OS smoke, SSH panes, and startup layouts remain. |
 | External tmux/screen/zellij compatibility | partial | partial | partial | partial | Architecture preserves compatibility; real app suite is not automated. |
 | Semantic timeline | tested | implemented | implemented | implemented | Storage and command-region model exist. |
 | Semantic escape parser | tested | implemented | implemented | implemented | OSC 133, OSC 633, OSC 7, and private OSC 777 foundations exist. |
@@ -73,7 +73,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | SSH host-key policy | tested | implemented | implemented | implemented | Security contract exists; interactive UI remains. |
 | SSH transport | partial | partial | partial | partial | Backend exists; real server smoke tests are unverified. |
 | SSH secret handling | partial | partial | partial | partial | Secret-provider interface exists; OS keychain providers and prompts remain. |
-| SSH in mux | partial | partial | partial | partial | Session specs exist; runtime tab/pane actions remain. |
+| SSH in mux | partial | partial | partial | partial | Session specs exist; direct SSH tab/pane runtime actions remain deferred until SSH trust/secret UI is ready. |
 | Doctor diagnostics | tested | implemented | implemented | implemented | Shared diagnostics and xtask commands exist; installed product command remains. |
 | Bug-report snapshot | tested | implemented | implemented | implemented | Privacy-aware model exists; product export UX remains. |
 | Native notifications | planned | planned | planned | planned | Not implemented. |

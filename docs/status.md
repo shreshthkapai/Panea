@@ -57,6 +57,7 @@ stated scope:
 | Diagnostics foundations | tested | `cargo xtask doctor ...`, bug-report snapshots, release/security/hardening/package readiness reports, and iOS readiness reports exist through shared diagnostics models. |
 | Performance harness foundation | tested | `cargo xtask bench ...` and `tools/bench` fixtures exist for repeatable local measurements. |
 | Mux model | tested | Workspace, window, tab, pane, session, split tree, restore snapshot, and mux action models exist with unit coverage. |
+| Desktop mux runtime foundation | tested | The desktop app owns one terminal/semantic/transport runtime per native pane, routes focus/input/paste/mouse to the active pane, composes pane viewports into one render scene, draws basic tab chrome/borders, and resizes active pane PTYs from split layout. |
 | Semantic model | tested | Semantic regions, command blocks, OSC semantic parser support, navigation, copy actions, shell metadata, and diagnostics models exist. |
 | Clipboard/OSC 52 policy | tested | Portable `clipboard` config, paste protection, bracketed paste forwarding, middle-click paste suppression during mouse reporting, parser pending OSC 52 requests, bounded security policy, local allow/default remote deny behavior, and TOML/security/parser/app tests exist. |
 | SSH transport foundation | tested | SSH profile mapping, host-key policy contracts, secret-provider boundaries, SSH2 transport, remote PTY request, resize, and shutdown foundations exist. |
@@ -77,7 +78,7 @@ These areas are real foundations but must not be called complete:
 | Baseline compatibility | partial | Real app smoke matrix for shells, editors, pagers, TUIs, tmux, screen, zellij, SSH, WSL, and command-line tools. |
 | Shell integration | partial | Runtime activation/injection, remote install flows, heuristic fallback, and real bash/zsh/fish/PowerShell session verification. |
 | Visual overlays | partial | Product-complete prompt decorations, command blocks, badge text composition, collapse/expand behavior, animated image cursor pipeline, and cross-OS visual verification. |
-| Native mux runtime | partial | Tab chrome, split rendering, per-pane transports, pane resize-to-PTY propagation, startup workspaces, and runtime smoke tests. |
+| Native mux runtime | partial | Local tab/split runtime wiring exists, but startup workspaces, SSH panes, polished tab chrome, pane drag/move UI, and cross-OS GUI/runtime smoke tests remain. |
 | SSH UX and security | partial | Interactive host-key approval UI, changed-host-key resolution UI, password/passphrase prompts, OS keychain providers, reconnect UI, proxy jump, and real SSH server smoke tests. |
 | Performance reporting | partial | Hardware GPU timings, installed in-window overlay, CI regression gates, and reproducible cross-machine benchmark reporting. |
 | Hardening/release readiness | partial | GPU recovery and crash-safe config reload foundations exist, but real device-loss platform validation, packaging artifacts, validation suite automation, and platform lab coverage remain. |
@@ -116,7 +117,8 @@ The following major accepted features have no complete product behavior yet:
   changes, and backend failure simulation across desktop OSes.
 - Linux primary selection provider and remote OSC 52 confirmation UI.
 - Native OS config watcher backends and real macOS/Linux runtime reload validation.
-- Full desktop tabs/panes/sessions/workspaces runtime.
+- Product-complete desktop tabs/panes/sessions/workspaces runtime, including
+  startup layouts, SSH panes, polished chrome, and cross-OS smoke tests.
 - Runtime shell integration activation and remote install flows.
 - Product-complete command blocks and semantic visual overlays.
 - Cursor animation polish and animated image cursor asset pipeline.
@@ -137,11 +139,11 @@ The following major accepted features have no complete product behavior yet:
 | semantic meaning | partial | Semantic events and timeline exist; runtime shell activation and real-shell verification remain. |
 | visual overlay | partial | Overlay contracts and basic generation exist; polished command blocks/cursor assets remain. |
 | session transport | partial | Local and SSH transport foundations exist; non-Windows local smoke, SSH real-server tests, and app UX remain. |
-| multiplexer structure | partial | Model exists; runtime desktop wiring remains. |
+| multiplexer structure | partial | Model and local desktop runtime wiring exist; startup layouts, SSH panes, polished chrome, and cross-OS smoke remain. |
 | diagnostics | partial | Xtask diagnostics exist; installed doctor and live platform reports remain. |
 | security | partial | SSH/security contracts and OSC 52 policy exist; keychain/secret UI and remote OSC 52 confirmation UI remain. |
 
 ## Immediate Next Slice
 
-After runtime config watching and live reload, the next
-dependency-ordered phase is desktop multiplexer runtime wiring.
+After desktop multiplexer runtime wiring, the next dependency-ordered phase is
+shell integration activation and verification.

@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     error::Error,
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
@@ -16,6 +16,10 @@ use config_core::{
 };
 use diagnostics::{PerformanceBudget, PerformanceOverlay};
 use font_system::{CellMetrics, FontConfig as RuntimeFontConfig, FontSystem};
+use mux::{
+    LogicalRect, MuxAction, MuxModel, PaneId, PaneLayout, SessionSpec, SessionStatus, SplitAxis,
+    TerminalGridSize,
+};
 use platform_core::{
     DecorationMode, InputEvent, KeyEvent, KeyModifiers, KeyState, LinuxWindowBackend, MouseButton,
     MouseEvent, MouseEventKind, WindowAction, WindowMode,
@@ -75,25 +79,15 @@ fn run() -> Result<(), Box<dyn Error>> {
     let capabilities = platform_capabilities(&event_loop, &window);
     let _diagnostics =
         DesktopDiagnosticsPlaceholder::new(desktop_window.diagnostics().clone(), capabilities);
-    let _session_manager = SessionManagerPlaceholder;
     let mut input_translator = InputTranslator::new();
     let mut clipboard = ClipboardBridge::new();
     let mut current_window_mode = map_window_mode(config.window.mode);
     let mut clipboard_config = config.clipboard.clone();
     let mut paste_config = config.paste.clone();
     let mut osc52_policy = osc52_policy(&clipboard_config);
-    let session_is_remote = false;
-    let mut mouse_protocol = MouseProtocolState::default();
 
     let mut fonts = FontSystem::new(font_config(&config.font));
     let metrics = fonts.cell_metrics()?;
-    let initial_size = terminal_size_for_window(config.window.columns, config.window.rows, metrics);
-    let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(
-        config.window.columns,
-        config.window.rows,
-    ));
-    let mut semantic_parser = SemanticEscapeParser::new();
-    let mut semantic_timeline = SemanticTimelineStore::new();
     let mut renderer = pollster::block_on(GpuTerminalRenderer::new(
         Arc::clone(&window),
         renderer_options(&config),
@@ -102,14 +96,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut performance_overlay =
         PerformanceOverlay::new(config.diagnostics.performance_overlay, "wgpu");
     let mut performance_budget = performance_budget(&config);
-    let mut transport = match spawn_initial_transport(&config, initial_size) {
-        Ok(transport) => Some(transport),
-        Err(error) => {
-            terminal.apply_bytes(format!("failed to spawn local shell: {error}\r\n").as_bytes())?;
-            scheduler.terminal_content_changed();
-            None
-        }
-    };
+    let mut surface_size = window.inner_size();
+    let mut mux_runtime =
+        MuxRuntime::new(&config, metrics, surface_size.width, surface_size.height);
 
     scheduler.terminal_content_changed();
 
@@ -120,8 +109,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
                 WindowEvent::RedrawRequested => {
                     let metrics = fonts.cell_metrics().ok();
-                    let scene =
-                        scene_from_terminal(&terminal, &semantic_timeline, metrics, &config);
+                    let scene = scene_from_mux(&mux_runtime, metrics, &config);
                     let idle_wakeups = scheduler.take_idle_wakeups();
                     match catch_unwind(AssertUnwindSafe(|| {
                         renderer.render_scene(&scene, &mut fonts)
@@ -173,10 +161,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                     for platform_event in platform_events {
                         match platform_event {
                             InputEvent::CloseRequested => {
-                                shutdown_transport(transport.as_mut());
+                                mux_runtime.shutdown_all();
                                 target.exit();
                             }
                             InputEvent::Resized { width, height } => {
+                                surface_size = winit::dpi::PhysicalSize::new(width, height);
                                 if let Err(panic) = catch_unwind(AssertUnwindSafe(|| {
                                     renderer.resize(width, height)
                                 })) {
@@ -186,99 +175,115 @@ fn run() -> Result<(), Box<dyn Error>> {
                                     );
                                 }
                                 if let Ok(metrics) = fonts.cell_metrics() {
-                                    let cols = cols_for_width(width, metrics).max(1);
-                                    let rows = rows_for_height(height, metrics).max(1);
-                                    let core_size = CoreTerminalSize::new(cols, rows);
-                                    let transport_size =
-                                        TransportSize::new(cols, rows, width, height);
-                                    let _ = terminal.resize(core_size);
-                                    if let Some(transport) = transport.as_mut() {
-                                        match catch_unwind(AssertUnwindSafe(|| {
-                                            transport.resize(transport_size)
-                                        })) {
-                                            Ok(Ok(())) => {}
-                                            Ok(Err(error)) => {
-                                                eprintln!("transport resize error: {error}");
-                                            }
-                                            Err(panic) => eprintln!(
-                                                "transport resize panic boundary: {}",
-                                                panic_payload(panic)
-                                            ),
-                                        }
-                                    }
+                                    mux_runtime.resize_all(width, height, metrics, &config);
                                 }
                                 scheduler.window_resized();
                                 window.request_redraw();
                             }
                             InputEvent::Key(key) => {
-                                if is_copy_shortcut(&key) {
-                                    if clipboard_config.enabled
-                                        && let Some(text) = terminal.state().selected_text()
-                                    {
-                                        copy_text_with_diagnostics(
-                                            &mut clipboard,
-                                            &text,
-                                            &clipboard_config,
-                                            "selection copy",
-                                        );
-                                    }
-                                } else if let Some(transport) = transport.as_mut() {
-                                    if is_paste_shortcut(&key) {
-                                        if clipboard_config.enabled
-                                            && let Ok(text) = clipboard.paste_text()
-                                        {
-                                            let bytes = paste_bytes(
-                                                &text,
-                                                &clipboard_config,
-                                                &paste_config,
-                                                terminal
-                                                    .modes()
-                                                    .contains(&TerminalMode::BracketedPaste),
-                                            );
-                                            write_transport_input(transport, &bytes);
+                                if key.state != KeyState::Pressed {
+                                    continue;
+                                }
+
+                                if let Some(action) = keybinding_action(&key, &config) {
+                                    match action.as_str() {
+                                        "copy" => {
+                                            if clipboard_config.enabled
+                                                && let Some(text) =
+                                                    mux_runtime.active_selected_text()
+                                            {
+                                                copy_text_with_diagnostics(
+                                                    &mut clipboard,
+                                                    &text,
+                                                    &clipboard_config,
+                                                    "selection copy",
+                                                );
+                                            }
                                         }
-                                    } else if let Some(bytes) = input_bytes(&key) {
-                                        write_transport_input(transport, &bytes);
+                                        "paste" => {
+                                            if clipboard_config.enabled
+                                                && let Ok(text) = clipboard.paste_text()
+                                            {
+                                                mux_runtime.paste_into_active(
+                                                    &text,
+                                                    &clipboard_config,
+                                                    &paste_config,
+                                                );
+                                            }
+                                        }
+                                        "toggle_fullscreen" => {
+                                            current_window_mode = if matches!(
+                                                current_window_mode,
+                                                WindowMode::Windowed
+                                            ) {
+                                                WindowMode::BorderlessFullscreen
+                                            } else {
+                                                WindowMode::Windowed
+                                            };
+                                            let _ = apply_window_mode(&window, current_window_mode);
+                                        }
+                                        "restore_window_decorations" => {
+                                            current_window_mode = WindowMode::Windowed;
+                                            let _ = apply_window_mode(&window, current_window_mode);
+                                        }
+                                        "toggle_frameless" => {
+                                            current_window_mode = if matches!(
+                                                current_window_mode,
+                                                WindowMode::FramelessWindowed
+                                            ) {
+                                                WindowMode::Windowed
+                                            } else {
+                                                WindowMode::FramelessWindowed
+                                            };
+                                            let _ = apply_window_mode(&window, current_window_mode);
+                                        }
+                                        "close_window" => {
+                                            mux_runtime.shutdown_all();
+                                            target.exit();
+                                        }
+                                        "open_command_palette_later" => {
+                                            eprintln!(
+                                                "command palette action is reserved for a later phase"
+                                            );
+                                        }
+                                        _ => {
+                                            if let Some(action) = MuxAction::named(&action) {
+                                                if mux_runtime.handle_mux_action(
+                                                    action,
+                                                    &config,
+                                                    metrics,
+                                                    surface_size.width,
+                                                    surface_size.height,
+                                                ) {
+                                                    scheduler.terminal_content_changed();
+                                                    window.request_redraw();
+                                                }
+                                            } else {
+                                                eprintln!("unhandled keybinding action: {action}");
+                                            }
+                                        }
                                     }
+                                } else if let Some(bytes) = input_bytes(&key) {
+                                    mux_runtime.write_active(&bytes);
                                 }
                             }
                             InputEvent::Mouse(mouse) => {
-                                if let Some(transport) = transport.as_mut()
-                                    && let Ok(metrics) = fonts.cell_metrics()
-                                {
-                                    let modes = terminal.modes();
-                                    if let Some(bytes) =
-                                        mouse_protocol.report_bytes(mouse, metrics, &modes)
-                                    {
-                                        write_transport_input(transport, &bytes);
-                                    } else if should_middle_click_paste(
-                                        &mouse,
-                                        &modes,
+                                if let Ok(metrics) = fonts.cell_metrics() {
+                                    mux_runtime.handle_mouse(
+                                        mouse,
+                                        metrics,
+                                        &config,
                                         &clipboard_config,
-                                    ) && let Ok(text) = clipboard.paste_text()
-                                    {
-                                        let bytes = paste_bytes(
-                                            &text,
-                                            &clipboard_config,
-                                            &paste_config,
-                                            false,
-                                        );
-                                        write_transport_input(transport, &bytes);
-                                    }
+                                        &paste_config,
+                                        &mut clipboard,
+                                    );
                                 }
                             }
                             InputEvent::Ime(platform_core::ImeEvent::Commit { text }) => {
-                                if let Some(transport) = transport.as_mut() {
-                                    write_transport_input(transport, text.as_bytes());
-                                }
+                                mux_runtime.write_active(text.as_bytes());
                             }
                             InputEvent::Focused(focused) => {
-                                if terminal.modes().contains(&TerminalMode::FocusEvents)
-                                    && let Some(transport) = transport.as_mut()
-                                {
-                                    let bytes = if focused { b"\x1b[I" } else { b"\x1b[O" };
-                                    write_transport_input(transport, bytes);
-                                }
+                                mux_runtime.send_focus_event(focused);
                             }
                             InputEvent::WindowAction(action) => match action {
                                 WindowAction::ToggleFullscreen => {
@@ -306,7 +311,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                                     let _ = apply_window_mode(&window, current_window_mode);
                                 }
                                 WindowAction::CloseWindow => {
-                                    shutdown_transport(transport.as_mut());
+                                    mux_runtime.shutdown_all();
                                     target.exit();
                                 }
                                 WindowAction::OpenCommandPaletteLater => {
@@ -353,6 +358,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                         ) {
                             Ok(reloaded) => {
                                 if reloaded {
+                                    if let Ok(metrics) = fonts.cell_metrics() {
+                                        mux_runtime.resize_all(
+                                            surface_size.width,
+                                            surface_size.height,
+                                            metrics,
+                                            &config,
+                                        );
+                                    }
                                     scheduler.terminal_content_changed();
                                     window.request_redraw();
                                 }
@@ -374,63 +387,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                     }
                 }
 
-                if let Some(transport) = transport.as_mut() {
-                    let mut content_changed = false;
-                    for _ in 0..64 {
-                        let output =
-                            match catch_unwind(AssertUnwindSafe(|| transport.poll_output())) {
-                                Ok(Ok(output)) => output,
-                                Ok(Err(error)) => {
-                                    eprintln!("transport poll error: {error}");
-                                    break;
-                                }
-                                Err(panic) => {
-                                    eprintln!(
-                                        "transport poll panic boundary: {}",
-                                        panic_payload(panic)
-                                    );
-                                    break;
-                                }
-                            };
-                        if output.bytes.is_empty() && output.lifecycle.is_empty() {
-                            break;
-                        }
-
-                        if !output.bytes.is_empty() {
-                            let cursor = terminal.cursor_state();
-                            let semantic_position =
-                                BufferPosition::new(cursor.position.row, cursor.position.col);
-                            for parsed in semantic_parser.parse(&output.bytes, semantic_position) {
-                                semantic_timeline.apply_event(parsed.event);
-                            }
-                            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| {
-                                let _ = terminal.apply_bytes(&output.bytes);
-                            })) {
-                                eprintln!(
-                                    "terminal parser panic boundary: {}",
-                                    panic_payload(panic)
-                                );
-                                break;
-                            }
-                            process_pending_clipboard_requests(
-                                &mut terminal,
-                                &mut clipboard,
-                                &osc52_policy,
-                                &clipboard_config,
-                                session_is_remote,
-                            );
-                            flush_terminal_responses(&mut terminal, transport);
-                            content_changed = true;
-                        }
-                        if output.closed {
-                            content_changed = true;
-                            break;
-                        }
-                    }
-
-                    if content_changed {
-                        scheduler.terminal_content_changed();
-                    }
+                if mux_runtime.poll_outputs(&mut clipboard, &osc52_policy, &clipboard_config) {
+                    scheduler.terminal_content_changed();
                 }
 
                 if matches!(scheduler.next_frame(), FrameDecision::FrameNeeded(_)) {
@@ -657,15 +615,6 @@ fn ssh_connection_profile(profile: &SshProfile) -> SshConnectionProfile {
     connection
 }
 
-fn terminal_size_for_window(cols: u16, rows: u16, metrics: CellMetrics) -> TransportSize {
-    TransportSize::new(
-        cols,
-        rows,
-        (f32::from(cols) * metrics.cell_width).ceil() as u32,
-        (f32::from(rows) * metrics.cell_height).ceil() as u32,
-    )
-}
-
 fn cols_for_width(width: u32, metrics: CellMetrics) -> u16 {
     ((width as f32 / metrics.cell_width).floor() as u16).max(1)
 }
@@ -696,18 +645,75 @@ fn input_bytes(event: &KeyEvent) -> Option<Vec<u8>> {
     }
 }
 
-fn is_paste_shortcut(event: &KeyEvent) -> bool {
-    event.state == KeyState::Pressed
-        && event.modifiers.ctrl
-        && event.modifiers.shift
-        && event.logical_key.eq_ignore_ascii_case("v")
+fn keybinding_action(event: &KeyEvent, config: &AppConfig) -> Option<String> {
+    if event.state != KeyState::Pressed {
+        return None;
+    }
+    let event_key = canonical_key_event(event);
+    config
+        .keyboard
+        .keybindings
+        .iter()
+        .find(|binding| canonical_key_spec(&binding.keys) == event_key)
+        .map(|binding| binding.action.clone())
 }
 
-fn is_copy_shortcut(event: &KeyEvent) -> bool {
-    event.state == KeyState::Pressed
-        && event.modifiers.ctrl
-        && event.modifiers.shift
-        && event.logical_key.eq_ignore_ascii_case("c")
+fn canonical_key_event(event: &KeyEvent) -> String {
+    let mut parts = Vec::new();
+    if event.modifiers.ctrl {
+        parts.push("ctrl".to_owned());
+    }
+    if event.modifiers.alt {
+        parts.push("alt".to_owned());
+    }
+    if event.modifiers.shift {
+        parts.push("shift".to_owned());
+    }
+    if event.modifiers.super_key {
+        parts.push("super".to_owned());
+    }
+    parts.push(canonical_key_name(&event.logical_key));
+    parts.join("+")
+}
+
+fn canonical_key_spec(spec: &str) -> String {
+    let mut modifiers = BTreeSet::new();
+    let mut key = String::new();
+    for part in spec.split('+') {
+        match part.trim().to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => {
+                modifiers.insert("ctrl");
+            }
+            "alt" | "option" => {
+                modifiers.insert("alt");
+            }
+            "shift" => {
+                modifiers.insert("shift");
+            }
+            "super" | "cmd" | "command" | "meta" => {
+                modifiers.insert("super");
+            }
+            other if !other.is_empty() => key = canonical_key_name(other),
+            _ => {}
+        }
+    }
+
+    let mut parts = modifiers.into_iter().collect::<Vec<_>>();
+    parts.push(key.as_str());
+    parts.join("+")
+}
+
+fn canonical_key_name(key: &str) -> String {
+    match key.trim().to_ascii_lowercase().as_str() {
+        "pagedown" | "page_down" | "page down" => "pagedown".to_owned(),
+        "pageup" | "page_up" | "page up" => "pageup".to_owned(),
+        "arrowleft" | "left" => "left".to_owned(),
+        "arrowright" | "right" => "right".to_owned(),
+        "arrowup" | "up" => "up".to_owned(),
+        "arrowdown" | "down" => "down".to_owned(),
+        " " | "space" => "space".to_owned(),
+        other => other.to_owned(),
+    }
 }
 
 fn paste_bytes(
@@ -920,8 +926,6 @@ fn map_decoration_mode(mode: DecorationStrategyConfig) -> DecorationMode {
     }
 }
 
-struct SessionManagerPlaceholder;
-
 struct DesktopDiagnosticsPlaceholder {
     _window: platform_winit::DesktopWindowDiagnostics,
     _capabilities: platform_core::PlatformCapabilities,
@@ -936,6 +940,704 @@ impl DesktopDiagnosticsPlaceholder {
             _window: window,
             _capabilities: capabilities,
         }
+    }
+}
+
+struct MuxRuntime {
+    model: MuxModel,
+    panes: HashMap<PaneId, PaneRuntime>,
+    surface_cols: u16,
+    surface_rows: u16,
+}
+
+impl MuxRuntime {
+    fn new(config: &AppConfig, metrics: CellMetrics, width: u32, height: u32) -> Self {
+        let mut model = MuxModel::new(session_spec_for_config(config));
+        model.active_workspace_mut().name = config.mux.default_workspace.clone();
+
+        let surface_cols = cols_for_width(width, metrics).max(1);
+        let surface_rows = rows_for_height(height, metrics).max(1);
+        let pane_id = model.active_tab().active_pane;
+        let pane_size = TerminalGridSize::new(
+            surface_cols,
+            surface_rows
+                .saturating_sub(tab_bar_rows(&model, config))
+                .max(1),
+        );
+        let pane = PaneRuntime::new(config, pane_size, metrics);
+        let mut panes = HashMap::new();
+        panes.insert(pane_id, pane);
+        mark_session_status(&mut model, pane_id, SessionStatus::Running);
+
+        let mut runtime = Self {
+            model,
+            panes,
+            surface_cols,
+            surface_rows,
+        };
+        runtime.resize_all(width, height, metrics, config);
+        runtime
+    }
+
+    fn resize_all(&mut self, width: u32, height: u32, metrics: CellMetrics, config: &AppConfig) {
+        self.surface_cols = cols_for_width(width, metrics).max(1);
+        self.surface_rows = rows_for_height(height, metrics).max(1);
+        self.resize_active_tab(metrics, config);
+    }
+
+    fn resize_active_tab(&mut self, metrics: CellMetrics, config: &AppConfig) {
+        let layouts = self.active_layouts(config);
+        for layout in layouts {
+            if let Some(pane) = self.panes.get_mut(&layout.pane_id) {
+                pane.resize(layout.terminal_size, metrics);
+            }
+            if let Some(model_pane) = self.model.active_tab_mut().panes.get_mut(&layout.pane_id) {
+                model_pane.last_size = Some(layout.terminal_size);
+            }
+        }
+    }
+
+    fn handle_mux_action(
+        &mut self,
+        action: MuxAction,
+        config: &AppConfig,
+        metrics: CellMetrics,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        if !config.mux.enabled {
+            eprintln!("mux action ignored because mux.enabled is false");
+            return false;
+        }
+
+        let result = match action {
+            MuxAction::NewTab => {
+                self.new_tab(config, metrics, width, height);
+                Ok(())
+            }
+            MuxAction::CloseTab => self.close_active_tab(metrics, config),
+            MuxAction::NextTab => self.switch_relative_tab(1, metrics, config),
+            MuxAction::PreviousTab => self.switch_relative_tab(-1, metrics, config),
+            MuxAction::RenameTab { name } => {
+                let tab_id = self.model.active_tab().id;
+                let name = if name.trim().is_empty() {
+                    format!("tab {}", tab_id.0)
+                } else {
+                    name
+                };
+                self.model.rename_tab(tab_id, name)
+            }
+            MuxAction::MoveTab { target_index } => self
+                .model
+                .move_tab(self.model.active_tab().id, target_index),
+            MuxAction::SplitHorizontal => {
+                self.split_active(SplitAxis::Horizontal, config, metrics, width, height);
+                Ok(())
+            }
+            MuxAction::SplitVertical => {
+                self.split_active(SplitAxis::Vertical, config, metrics, width, height);
+                Ok(())
+            }
+            MuxAction::ClosePane => self.close_active_pane(metrics, config),
+            MuxAction::FocusDirection(direction) => self
+                .model
+                .focus_direction(direction)
+                .map(|_| self.resize_active_tab(metrics, config)),
+            MuxAction::ResizePane(direction) => self
+                .model
+                .resize_active_pane(direction, config.mux.pane_resize_step as f32)
+                .map(|_| self.resize_active_tab(metrics, config)),
+            MuxAction::ZoomPane => {
+                self.model.toggle_zoom_active_pane();
+                self.resize_active_tab(metrics, config);
+                Ok(())
+            }
+            MuxAction::MovePane => {
+                eprintln!("mux move_pane is reserved for layout persistence after pane drag UI");
+                Ok(())
+            }
+            MuxAction::SwapPane { other } => self
+                .model
+                .swap_panes(self.model.active_tab().active_pane, other)
+                .map(|_| self.resize_active_tab(metrics, config)),
+        };
+
+        if let Err(error) = result {
+            eprintln!("mux action failed: {error}");
+            return false;
+        }
+        true
+    }
+
+    fn new_tab(&mut self, config: &AppConfig, metrics: CellMetrics, width: u32, height: u32) {
+        let tab_number = self.model.active_workspace().active_window().tabs.len() + 1;
+        match self
+            .model
+            .new_tab(tab_number.to_string(), session_spec_for_config(config))
+        {
+            Ok(_) => {
+                let pane_id = self.model.active_tab().active_pane;
+                self.insert_runtime_for_pane(pane_id, config, metrics);
+                self.resize_all(width, height, metrics, config);
+            }
+            Err(error) => eprintln!("mux new tab failed: {error}"),
+        }
+    }
+
+    fn split_active(
+        &mut self,
+        axis: SplitAxis,
+        config: &AppConfig,
+        metrics: CellMetrics,
+        width: u32,
+        height: u32,
+    ) {
+        match self
+            .model
+            .split_active_pane(axis, session_spec_for_config(config))
+        {
+            Ok(pane_id) => {
+                self.insert_runtime_for_pane(pane_id, config, metrics);
+                self.resize_all(width, height, metrics, config);
+            }
+            Err(error) => eprintln!("mux split failed: {error}"),
+        }
+    }
+
+    fn insert_runtime_for_pane(
+        &mut self,
+        pane_id: PaneId,
+        config: &AppConfig,
+        metrics: CellMetrics,
+    ) {
+        let size = self
+            .active_layouts(config)
+            .into_iter()
+            .find(|layout| layout.pane_id == pane_id)
+            .map(|layout| layout.terminal_size)
+            .unwrap_or_else(|| TerminalGridSize::new(self.surface_cols, self.surface_rows));
+        let pane = PaneRuntime::new(config, size, metrics);
+        mark_session_status(&mut self.model, pane_id, SessionStatus::Running);
+        self.panes.insert(pane_id, pane);
+    }
+
+    fn close_active_tab(&mut self, metrics: CellMetrics, config: &AppConfig) -> mux::MuxResult<()> {
+        let tab_id = self.model.active_tab().id;
+        let pane_ids = self
+            .model
+            .active_tab()
+            .panes
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        self.model.close_tab(tab_id)?;
+        for pane_id in pane_ids {
+            if let Some(mut pane) = self.panes.remove(&pane_id) {
+                pane.shutdown();
+            }
+        }
+        self.resize_active_tab(metrics, config);
+        Ok(())
+    }
+
+    fn switch_relative_tab(
+        &mut self,
+        delta: isize,
+        metrics: CellMetrics,
+        config: &AppConfig,
+    ) -> mux::MuxResult<()> {
+        let window = self.model.active_workspace().active_window();
+        let active_index = window
+            .tabs
+            .iter()
+            .position(|tab| tab.id == window.active_tab)
+            .ok_or(mux::MuxError::TabNotFound(window.active_tab))?;
+        let next_index = (active_index as isize + delta).rem_euclid(window.tabs.len() as isize);
+        let next_tab = window.tabs[next_index as usize].id;
+        self.model.switch_tab(next_tab)?;
+        self.resize_active_tab(metrics, config);
+        Ok(())
+    }
+
+    fn close_active_pane(
+        &mut self,
+        metrics: CellMetrics,
+        config: &AppConfig,
+    ) -> mux::MuxResult<()> {
+        let pane_id = self.model.active_tab().active_pane;
+        self.model.close_pane(pane_id)?;
+        if let Some(mut pane) = self.panes.remove(&pane_id) {
+            pane.shutdown();
+        }
+        self.resize_active_tab(metrics, config);
+        Ok(())
+    }
+
+    fn write_active(&mut self, bytes: &[u8]) {
+        if let Some(pane) = self.active_pane_mut() {
+            pane.write_input(bytes);
+        }
+    }
+
+    fn paste_into_active(
+        &mut self,
+        text: &str,
+        clipboard: &ClipboardConfig,
+        paste_config: &PasteConfig,
+    ) {
+        if let Some(pane) = self.active_pane_mut() {
+            let bytes = paste_bytes(
+                text,
+                clipboard,
+                paste_config,
+                pane.terminal
+                    .modes()
+                    .contains(&TerminalMode::BracketedPaste),
+            );
+            pane.write_input(&bytes);
+        }
+    }
+
+    fn send_focus_event(&mut self, focused: bool) {
+        if let Some(pane) = self.active_pane_mut()
+            && pane.terminal.modes().contains(&TerminalMode::FocusEvents)
+        {
+            let bytes = if focused { b"\x1b[I" } else { b"\x1b[O" };
+            pane.write_input(bytes);
+        }
+    }
+
+    fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        metrics: CellMetrics,
+        config: &AppConfig,
+        clipboard_config: &ClipboardConfig,
+        paste_config: &PasteConfig,
+        clipboard: &mut ClipboardBridge,
+    ) {
+        let Some((pane_id, local_mouse)) = self.local_mouse_event(mouse, metrics, config) else {
+            return;
+        };
+        if matches!(mouse.kind, MouseEventKind::Pressed(_)) {
+            let _ = self.model.focus_pane(pane_id);
+        }
+        let Some(pane) = self.panes.get_mut(&pane_id) else {
+            return;
+        };
+        let modes = pane.terminal.modes();
+        if let Some(bytes) = pane
+            .mouse_protocol
+            .report_bytes(local_mouse, metrics, &modes)
+        {
+            pane.write_input(&bytes);
+        } else if should_middle_click_paste(&local_mouse, &modes, clipboard_config)
+            && let Ok(text) = clipboard.paste_text()
+        {
+            let bytes = paste_bytes(&text, clipboard_config, paste_config, false);
+            pane.write_input(&bytes);
+        }
+    }
+
+    fn local_mouse_event(
+        &self,
+        mouse: MouseEvent,
+        metrics: CellMetrics,
+        config: &AppConfig,
+    ) -> Option<(PaneId, MouseEvent)> {
+        let x_cells = (mouse.x as f32 / metrics.cell_width).floor();
+        let y_cells = (mouse.y as f32 / metrics.cell_height).floor();
+        self.active_layouts(config)
+            .into_iter()
+            .find(|layout| {
+                x_cells >= layout.rect.x
+                    && x_cells < layout.rect.x + layout.rect.width
+                    && y_cells >= layout.rect.y
+                    && y_cells < layout.rect.y + layout.rect.height
+            })
+            .map(|layout| {
+                let local = MouseEvent {
+                    x: (mouse.x as f32 - layout.rect.x * metrics.cell_width).max(0.0) as f64,
+                    y: (mouse.y as f32 - layout.rect.y * metrics.cell_height).max(0.0) as f64,
+                    ..mouse
+                };
+                (layout.pane_id, local)
+            })
+    }
+
+    fn poll_outputs(
+        &mut self,
+        clipboard: &mut ClipboardBridge,
+        policy: &Osc52ClipboardPolicy,
+        clipboard_config: &ClipboardConfig,
+    ) -> bool {
+        let mut content_changed = false;
+        for pane in self.panes.values_mut() {
+            if pane.poll_output(clipboard, policy, clipboard_config) {
+                content_changed = true;
+            }
+        }
+        content_changed
+    }
+
+    fn active_selected_text(&self) -> Option<String> {
+        self.active_pane()
+            .and_then(|pane| pane.terminal.state().selected_text())
+    }
+
+    fn active_pane(&self) -> Option<&PaneRuntime> {
+        self.panes.get(&self.model.active_tab().active_pane)
+    }
+
+    fn active_pane_mut(&mut self) -> Option<&mut PaneRuntime> {
+        let pane_id = self.model.active_tab().active_pane;
+        self.panes.get_mut(&pane_id)
+    }
+
+    fn active_layouts(&self, config: &AppConfig) -> Vec<PaneLayout> {
+        let tab_bar_rows = tab_bar_rows(&self.model, config);
+        self.model.active_tab().layout(LogicalRect::new(
+            0.0,
+            f32::from(tab_bar_rows),
+            f32::from(self.surface_cols),
+            f32::from(self.surface_rows.saturating_sub(tab_bar_rows).max(1)),
+        ))
+    }
+
+    fn shutdown_all(&mut self) {
+        for pane in self.panes.values_mut() {
+            pane.shutdown();
+        }
+    }
+}
+
+struct PaneRuntime {
+    terminal: TerminalEmulator,
+    semantic_parser: SemanticEscapeParser,
+    semantic_timeline: SemanticTimelineStore,
+    transport: Option<LocalPtyTransport>,
+    mouse_protocol: MouseProtocolState,
+}
+
+impl PaneRuntime {
+    fn new(config: &AppConfig, size: TerminalGridSize, metrics: CellMetrics) -> Self {
+        let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(size.cols, size.rows));
+        let transport_size = terminal_transport_size(size, metrics);
+        let transport = match spawn_initial_transport(config, transport_size) {
+            Ok(transport) => Some(transport),
+            Err(error) => {
+                let _ = terminal
+                    .apply_bytes(format!("failed to spawn local shell: {error}\r\n").as_bytes());
+                None
+            }
+        };
+
+        Self {
+            terminal,
+            semantic_parser: SemanticEscapeParser::new(),
+            semantic_timeline: SemanticTimelineStore::new(),
+            transport,
+            mouse_protocol: MouseProtocolState::default(),
+        }
+    }
+
+    fn resize(&mut self, size: TerminalGridSize, metrics: CellMetrics) {
+        let _ = self
+            .terminal
+            .resize(CoreTerminalSize::new(size.cols, size.rows));
+        if let Some(transport) = self.transport.as_mut() {
+            resize_transport(transport, terminal_transport_size(size, metrics));
+        }
+    }
+
+    fn write_input(&mut self, bytes: &[u8]) {
+        if let Some(transport) = self.transport.as_mut() {
+            write_transport_input(transport, bytes);
+        }
+    }
+
+    fn poll_output(
+        &mut self,
+        clipboard: &mut ClipboardBridge,
+        policy: &Osc52ClipboardPolicy,
+        clipboard_config: &ClipboardConfig,
+    ) -> bool {
+        let Some(transport) = self.transport.as_mut() else {
+            return false;
+        };
+
+        let mut content_changed = false;
+        for _ in 0..64 {
+            let output = match catch_unwind(AssertUnwindSafe(|| transport.poll_output())) {
+                Ok(Ok(output)) => output,
+                Ok(Err(error)) => {
+                    eprintln!("transport poll error: {error}");
+                    break;
+                }
+                Err(panic) => {
+                    eprintln!("transport poll panic boundary: {}", panic_payload(panic));
+                    break;
+                }
+            };
+            if output.bytes.is_empty() && output.lifecycle.is_empty() {
+                break;
+            }
+
+            if !output.bytes.is_empty() {
+                let cursor = self.terminal.cursor_state();
+                let semantic_position =
+                    BufferPosition::new(cursor.position.row, cursor.position.col);
+                for parsed in self.semantic_parser.parse(&output.bytes, semantic_position) {
+                    self.semantic_timeline.apply_event(parsed.event);
+                }
+                if let Err(panic) = catch_unwind(AssertUnwindSafe(|| {
+                    let _ = self.terminal.apply_bytes(&output.bytes);
+                })) {
+                    eprintln!("terminal parser panic boundary: {}", panic_payload(panic));
+                    break;
+                }
+                process_pending_clipboard_requests(
+                    &mut self.terminal,
+                    clipboard,
+                    policy,
+                    clipboard_config,
+                    false,
+                );
+                flush_terminal_responses(&mut self.terminal, transport);
+                content_changed = true;
+            }
+            if output.closed {
+                content_changed = true;
+                break;
+            }
+        }
+        content_changed
+    }
+
+    fn shutdown(&mut self) {
+        shutdown_transport(self.transport.as_mut());
+    }
+}
+
+fn mark_session_status(model: &mut MuxModel, pane_id: PaneId, status: SessionStatus) {
+    let Some(session_id) = model
+        .active_tab()
+        .panes
+        .get(&pane_id)
+        .map(|pane| pane.session_id)
+    else {
+        return;
+    };
+    if let Some(session) = model.active_tab_mut().sessions.get_mut(&session_id) {
+        session.status = status;
+    }
+}
+
+fn session_spec_for_config(config: &AppConfig) -> SessionSpec {
+    let profile = selected_shell_profile(config);
+    let mut spec = SessionSpec::local(
+        profile
+            .map(|profile| profile.name.clone())
+            .unwrap_or_else(|| "default".to_owned()),
+    );
+    if let Some(profile) = profile {
+        spec.working_directory = profile.working_directory.clone();
+        spec.startup_command = profile.startup_command.clone();
+    }
+    spec
+}
+
+fn terminal_transport_size(size: TerminalGridSize, metrics: CellMetrics) -> TransportSize {
+    TransportSize::new(
+        size.cols,
+        size.rows,
+        (f32::from(size.cols) * metrics.cell_width).ceil() as u32,
+        (f32::from(size.rows) * metrics.cell_height).ceil() as u32,
+    )
+}
+
+fn resize_transport(transport: &mut LocalPtyTransport, size: TransportSize) {
+    match catch_unwind(AssertUnwindSafe(|| transport.resize(size))) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("transport resize error: {error}"),
+        Err(panic) => eprintln!("transport resize panic boundary: {}", panic_payload(panic)),
+    }
+}
+
+fn tab_bar_rows(model: &MuxModel, config: &AppConfig) -> u16 {
+    if config.mux.show_tab_bar && model.active_workspace().active_window().tabs.len() > 1 {
+        1
+    } else {
+        0
+    }
+}
+
+fn scene_from_mux(
+    runtime: &MuxRuntime,
+    metrics: Option<CellMetrics>,
+    config: &AppConfig,
+) -> RenderScene {
+    let mut scene = RenderScene {
+        grid: RenderGrid {
+            columns: runtime.surface_cols,
+            rows: runtime.surface_rows,
+            cells: Vec::new(),
+        },
+        ..RenderScene::default()
+    };
+    let tab_bar_rows = tab_bar_rows(&runtime.model, config);
+
+    if tab_bar_rows > 0 {
+        append_tab_bar_cells(&mut scene, runtime, config);
+    }
+
+    let active_pane = runtime.model.active_tab().active_pane;
+    for layout in runtime.active_layouts(config) {
+        let Some(pane) = runtime.panes.get(&layout.pane_id) else {
+            continue;
+        };
+        append_pane_scene(&mut scene, pane, layout, active_pane, metrics, config);
+    }
+
+    if let Some(metrics) = metrics {
+        append_pane_borders(&mut scene, runtime, tab_bar_rows, metrics, config);
+    }
+
+    scene
+}
+
+fn append_pane_scene(
+    target: &mut RenderScene,
+    pane: &PaneRuntime,
+    layout: PaneLayout,
+    active_pane: PaneId,
+    metrics: Option<CellMetrics>,
+    config: &AppConfig,
+) {
+    let mut pane_scene =
+        scene_from_terminal(&pane.terminal, &pane.semantic_timeline, metrics, config);
+    let row_offset = layout.rect.y.floor() as i64;
+    let col_offset = layout.rect.x.floor() as u16;
+
+    for mut cell in pane_scene.grid.cells.drain(..) {
+        cell.position.row += row_offset;
+        cell.position.col = cell.position.col.saturating_add(col_offset);
+        target.grid.cells.push(cell);
+    }
+
+    for mut overlay in pane_scene.semantic_overlays.drain(..) {
+        offset_rect(&mut overlay.bounds, row_offset, col_offset, metrics);
+        target.semantic_overlays.push(overlay);
+    }
+    for mut overlay in pane_scene.search_highlights.drain(..) {
+        offset_rect(&mut overlay.bounds, row_offset, col_offset, metrics);
+        target.search_highlights.push(overlay);
+    }
+    for mut selection in pane_scene.selections.drain(..) {
+        for position in &mut selection.cells {
+            position.row += row_offset;
+            position.col = position.col.saturating_add(col_offset);
+        }
+        target.selections.push(selection);
+    }
+
+    if layout.pane_id == active_pane
+        && let Some(mut cursor) = pane_scene.cursor
+    {
+        cursor.position.row += row_offset;
+        cursor.position.col = cursor.position.col.saturating_add(col_offset);
+        target.cursor = Some(cursor);
+    }
+}
+
+fn append_tab_bar_cells(scene: &mut RenderScene, runtime: &MuxRuntime, config: &AppConfig) {
+    let window = runtime.model.active_workspace().active_window();
+    let mut col = 0u16;
+    for tab in &window.tabs {
+        let active = tab.id == window.active_tab;
+        let label = if active {
+            format!(" [{}] ", tab.name)
+        } else {
+            format!(" {} ", tab.name)
+        };
+        for ch in label.chars() {
+            if col >= runtime.surface_cols {
+                return;
+            }
+            scene.grid.cells.push(RenderCell {
+                position: CellPosition { row: 0, col },
+                text: ch.to_string(),
+                foreground: render_color(config.colors.foreground),
+                background: if active {
+                    render_color(config.colors.selection_background)
+                } else {
+                    render_color(config.colors.background)
+                },
+                style: RenderCellStyle {
+                    bold: active,
+                    ..RenderCellStyle::default()
+                },
+            });
+            col = col.saturating_add(1);
+        }
+    }
+}
+
+fn append_pane_borders(
+    scene: &mut RenderScene,
+    runtime: &MuxRuntime,
+    tab_bar_rows: u16,
+    metrics: CellMetrics,
+    config: &AppConfig,
+) {
+    let active = runtime.model.active_tab().active_pane;
+    let layouts = runtime.active_layouts(config);
+    let show_borders = layouts.len() > 1 || tab_bar_rows > 0;
+    for layout in layouts {
+        let rect = rect_from_layout(layout.rect, metrics);
+        let border = if layout.pane_id == active {
+            render_color(config.colors.cursor)
+        } else {
+            RenderColor {
+                red: 120,
+                green: 130,
+                blue: 145,
+                alpha: 120,
+            }
+        };
+        if show_borders {
+            scene.decorations.push(render_core::RenderDecoration {
+                bounds: rect,
+                color: RenderColor {
+                    red: 0,
+                    green: 0,
+                    blue: 0,
+                    alpha: 0,
+                },
+                border_color: Some(border),
+            });
+        }
+    }
+}
+
+fn rect_from_layout(rect: LogicalRect, metrics: CellMetrics) -> RenderRect {
+    RenderRect {
+        x: (rect.x * metrics.cell_width).floor() as i32,
+        y: (rect.y * metrics.cell_height).floor() as i32,
+        width: (rect.width * metrics.cell_width).ceil() as u32,
+        height: (rect.height * metrics.cell_height).ceil() as u32,
+    }
+}
+
+fn offset_rect(
+    rect: &mut RenderRect,
+    row_offset: i64,
+    col_offset: u16,
+    metrics: Option<CellMetrics>,
+) {
+    if let Some(metrics) = metrics {
+        rect.x += (f32::from(col_offset) * metrics.cell_width).floor() as i32;
+        rect.y += (row_offset as f32 * metrics.cell_height).floor() as i32;
     }
 }
 
@@ -1512,6 +2214,17 @@ mod tests {
         }
     }
 
+    fn key_event(logical_key: &str, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            physical_key: None,
+            logical_key: logical_key.to_owned(),
+            text: None,
+            state: KeyState::Pressed,
+            modifiers,
+            repeat: false,
+        }
+    }
+
     #[test]
     fn paste_protection_normalizes_and_strips_controls() {
         let clipboard = ClipboardConfig::default();
@@ -1565,5 +2278,51 @@ mod tests {
         assert!(
             matches!(decision, Osc52ClipboardDecision::Deny { reason } if reason.contains("remote"))
         );
+    }
+
+    #[test]
+    fn configured_keybindings_drive_mux_actions() {
+        let config = AppConfig::default();
+        let event = key_event(
+            "T",
+            KeyModifiers {
+                ctrl: true,
+                shift: true,
+                ..KeyModifiers::default()
+            },
+        );
+
+        assert_eq!(
+            keybinding_action(&event, &config).as_deref(),
+            Some("new_tab")
+        );
+        assert_eq!(
+            canonical_key_spec("Shift+Ctrl+T"),
+            canonical_key_event(&event)
+        );
+    }
+
+    #[test]
+    fn mux_layout_reserves_tab_bar_only_when_configured_and_needed() {
+        let mut config = AppConfig::default();
+        let mut model = MuxModel::new(SessionSpec::local("default"));
+        model
+            .new_tab("2", SessionSpec::local("default"))
+            .expect("new tab");
+        let runtime = MuxRuntime {
+            model,
+            panes: HashMap::new(),
+            surface_cols: 100,
+            surface_rows: 30,
+        };
+
+        let layout = runtime.active_layouts(&config);
+        assert_eq!(layout[0].rect.y, 1.0);
+        assert_eq!(layout[0].terminal_size.rows, 29);
+
+        config.mux.show_tab_bar = false;
+        let layout = runtime.active_layouts(&config);
+        assert_eq!(layout[0].rect.y, 0.0);
+        assert_eq!(layout[0].terminal_size.rows, 30);
     }
 }
