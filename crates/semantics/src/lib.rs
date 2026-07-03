@@ -305,6 +305,10 @@ impl SemanticTimelineStore {
         &self.metadata
     }
 
+    pub fn set_integration_mode(&mut self, mode: IntegrationMode) {
+        self.mode = mode;
+    }
+
     pub fn apply_event(&mut self, event: SemanticEvent) {
         match event {
             SemanticEvent::PromptStarted { position, metadata } => {

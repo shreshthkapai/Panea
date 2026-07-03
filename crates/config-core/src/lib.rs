@@ -337,6 +337,11 @@ impl AppConfig {
                     format!("shell_integration.enabled_shells[{index}]"),
                     "shell name cannot be empty",
                 );
+            } else if !is_supported_shell_integration_name(shell) {
+                report.warning(
+                    format!("shell_integration.enabled_shells[{index}]"),
+                    format!("shell '{shell}' is not supported by the shell integration layer"),
+                );
             }
         }
 
@@ -548,6 +553,13 @@ impl AppConfig {
             }
         }
     }
+}
+
+fn is_supported_shell_integration_name(shell: &str) -> bool {
+    matches!(
+        shell.trim().to_ascii_lowercase().as_str(),
+        "bash" | "zsh" | "fish" | "powershell" | "windows_powershell" | "pwsh" | "cmd"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1025,9 +1037,13 @@ impl Default for ShellIntegrationConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ShellIntegrationActivationConfig {
+    Full,
     #[default]
+    #[serde(alias = "auto")]
     AutoDetect,
     Manual,
+    Heuristic,
+    #[serde(alias = "off")]
     Disabled,
 }
 
@@ -2759,6 +2775,46 @@ mod tests {
 
         assert!(resolved.clipboard.osc52.allow_remote);
         assert!(resolved.clipboard.osc52.confirm_remote_writes);
+    }
+
+    #[test]
+    fn shell_integration_activation_aliases_parse() {
+        let auto: AppConfig = toml::from_str(
+            r#"
+            [shell_integration]
+            activation = "auto"
+            "#,
+        )
+        .expect("auto alias should parse");
+        assert_eq!(
+            auto.shell_integration.activation,
+            ShellIntegrationActivationConfig::AutoDetect
+        );
+
+        let off: AppConfig = toml::from_str(
+            r#"
+            [shell_integration]
+            activation = "off"
+            "#,
+        )
+        .expect("off alias should parse");
+        assert_eq!(
+            off.shell_integration.activation,
+            ShellIntegrationActivationConfig::Disabled
+        );
+    }
+
+    #[test]
+    fn shell_integration_validation_warns_for_unknown_shell_names() {
+        let mut config = AppConfig::default();
+        config.shell_integration.enabled_shells = vec!["bash".to_owned(), "bogus".to_owned()];
+
+        let report = config.validate();
+
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == "shell_integration.enabled_shells[1]"
+                && diagnostic.message.contains("not supported")
+        }));
     }
 
     #[test]

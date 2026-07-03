@@ -53,6 +53,27 @@ Configuration controls shell integration with:
 - `shell_integration.disabled_shell_profiles`
 - `shell_integration.remote_instructions`
 
+Activation modes:
+
+- `full`: inject a runtime hook for supported local shells.
+- `auto_detect` / `auto`: accept semantic escape sequences and inject only
+  when `auto_install = true`.
+- `manual`: do not inject; report install instructions.
+- `heuristic`: reserve heuristic semantic mode without claiming shell
+  integration accuracy.
+- `disabled` / `off`: do not parse shell semantic events for the session.
+
+Runtime activation is applied at session startup, before PTY spawn. The desktop
+app maps the portable config into a `ShellIntegrationPolicy`, asks the
+`shell-integration` crate for an activation plan, and then applies
+backend-specific startup mechanics behind the local transport profile:
+
+- bash uses a temporary init file.
+- zsh uses a temporary `ZDOTDIR`.
+- fish uses startup command execution.
+- PowerShell / pwsh uses `-NoExit -Command`.
+- cmd and unsupported shells run without hooks and produce diagnostics.
+
 The terminal must continue working when shell integration is disabled,
 unsupported, or not installed on a remote host.
 
@@ -67,3 +88,52 @@ Diagnostics should report:
 - heuristic mode
 - remote integration status
 
+## Phase 11 Design Note
+
+Feature name: Shell integration activation and verification
+
+Layer: semantic meaning, with session-transport startup wiring in the desktop
+app.
+
+User-facing behavior: supported local shells can emit prompt/input/output,
+current-directory, shell metadata, exit-status, and duration events without
+mutating terminal text. Missing integration falls back to auto/manual/heuristic
+or off modes.
+
+Config keys: `shell_integration.enabled`,
+`shell_integration.activation`, `shell_integration.auto_install`,
+`shell_integration.enabled_shells`,
+`shell_integration.disabled_shell_profiles`,
+`shell_integration.remote_instructions`.
+
+macOS behavior: bash, zsh, and fish use the same runtime activation contract;
+real host verification is still required.
+
+Windows behavior: PowerShell / pwsh activation is wired through the same
+contract; the bounded real PowerShell semantic smoke passed on the current
+Windows host. cmd remains basic/no-hook mode.
+
+Linux X11 behavior: shell activation is independent of the window backend;
+real X11 host shell verification is still required.
+
+Linux Wayland behavior: shell activation is independent of the compositor;
+real Wayland host shell verification is still required.
+
+Fallback behavior: unsupported shells, disabled profiles, manual mode, explicit
+args that block safe injection, and disabled config all avoid injection and
+report diagnostics.
+
+Diagnostics: activation plans carry status messages; semantic diagnostics
+report detected shell, last event, active/inactive state, confidence, heuristic
+mode, and remote status.
+
+Performance cost when disabled: no shell hook injection and no semantic escape
+parsing for `off`.
+
+Performance cost when enabled: startup-only profile shaping plus incremental
+OSC parsing per PTY output batch.
+
+Tests: unit tests cover activation plans, shell detection, verification
+sequence generation, desktop profile shaping, disabled/off behavior, and
+explicit-args fallback. Ignored real-shell tests exist for PowerShell, bash,
+zsh, and fish; PowerShell has been run on the current Windows host.

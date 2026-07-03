@@ -34,7 +34,7 @@ considered verified until that matrix has real X11 and Wayland host evidence.
 | GPU backend | partial | partial | partial | partial | WGPU surface/device path exists; GPU backend inventory and screenshot verification remain open. |
 | local PTY | partial | full | partial | partial | Windows real-shell smoke passed on the current host; macOS/Linux real PTY smoke remains unverified. |
 | PowerShell/cmd/WSL | not implemented yet | partial | not implemented yet | not implemented yet | Windows shell profile groundwork exists; WSL runtime smoke is not verified. |
-| shell integration | partial | partial | partial | partial | Semantic parsers and scripts exist; desktop startup activation and real shell validation remain open. |
+| shell integration | partial | partial | partial | partial | Semantic parsers, config modes, desktop runtime activation, and real PowerShell smoke exist; bash/zsh/fish, WSL, remote, macOS, and Linux validation remain open. |
 | tabs/panes | partial | partial | partial | partial | Local desktop tabs/splits are wired with per-pane terminal and PTY ownership; real cross-OS GUI smoke, startup layouts, and SSH panes remain open. |
 | command blocks | partial | partial | partial | partial | Semantic storage and basic overlays exist; real shell-driven UI verification remains open. |
 | cursor animations | partial | partial | partial | partial | Config and budget contracts exist; polished animation runtime and asset pipeline are deferred. |
@@ -53,7 +53,7 @@ considered verified until that matrix has real X11 and Wayland host evidence.
 | GPU renderer window path | Build-verified on current host | Unverified | Unverified | Unverified |
 | Linux compositor matrix | Not applicable | Not applicable | Matrix exists, unverified | Matrix exists, unverified |
 | SSH real-server smoke | Unverified | Unverified | Unverified | Unverified |
-| Shell integration real-session smoke | Unverified | Unverified | Unverified | Unverified |
+| Shell integration real-session smoke | PowerShell verified on current host | Unverified | Unverified | Unverified |
 | Native mux runtime smoke | Unit-tested only | Unverified | Unverified | Unverified |
 
 ## macOS Polish Checklist

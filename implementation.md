@@ -299,11 +299,15 @@ to more visible features before the dependencies they rely on are hardened.
   split-aware render scene composition, basic tab chrome, and pane borders now
   exist. Declarative startup layouts, SSH panes, polished tab/move UI, and
   cross-OS native mux GUI smoke tests remain follow-up work.
-- Phase 10 establishes semantic storage, parsers, scripts, config, and
-  diagnostics. Desktop runtime injection/loading of shell integration scripts,
-  remote installation flows, heuristic fallback, and cross-shell real-session
-  verification remain follow-up work before command blocks can be considered
-  product-complete.
+- Next-pass Phase 11 wires local shell integration activation into desktop
+  session startup through a shared activation plan, supports full/auto/manual/
+  heuristic/off config modes, injects runtime hooks for bash/zsh/fish/
+  PowerShell where safe, disables semantic parsing for off mode, and adds
+  bounded real-shell verification tests. The PowerShell semantic smoke passed
+  on the current Windows host. Real bash/zsh/fish, WSL, remote, macOS, Linux
+  X11, and Linux Wayland verification, plus heuristic command detection and
+  remote install flows, remain follow-up work before command blocks can be
+  considered product-complete.
 - Phase 11 establishes visual overlay contracts and basic semantic overlay
   generation, but animated image cursors, off-render-thread decoding, GPU frame
   caching for animated assets, polished badge text rendering, collapse/expand

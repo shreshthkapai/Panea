@@ -2,7 +2,7 @@
 
 pub const LAYER: &str = "semantic meaning";
 
-use std::time::Duration;
+use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use semantics::{
     BufferPosition, CommandStatus, RemoteMetadata, SemanticEvent, SemanticMetadata, ShellMetadata,
@@ -26,14 +26,18 @@ pub enum ShellKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntegrationActivation {
+    Full,
     AutoDetect,
     Manual,
+    Heuristic,
     Disabled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellIntegrationPolicy {
+    pub enabled: bool,
     pub activation: IntegrationActivation,
+    pub auto_install: bool,
     pub enabled_shells: Vec<ShellKind>,
     pub disabled_profiles: Vec<String>,
     pub remote_instructions: bool,
@@ -42,7 +46,9 @@ pub struct ShellIntegrationPolicy {
 impl Default for ShellIntegrationPolicy {
     fn default() -> Self {
         Self {
+            enabled: true,
             activation: IntegrationActivation::AutoDetect,
+            auto_install: false,
             enabled_shells: vec![
                 ShellKind::Bash,
                 ShellKind::Zsh,
@@ -59,12 +65,198 @@ impl Default for ShellIntegrationPolicy {
 impl ShellIntegrationPolicy {
     #[must_use]
     pub fn should_enable_for_profile(&self, profile_name: &str, shell: ShellKind) -> bool {
-        self.activation != IntegrationActivation::Disabled
+        self.enabled
+            && self.activation != IntegrationActivation::Disabled
             && self.enabled_shells.contains(&shell)
             && !self
                 .disabled_profiles
                 .iter()
                 .any(|profile| profile == profile_name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellIntegrationRuntimeMode {
+    Full,
+    Auto,
+    Heuristic,
+    Off,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellIntegrationActivationAction {
+    InjectRuntimeScript,
+    DetectExisting,
+    ManualInstructions,
+    Heuristic,
+    Disabled,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellIntegrationActivationPlan {
+    pub shell: ShellKind,
+    pub mode: ShellIntegrationRuntimeMode,
+    pub action: ShellIntegrationActivationAction,
+    pub script: Option<ShellIntegrationScript>,
+    pub environment: BTreeMap<String, String>,
+    pub diagnostics: Vec<String>,
+}
+
+impl ShellIntegrationActivationPlan {
+    #[must_use]
+    pub fn parses_escape_sequences(&self) -> bool {
+        matches!(
+            self.action,
+            ShellIntegrationActivationAction::InjectRuntimeScript
+                | ShellIntegrationActivationAction::DetectExisting
+                | ShellIntegrationActivationAction::ManualInstructions
+        )
+    }
+}
+
+#[must_use]
+pub fn activation_plan(
+    policy: &ShellIntegrationPolicy,
+    profile_name: &str,
+    shell: ShellKind,
+) -> ShellIntegrationActivationPlan {
+    let mut environment = BTreeMap::from([
+        ("PANEA_TERMINAL".to_owned(), "1".to_owned()),
+        (
+            "PANEA_SHELL".to_owned(),
+            shell.as_str().unwrap_or("unknown").to_owned(),
+        ),
+    ]);
+    let mut diagnostics = Vec::new();
+
+    if !policy.enabled || policy.activation == IntegrationActivation::Disabled {
+        environment.insert("PANEA_SHELL_INTEGRATION".to_owned(), "0".to_owned());
+        diagnostics.push("shell integration disabled by config".to_owned());
+        return ShellIntegrationActivationPlan {
+            shell,
+            mode: ShellIntegrationRuntimeMode::Off,
+            action: ShellIntegrationActivationAction::Disabled,
+            script: None,
+            environment,
+            diagnostics,
+        };
+    }
+
+    if !policy.enabled_shells.contains(&shell) {
+        environment.insert("PANEA_SHELL_INTEGRATION".to_owned(), "0".to_owned());
+        diagnostics.push(format!(
+            "shell integration not enabled for shell {}",
+            shell.as_str().unwrap_or("unknown")
+        ));
+        return ShellIntegrationActivationPlan {
+            shell,
+            mode: ShellIntegrationRuntimeMode::Off,
+            action: ShellIntegrationActivationAction::Unsupported,
+            script: None,
+            environment,
+            diagnostics,
+        };
+    }
+
+    if policy
+        .disabled_profiles
+        .iter()
+        .any(|profile| profile == profile_name)
+    {
+        environment.insert("PANEA_SHELL_INTEGRATION".to_owned(), "0".to_owned());
+        diagnostics.push(format!(
+            "shell integration disabled for shell profile '{profile_name}'"
+        ));
+        return ShellIntegrationActivationPlan {
+            shell,
+            mode: ShellIntegrationRuntimeMode::Off,
+            action: ShellIntegrationActivationAction::Disabled,
+            script: None,
+            environment,
+            diagnostics,
+        };
+    }
+
+    if policy.activation == IntegrationActivation::Heuristic {
+        environment.insert("PANEA_SHELL_INTEGRATION".to_owned(), "heuristic".to_owned());
+        diagnostics.push("shell integration heuristic mode requested".to_owned());
+        return ShellIntegrationActivationPlan {
+            shell,
+            mode: ShellIntegrationRuntimeMode::Heuristic,
+            action: ShellIntegrationActivationAction::Heuristic,
+            script: None,
+            environment,
+            diagnostics,
+        };
+    }
+
+    let Some(script) = script_for_shell(shell) else {
+        environment.insert("PANEA_SHELL_INTEGRATION".to_owned(), "0".to_owned());
+        diagnostics.push(format!(
+            "no runtime shell integration script exists for {}",
+            shell.as_str().unwrap_or("unknown")
+        ));
+        return ShellIntegrationActivationPlan {
+            shell,
+            mode: ShellIntegrationRuntimeMode::Off,
+            action: ShellIntegrationActivationAction::Unsupported,
+            script: None,
+            environment,
+            diagnostics,
+        };
+    };
+
+    let (mode, action) = match policy.activation {
+        IntegrationActivation::Full => (
+            ShellIntegrationRuntimeMode::Full,
+            ShellIntegrationActivationAction::InjectRuntimeScript,
+        ),
+        IntegrationActivation::AutoDetect if policy.auto_install => (
+            ShellIntegrationRuntimeMode::Auto,
+            ShellIntegrationActivationAction::InjectRuntimeScript,
+        ),
+        IntegrationActivation::AutoDetect => (
+            ShellIntegrationRuntimeMode::Auto,
+            ShellIntegrationActivationAction::DetectExisting,
+        ),
+        IntegrationActivation::Manual => (
+            ShellIntegrationRuntimeMode::Auto,
+            ShellIntegrationActivationAction::ManualInstructions,
+        ),
+        IntegrationActivation::Heuristic | IntegrationActivation::Disabled => unreachable!(),
+    };
+
+    environment.insert(
+        "PANEA_SHELL_INTEGRATION".to_owned(),
+        match mode {
+            ShellIntegrationRuntimeMode::Full => "full",
+            ShellIntegrationRuntimeMode::Auto => "auto",
+            ShellIntegrationRuntimeMode::Heuristic => "heuristic",
+            ShellIntegrationRuntimeMode::Off => "0",
+        }
+        .to_owned(),
+    );
+
+    if action == ShellIntegrationActivationAction::DetectExisting {
+        diagnostics.push(
+            "auto-detect mode will accept semantic escape sequences but will not inject hooks"
+                .to_owned(),
+        );
+    }
+    if action == ShellIntegrationActivationAction::ManualInstructions
+        && let Some(instructions) = manual_install_instructions(shell)
+    {
+        diagnostics.push(instructions.to_owned());
+    }
+
+    ShellIntegrationActivationPlan {
+        shell,
+        mode,
+        action,
+        script: Some(script),
+        environment,
+        diagnostics,
     }
 }
 
@@ -102,6 +294,51 @@ pub fn script_for_shell(shell: ShellKind) -> Option<ShellIntegrationScript> {
     }
 }
 
+impl ShellKind {
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "bash" => Self::Bash,
+            "zsh" => Self::Zsh,
+            "fish" => Self::Fish,
+            "powershell" | "windows_powershell" | "powershell.exe" => Self::PowerShell,
+            "pwsh" | "pwsh.exe" => Self::Pwsh,
+            "nu" | "nushell" => Self::Nushell,
+            "cmd" | "cmd.exe" => Self::Cmd,
+            _ => Self::Unknown,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::Bash => Some("bash"),
+            Self::Zsh => Some("zsh"),
+            Self::Fish => Some("fish"),
+            Self::PowerShell => Some("powershell"),
+            Self::Pwsh => Some("pwsh"),
+            Self::Nushell => Some("nushell"),
+            Self::Cmd => Some("cmd"),
+            Self::Unknown => None,
+        }
+    }
+}
+
+#[must_use]
+pub fn detect_shell_kind(program_or_name: &str) -> ShellKind {
+    let path = Path::new(program_or_name);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program_or_name);
+    let without_extension = file_name
+        .strip_suffix(".exe")
+        .or_else(|| file_name.strip_suffix(".EXE"))
+        .unwrap_or(file_name);
+
+    ShellKind::parse(without_extension)
+}
+
 #[must_use]
 pub fn manual_install_instructions(shell: ShellKind) -> Option<&'static str> {
     match shell {
@@ -116,6 +353,28 @@ pub fn manual_install_instructions(shell: ShellKind) -> Option<&'static str> {
             Some("cmd has limited shell integration and currently runs without hooks")
         }
         ShellKind::Unknown => None,
+    }
+}
+
+#[must_use]
+pub fn verification_sequence(shell: ShellKind, marker: &str) -> Option<String> {
+    let escaped_marker = marker.replace('\'', "'\\''");
+    match shell {
+        ShellKind::Bash | ShellKind::Zsh => Some(format!(
+            "printf '\\033]777;shell;shell={}\\007\\033]777;prompt_start;shell={}\\007\\033]777;prompt_end\\007\\033]777;input_start\\007\\033]777;input_end\\007\\033]777;output_start\\007%s\\n\\033]777;output_end\\007\\033]777;command_finished;status=0;duration_ms=1\\007' '{}'",
+            shell.as_str().unwrap_or("sh"),
+            shell.as_str().unwrap_or("sh"),
+            escaped_marker
+        )),
+        ShellKind::Fish => Some(format!(
+            "printf '\\e]777;shell;shell=fish\\a\\e]777;prompt_start;shell=fish\\a\\e]777;prompt_end\\a\\e]777;input_start\\a\\e]777;input_end\\a\\e]777;output_start\\a%s\\n\\e]777;output_end\\a\\e]777;command_finished;status=0;duration_ms=1\\a' '{}'",
+            escaped_marker
+        )),
+        ShellKind::PowerShell | ShellKind::Pwsh => Some(format!(
+            "$e=[char]27; Write-Host -NoNewline \"$e]777;shell;shell=powershell$([char]7)$e]777;prompt_start;shell=powershell$([char]7)$e]777;prompt_end$([char]7)$e]777;input_start$([char]7)$e]777;input_end$([char]7)$e]777;output_start$([char]7)\"; Write-Output '{}'; Write-Host -NoNewline \"$e]777;output_end$([char]7)$e]777;command_finished;status=0;duration_ms=1$([char]7)\"",
+            marker.replace('\"', "`\"")
+        )),
+        ShellKind::Cmd | ShellKind::Nushell | ShellKind::Unknown => None,
     }
 }
 
@@ -593,6 +852,115 @@ mod tests {
         assert!(policy.should_enable_for_profile("default", ShellKind::Bash));
         assert!(!policy.should_enable_for_profile("plain", ShellKind::Bash));
         assert!(!policy.should_enable_for_profile("default", ShellKind::Cmd));
+    }
+
+    #[test]
+    fn activation_plan_distinguishes_full_auto_manual_heuristic_and_off() {
+        let full = activation_plan(
+            &ShellIntegrationPolicy {
+                activation: IntegrationActivation::Full,
+                ..ShellIntegrationPolicy::default()
+            },
+            "default",
+            ShellKind::Bash,
+        );
+        assert_eq!(full.mode, ShellIntegrationRuntimeMode::Full);
+        assert_eq!(
+            full.action,
+            ShellIntegrationActivationAction::InjectRuntimeScript
+        );
+        assert!(full.script.is_some());
+
+        let auto = activation_plan(
+            &ShellIntegrationPolicy::default(),
+            "default",
+            ShellKind::Bash,
+        );
+        assert_eq!(auto.mode, ShellIntegrationRuntimeMode::Auto);
+        assert_eq!(
+            auto.action,
+            ShellIntegrationActivationAction::DetectExisting
+        );
+        assert!(auto.parses_escape_sequences());
+
+        let manual = activation_plan(
+            &ShellIntegrationPolicy {
+                activation: IntegrationActivation::Manual,
+                ..ShellIntegrationPolicy::default()
+            },
+            "default",
+            ShellKind::Bash,
+        );
+        assert_eq!(
+            manual.action,
+            ShellIntegrationActivationAction::ManualInstructions
+        );
+        assert!(
+            manual
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("bashrc"))
+        );
+
+        let heuristic = activation_plan(
+            &ShellIntegrationPolicy {
+                activation: IntegrationActivation::Heuristic,
+                ..ShellIntegrationPolicy::default()
+            },
+            "default",
+            ShellKind::Bash,
+        );
+        assert_eq!(heuristic.mode, ShellIntegrationRuntimeMode::Heuristic);
+        assert!(!heuristic.parses_escape_sequences());
+
+        let off = activation_plan(
+            &ShellIntegrationPolicy {
+                enabled: false,
+                ..ShellIntegrationPolicy::default()
+            },
+            "default",
+            ShellKind::Bash,
+        );
+        assert_eq!(off.mode, ShellIntegrationRuntimeMode::Off);
+        assert_eq!(off.action, ShellIntegrationActivationAction::Disabled);
+    }
+
+    #[test]
+    fn auto_install_injects_script_only_for_supported_shells() {
+        let policy = ShellIntegrationPolicy {
+            auto_install: true,
+            ..ShellIntegrationPolicy::default()
+        };
+
+        let bash = activation_plan(&policy, "default", ShellKind::Bash);
+        assert_eq!(
+            bash.action,
+            ShellIntegrationActivationAction::InjectRuntimeScript
+        );
+
+        let cmd = activation_plan(&policy, "cmd", ShellKind::Cmd);
+        assert_eq!(cmd.action, ShellIntegrationActivationAction::Unsupported);
+        assert_eq!(cmd.mode, ShellIntegrationRuntimeMode::Off);
+    }
+
+    #[test]
+    fn detects_shell_from_program_path() {
+        assert_eq!(detect_shell_kind("/bin/bash"), ShellKind::Bash);
+        assert_eq!(
+            detect_shell_kind("C:\\Program Files\\PowerShell\\7\\pwsh.exe"),
+            ShellKind::Pwsh
+        );
+        assert_eq!(detect_shell_kind("unknown-shell"), ShellKind::Unknown);
+    }
+
+    #[test]
+    fn verification_sequence_contains_semantic_markers_and_visible_text() {
+        let sequence =
+            verification_sequence(ShellKind::Bash, "panea-shell-integration-smoke").unwrap();
+
+        assert!(sequence.contains("777;shell"));
+        assert!(sequence.contains("777;output_start"));
+        assert!(sequence.contains("panea-shell-integration-smoke"));
     }
 
     #[test]

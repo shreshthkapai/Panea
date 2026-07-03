@@ -2,6 +2,7 @@ use std::{
     any::Any,
     collections::{BTreeSet, HashMap},
     error::Error,
+    fs,
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::Arc,
@@ -11,8 +12,9 @@ use std::{
 use config_core::{
     AppConfig, ClipboardConfig, CommandBlockStyle, ConfigDiagnosticSeverity,
     DecorationStrategyConfig, LinuxBackendConfig, LogLevel, PasteConfig, PresentModePreference,
-    PromptDecorationStyle, ReloadPlan, ReloadableSection, ShellProfile, ShellProfileKind,
-    SshAuthMethod, SshKnownHostsPolicy, SshProfile, WindowModeConfig,
+    PromptDecorationStyle, ReloadPlan, ReloadableSection, ShellIntegrationActivationConfig,
+    ShellProfile, ShellProfileKind, SshAuthMethod, SshKnownHostsPolicy, SshProfile,
+    WindowModeConfig,
 };
 use diagnostics::{PerformanceBudget, PerformanceOverlay};
 use font_system::{CellMetrics, FontConfig as RuntimeFontConfig, FontSystem};
@@ -40,8 +42,14 @@ use security::{
     Osc52ClipboardTarget, evaluate_osc52_clipboard_write,
 };
 use semantics::detect_url_hints;
-use semantics::{BufferPosition, CommandStatus, SemanticRegionKind, SemanticTimelineStore};
-use shell_integration::SemanticEscapeParser;
+use semantics::{
+    BufferPosition, CommandStatus, IntegrationMode, SemanticRegionKind, SemanticTimelineStore,
+};
+use shell_integration::{
+    IntegrationActivation, SemanticEscapeParser, ShellIntegrationActivationAction,
+    ShellIntegrationActivationPlan, ShellIntegrationPolicy, ShellIntegrationRuntimeMode, ShellKind,
+    detect_shell_kind,
+};
 use term_core::{
     CellAttributes, ClipboardTarget, Color, CursorShape, Osc52ClipboardRequest, TerminalCore,
     TerminalMode, TerminalSize as CoreTerminalSize,
@@ -527,12 +535,18 @@ fn performance_budget(config: &AppConfig) -> PerformanceBudget {
 fn spawn_initial_transport(
     config: &AppConfig,
     size: TransportSize,
-) -> transport_core::TransportResult<LocalPtyTransport> {
-    let Some(profile) = selected_shell_profile(config) else {
-        return LocalPtyTransport::spawn_default(size);
-    };
+) -> transport_core::TransportResult<InitialTransport> {
+    let (profile, activation) = initial_local_shell_profile(config);
+    let parse_semantic_events = activation.parses_escape_sequences();
+    let semantic_mode = semantic_mode_for_activation(&activation);
 
-    LocalPtyTransport::spawn(local_shell_profile(profile), size)
+    let transport = LocalPtyTransport::spawn(profile, size)?;
+    Ok(InitialTransport {
+        transport,
+        semantic_mode,
+        parse_semantic_events,
+        activation_diagnostics: activation.diagnostics,
+    })
 }
 
 fn selected_shell_profile(config: &AppConfig) -> Option<&ShellProfile> {
@@ -546,6 +560,26 @@ fn selected_shell_profile(config: &AppConfig) -> Option<&ShellProfile> {
     }
 
     config.shell_profiles.first()
+}
+
+struct InitialTransport {
+    transport: LocalPtyTransport,
+    semantic_mode: IntegrationMode,
+    parse_semantic_events: bool,
+    activation_diagnostics: Vec<String>,
+}
+
+fn initial_local_shell_profile(
+    config: &AppConfig,
+) -> (LocalShellProfile, ShellIntegrationActivationPlan) {
+    let mut profile = selected_shell_profile(config)
+        .map(local_shell_profile)
+        .unwrap_or_else(LocalShellProfile::default_for_platform);
+    let shell = shell_kind_for_local_profile(&profile);
+    let policy = shell_integration_policy(config);
+    let activation = shell_integration::activation_plan(&policy, &profile.name, shell);
+    apply_shell_integration_activation(&mut profile, &activation);
+    (profile, activation)
 }
 
 fn local_shell_profile(profile: &ShellProfile) -> LocalShellProfile {
@@ -583,6 +617,185 @@ fn local_shell_profile(profile: &ShellProfile) -> LocalShellProfile {
         working_directory: profile.working_directory.as_ref().map(PathBuf::from),
         startup_command: profile.startup_command.clone(),
     }
+}
+
+fn shell_integration_policy(config: &AppConfig) -> ShellIntegrationPolicy {
+    let activation = if !config.shell_integration.enabled {
+        IntegrationActivation::Disabled
+    } else {
+        match config.shell_integration.activation {
+            ShellIntegrationActivationConfig::Full => IntegrationActivation::Full,
+            ShellIntegrationActivationConfig::AutoDetect => IntegrationActivation::AutoDetect,
+            ShellIntegrationActivationConfig::Manual => IntegrationActivation::Manual,
+            ShellIntegrationActivationConfig::Heuristic => IntegrationActivation::Heuristic,
+            ShellIntegrationActivationConfig::Disabled => IntegrationActivation::Disabled,
+        }
+    };
+
+    ShellIntegrationPolicy {
+        enabled: config.shell_integration.enabled,
+        activation,
+        auto_install: config.shell_integration.auto_install,
+        enabled_shells: config
+            .shell_integration
+            .enabled_shells
+            .iter()
+            .map(|shell| ShellKind::parse(shell))
+            .filter(|shell| *shell != ShellKind::Unknown)
+            .collect(),
+        disabled_profiles: config.shell_integration.disabled_shell_profiles.clone(),
+        remote_instructions: config.shell_integration.remote_instructions,
+    }
+}
+
+fn shell_kind_for_local_profile(profile: &LocalShellProfile) -> ShellKind {
+    match profile.kind {
+        LocalShellKind::PowerShell => ShellKind::PowerShell,
+        LocalShellKind::Cmd => ShellKind::Cmd,
+        LocalShellKind::Wsl => ShellKind::Bash,
+        LocalShellKind::Default | LocalShellKind::Custom => {
+            let detected = detect_shell_kind(&profile.program);
+            if detected == ShellKind::Unknown && cfg!(windows) {
+                ShellKind::PowerShell
+            } else {
+                detected
+            }
+        }
+    }
+}
+
+fn semantic_mode_for_activation(activation: &ShellIntegrationActivationPlan) -> IntegrationMode {
+    match activation.mode {
+        ShellIntegrationRuntimeMode::Full | ShellIntegrationRuntimeMode::Auto => {
+            IntegrationMode::EscapeSequences
+        }
+        ShellIntegrationRuntimeMode::Heuristic => IntegrationMode::Heuristic,
+        ShellIntegrationRuntimeMode::Off => IntegrationMode::Disabled,
+    }
+}
+
+fn apply_shell_integration_activation(
+    profile: &mut LocalShellProfile,
+    activation: &ShellIntegrationActivationPlan,
+) {
+    profile.env.extend(activation.environment.clone());
+
+    if activation.action != ShellIntegrationActivationAction::InjectRuntimeScript {
+        return;
+    }
+
+    if !profile.args.is_empty() {
+        eprintln!(
+            "shell integration fallback: profile '{}' has explicit args, runtime hook injection skipped",
+            profile.name
+        );
+        return;
+    }
+
+    let Some(script) = activation.script.as_ref() else {
+        return;
+    };
+    let existing_startup = profile.startup_command.take();
+    let hook = combine_shell_startup(script.contents, existing_startup.as_deref());
+
+    match activation.shell {
+        ShellKind::Bash => {
+            if let Ok(path) = write_runtime_shell_hook(&profile.name, "bashrc", &hook) {
+                profile.args = vec![
+                    "--init-file".to_owned(),
+                    path.display().to_string(),
+                    "-i".to_owned(),
+                ];
+            } else {
+                profile.startup_command = existing_startup;
+            }
+        }
+        ShellKind::Zsh => {
+            if let Ok(path) = write_runtime_shell_hook(&profile.name, "zshrc", &hook)
+                && let Some(directory) = path.parent()
+            {
+                profile.env.insert(
+                    "PANEA_ORIGINAL_ZDOTDIR".to_owned(),
+                    std::env::var("ZDOTDIR").unwrap_or_else(|_| {
+                        std::env::var("HOME").unwrap_or_else(|_| "~".to_owned())
+                    }),
+                );
+                profile
+                    .env
+                    .insert("ZDOTDIR".to_owned(), directory.display().to_string());
+                profile.args = vec!["-i".to_owned()];
+            } else {
+                profile.startup_command = existing_startup;
+            }
+        }
+        ShellKind::Fish => {
+            profile.args = vec!["-C".to_owned(), hook];
+        }
+        ShellKind::PowerShell | ShellKind::Pwsh => {
+            profile.startup_command = Some(hook);
+        }
+        ShellKind::Cmd | ShellKind::Nushell | ShellKind::Unknown => {
+            profile.startup_command = existing_startup;
+        }
+    }
+}
+
+fn combine_shell_startup(script: &str, existing_startup: Option<&str>) -> String {
+    let mut combined = String::from(script);
+    if let Some(existing_startup) = existing_startup
+        && !existing_startup.trim().is_empty()
+    {
+        combined.push('\n');
+        combined.push_str(existing_startup);
+        combined.push('\n');
+    }
+    combined
+}
+
+fn write_runtime_shell_hook(
+    profile_name: &str,
+    file_name: &str,
+    contents: &str,
+) -> std::io::Result<PathBuf> {
+    let directory = std::env::temp_dir()
+        .join("panea-shell-integration")
+        .join(std::process::id().to_string())
+        .join(sanitize_file_component(profile_name));
+    fs::create_dir_all(&directory)?;
+
+    let path = match file_name {
+        "zshrc" => directory.join(".zshrc"),
+        "bashrc" => directory.join("panea.bashrc"),
+        _ => directory.join(file_name),
+    };
+    let wrapped = wrap_runtime_shell_hook(file_name, contents);
+    fs::write(&path, wrapped)?;
+    Ok(path)
+}
+
+fn wrap_runtime_shell_hook(file_name: &str, contents: &str) -> String {
+    match file_name {
+        "bashrc" => {
+            format!("if [ -r \"$HOME/.bashrc\" ]; then . \"$HOME/.bashrc\"; fi\n{contents}\n")
+        }
+        "zshrc" => format!(
+            "if [ -n \"$PANEA_ORIGINAL_ZDOTDIR\" ] && [ -r \"$PANEA_ORIGINAL_ZDOTDIR/.zshrc\" ]; then . \"$PANEA_ORIGINAL_ZDOTDIR/.zshrc\"; fi\n{contents}\n"
+        ),
+        _ => contents.to_owned(),
+    }
+}
+
+fn sanitize_file_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn ssh_connection_profile(profile: &SshProfile) -> SshConnectionProfile {
@@ -1315,6 +1528,7 @@ struct PaneRuntime {
     terminal: TerminalEmulator,
     semantic_parser: SemanticEscapeParser,
     semantic_timeline: SemanticTimelineStore,
+    parse_semantic_events: bool,
     transport: Option<LocalPtyTransport>,
     mouse_protocol: MouseProtocolState,
 }
@@ -1323,19 +1537,30 @@ impl PaneRuntime {
     fn new(config: &AppConfig, size: TerminalGridSize, metrics: CellMetrics) -> Self {
         let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(size.cols, size.rows));
         let transport_size = terminal_transport_size(size, metrics);
-        let transport = match spawn_initial_transport(config, transport_size) {
-            Ok(transport) => Some(transport),
-            Err(error) => {
-                let _ = terminal
-                    .apply_bytes(format!("failed to spawn local shell: {error}\r\n").as_bytes());
-                None
-            }
-        };
+        let mut semantic_timeline = SemanticTimelineStore::new();
+        let (transport, parse_semantic_events) =
+            match spawn_initial_transport(config, transport_size) {
+                Ok(initial) => {
+                    semantic_timeline.set_integration_mode(initial.semantic_mode);
+                    for diagnostic in initial.activation_diagnostics {
+                        eprintln!("shell integration: {diagnostic}");
+                    }
+                    (Some(initial.transport), initial.parse_semantic_events)
+                }
+                Err(error) => {
+                    let _ = terminal.apply_bytes(
+                        format!("failed to spawn local shell: {error}\r\n").as_bytes(),
+                    );
+                    semantic_timeline.set_integration_mode(IntegrationMode::Disabled);
+                    (None, false)
+                }
+            };
 
         Self {
             terminal,
             semantic_parser: SemanticEscapeParser::new(),
-            semantic_timeline: SemanticTimelineStore::new(),
+            semantic_timeline,
+            parse_semantic_events,
             transport,
             mouse_protocol: MouseProtocolState::default(),
         }
@@ -1387,8 +1612,10 @@ impl PaneRuntime {
                 let cursor = self.terminal.cursor_state();
                 let semantic_position =
                     BufferPosition::new(cursor.position.row, cursor.position.col);
-                for parsed in self.semantic_parser.parse(&output.bytes, semantic_position) {
-                    self.semantic_timeline.apply_event(parsed.event);
+                if self.parse_semantic_events {
+                    for parsed in self.semantic_parser.parse(&output.bytes, semantic_position) {
+                        self.semantic_timeline.apply_event(parsed.event);
+                    }
                 }
                 if let Err(panic) = catch_unwind(AssertUnwindSafe(|| {
                     let _ = self.terminal.apply_bytes(&output.bytes);
@@ -2204,6 +2431,7 @@ fn ansi_color(index: u8, config: &AppConfig) -> RenderColor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use semantics::SemanticEventKind;
 
     fn mouse_event(kind: MouseEventKind) -> MouseEvent {
         MouseEvent {
@@ -2223,6 +2451,10 @@ mod tests {
             modifiers,
             repeat: false,
         }
+    }
+
+    fn smoke_size() -> TransportSize {
+        TransportSize::new(80, 24, 640, 384)
     }
 
     #[test]
@@ -2324,5 +2556,231 @@ mod tests {
         let layout = runtime.active_layouts(&config);
         assert_eq!(layout[0].rect.y, 0.0);
         assert_eq!(layout[0].terminal_size.rows, 30);
+    }
+
+    #[test]
+    fn shell_integration_full_mode_injects_supported_runtime_hook() {
+        let mut config = AppConfig {
+            default_shell_profile: Some("bash".to_owned()),
+            shell_profiles: vec![ShellProfile {
+                name: "bash".to_owned(),
+                kind: ShellProfileKind::Custom,
+                program: "bash".to_owned(),
+                ..ShellProfile::default()
+            }],
+            ..AppConfig::default()
+        };
+        config.shell_integration.activation = ShellIntegrationActivationConfig::Full;
+
+        let (profile, activation) = initial_local_shell_profile(&config);
+
+        assert_eq!(
+            activation.action,
+            ShellIntegrationActivationAction::InjectRuntimeScript
+        );
+        assert_eq!(
+            profile
+                .env
+                .get("PANEA_SHELL_INTEGRATION")
+                .map(String::as_str),
+            Some("full")
+        );
+        if cfg!(windows) {
+            assert!(
+                profile
+                    .startup_command
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("777")
+                    || profile.args.iter().any(|arg| arg.contains("panea"))
+            );
+        } else {
+            assert!(profile.args.iter().any(|arg| arg.contains("panea")));
+        }
+    }
+
+    #[test]
+    fn shell_integration_off_mode_does_not_inject_or_parse() {
+        let mut config = AppConfig {
+            default_shell_profile: Some("bash".to_owned()),
+            shell_profiles: vec![ShellProfile {
+                name: "bash".to_owned(),
+                kind: ShellProfileKind::Custom,
+                program: "bash".to_owned(),
+                ..ShellProfile::default()
+            }],
+            ..AppConfig::default()
+        };
+        config.shell_integration.activation = ShellIntegrationActivationConfig::Disabled;
+
+        let (profile, activation) = initial_local_shell_profile(&config);
+
+        assert_eq!(
+            semantic_mode_for_activation(&activation),
+            IntegrationMode::Disabled
+        );
+        assert!(!activation.parses_escape_sequences());
+        assert!(profile.args.is_empty());
+        assert_eq!(
+            profile
+                .env
+                .get("PANEA_SHELL_INTEGRATION")
+                .map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn explicit_shell_args_prevent_runtime_hook_injection() {
+        let mut config = AppConfig {
+            default_shell_profile: Some("bash".to_owned()),
+            shell_profiles: vec![ShellProfile {
+                name: "bash".to_owned(),
+                kind: ShellProfileKind::Custom,
+                program: "bash".to_owned(),
+                args: vec!["--login".to_owned()],
+                ..ShellProfile::default()
+            }],
+            ..AppConfig::default()
+        };
+        config.shell_integration.activation = ShellIntegrationActivationConfig::Full;
+
+        let (profile, activation) = initial_local_shell_profile(&config);
+
+        assert_eq!(
+            activation.action,
+            ShellIntegrationActivationAction::InjectRuntimeScript
+        );
+        assert_eq!(profile.args, ["--login"]);
+        assert!(profile.startup_command.is_none());
+    }
+
+    #[test]
+    #[ignore = "spawns a real PowerShell process"]
+    fn real_powershell_emits_semantic_shell_events() {
+        run_real_shell_semantic_smoke(
+            ShellKind::PowerShell,
+            LocalShellProfile::powershell().with_args([
+                "-NoLogo".to_owned(),
+                "-NoProfile".to_owned(),
+                "-Command".to_owned(),
+                shell_integration::verification_sequence(
+                    ShellKind::PowerShell,
+                    "panea-shell-integration-smoke",
+                )
+                .expect("PowerShell verification sequence"),
+            ]),
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns a real bash process"]
+    fn real_bash_emits_semantic_shell_events() {
+        run_real_shell_semantic_smoke(
+            ShellKind::Bash,
+            LocalShellProfile::custom("bash", "bash").with_args([
+                "-lc".to_owned(),
+                shell_integration::verification_sequence(
+                    ShellKind::Bash,
+                    "panea-shell-integration-smoke",
+                )
+                .expect("bash verification sequence"),
+            ]),
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns a real zsh process"]
+    fn real_zsh_emits_semantic_shell_events() {
+        run_real_shell_semantic_smoke(
+            ShellKind::Zsh,
+            LocalShellProfile::custom("zsh", "zsh").with_args([
+                "-lc".to_owned(),
+                shell_integration::verification_sequence(
+                    ShellKind::Zsh,
+                    "panea-shell-integration-smoke",
+                )
+                .expect("zsh verification sequence"),
+            ]),
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns a real fish process"]
+    fn real_fish_emits_semantic_shell_events() {
+        run_real_shell_semantic_smoke(
+            ShellKind::Fish,
+            LocalShellProfile::custom("fish", "fish").with_args([
+                "-c".to_owned(),
+                shell_integration::verification_sequence(
+                    ShellKind::Fish,
+                    "panea-shell-integration-smoke",
+                )
+                .expect("fish verification sequence"),
+            ]),
+        );
+    }
+
+    fn run_real_shell_semantic_smoke(shell: ShellKind, profile: LocalShellProfile) {
+        let marker = b"panea-shell-integration-smoke";
+        let mut transport = match LocalPtyTransport::spawn(profile.clone(), smoke_size()) {
+            Ok(transport) => transport,
+            Err(error) => {
+                eprintln!(
+                    "skipping real {shell:?} semantic smoke because spawn failed for {}: {error}",
+                    profile.program
+                );
+                return;
+            }
+        };
+        let mut parser = SemanticEscapeParser::new();
+        let mut bytes = Vec::new();
+        let mut events = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+
+        while std::time::Instant::now() < deadline {
+            let output = transport.poll_output().expect("poll shell output");
+            if !output.bytes.is_empty() {
+                answer_real_shell_terminal_queries(&mut transport, &output.bytes);
+                events.extend(
+                    parser
+                        .parse(&output.bytes, BufferPosition::new(0, 0))
+                        .into_iter()
+                        .map(|parsed| parsed.event.kind()),
+                );
+                bytes.extend(output.bytes);
+            }
+
+            if bytes.windows(marker.len()).any(|window| window == marker)
+                && events.contains(&SemanticEventKind::CommandFinished)
+            {
+                let _ = transport.shutdown();
+                assert!(events.contains(&SemanticEventKind::ShellMetadataChanged));
+                assert!(events.contains(&SemanticEventKind::OutputStarted));
+                return;
+            }
+
+            if output.closed {
+                break;
+            }
+
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let diagnostics = transport.diagnostics();
+        let _ = transport.shutdown();
+        panic!(
+            "real {shell:?} semantic smoke did not observe expected events; bytes={}, events={events:?}, diagnostics={diagnostics:?}",
+            bytes.len()
+        );
+    }
+
+    fn answer_real_shell_terminal_queries(transport: &mut LocalPtyTransport, bytes: &[u8]) {
+        if bytes
+            .windows(b"\x1b[6n".len())
+            .any(|window| window == b"\x1b[6n")
+        {
+            let _ = transport.write_input(b"\x1b[1;1R");
+        }
     }
 }

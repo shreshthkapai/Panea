@@ -52,7 +52,9 @@ The remaining high-level work is:
 - GPU timestamp queries and in-window performance overlay.
 - Product-complete desktop mux runtime polish: startup layouts, SSH panes,
   polished tab chrome, pane move/swap UI, and cross-OS GUI smoke.
-- Runtime shell integration activation and real shell verification.
+- Runtime shell integration activation exists for local desktop sessions; real
+  bash/zsh/fish/macOS/Linux/WSL/remote verification and heuristic fallback
+  hardening remain.
 - Product-complete command blocks/visual overlays.
 - Animated image cursor pipeline.
 - Interactive SSH trust/secret UI and OS keychain providers.

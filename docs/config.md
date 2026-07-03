@@ -88,6 +88,28 @@ confirm_remote_writes = true
 Remote OSC 52 clipboard writes are denied by default. Large OSC 52 writes are
 capped before they can touch the system clipboard.
 
+## Shell Integration
+
+Shell integration is optional. It enables semantic prompt, input, output,
+current-directory, shell, exit-status, and command-duration events without
+changing terminal buffer text.
+
+```toml
+[shell_integration]
+enabled = true
+activation = "auto_detect"
+auto_install = false
+enabled_shells = ["bash", "zsh", "fish", "powershell", "pwsh"]
+disabled_shell_profiles = []
+remote_instructions = true
+```
+
+Supported `activation` values are `full`, `auto_detect` / `auto`, `manual`,
+`heuristic`, and `disabled` / `off`. `full` injects a runtime hook for
+supported local shells. `auto_detect` accepts semantic escape sequences and
+injects only when `auto_install = true`. `off` disables semantic event parsing
+for the session.
+
 ## SSH Profiles
 
 SSH profiles describe remote sessions; defining one does not automatically

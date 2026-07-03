@@ -62,7 +62,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | External tmux/screen/zellij compatibility | partial | partial | partial | partial | Architecture preserves compatibility; real app suite is not automated. |
 | Semantic timeline | tested | implemented | implemented | implemented | Storage and command-region model exist. |
 | Semantic escape parser | tested | implemented | implemented | implemented | OSC 133, OSC 633, OSC 7, and private OSC 777 foundations exist. |
-| Shell integration scripts | partial | partial | partial | partial | bash/zsh/fish/PowerShell scripts exist; runtime activation and real-shell verification remain. |
+| Shell integration activation | partial | partial | partial | partial | Activation plans, desktop hook injection, config modes, and ignored real-shell tests exist; Windows PowerShell smoke passed, while bash/zsh/fish, WSL, remote, macOS, and Linux verification remain. |
 | Command navigation/copy actions | tested | implemented | implemented | implemented | Semantic actions exist; desktop UX integration remains partial. |
 | Prompt decorations | partial | partial | partial | partial | Overlay contracts and basic generation exist; polished UI remains. |
 | Command blocks | partial | partial | partial | partial | Semantic model and overlays exist; product-complete UI and real shell verification remain. |
