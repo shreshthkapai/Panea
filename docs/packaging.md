@@ -106,7 +106,7 @@ Linux portable:
 panea-<version>-linux-portable-<profile>/
   bin/panea
   share/applications/panea.desktop
-  share/icons/hicolor/scalable/apps/panea.svg
+  share/icons/hicolor/512x512/apps/panea.png
   share/panea/
     config/default.toml
     config/schema.json

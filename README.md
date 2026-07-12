@@ -73,4 +73,5 @@ cargo xtask fuzz-smoke
 - [Troubleshooting](docs/troubleshooting.md)
 - [Security](docs/security.md)
 - [Packaging](docs/packaging.md)
+- [Branding assets](docs/branding.md)
 - [Release validation](docs/release-validation.md)

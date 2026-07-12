@@ -1,10 +1,16 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
+    io::Cursor,
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
     thread,
     time::{Duration, Instant},
+};
+
+use image::{
+    DynamicImage, ImageFormat, RgbaImage,
+    imageops::{FilterType, crop_imm, overlay, resize},
 };
 
 use security::{
@@ -21,7 +27,7 @@ fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("help") | None => {
             eprintln!(
-                "usage: cargo xtask <fmt|clippy|test|build|check|layer-check|ci|config-default|config-schema|bench|screenshot|fuzz-smoke|fuzz|doctor|bug-report|hardening|security-review|linux-compositor|compat|ssh-smoke|verify-os|package|package-plan|release-check|ios-readiness>"
+                "usage: cargo xtask <fmt|clippy|test|build|check|layer-check|ci|branding|config-default|config-schema|bench|screenshot|fuzz-smoke|fuzz|doctor|bug-report|hardening|security-review|linux-compositor|compat|ssh-smoke|verify-os|package|package-plan|release-check|ios-readiness>"
             );
             ExitCode::SUCCESS
         }
@@ -31,6 +37,7 @@ fn main() -> ExitCode {
         Some("build") => run("cargo", &["build", "--workspace"]),
         Some("check") => run("cargo", &["check", "--workspace"]),
         Some("layer-check") => run_layer_check(),
+        Some("branding") => run_branding(),
         Some("config-default") => print_config_default(),
         Some("config-schema") => print_config_schema(),
         Some("bench") => run_bench(),
@@ -55,6 +62,162 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+const BRAND_SOURCE: &str = "crates/assets/branding/panea-source.png";
+const BRAND_OUTPUT_DIR: &str = "crates/assets/branding/generated";
+const BRAND_MASTER_SIZE: u32 = 1024;
+const BRAND_MARK_FILL: u32 = 768;
+
+fn run_branding() -> ExitCode {
+    match generate_brand_assets(Path::new(BRAND_SOURCE), Path::new(BRAND_OUTPUT_DIR)) {
+        Ok(()) => {
+            println!("generated Panea brand assets in {BRAND_OUTPUT_DIR}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("branding generation failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn generate_brand_assets(source: &Path, output_dir: &Path) -> Result<(), String> {
+    let source_image = image::open(source)
+        .map_err(|error| format!("failed to decode {}: {error}", source.display()))?
+        .to_rgba8();
+    let master = square_brand_master(&source_image)?;
+
+    fs::create_dir_all(output_dir)
+        .map_err(|error| format!("failed to create {}: {error}", output_dir.display()))?;
+    save_png(&master, &output_dir.join("panea-icon-1024.png"))?;
+
+    for size in [16, 24, 32, 48, 64, 128, 256, 512] {
+        let icon = resize(&master, size, size, FilterType::Lanczos3);
+        save_png(&icon, &output_dir.join(format!("panea-icon-{size}.png")))?;
+    }
+
+    let ico_sizes = [16, 24, 32, 48, 64, 128, 256];
+    let ico_images = encoded_png_sizes(&master, &ico_sizes)?;
+    fs::write(output_dir.join("panea.ico"), encode_ico(&ico_images))
+        .map_err(|error| format!("failed to write Panea ICO: {error}"))?;
+
+    let icns_sizes = [16, 32, 64, 128, 256, 512, 1024];
+    let icns_images = encoded_png_sizes(&master, &icns_sizes)?;
+    fs::write(output_dir.join("Panea.icns"), encode_icns(&icns_images)?)
+        .map_err(|error| format!("failed to write Panea ICNS: {error}"))?;
+    Ok(())
+}
+
+fn square_brand_master(source: &RgbaImage) -> Result<RgbaImage, String> {
+    if source.width() == 0 || source.height() == 0 {
+        return Err("brand source is empty".to_owned());
+    }
+    let background = *source.get_pixel(0, 0);
+    let (mut min_x, mut min_y) = (source.width(), source.height());
+    let (mut max_x, mut max_y) = (0, 0);
+    let mut found = false;
+
+    for (x, y, pixel) in source.enumerate_pixels() {
+        let difference = pixel.0[..3]
+            .iter()
+            .zip(background.0[..3].iter())
+            .map(|(left, right)| i32::from(*left) - i32::from(*right))
+            .map(|delta| delta * delta)
+            .sum::<i32>();
+        if pixel[3] > 0 && difference > 64 {
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+            found = true;
+        }
+    }
+    if !found {
+        return Err("brand source contains no mark distinct from its background".to_owned());
+    }
+
+    let mark = crop_imm(source, min_x, min_y, max_x - min_x + 1, max_y - min_y + 1).to_image();
+    let scale = (BRAND_MARK_FILL as f64 / f64::from(mark.width().max(mark.height()))).min(1.0);
+    let width = (f64::from(mark.width()) * scale).round() as u32;
+    let height = (f64::from(mark.height()) * scale).round() as u32;
+    let mark = resize(&mark, width.max(1), height.max(1), FilterType::Lanczos3);
+    let mut master = RgbaImage::from_pixel(BRAND_MASTER_SIZE, BRAND_MASTER_SIZE, background);
+    overlay(
+        &mut master,
+        &mark,
+        i64::from((BRAND_MASTER_SIZE - mark.width()) / 2),
+        i64::from((BRAND_MASTER_SIZE - mark.height()) / 2),
+    );
+    Ok(master)
+}
+
+fn save_png(image: &RgbaImage, path: &Path) -> Result<(), String> {
+    image
+        .save_with_format(path, ImageFormat::Png)
+        .map_err(|error| format!("failed to write {}: {error}", path.display()))
+}
+
+fn encoded_png_sizes(master: &RgbaImage, sizes: &[u32]) -> Result<Vec<(u32, Vec<u8>)>, String> {
+    sizes
+        .iter()
+        .map(|size| {
+            let image = resize(master, *size, *size, FilterType::Lanczos3);
+            let mut bytes = Vec::new();
+            DynamicImage::ImageRgba8(image)
+                .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+                .map_err(|error| format!("failed to encode {size}px PNG: {error}"))?;
+            Ok((*size, bytes))
+        })
+        .collect()
+}
+
+fn encode_ico(images: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    let header_size = 6 + images.len() * 16;
+    let data_size = images.iter().map(|(_, bytes)| bytes.len()).sum::<usize>();
+    let mut output = Vec::with_capacity(header_size + data_size);
+    output.extend_from_slice(&0_u16.to_le_bytes());
+    output.extend_from_slice(&1_u16.to_le_bytes());
+    output.extend_from_slice(&(images.len() as u16).to_le_bytes());
+    let mut offset = header_size as u32;
+    for (size, bytes) in images {
+        output.push(if *size >= 256 { 0 } else { *size as u8 });
+        output.push(if *size >= 256 { 0 } else { *size as u8 });
+        output.extend_from_slice(&[0, 0]);
+        output.extend_from_slice(&1_u16.to_le_bytes());
+        output.extend_from_slice(&32_u16.to_le_bytes());
+        output.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        output.extend_from_slice(&offset.to_le_bytes());
+        offset += bytes.len() as u32;
+    }
+    for (_, bytes) in images {
+        output.extend_from_slice(bytes);
+    }
+    output
+}
+
+fn encode_icns(images: &[(u32, Vec<u8>)]) -> Result<Vec<u8>, String> {
+    let mut chunks = Vec::new();
+    for (size, bytes) in images {
+        let kind = match size {
+            16 => *b"icp4",
+            32 => *b"icp5",
+            64 => *b"icp6",
+            128 => *b"ic07",
+            256 => *b"ic08",
+            512 => *b"ic09",
+            1024 => *b"ic10",
+            _ => return Err(format!("unsupported ICNS icon size: {size}")),
+        };
+        chunks.extend_from_slice(&kind);
+        chunks.extend_from_slice(&((bytes.len() + 8) as u32).to_be_bytes());
+        chunks.extend_from_slice(bytes);
+    }
+    let mut output = Vec::with_capacity(chunks.len() + 8);
+    output.extend_from_slice(b"icns");
+    output.extend_from_slice(&((chunks.len() + 8) as u32).to_be_bytes());
+    output.extend_from_slice(&chunks);
+    Ok(output)
 }
 
 fn run_linux_compositor() -> ExitCode {
@@ -3099,7 +3262,7 @@ fn smoke_package(options: &PackageOptions) -> ExitCode {
     }
 
     let layout = package_layout(options);
-    match verify_package_contents(&layout) {
+    match verify_package_contents(&layout, options.target_platform) {
         Ok(()) => {}
         Err(error) => {
             eprintln!("package smoke failed before launch: {error}");
@@ -3301,12 +3464,17 @@ fn write_macos_bundle_files(layout: &PackageLayout) -> Result<(), String> {
   <key>CFBundleExecutable</key><string>panea</string>
   <key>CFBundleIdentifier</key><string>dev.panea.terminal</string>
   <key>CFBundleName</key><string>Panea</string>
+  <key>CFBundleIconFile</key><string>Panea.icns</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
 </dict>
 </plist>
 "#,
+    )?;
+    write_bytes(
+        &layout.resource_dir.join("Panea.icns"),
+        assets::PANEA_ICON_ICNS,
     )
 }
 
@@ -3319,19 +3487,14 @@ fn write_linux_package_files(layout: &PackageLayout) -> Result<(), String> {
         &share_dir.join("applications").join("panea.desktop"),
         "[Desktop Entry]\nType=Application\nName=Panea\nComment=GPU-first cross-platform terminal\nExec=panea\nTerminal=false\nCategories=System;TerminalEmulator;\nIcon=panea\n",
     )?;
-    write_file(
+    write_bytes(
         &share_dir
             .join("icons")
             .join("hicolor")
-            .join("scalable")
+            .join("512x512")
             .join("apps")
-            .join("panea.svg"),
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
-  <rect width="128" height="128" rx="18" fill="#101820"/>
-  <path d="M28 38l28 26-28 26" fill="none" stroke="#e6f0ff" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M66 90h34" stroke="#4dd4ac" stroke-width="10" stroke-linecap="round"/>
-</svg>
-"##,
+            .join("panea.png"),
+        assets::PANEA_ICON_PNG_512,
     )
 }
 
@@ -3339,10 +3502,17 @@ fn write_windows_package_files(layout: &PackageLayout) -> Result<(), String> {
     write_file(
         &layout.resource_dir.join("WINDOWS.txt"),
         "Panea Windows portable package.\n\nRun panea.exe from the package root or add the package root to PATH.\nInstaller, Start menu shortcuts, and PATH mutation are deferred to the installer phase.\n",
+    )?;
+    write_bytes(
+        &layout.resource_dir.join("icons").join("panea.ico"),
+        assets::PANEA_ICON_ICO,
     )
 }
 
-fn verify_package_contents(layout: &PackageLayout) -> Result<(), String> {
+fn verify_package_contents(
+    layout: &PackageLayout,
+    target_platform: CompatPlatform,
+) -> Result<(), String> {
     for path in [
         &layout.binary_path,
         &layout.manifest_path,
@@ -3376,7 +3546,32 @@ fn verify_package_contents(layout: &PackageLayout) -> Result<(), String> {
             return Err(format!("missing packaged file {}", path.display()));
         }
     }
+    for path in package_icon_paths(layout, target_platform) {
+        if !path.exists() {
+            return Err(format!("missing packaged icon {}", path.display()));
+        }
+    }
     Ok(())
+}
+
+fn package_icon_paths(layout: &PackageLayout, target_platform: CompatPlatform) -> Vec<PathBuf> {
+    match target_platform {
+        CompatPlatform::Macos => vec![layout.resource_dir.join("Panea.icns")],
+        CompatPlatform::LinuxX11 | CompatPlatform::LinuxWayland => {
+            let share_dir = layout.resource_dir.parent().unwrap_or(&layout.resource_dir);
+            vec![
+                share_dir
+                    .join("icons")
+                    .join("hicolor")
+                    .join("512x512")
+                    .join("apps")
+                    .join("panea.png"),
+            ]
+        }
+        CompatPlatform::Windows | CompatPlatform::Any | CompatPlatform::Unix => {
+            vec![layout.resource_dir.join("icons").join("panea.ico")]
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3645,7 +3840,7 @@ fn render_package_manifest(options: &PackageOptions, layout: &PackageLayout) -> 
             "  \"resources\": \"{}\",\n",
             "  \"doctor_smoke\": \"panea doctor --json\",\n",
             "  \"shell_launch_smoke\": \"panea shell-smoke --json\",\n",
-            "  \"contains\": [\"binary\", \"default_config\", \"config_schema\", \"config_examples\", \"programmable_config_examples\", \"shell_integration_scripts\", \"doctor_command\", \"shell_smoke_command\", \"license\", \"readme\"]\n",
+            "  \"contains\": [\"binary\", \"application_icon\", \"default_config\", \"config_schema\", \"config_examples\", \"programmable_config_examples\", \"shell_integration_scripts\", \"doctor_command\", \"shell_smoke_command\", \"license\", \"readme\"]\n",
             "}}\n"
         ),
         env!("CARGO_PKG_VERSION"),
@@ -3688,6 +3883,15 @@ fn copy_repo_file(source: &str, dest: &Path) -> Result<(), String> {
 }
 
 fn write_file(path: &Path, contents: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    }
+    fs::write(path, contents)
+        .map_err(|error| format!("failed to write {}: {error}", path.display()))
+}
+
+fn write_bytes(path: &Path, contents: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
@@ -4905,5 +5109,24 @@ mod tests {
         assert!(manifest.contains("\"shell_smoke_command\""));
         assert!(manifest.contains("\"programmable_config_examples\""));
         assert!(manifest.contains("\"license\""));
+        assert!(manifest.contains("\"application_icon\""));
+    }
+
+    #[test]
+    fn package_icon_paths_follow_platform_conventions() {
+        let windows_options = PackageOptions::default_for(CompatPlatform::Windows);
+        let windows = package_layout(&windows_options);
+        assert!(package_icon_paths(&windows, CompatPlatform::Windows)[0].ends_with("panea.ico"));
+
+        let macos_options = PackageOptions::default_for(CompatPlatform::Macos);
+        let macos = package_layout(&macos_options);
+        assert!(package_icon_paths(&macos, CompatPlatform::Macos)[0].ends_with("Panea.icns"));
+
+        let linux_options = PackageOptions::default_for(CompatPlatform::LinuxWayland);
+        let linux = package_layout(&linux_options);
+        assert!(
+            package_icon_paths(&linux, CompatPlatform::LinuxWayland)[0]
+                .ends_with(Path::new("512x512").join("apps").join("panea.png"))
+        );
     }
 }

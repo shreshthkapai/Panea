@@ -32,3 +32,6 @@ transport-core = { path = "../../crates/transport-core" }
 transport-pty = { path = "../../crates/transport-pty" }
 transport-ssh = { path = "../../crates/transport-ssh" }
 winit.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"

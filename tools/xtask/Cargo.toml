@@ -16,6 +16,7 @@ workspace = true
 assets = { path = "../../crates/assets" }
 config-toml = { path = "../../crates/config-toml" }
 diagnostics = { path = "../../crates/diagnostics" }
+image.workspace = true
 render-wgpu = { path = "../../crates/render-wgpu" }
 security = { path = "../../crates/security" }
 shell-integration = { path = "../../crates/shell-integration" }

@@ -41,6 +41,7 @@ arboard = "3"
 base64 = "0.22"
 bytemuck = { version = "1", features = ["derive"] }
 fontdb = "0.23"
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
 pollster = "0.4"
 portable-pty = "0.9.0"
 proptest = "1.6"

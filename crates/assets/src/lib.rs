@@ -2,6 +2,10 @@
 
 pub const LAYER: &str = "visual overlay";
 
+pub const PANEA_ICON_PNG_512: &[u8] = include_bytes!("../branding/generated/panea-icon-512.png");
+pub const PANEA_ICON_ICO: &[u8] = include_bytes!("../branding/generated/panea.ico");
+pub const PANEA_ICON_ICNS: &[u8] = include_bytes!("../branding/generated/Panea.icns");
+
 pub struct ConfigExample {
     pub name: &'static str,
     pub contents: &'static str,
@@ -52,5 +56,12 @@ mod tests {
         assert_eq!(CONFIG_EXAMPLES.len(), 5);
         assert!(config_example("balanced.toml").is_some());
         assert_eq!(PROGRAMMABLE_CONFIG_EXAMPLES.len(), 1);
+    }
+
+    #[test]
+    fn application_icons_have_expected_container_signatures() {
+        assert_eq!(&PANEA_ICON_PNG_512[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(&PANEA_ICON_ICO[..4], &[0, 0, 1, 0]);
+        assert_eq!(&PANEA_ICON_ICNS[..4], b"icns");
     }
 }
