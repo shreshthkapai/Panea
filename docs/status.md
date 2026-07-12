@@ -48,7 +48,7 @@ stated scope:
 | Architecture boundary enforcement | tested | `cargo xtask layer-check` validates allowed workspace dependencies, `cargo xtask ci` runs it, and GitHub Actions runs the architecture boundary subset on Windows, macOS, and Ubuntu. |
 | Terminal core baseline | tested | Grid, cells, cursor, anchored scrollback viewport, alternate screen, resize, modes, absolute normal/rectangular selection extraction, terminal key encoding, and baseline golden coverage exist. |
 | Unicode/grapheme cell model | tested | UTF-8 scalar buffering, grapheme clustering, combining marks, wide CJK cells, emoji modifiers, ZWJ emoji, variation selectors, selection, cursor movement, overwrite/delete/erase, resize, and scrollback tests exist in `term-core` and `term-parser`. |
-| Parser baseline | tested | ANSI/VT parser adapter handles printable text, common controls, SGR colors/styles, alternate screen, clears, insert/delete groundwork, tab stops, title OSC, mouse/focus/bracketed-paste mode state, and pending responses. |
+| Parser compatibility | tested | ANSI/VT parser handles common controls, SGR colors/styles, origin/autowrap/insert modes, alternate screen, scroll regions, index/reverse-index, insert/delete/erase/repeat, tab controls, DEC line graphics, title/clipboard OSC, bounded string controls, tmux DCS passthrough, mouse/focus/bracketed-paste modes, and DA/DSR responses. |
 | Fuzzing harness | tested | `fuzz/` contains cargo-fuzz targets for parser, grid, resize, Unicode, selection, OSC/DCS, and shell markers; property smoke tests run through `cargo xtask fuzz-smoke` and scheduled CI. |
 | App compatibility runner | tested | `cargo xtask compat` lists and runs bounded process/PTY compatibility probes, writes reports under `target/compatibility`, and the required Windows PowerShell/cmd/protocol subset passed on the current host. |
 | Screenshot verification runner | tested | Deterministic renderer fixtures, PPM capture, tolerance-based diffing, Windows baselines, and `cargo xtask screenshot verify --platform windows` exist. |
@@ -82,10 +82,10 @@ These areas are real foundations but must not be called complete:
 | Desktop app runtime | partial | Full app lifecycle, polished UI chrome, complete mux integration, installer-grade packaging, and cross-OS manual validation. |
 | Platform windowing | partial | Real macOS lifecycle, real Linux X11/Wayland compositor behavior, decoration negotiation, IME validation, native notifications, and platform-specific fallback verification. |
 | GPU renderer | tested | WGPU surface/device setup, glyph atlas/cache policy, damage-aware batch preparation, indexed background/glyph/decoration/selection/cursor batches, row-scoped atlas uploads, renderer benchmarks, recovery status/event contracts, WGPU device-lost callback detection, disposable WGPU backend recreation, GPU atlas invalidation after recovery, screenshot verification infrastructure, and GPU timestamp status plumbing exist; real GPU timing samples, sleep/wake/monitor-loss validation, macOS/Linux screenshot baselines, and cross-OS render validation remain. |
-| Font system | partial | Deeper shaping, full fallback validation across installed font sets, emoji fallback, and grapheme-aware metrics. |
-| Unicode support | tested | Core/parser Unicode hardening is covered by automated tests; renderer font fallback, shaping, screenshot parity, and real app conformance remain later phases. |
+| Font and text rendering | tested | OpenType shaping, per-grapheme configured/system fallback, real regular/bold/italic/bold-italic face resolution, CJK/combining/ligature/emoji shaping, COLR/bitmap color glyph rasterization, RGBA atlas batching, run caching, and portable font diagnostics pass automated tests on Windows. |
+| Unicode support | tested | Core/parser grapheme correctness and renderer shaping/fallback/color-glyph paths are covered by automated tests; real installed-font and screenshot/app parity still require macOS/Linux host reports. |
 | Input, clipboard, selection, and scrollback UX | tested | Shared key/application-mode encoding, mouse/focus protocols, absolute normal/rectangular mouse and keyboard selection, selection overlays, anchored wheel/page scrollback, interactive search, portable HTTP(S) URL activation, keyboard copy/paste, Linux primary-selection provider behavior, paste protection, bracketed paste, middle-click paste, and OSC 52 policy exist. Real macOS/Linux runtime verification, remote OSC 52 confirmation UI, and full app compatibility coverage remain. |
-| Baseline compatibility | partial | App compatibility runner and required Windows smoke exist; full interactive verification for shells, editors, pagers, TUIs, tmux, screen, zellij, SSH, WSL, and command-line tools remains incomplete. |
+| Baseline compatibility | tested | The xterm-256color protocol implementation and Windows required compatibility smoke are tested; full interactive evidence for editors, pagers, TUIs, tmux, screen, zellij, SSH, WSL, and all target OSes remains tracked by app/cross-OS verification. |
 | Shell integration | partial | Local runtime activation planning and desktop injection exist for supported shells, with Windows PowerShell semantic smoke verified. Remote install flows, heuristic command detection, WSL-specific coverage, and real bash/zsh/fish/macOS/Linux session verification remain. |
 | Visual overlays | partial | Semantic command-block overlay projection, badge glyph batching, cursor animation quads, and image cursor metadata caching exist; collapse/expand behavior, polished interactive UI, full image cursor frame upload/draw, real shell-driven verification, and cross-OS visual verification remain. |
 | Native mux runtime | partial | Local tab/split runtime wiring exists, but startup workspaces, SSH panes, polished tab chrome, pane drag/move UI, and cross-OS GUI/runtime smoke tests remain. |
@@ -118,8 +118,8 @@ The following major accepted features have no complete product behavior yet:
   wlroots/Sway, Hyprland class, tiling window managers, and X11 window managers.
 - Long-running coverage-guided fuzz history and crash-regression backlog from
   real-world fuzz findings.
-- Unicode/font/render conformance beyond the core parser model, including
-  cross-OS font fallback and real app screenshot parity.
+- Cross-OS installed-font, shaping, color-emoji, screenshot, and real-app
+  evidence for the implemented text renderer.
 - macOS, Linux X11, and Linux Wayland screenshot baseline capture and
   verification.
 - Cross-OS runtime verification of the batched GPU glyph renderer.

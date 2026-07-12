@@ -1386,7 +1386,7 @@ fn run_pty_compat(
                     saw_marker || output.windows(marker.len()).any(|window| window == marker);
                 let closed =
                     poll.closed || matches!(transport.state(), TransportState::Closed { .. });
-                if saw_marker && closed {
+                if closed {
                     break;
                 }
             }
@@ -1417,13 +1417,19 @@ fn run_pty_compat(
     );
 
     if !saw_marker {
+        let runtime_unavailable = pty_runtime_unavailable(&output);
         return Err(CompatRunError {
-            missing_program: false,
-            message: format!(
-                "PTY case did not observe marker {:?}; shutdown={:?}",
-                String::from_utf8_lossy(marker),
-                shutdown_result.map_err(|error| error.to_string())
-            ),
+            missing_program: runtime_unavailable,
+            message: if runtime_unavailable {
+                "PTY launcher exists, but its optional runtime is unavailable on this host"
+                    .to_owned()
+            } else {
+                format!(
+                    "PTY case did not observe marker {:?}; shutdown={:?}",
+                    String::from_utf8_lossy(marker),
+                    shutdown_result.map_err(|error| error.to_string())
+                )
+            },
             bytes_received: output.len(),
             preview: preview_bytes(&output),
             lifecycle,
@@ -1461,6 +1467,12 @@ fn run_pty_compat(
         lifecycle,
         diagnostics: Some(diagnostics),
     })
+}
+
+fn pty_runtime_unavailable(output: &[u8]) -> bool {
+    let output = String::from_utf8_lossy(output).to_ascii_lowercase();
+    output.contains("windows subsystem for linux has no installed distributions")
+        || output.contains("there are no distributions installed")
 }
 
 fn answer_terminal_queries(
@@ -4907,6 +4919,14 @@ mod tests {
         assert_eq!(options.category, Some(CompatCategory::Shells));
         assert_eq!(options.case_key.as_deref(), Some("shell-cmd"));
         assert_eq!(options.timeout, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn compatibility_classifies_missing_wsl_distribution_as_unavailable_runtime() {
+        assert!(pty_runtime_unavailable(
+            b"Windows Subsystem for Linux has no installed distributions."
+        ));
+        assert!(!pty_runtime_unavailable(b"bash: printf: command not found"));
     }
 
     #[test]

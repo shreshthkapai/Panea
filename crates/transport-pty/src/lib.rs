@@ -158,6 +158,12 @@ impl LocalShellProfile {
         if !self.env.contains_key("COLORTERM") {
             command.env("COLORTERM", "truecolor");
         }
+        if !self.env.contains_key("TERM_PROGRAM") {
+            command.env("TERM_PROGRAM", "Panea");
+        }
+        if !self.env.contains_key("TERM_PROGRAM_VERSION") {
+            command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        }
 
         for (key, value) in &self.env {
             command.env(key, value);

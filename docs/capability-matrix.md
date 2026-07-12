@@ -22,11 +22,11 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Workspace build/test/lint | tested | partial | partial | partial | Verified on the current Windows host; other desktop OSes require runners. |
 | Cross-OS verification runner | tested | implemented | implemented | implemented | `cargo xtask verify-os` and GitHub Actions jobs exist for Windows, macOS, Linux X11, and Linux Wayland. Current host verification has run on Windows only; CI/platform reports must be collected before any platform becomes cross-OS verified. |
 | Terminal core grid/state | tested | implemented | implemented | implemented | Platform-neutral code exists; runtime app verification still needed off Windows. |
-| Parser baseline | tested | implemented | implemented | implemented | Lower-level tests and a compatibility smoke runner exist; full interactive app verification remains incomplete. |
+| Parser/xterm baseline | tested | implemented | implemented | implemented | ANSI/VT controls, modes, DEC line graphics, bounded OSC/DCS strings, tmux passthrough, and DA/DSR tests exist; full interactive app verification remains separate. |
 | Fuzz/property harness | tested | implemented | implemented | implemented | cargo-fuzz targets and proptest smoke tests exist; scheduled CI runs smoke properties, but long-running fuzz history has not accumulated yet. |
 | Scrollback/alternate screen/resize | tested | implemented | implemented | implemented | Core behavior exists; full app smoke remains open per OS. |
 | Selection extraction | tested | implemented | implemented | implemented | Absolute-buffer normal and rectangular extraction, pane-aware mouse and keyboard selection, and renderer selection overlays exist; real off-Windows UX verification remains. |
-| Unicode/grapheme cell model | tested | implemented | implemented | implemented | Platform-neutral parser/core tests cover split UTF-8, combining marks, CJK width, emoji modifiers, ZWJ emoji, variation selectors, selection, cursor movement, resize, and scrollback; cross-OS renderer/font screenshots remain open. |
+| Unicode/grapheme cell and render model | tested | implemented | implemented | implemented | Core grapheme/cell tests plus OpenType shaping, fallback, style-face, ligature, and color-emoji renderer tests exist; cross-OS installed-font screenshots remain open. |
 | Local PTY transport | tested | partial | partial | partial | Windows ConPTY smoke passed; macOS/Linux real PTY smoke is unverified. |
 | Local PTY lifecycle contract | tested | implemented | implemented | implemented | Shared bounded lifecycle exists; non-Windows real shell validation remains open. |
 | Windows PowerShell/cmd/WSL profiles | partial | planned | planned | planned | Windows profile groundwork exists; WSL smoke is unverified. |
@@ -43,11 +43,11 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Linux primary selection | planned | planned | implemented | implemented | Arboard Primary selection get/set and explicit system-clipboard fallback diagnostics are wired for X11/Wayland; real compositor verification remains open. |
 | OSC 52 clipboard policy | tested | implemented | implemented | implemented | Parser pending requests and bounded security policy exist; remote writes are denied by default. Remote confirmation UI and cross-OS app smoke remain open. |
 | GPU surface/device path | partial | partial | partial | partial | WGPU initialization and device-loss recovery foundation exist; sleep/wake, monitor-change, and backend validation remain. |
-| GPU glyph rendering | partial | partial | partial | partial | Damage-aware batched glyph/quad submission, atlas rebuild after recovery, and screenshot tooling exist; macOS/Linux baselines and cross-OS GPU validation remain open. |
+| GPU glyph rendering | partial | tested | partial | partial | Damage-aware OpenType-shaped runs, per-grapheme fallback, RGBA color/monochrome atlas batches, cache reuse, recovery, and screenshot tooling exist; macOS/Linux baselines and cross-OS GPU validation remain open. |
 | Screenshot verification | tested | partial | partial | partial | Deterministic fixtures, PPM baselines, tolerance diffing, and reports exist. Windows baselines verify on the current host; macOS/Linux X11/Linux Wayland baselines remain uncaptured. |
 | Damage tracking | tested | implemented | implemented | implemented | Renderer-independent tracking exists; real GPU partial-update behavior needs hardening. |
 | Frame scheduler | tested | implemented | implemented | implemented | Scheduler distinctions exist; idle behavior still needs platform profiling. |
-| Font discovery/fallback | partial | partial | partial | partial | Font fallback chain exists; installed-font variance and emoji fallback remain. |
+| Font discovery/fallback | partial | tested | partial | partial | Configured/system per-grapheme fallback, real style faces, CJK/emoji candidates, COLR/bitmap color rendering, and doctor source diagnostics exist; installed-font variance still needs non-Windows reports. |
 | Static TOML config | tested | implemented | implemented | implemented | Portable model and parser exist; non-Windows file-location behavior needs runtime validation. |
 | Platform config overrides | tested | implemented | implemented | implemented | Model exists for macOS/Windows/Linux/X11/Wayland refinement. |
 | Config validation diagnostics | tested | implemented | implemented | implemented | Validation exists; runtime UX still needs product integration. |

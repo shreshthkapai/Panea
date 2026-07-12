@@ -104,7 +104,7 @@ pub fn feature_parity_matrix() -> Vec<PlatformFeatureStatus> {
             windows: Partial,
             linux_x11: Partial,
             linux_wayland: Partial,
-            notes: "fallback chains are configurable; per-OS font availability validation is not automated yet",
+            notes: "OpenType shaping, per-grapheme fallback, real style faces, color emoji, and source diagnostics exist; non-Windows installed-font and screenshot reports remain open",
         },
         PlatformFeatureStatus {
             feature: "GPU backend",

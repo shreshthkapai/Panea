@@ -539,8 +539,11 @@ pub enum TerminalAction {
     Print(char),
     CarriageReturn,
     LineFeed,
+    NextLine,
+    ReverseIndex,
     Backspace,
     Tab,
+    BackTab(u16),
     MoveCursor {
         direction: CursorDirection,
         count: u16,
@@ -550,6 +553,7 @@ pub enum TerminalAction {
         col: u16,
     },
     SetCursorColumn(u16),
+    SetCursorRow(u16),
     SaveCursor,
     RestoreCursor,
     ClearScreen(ClearMode),
@@ -559,6 +563,9 @@ pub enum TerminalAction {
     InsertChars(u16),
     DeleteChars(u16),
     EraseChars(u16),
+    RepeatLastPrinted(u16),
+    ScrollUp(u16),
+    ScrollDown(u16),
     SetGraphicRendition(Vec<GraphicRendition>),
     SetMode {
         mode: TerminalMode,
@@ -572,6 +579,8 @@ pub enum TerminalAction {
     ClearTabStop,
     ClearAllTabStops,
     DeviceStatusReport(u16),
+    PrivateDeviceStatusReport(u16),
+    PrimaryDeviceAttributes,
     SetScrollRegion {
         top: u16,
         bottom: u16,
@@ -597,6 +606,7 @@ pub struct TerminalState {
     pending_output: Vec<u8>,
     pending_clipboard_requests: Vec<Osc52ClipboardRequest>,
     title: Option<String>,
+    last_printed: Option<char>,
 }
 
 impl TerminalState {
@@ -622,6 +632,7 @@ impl TerminalState {
             pending_output: Vec::new(),
             pending_clipboard_requests: Vec::new(),
             title: None,
+            last_printed: None,
         }
     }
 
@@ -631,15 +642,31 @@ impl TerminalState {
             TerminalAction::Print(ch) => self.print(ch),
             TerminalAction::CarriageReturn => self.active_mut().carriage_return(),
             TerminalAction::LineFeed => self.line_feed(),
+            TerminalAction::NextLine => {
+                self.active_mut().carriage_return();
+                self.line_feed();
+            }
+            TerminalAction::ReverseIndex => {
+                let attributes = self.attributes;
+                self.active_mut().reverse_index(attributes);
+            }
             TerminalAction::Backspace => self.active_mut().backspace(),
             TerminalAction::Tab => self.tab(),
+            TerminalAction::BackTab(count) => self.back_tab(count),
             TerminalAction::MoveCursor { direction, count } => {
-                self.active_mut().move_cursor(direction, count.max(1));
+                let origin = self.modes.contains(&TerminalMode::Origin);
+                self.active_mut()
+                    .move_cursor(direction, count.max(1), origin);
             }
             TerminalAction::SetCursorPosition { row, col } => {
-                self.active_mut().set_cursor_position(row, col);
+                let origin = self.modes.contains(&TerminalMode::Origin);
+                self.active_mut().set_cursor_position(row, col, origin);
             }
             TerminalAction::SetCursorColumn(col) => self.active_mut().set_cursor_column(col),
+            TerminalAction::SetCursorRow(row) => {
+                let origin = self.modes.contains(&TerminalMode::Origin);
+                self.active_mut().set_cursor_row(row, origin);
+            }
             TerminalAction::SaveCursor => self.save_cursor(),
             TerminalAction::RestoreCursor => self.restore_cursor(),
             TerminalAction::ClearScreen(mode) => self.clear_screen(mode),
@@ -649,6 +676,17 @@ impl TerminalState {
             TerminalAction::InsertChars(count) => self.insert_chars(count),
             TerminalAction::DeleteChars(count) => self.delete_chars(count),
             TerminalAction::EraseChars(count) => self.erase_chars(count),
+            TerminalAction::RepeatLastPrinted(count) => self.repeat_last_printed(count),
+            TerminalAction::ScrollUp(count) => {
+                let attributes = self.attributes;
+                self.active_mut()
+                    .scroll_up_explicit(count.max(1), attributes);
+            }
+            TerminalAction::ScrollDown(count) => {
+                let attributes = self.attributes;
+                self.active_mut()
+                    .scroll_down_explicit(count.max(1), attributes);
+            }
             TerminalAction::SetGraphicRendition(renditions) => self.apply_sgr(&renditions),
             TerminalAction::SetMode { mode, enabled } => self.set_mode(mode, enabled),
             TerminalAction::SetCursorVisible(visible) => self.cursor_visible = visible,
@@ -671,8 +709,21 @@ impl TerminalState {
                 self.tab_stops_modified = true;
             }
             TerminalAction::DeviceStatusReport(report) => self.device_status_report(report),
+            TerminalAction::PrivateDeviceStatusReport(report) => {
+                self.private_device_status_report(report);
+            }
+            TerminalAction::PrimaryDeviceAttributes => {
+                self.pending_output.extend_from_slice(b"\x1b[?1;2c");
+            }
             TerminalAction::SetScrollRegion { top, bottom } => {
                 self.active_mut().set_scroll_region(top, bottom);
+                let row = if self.modes.contains(&TerminalMode::Origin) {
+                    self.active().scroll_top
+                } else {
+                    0
+                };
+                self.active_mut().cursor_row = row;
+                self.active_mut().cursor_col = 0;
             }
             TerminalAction::ResetScrollRegion => self.active_mut().reset_scroll_region(),
             TerminalAction::Reset => self.reset(),
@@ -965,14 +1016,17 @@ impl TerminalState {
         let use_scrollback = self.active_is_primary();
         self.active_mut()
             .print(ch, attributes, autowrap, insert, use_scrollback);
+        self.last_printed = Some(ch);
     }
 
     fn line_feed(&mut self) {
         let use_scrollback = self.active_is_primary();
-        self.active_mut().line_feed(use_scrollback);
+        let attributes = self.attributes;
+        self.active_mut().line_feed(use_scrollback, attributes);
     }
 
     fn tab(&mut self) {
+        self.active_mut().wrap_pending = false;
         let current = self.active().cursor_col as u16;
         let next_tab = self
             .tab_stops
@@ -983,6 +1037,29 @@ impl TerminalState {
         let max_col = usize::from(self.active().size.cols.saturating_sub(1));
         self.active_mut().cursor_col = usize::from(next_tab).min(max_col);
         self.active_mut().normalize_cursor_col();
+    }
+
+    fn back_tab(&mut self, count: u16) {
+        self.active_mut().wrap_pending = false;
+        for _ in 0..count.max(1) {
+            let current = self.active().cursor_col as u16;
+            let previous = self
+                .tab_stops
+                .range(..current)
+                .copied()
+                .next_back()
+                .unwrap_or(0);
+            self.active_mut().cursor_col = usize::from(previous);
+            self.active_mut().normalize_cursor_col();
+        }
+    }
+
+    fn repeat_last_printed(&mut self, count: u16) {
+        if let Some(ch) = self.last_printed {
+            for _ in 0..count.max(1) {
+                self.print(ch);
+            }
+        }
     }
 
     fn clear_screen(&mut self, mode: ClearMode) {
@@ -1094,6 +1171,15 @@ impl TerminalState {
         }
     }
 
+    fn private_device_status_report(&mut self, report: u16) {
+        if report == 6 {
+            let cursor = self.active().cursor_position();
+            self.pending_output.extend_from_slice(
+                format!("\x1b[?{};{}R", cursor.row + 1, cursor.col + 1).as_bytes(),
+            );
+        }
+    }
+
     fn set_mode(&mut self, mode: TerminalMode, enabled: bool) {
         if enabled {
             self.modes.insert(mode);
@@ -1111,6 +1197,12 @@ impl TerminalState {
             }
 
             self.selection = None;
+        } else if mode == TerminalMode::Origin {
+            let row = if enabled { self.active().scroll_top } else { 0 };
+            self.active_mut().cursor_row = row;
+            self.active_mut().cursor_col = 0;
+        } else if mode == TerminalMode::AutoWrap && !enabled {
+            self.active_mut().wrap_pending = false;
         }
     }
 
@@ -1276,6 +1368,7 @@ struct ScreenBuffer {
     cursor_col: usize,
     scroll_top: usize,
     scroll_bottom: usize,
+    wrap_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1300,6 +1393,7 @@ impl ScreenBuffer {
             cursor_col: 0,
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
+            wrap_pending: false,
         }
     }
 
@@ -1324,19 +1418,21 @@ impl ScreenBuffer {
 
         let cols = usize::from(self.size.cols);
         let width = scalar_cell_width(ch, cols);
-        if self.cursor_col >= cols {
+        if self.wrap_pending {
             if autowrap {
-                self.wrap_line(append_scrollback);
-            } else {
-                self.cursor_col = cols.saturating_sub(1);
+                if let Some(line) = self.lines.get_mut(self.cursor_row) {
+                    line.hard_wrapped = true;
+                }
+                self.wrap_line(append_scrollback, attributes);
             }
+            self.wrap_pending = false;
         }
 
         if width == 2 && self.cursor_col + 1 >= cols && autowrap {
             if let Some(line) = self.lines.get_mut(self.cursor_row) {
                 line.hard_wrapped = true;
             }
-            self.wrap_line(append_scrollback);
+            self.wrap_line(append_scrollback, attributes);
         }
 
         if insert {
@@ -1366,12 +1462,8 @@ impl ScreenBuffer {
 
         let advance = width.max(1);
         if self.cursor_col + advance >= cols {
-            if autowrap {
-                if let Some(line) = self.lines.get_mut(self.cursor_row) {
-                    line.hard_wrapped = true;
-                }
-                self.wrap_line(append_scrollback);
-            }
+            self.cursor_col = cols.saturating_sub(1);
+            self.wrap_pending = autowrap;
         } else {
             self.cursor_col += advance;
         }
@@ -1429,7 +1521,9 @@ impl ScreenBuffer {
     }
 
     fn previous_grapheme_position(&self) -> Option<(usize, usize)> {
-        let (row, mut col) = if self.cursor_col > 0 {
+        let (row, mut col) = if self.wrap_pending {
+            (self.cursor_row, self.cursor_col)
+        } else if self.cursor_col > 0 {
             (self.cursor_row, self.cursor_col - 1)
         } else if self.cursor_row > 0 {
             (
@@ -1453,38 +1547,48 @@ impl ScreenBuffer {
         Some((row, col))
     }
 
-    fn wrap_line(&mut self, append_scrollback: bool) {
+    fn wrap_line(&mut self, append_scrollback: bool, attributes: CellAttributes) {
         self.cursor_col = 0;
-        self.line_feed(append_scrollback);
+        self.line_feed(append_scrollback, attributes);
     }
 
     fn carriage_return(&mut self) {
+        self.wrap_pending = false;
         self.cursor_col = 0;
     }
 
-    fn line_feed(&mut self, append_scrollback: bool) {
+    fn line_feed(&mut self, append_scrollback: bool, attributes: CellAttributes) {
+        self.wrap_pending = false;
         if self.cursor_row == self.scroll_bottom {
-            self.scroll_up(append_scrollback);
+            self.scroll_up(append_scrollback, attributes);
         } else {
             self.cursor_row = (self.cursor_row + 1).min(usize::from(self.size.rows) - 1);
         }
     }
 
     fn backspace(&mut self) {
+        self.wrap_pending = false;
         let Some(line) = self.lines.get(self.cursor_row) else {
             return;
         };
         self.cursor_col = previous_grapheme_col(line, self.cursor_col);
     }
 
-    fn move_cursor(&mut self, direction: CursorDirection, count: u16) {
+    fn move_cursor(&mut self, direction: CursorDirection, count: u16, origin: bool) {
+        self.wrap_pending = false;
         let count = usize::from(count);
+        let top = if origin { self.scroll_top } else { 0 };
+        let bottom = if origin {
+            self.scroll_bottom
+        } else {
+            usize::from(self.size.rows) - 1
+        };
         match direction {
             CursorDirection::Up => {
-                self.cursor_row = self.cursor_row.saturating_sub(count).max(self.scroll_top);
+                self.cursor_row = self.cursor_row.saturating_sub(count).max(top);
             }
             CursorDirection::Down => {
-                self.cursor_row = (self.cursor_row + count).min(self.scroll_bottom);
+                self.cursor_row = (self.cursor_row + count).min(bottom);
             }
             CursorDirection::Forward => {
                 self.normalize_cursor_col();
@@ -1505,28 +1609,46 @@ impl ScreenBuffer {
                 }
             }
             CursorDirection::NextLine => {
-                self.cursor_row = (self.cursor_row + count).min(self.scroll_bottom);
+                self.cursor_row = (self.cursor_row + count).min(bottom);
                 self.cursor_col = 0;
             }
             CursorDirection::PreviousLine => {
-                self.cursor_row = self.cursor_row.saturating_sub(count).max(self.scroll_top);
+                self.cursor_row = self.cursor_row.saturating_sub(count).max(top);
                 self.cursor_col = 0;
             }
         }
     }
 
-    fn set_cursor_position(&mut self, row: u16, col: u16) {
-        self.cursor_row = usize::from(row.saturating_sub(1)).min(usize::from(self.size.rows) - 1);
+    fn set_cursor_position(&mut self, row: u16, col: u16, origin: bool) {
+        self.wrap_pending = false;
+        let requested = usize::from(row.saturating_sub(1));
+        self.cursor_row = if origin {
+            (self.scroll_top + requested).min(self.scroll_bottom)
+        } else {
+            requested.min(usize::from(self.size.rows) - 1)
+        };
         self.cursor_col = usize::from(col.saturating_sub(1)).min(usize::from(self.size.cols) - 1);
         self.normalize_cursor_col();
     }
 
+    fn set_cursor_row(&mut self, row: u16, origin: bool) {
+        self.wrap_pending = false;
+        let requested = usize::from(row.saturating_sub(1));
+        self.cursor_row = if origin {
+            (self.scroll_top + requested).min(self.scroll_bottom)
+        } else {
+            requested.min(usize::from(self.size.rows) - 1)
+        };
+    }
+
     fn set_cursor_column(&mut self, col: u16) {
+        self.wrap_pending = false;
         self.cursor_col = usize::from(col.saturating_sub(1)).min(usize::from(self.size.cols) - 1);
         self.normalize_cursor_col();
     }
 
     fn clear_screen(&mut self, mode: ClearMode, attributes: CellAttributes) {
+        self.wrap_pending = false;
         match mode {
             ClearMode::FromCursor => {
                 self.clear_line(ClearMode::FromCursor, attributes);
@@ -1549,6 +1671,7 @@ impl ScreenBuffer {
     }
 
     fn clear_line(&mut self, mode: ClearMode, attributes: CellAttributes) {
+        self.wrap_pending = false;
         let Some(line) = self.lines.get_mut(self.cursor_row) else {
             return;
         };
@@ -1570,6 +1693,7 @@ impl ScreenBuffer {
     }
 
     fn insert_lines(&mut self, count: u16, attributes: CellAttributes) {
+        self.wrap_pending = false;
         if self.cursor_row < self.scroll_top || self.cursor_row > self.scroll_bottom {
             return;
         }
@@ -1585,6 +1709,7 @@ impl ScreenBuffer {
     }
 
     fn delete_lines(&mut self, count: u16, attributes: CellAttributes) {
+        self.wrap_pending = false;
         if self.cursor_row < self.scroll_top || self.cursor_row > self.scroll_bottom {
             return;
         }
@@ -1600,6 +1725,7 @@ impl ScreenBuffer {
     }
 
     fn insert_chars(&mut self, count: u16, attributes: CellAttributes) {
+        self.wrap_pending = false;
         self.normalize_cursor_col();
         let Some(line) = self.lines.get_mut(self.cursor_row) else {
             return;
@@ -1615,6 +1741,7 @@ impl ScreenBuffer {
     }
 
     fn delete_chars(&mut self, count: u16, attributes: CellAttributes) {
+        self.wrap_pending = false;
         self.normalize_cursor_col();
         let Some(line) = self.lines.get_mut(self.cursor_row) else {
             return;
@@ -1632,6 +1759,7 @@ impl ScreenBuffer {
     }
 
     fn erase_chars(&mut self, count: u16, attributes: CellAttributes) {
+        self.wrap_pending = false;
         self.normalize_cursor_col();
         let Some(line) = self.lines.get_mut(self.cursor_row) else {
             return;
@@ -1668,6 +1796,7 @@ impl ScreenBuffer {
     }
 
     fn set_scroll_region(&mut self, top: u16, bottom: u16) {
+        self.wrap_pending = false;
         let max = usize::from(self.size.rows.saturating_sub(1));
         let top = usize::from(top.saturating_sub(1)).min(max);
         let bottom = usize::from(bottom.saturating_sub(1)).min(max);
@@ -1681,12 +1810,13 @@ impl ScreenBuffer {
     }
 
     fn reset_scroll_region(&mut self) {
+        self.wrap_pending = false;
         self.scroll_top = 0;
         self.scroll_bottom = usize::from(self.size.rows.saturating_sub(1));
     }
 
-    fn scroll_up(&mut self, append_scrollback: bool) {
-        let blank = Line::blank(self.size.cols);
+    fn scroll_up(&mut self, append_scrollback: bool, attributes: CellAttributes) {
+        let blank = Line::blank_with_attributes(self.size.cols, attributes);
 
         if self.scroll_top == 0 && self.scroll_bottom == self.lines.len().saturating_sub(1) {
             let removed = self.lines.remove(0);
@@ -1700,7 +1830,39 @@ impl ScreenBuffer {
         }
     }
 
+    fn scroll_up_explicit(&mut self, count: u16, attributes: CellAttributes) {
+        self.wrap_pending = false;
+        for _ in 0..usize::from(count).min(self.scroll_bottom - self.scroll_top + 1) {
+            self.lines.remove(self.scroll_top);
+            self.lines.insert(
+                self.scroll_bottom,
+                Line::blank_with_attributes(self.size.cols, attributes),
+            );
+        }
+    }
+
+    fn scroll_down_explicit(&mut self, count: u16, attributes: CellAttributes) {
+        self.wrap_pending = false;
+        for _ in 0..usize::from(count).min(self.scroll_bottom - self.scroll_top + 1) {
+            self.lines.remove(self.scroll_bottom);
+            self.lines.insert(
+                self.scroll_top,
+                Line::blank_with_attributes(self.size.cols, attributes),
+            );
+        }
+    }
+
+    fn reverse_index(&mut self, attributes: CellAttributes) {
+        self.wrap_pending = false;
+        if self.cursor_row == self.scroll_top {
+            self.scroll_down_explicit(1, attributes);
+        } else {
+            self.cursor_row = self.cursor_row.saturating_sub(1);
+        }
+    }
+
     fn resize_visible(&mut self, size: TerminalSize) {
+        self.wrap_pending = false;
         let size = size.normalized();
         for line in &mut self.lines {
             line.resize_to(size.cols, CellAttributes::default());
@@ -1720,9 +1882,29 @@ impl ScreenBuffer {
     }
 
     fn resize_reflow(&mut self, size: TerminalSize) {
+        let old_wrap_pending = self.wrap_pending;
         let size = size.normalized();
         let logical = logical_lines(&self.scrollback, &self.lines);
-        let mut reflowed = reflow_logical_lines(logical, size.cols);
+        let target_physical = self.scrollback.len().saturating_add(self.cursor_row);
+        let (target_logical, target_offset) = logical_cursor_position(
+            &self.scrollback,
+            &self.lines,
+            target_physical,
+            self.cursor_col,
+        );
+        let mut reflowed = Vec::new();
+        let mut cursor_physical = 0usize;
+        let mut cursor_col = 0usize;
+        let mut cursor_wrap_pending = false;
+        for (logical_index, cells) in logical.into_iter().enumerate() {
+            if logical_index == target_logical {
+                let mapped = reflow_cursor_position(&cells, target_offset, size.cols);
+                cursor_physical = reflowed.len().saturating_add(mapped.0);
+                cursor_col = mapped.1;
+                cursor_wrap_pending = old_wrap_pending || mapped.2;
+            }
+            reflowed.extend(reflow_logical_lines(vec![cells], size.cols));
+        }
         let rows = usize::from(size.rows);
 
         while reflowed.len() < rows {
@@ -1734,7 +1916,11 @@ impl ScreenBuffer {
         self.lines = reflowed[split..].to_vec();
         self.size = size;
         self.reset_scroll_region();
-        self.clamp_cursor();
+        self.cursor_row = cursor_physical
+            .saturating_sub(split)
+            .min(rows.saturating_sub(1));
+        self.cursor_col = cursor_col.min(usize::from(size.cols) - 1);
+        self.wrap_pending = cursor_wrap_pending;
     }
 
     fn clamp_cursor(&mut self) {
@@ -1780,6 +1966,59 @@ fn logical_lines(scrollback: &[Line], visible: &[Line]) -> Vec<Vec<Cell>> {
     }
 
     out
+}
+
+fn logical_cursor_position(
+    scrollback: &[Line],
+    visible: &[Line],
+    target_physical: usize,
+    cursor_col: usize,
+) -> (usize, usize) {
+    let lines = scrollback.iter().chain(visible.iter()).collect::<Vec<_>>();
+    let mut logical_index = 0usize;
+    let mut logical_offset = 0usize;
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 && !lines[index - 1].hard_wrapped {
+            logical_index = logical_index.saturating_add(1);
+            logical_offset = 0;
+        }
+        if index == target_physical {
+            return (logical_index, logical_offset.saturating_add(cursor_col));
+        }
+        logical_offset = logical_offset.saturating_add(line_content(line).len());
+    }
+    (logical_index, logical_offset)
+}
+
+fn reflow_cursor_position(cells: &[Cell], offset: usize, cols: u16) -> (usize, usize, bool) {
+    let cols = usize::from(cols.max(1));
+    let mut source_col = 0usize;
+    let mut row = 0usize;
+    let mut col = 0usize;
+
+    for cell in cells.iter().filter(|cell| !cell.wide_continuation) {
+        let source_width = cell.width.max(1) as usize;
+        let width = cell_width_for_text_in_grid(&cell.text, cols);
+        if col > 0 && col + width > cols {
+            row = row.saturating_add(1);
+            col = 0;
+        }
+        if offset >= source_col && offset < source_col.saturating_add(source_width) {
+            return (row, (col + offset - source_col).min(cols - 1), false);
+        }
+        source_col = source_col.saturating_add(source_width);
+        col = col.saturating_add(width);
+        if col == cols && source_col < offset {
+            row = row.saturating_add(1);
+            col = 0;
+        }
+    }
+
+    if col >= cols {
+        (row, cols - 1, true)
+    } else {
+        (row, col, false)
+    }
 }
 
 fn line_content(line: &Line) -> Vec<Cell> {

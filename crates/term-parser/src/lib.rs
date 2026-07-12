@@ -10,6 +10,7 @@ use term_core::{
 
 const MAX_CSI_PARAM_BYTES: usize = 256;
 const MAX_OSC_PAYLOAD_BYTES: usize = 16 * 1024;
+const MAX_STRING_PAYLOAD_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalEmulator {
@@ -76,6 +77,9 @@ impl TerminalCore for TerminalEmulator {
 pub struct Parser {
     state: ParserState,
     print_buffer: Vec<u8>,
+    g0_charset: CharacterSet,
+    g1_charset: CharacterSet,
+    active_charset: CharacterSetSlot,
 }
 
 impl Default for Parser {
@@ -83,6 +87,9 @@ impl Default for Parser {
         Self {
             state: ParserState::Ground,
             print_buffer: Vec::new(),
+            g0_charset: CharacterSet::Ascii,
+            g1_charset: CharacterSet::Ascii,
+            active_charset: CharacterSetSlot::G0,
         }
     }
 }
@@ -115,13 +122,44 @@ impl Parser {
                         self.flush_print_buffer(&mut actions, false);
                         actions.push(TerminalAction::Tab);
                     }
+                    0x0e => {
+                        self.flush_print_buffer(&mut actions, false);
+                        self.active_charset = CharacterSetSlot::G1;
+                    }
+                    0x0f => {
+                        self.flush_print_buffer(&mut actions, false);
+                        self.active_charset = CharacterSetSlot::G0;
+                    }
                     0x00..=0x1f | 0x7f => {}
+                    byte @ 0x20..=0x7e
+                        if match self.active_charset {
+                            CharacterSetSlot::G0 => self.g0_charset,
+                            CharacterSetSlot::G1 => self.g1_charset,
+                        } == CharacterSet::DecSpecial =>
+                    {
+                        self.flush_print_buffer(&mut actions, false);
+                        actions.push(TerminalAction::Print(dec_special_graphic(byte)));
+                    }
                     _ => self.print_buffer.push(*byte),
                 },
                 ParserState::Escape => match *byte {
                     b'[' => self.state = ParserState::Csi(CsiState::default()),
                     b']' => {
                         self.state = ParserState::Osc {
+                            escape_seen: false,
+                            content: Vec::new(),
+                        }
+                    }
+                    b'P' => {
+                        self.state = ParserState::StringControl {
+                            kind: StringControlKind::Dcs,
+                            escape_seen: false,
+                            content: Vec::new(),
+                        }
+                    }
+                    b'_' | b'^' | b'X' => {
+                        self.state = ParserState::StringControl {
+                            kind: StringControlKind::Ignored,
                             escape_seen: false,
                             content: Vec::new(),
                         }
@@ -137,6 +175,24 @@ impl Parser {
                     b'H' => {
                         actions.push(TerminalAction::SetTabStop);
                         self.state = ParserState::Ground;
+                    }
+                    b'D' => {
+                        actions.push(TerminalAction::LineFeed);
+                        self.state = ParserState::Ground;
+                    }
+                    b'E' => {
+                        actions.push(TerminalAction::NextLine);
+                        self.state = ParserState::Ground;
+                    }
+                    b'M' => {
+                        actions.push(TerminalAction::ReverseIndex);
+                        self.state = ParserState::Ground;
+                    }
+                    b'(' | b')' | b'*' | b'+' => {
+                        self.state = ParserState::CharacterSetDesignation(match *byte {
+                            b')' | b'+' => CharacterSetSlot::G1,
+                            _ => CharacterSetSlot::G0,
+                        });
                     }
                     b'=' => {
                         actions.push(TerminalAction::SetMode {
@@ -154,6 +210,9 @@ impl Parser {
                     }
                     b'c' => {
                         actions.push(TerminalAction::Reset);
+                        self.g0_charset = CharacterSet::Ascii;
+                        self.g1_charset = CharacterSet::Ascii;
+                        self.active_charset = CharacterSetSlot::G0;
                         self.state = ParserState::Ground;
                     }
                     _ => self.state = ParserState::Ground,
@@ -208,8 +267,59 @@ impl Parser {
                         self.state = ParserState::Ground;
                     }
                 }
+                ParserState::CharacterSetDesignation(slot) => {
+                    let charset = if *byte == b'0' {
+                        CharacterSet::DecSpecial
+                    } else {
+                        CharacterSet::Ascii
+                    };
+                    match slot {
+                        CharacterSetSlot::G0 => self.g0_charset = charset,
+                        CharacterSetSlot::G1 => self.g1_charset = charset,
+                    }
+                    self.state = ParserState::Ground;
+                }
                 ParserState::IgnoringOsc { escape_seen } => match (*byte, *escape_seen) {
                     (0x07, _) | (b'\\', true) => self.state = ParserState::Ground,
+                    (0x1b, _) => *escape_seen = true,
+                    (_, _) => *escape_seen = false,
+                },
+                ParserState::StringControl {
+                    kind,
+                    escape_seen,
+                    content,
+                } => match (*byte, *escape_seen) {
+                    (0x18, _) | (0x1a, _) => self.state = ParserState::Ground,
+                    (b'\\', true) => {
+                        if content.last() == Some(&0x1b) {
+                            content.pop();
+                        }
+                        if *kind == StringControlKind::Dcs {
+                            actions.extend(dispatch_dcs(content));
+                        }
+                        self.state = ParserState::Ground;
+                    }
+                    (0x1b, _) => {
+                        if content.len() >= MAX_STRING_PAYLOAD_BYTES {
+                            self.state = ParserState::IgnoringStringControl { escape_seen: true };
+                        } else {
+                            content.push(*byte);
+                            *escape_seen = true;
+                        }
+                    }
+                    (_, _) => {
+                        if content.len() >= MAX_STRING_PAYLOAD_BYTES {
+                            self.state = ParserState::IgnoringStringControl { escape_seen: false };
+                        } else {
+                            content.push(*byte);
+                            *escape_seen = false;
+                        }
+                    }
+                },
+                ParserState::IgnoringStringControl { escape_seen } => match (*byte, *escape_seen) {
+                    (0x18, _) | (0x1a, _) | (b'\\', true) => {
+                        self.state = ParserState::Ground;
+                    }
                     (0x1b, _) => *escape_seen = true,
                     (_, _) => *escape_seen = false,
                 },
@@ -261,9 +371,79 @@ enum ParserState {
     Ground,
     Escape,
     Csi(CsiState),
-    Osc { escape_seen: bool, content: Vec<u8> },
+    Osc {
+        escape_seen: bool,
+        content: Vec<u8>,
+    },
+    CharacterSetDesignation(CharacterSetSlot),
     IgnoringCsi,
-    IgnoringOsc { escape_seen: bool },
+    IgnoringOsc {
+        escape_seen: bool,
+    },
+    StringControl {
+        kind: StringControlKind,
+        escape_seen: bool,
+        content: Vec<u8>,
+    },
+    IgnoringStringControl {
+        escape_seen: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StringControlKind {
+    Dcs,
+    Ignored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CharacterSetSlot {
+    G0,
+    G1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CharacterSet {
+    Ascii,
+    DecSpecial,
+}
+
+fn dec_special_graphic(byte: u8) -> char {
+    match byte {
+        b'_' => ' ',
+        b'`' => '◆',
+        b'a' => '▒',
+        b'b' => '␉',
+        b'c' => '␌',
+        b'd' => '␍',
+        b'e' => '␊',
+        b'f' => '°',
+        b'g' => '±',
+        b'h' => '␤',
+        b'i' => '␋',
+        b'j' => '┘',
+        b'k' => '┐',
+        b'l' => '┌',
+        b'm' => '└',
+        b'n' => '┼',
+        b'o' => '⎺',
+        b'p' => '⎻',
+        b'q' => '─',
+        b'r' => '⎼',
+        b's' => '⎽',
+        b't' => '├',
+        b'u' => '┤',
+        b'v' => '┴',
+        b'w' => '┬',
+        b'x' => '│',
+        b'y' => '≤',
+        b'z' => '≥',
+        b'{' => 'π',
+        b'|' => '≠',
+        b'}' => '£',
+        b'~' => '·',
+        _ => char::from(byte),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -323,10 +503,14 @@ fn dispatch_csi(csi: &CsiState) -> Vec<TerminalAction> {
         b'A' => vec![move_cursor(csi, CursorDirection::Up)],
         b'B' => vec![move_cursor(csi, CursorDirection::Down)],
         b'C' => vec![move_cursor(csi, CursorDirection::Forward)],
+        b'a' => vec![move_cursor(csi, CursorDirection::Forward)],
         b'D' => vec![move_cursor(csi, CursorDirection::Back)],
         b'E' => vec![move_cursor(csi, CursorDirection::NextLine)],
         b'F' => vec![move_cursor(csi, CursorDirection::PreviousLine)],
         b'G' => vec![TerminalAction::SetCursorColumn(csi.param_or(0, 1))],
+        b'`' => vec![TerminalAction::SetCursorColumn(csi.param_or(0, 1))],
+        b'd' => vec![TerminalAction::SetCursorRow(csi.param_or(0, 1))],
+        b'e' => vec![move_cursor(csi, CursorDirection::Down)],
         b'H' | b'f' => vec![TerminalAction::SetCursorPosition {
             row: csi.param_or(0, 1),
             col: csi.param_or(1, 1),
@@ -336,11 +520,22 @@ fn dispatch_csi(csi: &CsiState) -> Vec<TerminalAction> {
         b'L' => vec![TerminalAction::InsertLines(csi.param_or(0, 1))],
         b'M' => vec![TerminalAction::DeleteLines(csi.param_or(0, 1))],
         b'P' => vec![TerminalAction::DeleteChars(csi.param_or(0, 1))],
+        b'S' => vec![TerminalAction::ScrollUp(csi.param_or(0, 1))],
+        b'T' => vec![TerminalAction::ScrollDown(csi.param_or(0, 1))],
         b'X' => vec![TerminalAction::EraseChars(csi.param_or(0, 1))],
+        b'Z' => vec![TerminalAction::BackTab(csi.param_or(0, 1))],
+        b'I' => (0..csi.param_or(0, 1))
+            .map(|_| TerminalAction::Tab)
+            .collect(),
+        b'b' => vec![TerminalAction::RepeatLastPrinted(csi.param_or(0, 1))],
+        b'c' if !csi.private => vec![TerminalAction::PrimaryDeviceAttributes],
         b'g' => tab_clear_action(csi),
         b'm' => vec![TerminalAction::SetGraphicRendition(parse_sgr(
             &csi.params(),
         ))],
+        b'n' if csi.private => vec![TerminalAction::PrivateDeviceStatusReport(
+            csi.param_or(0, 0),
+        )],
         b'n' => vec![TerminalAction::DeviceStatusReport(csi.param_or(0, 0))],
         b's' => vec![TerminalAction::SaveCursor],
         b'u' => vec![TerminalAction::RestoreCursor],
@@ -468,6 +663,14 @@ fn mode_actions(csi: &CsiState, enabled: bool) -> Vec<TerminalAction> {
                 mode: TerminalMode::ApplicationCursorKeys,
                 enabled,
             }),
+            6 => actions.push(TerminalAction::SetMode {
+                mode: TerminalMode::Origin,
+                enabled,
+            }),
+            7 => actions.push(TerminalAction::SetMode {
+                mode: TerminalMode::AutoWrap,
+                enabled,
+            }),
             25 => actions.push(TerminalAction::SetCursorVisible(enabled)),
             66 => actions.push(TerminalAction::SetMode {
                 mode: TerminalMode::ApplicationKeypad,
@@ -584,6 +787,24 @@ fn osc52_action(payload: &str) -> Option<TerminalAction> {
         target,
         payload_base64: payload_base64.to_owned(),
     }))
+}
+
+fn dispatch_dcs(content: &[u8]) -> Vec<TerminalAction> {
+    let Some(payload) = content.strip_prefix(b"tmux;") else {
+        return Vec::new();
+    };
+    let mut unescaped = Vec::with_capacity(payload.len());
+    let mut index = 0;
+    while index < payload.len() {
+        if payload[index] == 0x1b && payload.get(index + 1) == Some(&0x1b) {
+            unescaped.push(0x1b);
+            index += 2;
+        } else {
+            unescaped.push(payload[index]);
+            index += 1;
+        }
+    }
+    Parser::default().parse(&unescaped)
 }
 
 #[cfg(test)]
@@ -725,7 +946,33 @@ mod tests {
 
         assert_eq!(line_text(&terminal, 0), "abc");
         assert_eq!(line_text(&terminal, 1), "def");
-        assert_eq!(terminal.cursor_state().position, GridPosition::new(1, 0));
+        assert_eq!(terminal.cursor_state().position, GridPosition::new(1, 2));
+    }
+
+    #[test]
+    fn autowrap_is_deferred_and_controls_cancel_wrap_pending() {
+        let mut emulator = terminal(TerminalSize::new(3, 2), b"abc");
+        assert_eq!(emulator.cursor_state().position, GridPosition::new(0, 2));
+        emulator.apply_bytes(b"d").unwrap();
+        assert_eq!(line_text(&emulator, 0), "abc");
+        assert_eq!(line_text(&emulator, 1), "d");
+        assert!(emulator.state().line(0).unwrap().hard_wrapped);
+
+        let terminal = terminal(TerminalSize::new(3, 2), b"abc\rX");
+        assert_eq!(line_text(&terminal, 0), "Xbc");
+        assert_eq!(line_text(&terminal, 1), "");
+    }
+
+    #[test]
+    fn scrolled_blank_lines_preserve_current_background_attributes() {
+        let terminal = terminal(TerminalSize::new(3, 2), b"\x1b[41mabc\r\ndef\r\n");
+        let bottom = terminal.state().line(1).unwrap();
+        assert!(
+            bottom
+                .cells
+                .iter()
+                .all(|cell| cell.attributes.background == Some(Color::Indexed(1)))
+        );
     }
 
     #[test]
@@ -814,6 +1061,87 @@ mod tests {
         assert_eq!(line_text(&terminal, 0), "one");
         assert_eq!(line_text(&terminal, 1), "new");
         assert_eq!(line_text(&terminal, 3), "tee");
+    }
+
+    #[test]
+    fn vt_index_reverse_index_and_next_line_respect_scroll_region() {
+        let terminal = terminal(
+            TerminalSize::new(4, 3),
+            b"one\r\ntwo\r\ntri\x1b[2;3r\x1b[2;1H\x1bMtop\x1bEend",
+        );
+
+        assert_eq!(line_text(&terminal, 0), "one");
+        assert_eq!(line_text(&terminal, 1), "top");
+        assert!(line_text(&terminal, 2).starts_with("end"));
+    }
+
+    #[test]
+    fn origin_autowrap_scroll_and_repeat_controls_are_applied() {
+        let mut terminal = TerminalEmulator::new(TerminalSize::new(5, 4));
+        terminal
+            .apply_bytes(b"\x1b[2;4r\x1b[?6h\x1b[2;2HX\x1b[?7l\x1b[4;5HYZ\x1b[?7h\x1b[?6l")
+            .unwrap();
+        assert_eq!(terminal.state().line(2).unwrap().cells[1].text, "X");
+        assert_eq!(terminal.state().line(3).unwrap().cells[4].text, "Z");
+
+        terminal
+            .apply_bytes(b"\x1b[1;1HA\x1b[4b\x1b[1S\x1b[1T")
+            .unwrap();
+        assert_eq!(line_text(&terminal, 0), "AAAAA");
+        assert!(!terminal.modes().contains(&TerminalMode::Origin));
+        assert!(terminal.modes().contains(&TerminalMode::AutoWrap));
+    }
+
+    #[test]
+    fn horizontal_vertical_tab_and_charset_controls_do_not_leak_bytes() {
+        let terminal = terminal(
+            TerminalSize::new(24, 3),
+            b"A\x1b(B\x1b[2IB\x1b[ZC\x1b[2dD\x1b[3`E",
+        );
+        assert_eq!(terminal.state().line(0).unwrap().cells[16].text, "C");
+        assert_eq!(terminal.state().line(1).unwrap().cells[2].text, "E");
+        assert!(!line_text(&terminal, 0).contains('B'));
+    }
+
+    #[test]
+    fn primary_attributes_and_private_cursor_report_are_bounded_responses() {
+        let mut terminal = terminal(TerminalSize::new(10, 4), b"\x1b[3;4H\x1b[c\x1b[?6n");
+        assert_eq!(
+            terminal.state_mut().take_pending_output(),
+            b"\x1b[?1;2c\x1b[?3;4R"
+        );
+    }
+
+    #[test]
+    fn string_controls_are_bounded_and_never_leak_into_terminal_text() {
+        let mut parser = Parser::default();
+        let mut input = b"before\x1bPignored".to_vec();
+        input.extend(std::iter::repeat_n(b'x', MAX_STRING_PAYLOAD_BYTES + 32));
+        input.extend_from_slice(b"\x1b\\after\x1b_hidden\x1b\\done");
+        let mut state = TerminalState::new(TerminalSize::new(32, 2));
+        state.apply_actions(parser.parse(&input)).unwrap();
+        assert_eq!(state.line(0).unwrap().raw_text(), "beforeafterdone");
+    }
+
+    #[test]
+    fn tmux_dcs_passthrough_applies_nested_terminal_sequences() {
+        let terminal = terminal(
+            TerminalSize::new(16, 2),
+            b"\x1bPtmux;\x1b\x1b[31mred\x1b\x1b[0m\x1b\\",
+        );
+        let line = terminal.state().line(0).unwrap();
+        assert_eq!(line.raw_text(), "red");
+        assert_eq!(line.cells[0].attributes.foreground, Some(Color::Indexed(1)));
+        assert_eq!(line.cells[2].attributes.foreground, Some(Color::Indexed(1)));
+    }
+
+    #[test]
+    fn dec_special_graphics_support_tui_line_drawing_in_g0_and_g1() {
+        let terminal = terminal(
+            TerminalSize::new(16, 2),
+            b"\x1b(0lqk\x1b(B \x1b)0\x0emqx\x0f ascii",
+        );
+        assert_eq!(line_text(&terminal, 0), "┌─┐ └─│ ascii");
     }
 
     #[test]

@@ -9,11 +9,17 @@ The default local PTY environment sets:
 ```text
 TERM=xterm-256color
 COLORTERM=truecolor
+TERM_PROGRAM=Panea
+TERM_PROGRAM_VERSION=<Panea version>
 ```
 
-Shell profiles may override either variable explicitly. A custom Panea terminfo
-entry is intentionally deferred until the emulator has enough compatibility
-surface to justify a stable public terminal identity.
+Shell profiles may override these variables explicitly. First-class SSH PTYs
+request `xterm-256color` as the portable remote terminal identity. A custom
+Panea terminfo entry is intentionally deferred until the emulator has enough
+compatibility surface to justify a stable public terminal identity. Panea does
+not advertise a private `TERM` value for which users lack a terminfo entry.
+Inside tmux, use tmux's normal `screen-256color` or `tmux-256color` policy; the
+outer Panea session remains `xterm-256color`.
 
 ## Current Baseline
 
@@ -29,7 +35,13 @@ Implemented in the baseline compatibility layer:
 - insert/delete lines
 - insert/delete/erase characters
 - tab stop set/clear/reset behavior
+- origin, autowrap, insert, application cursor, and application keypad modes
+- deferred wrap-pending semantics, resize cursor mapping, and background-color erase on scroll
+- index, next-line, reverse-index, explicit scrolling, back-tab, and repeat
 - DSR 5 and CPR/DSR 6 responses via terminal pending output
+- primary device attributes and private cursor-position responses
+- DEC Special Graphics G0/G1 line drawing
+- bounded DCS/APC/PM/SOS handling and tmux DCS passthrough
 - bracketed paste forwarding
 - OSC 52 clipboard requests as bounded pending events with security policy
 - focus in/out reporting
@@ -61,11 +73,10 @@ Details and manual compatibility checklists live in
 
 ## Deferred Compatibility Work
 
-- Primary selection provider support and remote OSC 52 confirmation UI
+- Remote OSC 52 confirmation UI
 - Real app-level Unicode conformance across shells, editors, TUIs, and SSH
 - Full configurable hint pattern engine
-- Application keypad output mapping
-- Full terminfo strategy and optional custom terminfo installation
+- Optional Panea-specific terminfo identity only if future capabilities require it
 - Full automated interactive app driving for editors, TUIs, tmux/screen/zellij,
   WSL, and SSH
 - Cross-OS app compatibility reports across Windows, macOS, Linux X11, and

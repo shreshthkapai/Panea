@@ -30,7 +30,7 @@ Does this run every input event? No, input only requests rendering through norma
 Does this run every PTY output batch? Only after terminal state changes request a render frame.
 Does this allocate in the hot path? Batch vectors are currently rebuilt per prepared frame; reuse/pooling is a future optimization after the direct batching contract is stable.
 Does this force full redraw? No; explicit damage regions filter generated cell, overlay, selection, and cursor batches.
-Does this require GPU uploads? Only newly cached glyphs produce atlas uploads; unchanged glyphs reuse atlas entries.
+Does this require GPU uploads? Only newly cached glyphs produce RGBA atlas uploads; unchanged monochrome and color glyphs reuse atlas entries.
 Does this run script/user code? No.
 Can it be cached? Glyph bitmaps, atlas entries, and text-to-glyph run keys are cached.
 Can it be disabled to near-zero cost? Optional visuals can produce no batches when disabled.
@@ -47,6 +47,11 @@ Can diagnostics show its cost? Yes, through RenderInstrumentation, benchmark out
 - decoration and semantic overlay quads
 - selection quads
 - cursor quads
+
+Text preparation groups compatible adjacent terminal cells into OpenType-shaped
+runs, selects fallback faces per grapheme, caches shaped output, and uploads
+monochrome or color glyphs into one RGBA atlas. Real bold/italic faces and color
+emoji use the same bounded batched draw path.
 
 `GpuTerminalRenderer::render_scene` uses those batches directly:
 
@@ -88,5 +93,4 @@ repeatable measurements for regression detection and feature-cost review.
 - Performance instrumentation and the developer in-window overlay are
   documented in [performance-instrumentation.md](performance-instrumentation.md);
   real GPU timing validation and polished installed UX remain open.
-- Batch vector reuse/pooling and deeper shaping/fallback behavior remain future
-  renderer/font hardening.
+- Batch vector reuse/pooling remains future renderer hot-path hardening.

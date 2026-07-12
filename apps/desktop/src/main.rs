@@ -624,25 +624,19 @@ fn pty_backend_label() -> String {
 
 fn font_discovery_label(config: &AppConfig) -> String {
     let fonts = FontSystem::new(font_config(&config.font));
-    let chain = fonts.resolve_fallback_chain();
-    let mut labels = Vec::new();
-    labels.push(format_font_descriptor("primary", &chain.primary));
-    labels.extend(
-        chain
-            .fallbacks
-            .iter()
-            .map(|fallback| format_font_descriptor("fallback", fallback)),
-    );
-    labels.join("; ")
-}
-
-fn format_font_descriptor(role: &str, descriptor: &font_system::FontDescriptor) -> String {
-    let source = match &descriptor.source {
-        FontSource::File(path) => format!("file:{}", path.display()),
-        FontSource::Memory => "memory".to_owned(),
-        FontSource::Unresolved => "unresolved".to_owned(),
-    };
-    format!("{role}:{}={source}", descriptor.family)
+    fonts
+        .diagnostics()
+        .into_iter()
+        .map(|diagnostic| {
+            let source = match &diagnostic.source {
+                FontSource::File(path) => format!("file:{}", path.display()),
+                FontSource::Memory => "memory".to_owned(),
+                FontSource::Unresolved => "unresolved".to_owned(),
+            };
+            format!("{}:{}={source}", diagnostic.role, diagnostic.family)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn run() -> Result<(), Box<dyn Error>> {

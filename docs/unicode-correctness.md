@@ -42,3 +42,11 @@ Tests: Unicode scalar buffering, combining accents, CJK wide cells, emoji modifi
   continuation cells or half-wide characters.
 - Visual features must still treat these cells as terminal content; overlays
   must not rewrite Unicode text.
+
+## Renderer Handoff
+
+The renderer consumes each cell's grapheme text without changing cell
+occupancy. OpenType shaping, per-grapheme font fallback, ligatures, real style
+faces, and color emoji rasterization are documented in
+[Text shaping and font fallback](text-rendering.md). Selection, copy, resize,
+and cursor behavior continue to use the raw `term-core` cell model.

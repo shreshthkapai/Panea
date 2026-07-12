@@ -14,7 +14,10 @@ use std::{
     time::Instant,
 };
 
-use font_system::{CellMetrics, FontError, FontSystem, GlyphBitmap, GlyphCache, GlyphCacheKey};
+use font_system::{
+    CellMetrics, FontError, FontSystem, GlyphBitmap, GlyphBitmapFormat, GlyphCache, GlyphCacheKey,
+    ShapedGlyph,
+};
 use render_core::{
     AnimationHandle, AnimationKind, CellPosition, CursorVisual, DamageRegion, FrameRequestReason,
     GpuTimingStatus, OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle, RenderColor,
@@ -223,13 +226,13 @@ impl GlyphAtlas {
     pub fn used_bytes(&self) -> u64 {
         self.entries
             .values()
-            .map(|entry| u64::from(entry.width) * u64::from(entry.height))
+            .map(|entry| u64::from(entry.width) * u64::from(entry.height) * 4)
             .sum()
     }
 
     #[must_use]
     pub fn capacity_bytes(&self) -> u64 {
-        u64::from(self.width) * u64::from(self.height)
+        u64::from(self.width) * u64::from(self.height) * 4
     }
 
     fn clear(&mut self) {
@@ -857,6 +860,7 @@ pub struct AtlasUpload {
     pub key: GlyphCacheKey,
     pub entry: AtlasEntry,
     pub pixels: Vec<u8>,
+    pub format: GlyphBitmapFormat,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -893,17 +897,14 @@ impl PreparedRenderBatches {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct GlyphRunKey {
-    font_id: u64,
+    font_generation: u64,
     text: String,
     size_millipoints: u32,
     bold: bool,
     italic: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GlyphRunItem {
-    key: Option<GlyphCacheKey>,
-}
+type GlyphRunItem = ShapedGlyph;
 
 #[derive(Debug)]
 pub struct RenderBatchPlanner {
@@ -917,7 +918,6 @@ struct GlyphBatchContext<'a> {
     atlas_uploads: &'a mut Vec<AtlasUpload>,
     instrumentation: &'a mut RenderInstrumentation,
     fonts: &'a mut FontSystem,
-    font_id: u64,
     metrics: CellMetrics,
     rect: RenderRect,
 }
@@ -953,7 +953,6 @@ impl RenderBatchPlanner {
             .ceil()
             .max(1.0) as u32;
         let damage_regions = effective_damage_regions(scene, metrics);
-        let font_id = fonts.primary_font()?.id();
 
         let mut background = QuadBatch::new(QuadBatchKind::Background);
         let mut glyphs = GlyphBatch {
@@ -985,16 +984,22 @@ impl RenderBatchPlanner {
             }
 
             push_solid_quad(&mut background, rect, cell.background);
+            push_text_decorations(&mut decorations, cell, metrics, rect);
+        }
+
+        for cell in terminal_text_runs(&scene.grid.cells) {
+            let rect = cell_region(cell.position, metrics);
+            if !intersects_any(text_run_region(&cell, metrics), &damage_regions) {
+                continue;
+            }
             let mut glyph_context = GlyphBatchContext {
                 atlas_uploads: &mut atlas_uploads,
                 instrumentation: &mut instrumentation,
                 fonts,
-                font_id,
                 metrics,
                 rect,
             };
-            self.push_glyphs(&mut glyphs, cell, &mut glyph_context)?;
-            push_text_decorations(&mut decorations, cell, metrics, rect);
+            self.push_glyphs(&mut glyphs, &cell, &mut glyph_context)?;
         }
 
         let mut overlays = scene
@@ -1019,7 +1024,6 @@ impl RenderBatchPlanner {
                     atlas_uploads: &mut atlas_uploads,
                     instrumentation: &mut instrumentation,
                     fonts,
-                    font_id,
                     metrics,
                     rect: overlay_label_rect(overlay, metrics),
                 };
@@ -1122,7 +1126,7 @@ impl RenderBatchPlanner {
         }
 
         let run_key = GlyphRunKey {
-            font_id: context.font_id,
+            font_generation: context.fonts.generation_id(),
             text: cell.text.clone(),
             size_millipoints: (context.metrics.font_size * 1000.0).round().max(1.0) as u32,
             bold: cell.style.bold,
@@ -1137,34 +1141,18 @@ impl RenderBatchPlanner {
                 };
                 self.glyph_runs.remove(&oldest);
             }
-            let run = cell
-                .text
-                .chars()
-                .filter(|ch| !ch.is_control())
-                .map(|ch| GlyphRunItem {
-                    key: if ch == ' ' {
-                        None
-                    } else {
-                        Some(GlyphCacheKey::new(
-                            context.font_id,
-                            ch,
-                            context.metrics.font_size,
-                            cell.style.bold,
-                            cell.style.italic,
-                        ))
-                    },
-                })
-                .collect::<Vec<_>>();
+            let run = context
+                .fonts
+                .shape_text(&cell.text, cell.style.bold, cell.style.italic)?
+                .glyphs;
             self.glyph_runs.insert(run_key, run.clone());
             run
         };
 
         let mut pen_x = context.rect.x;
+        let mut pen_y = context.rect.y;
         for item in run {
-            let Some(key) = item.key else {
-                pen_x += context.metrics.cell_width.ceil() as i32;
-                continue;
-            };
+            let key = item.key;
             let cache_hit = self.glyph_cache.contains_key(key);
             let bitmap = self.glyph_cache.get_or_insert_with(key, || {
                 context.fonts.rasterize_glyph(key).unwrap_or_else(|_| {
@@ -1197,22 +1185,25 @@ impl RenderBatchPlanner {
                         key,
                         entry,
                         pixels: bitmap.pixels.clone(),
+                        format: bitmap.format,
                     });
                 }
                 push_glyph_quad(
                     glyphs,
                     RenderRect {
-                        x: pen_x + bitmap.offset_x,
-                        y: context.rect.y + bitmap.offset_y,
+                        x: pen_x + item.x_offset.round() as i32 + bitmap.offset_x,
+                        y: pen_y - item.y_offset.round() as i32 + bitmap.offset_y,
                         width: bitmap.width,
                         height: bitmap.height,
                     },
                     entry,
                     self.atlas.dimensions(),
                     cell.foreground,
+                    bitmap.format == GlyphBitmapFormat::Rgba,
                 );
             }
-            pen_x += bitmap.advance_width.ceil() as i32;
+            pen_x += item.x_advance.round() as i32;
+            pen_y += item.y_advance.round() as i32;
         }
 
         Ok(())
@@ -1245,6 +1236,43 @@ impl RenderBatchPlanner {
         };
         self.push_glyphs(glyphs, &cell, context)
     }
+}
+
+fn terminal_text_runs(cells: &[RenderCell]) -> Vec<RenderCell> {
+    let mut runs: Vec<RenderCell> = Vec::new();
+
+    for cell in cells {
+        let can_join = runs.last().is_some_and(|run| {
+            run.text.is_ascii()
+                && cell.text.is_ascii()
+                && run.position.row == cell.position.row
+                && run
+                    .position
+                    .col
+                    .saturating_add(run.text.chars().count() as u16)
+                    == cell.position.col
+                && run.foreground == cell.foreground
+                && run.background == cell.background
+                && run.style == cell.style
+        });
+        if can_join {
+            runs.last_mut()
+                .expect("run exists")
+                .text
+                .push_str(&cell.text);
+        } else {
+            runs.push(cell.clone());
+        }
+    }
+    runs
+}
+
+fn text_run_region(cell: &RenderCell, metrics: CellMetrics) -> RenderRect {
+    let mut rect = cell_region(cell.position, metrics);
+    rect.width = (metrics.cell_width * cell.text.chars().count().max(1) as f32)
+        .ceil()
+        .max(1.0) as u32;
+    rect
 }
 
 fn count_non_empty_batches<const N: usize>(batches: [bool; N]) -> u32 {
@@ -1324,6 +1352,7 @@ fn push_glyph_quad(
     atlas_entry: AtlasEntry,
     atlas_dimensions: (u32, u32),
     color: RenderColor,
+    color_bitmap: bool,
 ) {
     let (atlas_width, atlas_height) = atlas_dimensions;
     let atlas_width = atlas_width.max(1) as f32;
@@ -1340,6 +1369,11 @@ fn push_glyph_quad(
         [[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
         color,
     );
+    if color_bitmap {
+        for vertex in batch.vertices.iter_mut().rev().take(4) {
+            vertex.color[3] = -vertex.color[3].max(f32::EPSILON);
+        }
+    }
     batch.glyph_count = batch.glyph_count.saturating_add(1);
 }
 
@@ -2622,8 +2656,8 @@ impl TerminalRasterizer {
             }
         }
 
-        for cell in &scene.grid.cells {
-            self.draw_cell_foreground(&mut frame, cell, fonts, metrics, &mut instrumentation)?;
+        for cell in terminal_text_runs(&scene.grid.cells) {
+            self.draw_cell_foreground(&mut frame, &cell, fonts, metrics, &mut instrumentation)?;
         }
 
         for overlay in overlays {
@@ -2660,24 +2694,13 @@ impl TerminalRasterizer {
         metrics: CellMetrics,
         _instrumentation: &mut RenderInstrumentation,
     ) -> Result<(), RendererError> {
-        let rect = cell_region(cell.position, metrics);
+        let rect = text_run_region(cell, metrics);
 
-        let font_id = fonts.primary_font()?.id();
         let mut pen_x = rect.x;
-
-        for ch in cell.text.chars() {
-            if ch == ' ' {
-                pen_x += metrics.cell_width.ceil() as i32;
-                continue;
-            }
-
-            let key = GlyphCacheKey::new(
-                font_id,
-                ch,
-                metrics.font_size,
-                cell.style.bold,
-                cell.style.italic,
-            );
+        let mut pen_y = rect.y;
+        let shaped = fonts.shape_text(&cell.text, cell.style.bold, cell.style.italic)?;
+        for glyph in shaped.glyphs {
+            let key = glyph.key;
             let bitmap = self.batch_planner.glyph_cache.get_or_insert_with(key, || {
                 fonts.rasterize_glyph(key).unwrap_or_else(|_| {
                     GlyphBitmap::missing(metrics.cell_width, metrics.cell_height as u32)
@@ -2685,12 +2708,13 @@ impl TerminalRasterizer {
             });
             draw_glyph(
                 frame,
-                pen_x + bitmap.offset_x,
-                rect.y + bitmap.offset_y,
+                pen_x + glyph.x_offset.round() as i32 + bitmap.offset_x,
+                pen_y - glyph.y_offset.round() as i32 + bitmap.offset_y,
                 bitmap.as_ref(),
                 cell.foreground,
             );
-            pen_x += bitmap.advance_width.ceil() as i32;
+            pen_x += glyph.x_advance.round() as i32;
+            pen_y += glyph.y_advance.round() as i32;
         }
 
         if cell.style.underline {
@@ -2750,15 +2774,11 @@ impl TerminalRasterizer {
             style: RenderCellStyle::default(),
         };
         let rect = overlay_label_rect(overlay, metrics);
-        let font_id = fonts.primary_font()?.id();
         let mut pen_x = rect.x;
-
-        for ch in cell.text.chars() {
-            if ch == ' ' {
-                pen_x += (metrics.cell_width * 0.62).ceil() as i32;
-                continue;
-            }
-            let key = GlyphCacheKey::new(font_id, ch, metrics.font_size, false, false);
+        let mut pen_y = rect.y;
+        let shaped = fonts.shape_text(&cell.text, false, false)?;
+        for glyph in shaped.glyphs {
+            let key = glyph.key;
             let bitmap = self.batch_planner.glyph_cache.get_or_insert_with(key, || {
                 fonts.rasterize_glyph(key).unwrap_or_else(|_| {
                     GlyphBitmap::missing(metrics.cell_width, metrics.cell_height as u32)
@@ -2766,12 +2786,13 @@ impl TerminalRasterizer {
             });
             draw_glyph(
                 frame,
-                pen_x + bitmap.offset_x,
-                rect.y + bitmap.offset_y,
+                pen_x + glyph.x_offset.round() as i32 + bitmap.offset_x,
+                pen_y - glyph.y_offset.round() as i32 + bitmap.offset_y,
                 bitmap.as_ref(),
                 cell.foreground,
             );
-            pen_x += bitmap.advance_width.ceil() as i32;
+            pen_x += glyph.x_advance.round() as i32;
+            pen_y += glyph.y_advance.round() as i32;
             if pen_x > rect.x + rect.width as i32 {
                 break;
             }
@@ -2884,13 +2905,31 @@ fn draw_glyph(frame: &mut CpuFrame, x: i32, y: i32, bitmap: &GlyphBitmap, color:
                 continue;
             }
 
-            let alpha = bitmap.pixels[(gy * bitmap.width + gx) as usize];
-            if alpha == 0 {
-                continue;
-            }
-
             let index = (((target_y as u32 * frame.width) + target_x as u32) * 4) as usize;
-            blend_pixel(&mut frame.pixels[index..index + 4], color, alpha);
+            let source = (gy * bitmap.width + gx) as usize;
+            match bitmap.format {
+                GlyphBitmapFormat::Alpha => {
+                    let alpha = bitmap.pixels[source];
+                    if alpha != 0 {
+                        blend_pixel(&mut frame.pixels[index..index + 4], color, alpha);
+                    }
+                }
+                GlyphBitmapFormat::Rgba => {
+                    let source = source * 4;
+                    let Some(rgba) = bitmap.pixels.get(source..source + 4) else {
+                        continue;
+                    };
+                    let emoji = RenderColor {
+                        red: rgba[0],
+                        green: rgba[1],
+                        blue: rgba[2],
+                        alpha: rgba[3],
+                    };
+                    if emoji.alpha != 0 {
+                        blend_pixel(&mut frame.pixels[index..index + 4], emoji, emoji.alpha);
+                    }
+                }
+            }
         }
     }
 }
@@ -3535,7 +3574,7 @@ impl GpuBackend {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::R8Unorm,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
@@ -3568,11 +3607,22 @@ impl GpuBackend {
                 continue;
             }
             for row in 0..upload.entry.height {
-                let start = (row * upload.entry.width) as usize;
-                let end = start + upload.entry.width as usize;
+                let source_channels = match upload.format {
+                    GlyphBitmapFormat::Alpha => 1,
+                    GlyphBitmapFormat::Rgba => 4,
+                };
+                let start = (row * upload.entry.width * source_channels) as usize;
+                let end = start + (upload.entry.width * source_channels) as usize;
                 if end > upload.pixels.len() {
                     break;
                 }
+                let row_pixels = match upload.format {
+                    GlyphBitmapFormat::Alpha => upload.pixels[start..end]
+                        .iter()
+                        .flat_map(|alpha| [255, 255, 255, *alpha])
+                        .collect::<Vec<_>>(),
+                    GlyphBitmapFormat::Rgba => upload.pixels[start..end].to_vec(),
+                };
                 self.queue.write_texture(
                     wgpu::ImageCopyTexture {
                         texture,
@@ -3584,7 +3634,7 @@ impl GpuBackend {
                         },
                         aspect: wgpu::TextureAspect::All,
                     },
-                    &upload.pixels[start..end],
+                    &row_pixels,
                     wgpu::ImageDataLayout {
                         offset: 0,
                         bytes_per_row: None,
@@ -3837,8 +3887,11 @@ fn fs_color(in: VertexOut) -> @location(0) vec4<f32> {
 
 @fragment
 fn fs_glyph(in: VertexOut) -> @location(0) vec4<f32> {
-    let coverage = textureSample(glyph_atlas, glyph_sampler, in.uv).r;
-    return vec4<f32>(in.color.rgb, in.color.a * coverage);
+    let sample = textureSample(glyph_atlas, glyph_sampler, in.uv);
+    if in.color.a < 0.0 {
+        return vec4<f32>(sample.rgb, sample.a * -in.color.a);
+    }
+    return vec4<f32>(in.color.rgb, in.color.a * sample.a);
 }
 "#;
 
@@ -3887,6 +3940,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn adjacent_ascii_cells_are_shaped_as_one_style_run() {
+        let runs = terminal_text_runs(&[
+            cell(0, 0, "="),
+            cell(0, 1, ">"),
+            cell(0, 2, " "),
+            cell(1, 0, "x"),
+        ]);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].text, "=> ");
+        assert_eq!(runs[1].text, "x");
+    }
+
+    #[test]
+    fn cpu_rasterizer_blends_color_glyph_pixels_without_terminal_tint() {
+        let mut frame = CpuFrame {
+            width: 1,
+            height: 1,
+            pixels: vec![0, 0, 0, 255],
+        };
+        let bitmap = GlyphBitmap {
+            width: 1,
+            height: 1,
+            offset_x: 0,
+            offset_y: 0,
+            advance_width: 1.0,
+            pixels: vec![240, 20, 80, 255],
+            format: GlyphBitmapFormat::Rgba,
+        };
+        draw_glyph(&mut frame, 0, 0, &bitmap, RenderColor::rgb(0, 255, 0));
+        assert_eq!(&frame.pixels[..3], &[240, 20, 80]);
+    }
+
     fn scene_without_cursor(cells: Vec<RenderCell>) -> RenderScene {
         RenderScene {
             cursor: None,
@@ -3897,8 +3983,8 @@ mod tests {
     #[test]
     fn atlas_allocates_and_clears_when_full() {
         let mut atlas = GlyphAtlas::new(8, 8);
-        let key_a = GlyphCacheKey::new(1, 'a', 13.0, false, false);
-        let key_b = GlyphCacheKey::new(1, 'b', 13.0, false, false);
+        let key_a = GlyphCacheKey::new(1, u16::from(b'a'), 13.0, false, false);
+        let key_b = GlyphCacheKey::new(1, u16::from(b'b'), 13.0, false, false);
         let bitmap = GlyphBitmap::missing(4.0, 4);
 
         assert!(atlas.allocate(key_a, &bitmap).is_some());

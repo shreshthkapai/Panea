@@ -30,7 +30,7 @@ considered verified until that matrix has real X11 and Wayland host evidence.
 | clipboard | partial | partial | partial | partial | System clipboard bridge, pane-aware mouse/keyboard selection, portable Ctrl/Super copy/paste, Linux Primary selection provider, paste protection, and OSC 52 policy exist; real cross-OS and Linux compositor smoke remain. |
 | IME | partial | partial | partial | partial | Platform-neutral IME events are represented; real composed-input validation is still required. |
 | DPI/fractional scaling | partial | partial | partial | partial | Monitor scale snapshots exist; fractional behavior needs real host verification. |
-| font fallback | partial | partial | partial | partial | Fallback chains are configurable; per-OS font availability validation is not automated yet. |
+| font fallback | partial | tested | partial | partial | OpenType shaping, per-grapheme fallback, real style-face lookup, COLR/bitmap color emoji, RGBA atlas rendering, and doctor diagnostics are implemented; installed-font/screenshot reports remain to be collected outside Windows. |
 | GPU backend | partial | partial | partial | partial | WGPU surface/device path exists; GPU backend inventory and screenshot verification remain open. |
 | local PTY | partial | full | partial | partial | Windows real-shell smoke passed on the current host; macOS/Linux real PTY smoke remains unverified. |
 | PowerShell/cmd/WSL | not implemented yet | partial | not implemented yet | not implemented yet | Windows shell profile groundwork exists; WSL runtime smoke is not verified. |

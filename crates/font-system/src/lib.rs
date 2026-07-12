@@ -3,7 +3,7 @@
 pub const LAYER: &str = "render performance";
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
     fmt, fs,
     hash::{Hash, Hasher},
@@ -11,7 +11,14 @@ use std::{
     sync::Arc,
 };
 
-use ab_glyph::{Font, FontArc, PxScale, ScaleFont, point};
+use ab_glyph::{Font, FontArc, FontVec, GlyphId, GlyphImageFormat, PxScale, ScaleFont, point};
+use image::imageops::FilterType;
+use swash::{
+    FontRef as SwashFontRef,
+    scale::{Render as SwashRender, ScaleContext, Source, StrikeWith, image::Content},
+    zeno::Format,
+};
+use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FontConfig {
@@ -38,7 +45,7 @@ pub struct FontDescriptor {
     pub source: FontSource,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FontSource {
     File(PathBuf),
     Memory,
@@ -64,7 +71,7 @@ pub struct CellMetrics {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GlyphCacheKey {
     pub font_id: u64,
-    pub ch: char,
+    pub glyph_id: u16,
     pub size_millipoints: u32,
     pub bold: bool,
     pub italic: bool,
@@ -72,10 +79,10 @@ pub struct GlyphCacheKey {
 
 impl GlyphCacheKey {
     #[must_use]
-    pub fn new(font_id: u64, ch: char, size: f32, bold: bool, italic: bool) -> Self {
+    pub fn new(font_id: u64, glyph_id: u16, size: f32, bold: bool, italic: bool) -> Self {
         Self {
             font_id,
-            ch,
+            glyph_id,
             size_millipoints: (size * 1000.0).round().max(1.0) as u32,
             bold,
             italic,
@@ -91,6 +98,13 @@ pub struct GlyphBitmap {
     pub offset_y: i32,
     pub advance_width: f32,
     pub pixels: Vec<u8>,
+    pub format: GlyphBitmapFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlyphBitmapFormat {
+    Alpha,
+    Rgba,
 }
 
 impl GlyphBitmap {
@@ -117,8 +131,34 @@ impl GlyphBitmap {
             offset_y: 0,
             advance_width,
             pixels,
+            format: GlyphBitmapFormat::Alpha,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShapedGlyph {
+    pub key: GlyphCacheKey,
+    pub cluster: u32,
+    pub x_advance: f32,
+    pub y_advance: f32,
+    pub x_offset: f32,
+    pub y_offset: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShapedRun {
+    pub glyphs: Vec<ShapedGlyph>,
+    pub advance_width: f32,
+    pub families_used: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontDiagnostic {
+    pub family: String,
+    pub role: &'static str,
+    pub resolved: bool,
+    pub source: FontSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +191,8 @@ pub struct FontSystem {
     database: fontdb::Database,
     config: FontConfig,
     primary: Option<LoadedFont>,
+    loaded: HashMap<u64, LoadedFont>,
+    attempted_faces: HashSet<(String, bool, bool)>,
 }
 
 impl FontSystem {
@@ -163,6 +205,8 @@ impl FontSystem {
             database,
             config,
             primary: None,
+            loaded: HashMap::new(),
+            attempted_faces: HashSet::new(),
         }
     }
 
@@ -187,9 +231,21 @@ impl FontSystem {
         }
     }
 
+    #[must_use]
+    pub fn generation_id(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.config.family.hash(&mut hasher);
+        self.config.fallback_families.hash(&mut hasher);
+        self.config.size.to_bits().hash(&mut hasher);
+        self.config.line_height.to_bits().hash(&mut hasher);
+        hasher.finish()
+    }
+
     pub fn primary_font(&mut self) -> Result<&LoadedFont, FontError> {
         if self.primary.is_none() {
-            self.primary = Some(self.load_primary()?);
+            let font = self.load_primary()?;
+            self.loaded.insert(font.id(), font.clone());
+            self.primary = Some(font);
         }
 
         Ok(self.primary.as_ref().expect("primary font is initialized"))
@@ -204,14 +260,115 @@ impl FontSystem {
 
     pub fn rasterize_glyph(&mut self, key: GlyphCacheKey) -> Result<GlyphBitmap, FontError> {
         let size = key.size_millipoints as f32 / 1000.0;
-        self.primary_font().map(|font| font.rasterize(key.ch, size))
+        if !self.loaded.contains_key(&key.font_id) {
+            let _ = self.primary_font()?;
+        }
+        self.loaded
+            .get(&key.font_id)
+            .map(|font| font.rasterize(key.glyph_id, size))
+            .ok_or_else(|| FontError::FontLoadFailed {
+                family: "resolved fallback".to_owned(),
+                reason: format!("unknown font id {} in glyph cache key", key.font_id),
+            })
+    }
+
+    pub fn shape_text(
+        &mut self,
+        text: &str,
+        bold: bool,
+        italic: bool,
+    ) -> Result<ShapedRun, FontError> {
+        if text.is_empty() {
+            return Ok(ShapedRun {
+                glyphs: Vec::new(),
+                advance_width: 0.0,
+                families_used: Vec::new(),
+            });
+        }
+
+        let mut segments: Vec<(u64, String, usize)> = Vec::new();
+        for (byte_index, grapheme) in text.grapheme_indices(true) {
+            let font_id = self.resolve_font_for_text(grapheme, bold, italic)?;
+            if let Some((last_id, segment, _)) = segments.last_mut()
+                && *last_id == font_id
+            {
+                segment.push_str(grapheme);
+            } else {
+                segments.push((font_id, grapheme.to_owned(), byte_index));
+            }
+        }
+
+        let size = self.config.size;
+        let mut glyphs = Vec::new();
+        let mut advance_width = 0.0;
+        let mut families_used = Vec::new();
+        for (font_id, segment, byte_offset) in segments {
+            let font = self.loaded.get(&font_id).expect("resolved font is cached");
+            if !families_used.contains(&font.family) {
+                families_used.push(font.family.clone());
+            }
+            let shaped = font.shape(&segment, size, bold, italic, byte_offset as u32)?;
+            advance_width += shaped.iter().map(|glyph| glyph.x_advance).sum::<f32>();
+            glyphs.extend(shaped);
+        }
+
+        Ok(ShapedRun {
+            glyphs,
+            advance_width,
+            families_used,
+        })
+    }
+
+    #[must_use]
+    pub fn diagnostics(&self) -> Vec<FontDiagnostic> {
+        let chain = self.resolve_fallback_chain();
+        let mut diagnostics = std::iter::once(FontDiagnostic {
+            family: chain.primary.family,
+            role: "primary",
+            resolved: chain.primary.source != FontSource::Unresolved,
+            source: chain.primary.source,
+        })
+        .chain(
+            chain
+                .fallbacks
+                .into_iter()
+                .map(|descriptor| FontDiagnostic {
+                    family: descriptor.family,
+                    role: "fallback",
+                    resolved: descriptor.source != FontSource::Unresolved,
+                    source: descriptor.source,
+                }),
+        )
+        .collect::<Vec<_>>();
+        for (role, bold, italic) in [
+            ("regular-face", false, false),
+            ("bold-face", true, false),
+            ("italic-face", false, true),
+            ("bold-italic-face", true, true),
+        ] {
+            let loaded = self
+                .load_family(&self.config.family, bold, italic)
+                .and_then(Result::ok);
+            let resolved = loaded
+                .as_ref()
+                .is_some_and(|font| font.is_bold() == bold && font.is_italic() == italic);
+            diagnostics.push(FontDiagnostic {
+                family: self.config.family.clone(),
+                role,
+                resolved,
+                source: loaded
+                    .map(|font| font.source)
+                    .unwrap_or(FontSource::Unresolved),
+            });
+        }
+        diagnostics
     }
 
     fn load_primary(&self) -> Result<LoadedFont, FontError> {
         let requested = self.requested_families();
 
         for family in &requested {
-            if let Some(loaded) = self.load_family(family) {
+            if let Some(loaded) = self.load_family(family, false, false) {
                 return loaded.map_err(|reason| FontError::FontLoadFailed {
                     family: family.clone(),
                     reason,
@@ -231,9 +388,19 @@ impl FontSystem {
             "Consolas".to_owned(),
             "Menlo".to_owned(),
             "DejaVu Sans Mono".to_owned(),
+            "Segoe UI Emoji".to_owned(),
+            "Apple Color Emoji".to_owned(),
+            "Noto Color Emoji".to_owned(),
+            "Noto Emoji".to_owned(),
+            "Microsoft YaHei UI".to_owned(),
+            "Yu Gothic UI".to_owned(),
+            "Hiragino Sans".to_owned(),
+            "Noto Sans Mono CJK JP".to_owned(),
+            "Noto Sans CJK JP".to_owned(),
             "monospace".to_owned(),
         ]);
-        requested.dedup();
+        let mut seen = HashSet::new();
+        requested.retain(|family| seen.insert(family.to_ascii_lowercase()));
         requested
     }
 
@@ -263,14 +430,33 @@ impl FontSystem {
         }
     }
 
-    fn load_family(&self, family: &str) -> Option<Result<LoadedFont, String>> {
+    fn load_family(
+        &self,
+        family: &str,
+        bold: bool,
+        italic: bool,
+    ) -> Option<Result<LoadedFont, String>> {
         let families = family_query(family);
         let query = fontdb::Query {
             families: &families,
+            weight: if bold {
+                fontdb::Weight::BOLD
+            } else {
+                fontdb::Weight::NORMAL
+            },
+            style: if italic {
+                fontdb::Style::Italic
+            } else {
+                fontdb::Style::Normal
+            },
             ..fontdb::Query::default()
         };
         let id = self.database.query(&query)?;
         let face = self.database.face(id)?;
+        let face_index = face.index;
+        let source = source_kind(&face.source);
+        let actual_bold = face.weight >= fontdb::Weight::SEMIBOLD;
+        let actual_italic = face.style != fontdb::Style::Normal;
         let bytes = match &face.source {
             fontdb::Source::File(path) => fs::read(path).map_err(|err| err.to_string()),
             fontdb::Source::SharedFile(path, _) => fs::read(path).map_err(|err| err.to_string()),
@@ -278,9 +464,67 @@ impl FontSystem {
         };
 
         Some(bytes.and_then(|bytes| {
-            let font = FontArc::try_from_vec(bytes).map_err(|err| err.to_string())?;
-            Ok(LoadedFont::new(family.to_owned(), font))
+            let font = FontArc::new(
+                FontVec::try_from_vec_and_index(bytes.clone(), face_index)
+                    .map_err(|err| err.to_string())?,
+            );
+            Ok(LoadedFont::new(
+                family.to_owned(),
+                font,
+                Arc::new(bytes),
+                face_index,
+                source,
+                actual_bold,
+                actual_italic,
+            ))
         }))
+    }
+
+    fn resolve_font_for_text(
+        &mut self,
+        text: &str,
+        bold: bool,
+        italic: bool,
+    ) -> Result<u64, FontError> {
+        let mut style_fallback = None;
+        for family in self.requested_families() {
+            for font in self.loaded.values().filter(|font| font.family == family) {
+                if font.supports_text(text) {
+                    if font.is_bold() == bold && font.is_italic() == italic {
+                        return Ok(font.id());
+                    }
+                    style_fallback.get_or_insert(font.id());
+                }
+            }
+            if !self.attempted_faces.insert((family.clone(), bold, italic)) {
+                continue;
+            }
+            let Some(result) = self.load_family(&family, bold, italic) else {
+                continue;
+            };
+            let font = result.map_err(|reason| FontError::FontLoadFailed {
+                family: family.clone(),
+                reason,
+            })?;
+            if font.supports_text(text) {
+                let id = font.id();
+                self.loaded.entry(id).or_insert(font);
+                let loaded = self.loaded.get(&id).expect("font was inserted");
+                if loaded.is_bold() == bold && loaded.is_italic() == italic {
+                    return Ok(id);
+                }
+                style_fallback.get_or_insert(id);
+            }
+        }
+
+        if let Some(id) = style_fallback {
+            return Ok(id);
+        }
+
+        let primary = self.primary_font()?.clone();
+        let id = primary.id();
+        self.loaded.entry(id).or_insert(primary);
+        Ok(id)
     }
 }
 
@@ -306,17 +550,39 @@ pub struct LoadedFont {
     id: u64,
     family: String,
     font: FontArc,
+    bytes: Arc<Vec<u8>>,
+    face_index: u32,
+    source: FontSource,
+    bold: bool,
+    italic: bool,
 }
 
 impl LoadedFont {
-    fn new(family: String, font: FontArc) -> Self {
+    fn new(
+        family: String,
+        font: FontArc,
+        bytes: Arc<Vec<u8>>,
+        face_index: u32,
+        source: FontSource,
+        bold: bool,
+        italic: bool,
+    ) -> Self {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         family.hash(&mut hasher);
+        face_index.hash(&mut hasher);
+        source.hash(&mut hasher);
+        bold.hash(&mut hasher);
+        italic.hash(&mut hasher);
 
         Self {
             id: hasher.finish(),
             family,
             font,
+            bytes,
+            face_index,
+            source,
+            bold,
+            italic,
         }
     }
 
@@ -328,6 +594,62 @@ impl LoadedFont {
     #[must_use]
     pub fn family(&self) -> &str {
         &self.family
+    }
+
+    #[must_use]
+    pub fn source(&self) -> &FontSource {
+        &self.source
+    }
+
+    #[must_use]
+    pub const fn is_bold(&self) -> bool {
+        self.bold
+    }
+
+    #[must_use]
+    pub const fn is_italic(&self) -> bool {
+        self.italic
+    }
+
+    fn supports_text(&self, text: &str) -> bool {
+        text.chars()
+            .all(|ch| is_default_ignorable(ch) || self.font.glyph_id(ch) != GlyphId(0))
+    }
+
+    fn shape(
+        &self,
+        text: &str,
+        size: f32,
+        bold: bool,
+        italic: bool,
+        cluster_offset: u32,
+    ) -> Result<Vec<ShapedGlyph>, FontError> {
+        let Some(face) = rustybuzz::Face::from_slice(&self.bytes, self.face_index) else {
+            return Err(FontError::FontLoadFailed {
+                family: self.family.clone(),
+                reason: "OpenType shaping face could not be created".to_owned(),
+            });
+        };
+        let units_per_em = face.units_per_em().max(1) as f32;
+        let scale = size / units_per_em;
+        let mut buffer = rustybuzz::UnicodeBuffer::new();
+        buffer.push_str(text);
+        buffer.guess_segment_properties();
+        let glyph_buffer = rustybuzz::shape(&face, &[], buffer);
+
+        Ok(glyph_buffer
+            .glyph_infos()
+            .iter()
+            .zip(glyph_buffer.glyph_positions())
+            .map(|(info, position)| ShapedGlyph {
+                key: GlyphCacheKey::new(self.id, info.glyph_id as u16, size, bold, italic),
+                cluster: cluster_offset.saturating_add(info.cluster),
+                x_advance: position.x_advance as f32 * scale,
+                y_advance: position.y_advance as f32 * scale,
+                x_offset: position.x_offset as f32 * scale,
+                y_offset: position.y_offset as f32 * scale,
+            })
+            .collect())
     }
 
     #[must_use]
@@ -352,14 +674,75 @@ impl LoadedFont {
     }
 
     #[must_use]
-    pub fn rasterize(&self, ch: char, size: f32) -> GlyphBitmap {
+    pub fn rasterize(&self, glyph_id: u16, size: f32) -> GlyphBitmap {
         let scaled = self.font.as_scaled(PxScale::from(size));
-        let glyph_id = self.font.glyph_id(ch);
-        let advance_width = scaled.h_advance(glyph_id).ceil().max(1.0);
+        let glyph_id = GlyphId(glyph_id);
+        let advance_width = scaled.h_advance(glyph_id).max(0.0);
         let ascent = scaled.ascent();
+
+        if let Some(font) = SwashFontRef::from_index(&self.bytes, self.face_index as usize) {
+            let mut context = ScaleContext::new();
+            let mut scaler = context.builder(font).size(size).hint(true).build();
+            if let Some(image) = SwashRender::new(&[
+                Source::ColorOutline(0),
+                Source::ColorBitmap(StrikeWith::BestFit),
+                Source::Outline,
+            ])
+            .format(Format::Alpha)
+            .render(&mut scaler, glyph_id.0)
+                && image.placement.width > 0
+                && image.placement.height > 0
+            {
+                let format = match image.content {
+                    Content::Color => GlyphBitmapFormat::Rgba,
+                    Content::Mask | Content::SubpixelMask => GlyphBitmapFormat::Alpha,
+                };
+                let mut pixels = if image.content == Content::SubpixelMask {
+                    image
+                        .data
+                        .chunks_exact(4)
+                        .map(|pixel| pixel[0].max(pixel[1]).max(pixel[2]).max(pixel[3]))
+                        .collect()
+                } else {
+                    image.data
+                };
+                if matches!(image.source, Source::ColorOutline(_)) {
+                    unpremultiply_rgba(&mut pixels);
+                }
+                return GlyphBitmap {
+                    width: image.placement.width,
+                    height: image.placement.height,
+                    offset_x: image.placement.left,
+                    offset_y: (ascent.round() as i32).saturating_sub(image.placement.top),
+                    advance_width,
+                    pixels,
+                    format,
+                };
+            }
+        }
+
+        if let Some(image) = self
+            .font
+            .glyph_raster_image2(glyph_id, size.round().clamp(1.0, u16::MAX as f32) as u16)
+            && let Some(bitmap) = raster_image_to_bitmap(&image, advance_width, size)
+        {
+            return bitmap;
+        }
+
         let glyph = glyph_id.with_scale_and_position(PxScale::from(size), point(0.0, ascent));
 
         let Some(outlined) = self.font.outline_glyph(glyph) else {
+            if glyph_id != GlyphId(0) {
+                return GlyphBitmap {
+                    width: 1,
+                    height: 1,
+                    offset_x: 0,
+                    offset_y: 0,
+                    advance_width,
+                    pixels: vec![0],
+                    format: GlyphBitmapFormat::Alpha,
+                };
+            }
             return GlyphBitmap::missing(advance_width, (ascent - scaled.descent()).ceil() as u32);
         };
 
@@ -380,6 +763,64 @@ impl LoadedFont {
             offset_y: bounds.min.y.floor() as i32,
             advance_width,
             pixels,
+            format: GlyphBitmapFormat::Alpha,
+        }
+    }
+}
+
+fn is_default_ignorable(ch: char) -> bool {
+    matches!(ch, '\u{200c}' | '\u{200d}' | '\u{fe0e}' | '\u{fe0f}')
+        || ('\u{e0100}'..='\u{e01ef}').contains(&ch)
+}
+
+fn raster_image_to_bitmap(
+    image: &ab_glyph::v2::GlyphImage<'_>,
+    advance_width: f32,
+    requested_size: f32,
+) -> Option<GlyphBitmap> {
+    let (width, height, pixels) = match &image.format {
+        GlyphImageFormat::Png => {
+            let decoded = image::load_from_memory(image.data).ok()?.to_rgba8();
+            let scale = requested_size / f32::from(image.pixels_per_em.max(1));
+            let width = (decoded.width() as f32 * scale).round().max(1.0) as u32;
+            let height = (decoded.height() as f32 * scale).round().max(1.0) as u32;
+            let resized = if decoded.width() == width && decoded.height() == height {
+                decoded
+            } else {
+                image::imageops::resize(&decoded, width, height, FilterType::Triangle)
+            };
+            (width, height, resized.into_raw())
+        }
+        GlyphImageFormat::BitmapPremulBgra32 => {
+            let mut rgba = Vec::with_capacity(image.data.len());
+            for pixel in image.data.chunks_exact(4) {
+                rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+            }
+            unpremultiply_rgba(&mut rgba);
+            (u32::from(image.width), u32::from(image.height), rgba)
+        }
+        _ => return None,
+    };
+
+    Some(GlyphBitmap {
+        width,
+        height,
+        offset_x: image.origin.x.round() as i32,
+        offset_y: image.origin.y.round() as i32,
+        advance_width,
+        pixels,
+        format: GlyphBitmapFormat::Rgba,
+    })
+}
+
+fn unpremultiply_rgba(pixels: &mut [u8]) {
+    for pixel in pixels.chunks_exact_mut(4) {
+        let alpha = u16::from(pixel[3]);
+        if alpha == 0 || alpha == 255 {
+            continue;
+        }
+        for channel in &mut pixel[..3] {
+            *channel = ((u16::from(*channel) * 255) / alpha).min(255) as u8;
         }
     }
 }
@@ -464,9 +905,9 @@ mod tests {
     #[test]
     fn glyph_cache_evicts_oldest_entry() {
         let mut cache = GlyphCache::new(2);
-        let key_a = GlyphCacheKey::new(1, 'a', 13.0, false, false);
-        let key_b = GlyphCacheKey::new(1, 'b', 13.0, false, false);
-        let key_c = GlyphCacheKey::new(1, 'c', 13.0, false, false);
+        let key_a = GlyphCacheKey::new(1, u16::from(b'a'), 13.0, false, false);
+        let key_b = GlyphCacheKey::new(1, u16::from(b'b'), 13.0, false, false);
+        let key_c = GlyphCacheKey::new(1, u16::from(b'c'), 13.0, false, false);
 
         cache.get_or_insert_with(key_a, || GlyphBitmap::missing(8.0, 12));
         cache.get_or_insert_with(key_b, || GlyphBitmap::missing(8.0, 12));
@@ -487,5 +928,86 @@ mod tests {
 
         assert!(metrics.cell_width > 0.0);
         assert!(metrics.cell_height > 0.0);
+    }
+
+    #[test]
+    fn shaping_preserves_clusters_and_rasterizes_selected_glyphs() {
+        let mut fonts = FontSystem::new(FontConfig::default());
+        let Ok(run) = fonts.shape_text("ffi e\u{301}", false, false) else {
+            return;
+        };
+        assert!(!run.glyphs.is_empty());
+        assert!(run.advance_width > 0.0);
+        assert!(!run.families_used.is_empty());
+        assert!(
+            run.glyphs
+                .windows(2)
+                .all(|pair| pair[0].cluster <= pair[1].cluster)
+        );
+        for glyph in run.glyphs {
+            let bitmap = fonts.rasterize_glyph(glyph.key).unwrap();
+            assert!(bitmap.width > 0);
+            assert!(bitmap.height > 0);
+        }
+    }
+
+    #[test]
+    fn fallback_selection_handles_cjk_and_emoji_without_losing_text() {
+        let mut fonts = FontSystem::new(FontConfig {
+            fallback_families: vec![
+                "Segoe UI Emoji".to_owned(),
+                "Apple Color Emoji".to_owned(),
+                "Noto Color Emoji".to_owned(),
+                "Noto Sans CJK JP".to_owned(),
+            ],
+            ..FontConfig::default()
+        });
+        let Ok(run) = fonts.shape_text("A界👍🏽👨‍👩‍👧‍👦", false, false)
+        else {
+            return;
+        };
+        assert!(!run.glyphs.is_empty());
+        assert!(run.glyphs.iter().all(|glyph| glyph.key.font_id != 0));
+    }
+
+    #[test]
+    fn diagnostics_report_style_faces_and_unresolved_fallbacks() {
+        let fonts = FontSystem::new(FontConfig {
+            fallback_families: vec!["Panea Definitely Missing Font".to_owned()],
+            ..FontConfig::default()
+        });
+        let diagnostics = fonts.diagnostics();
+        assert!(diagnostics.iter().any(|item| item.role == "bold-face"));
+        assert!(diagnostics.iter().any(|item| item.role == "italic-face"));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|item| { item.family == "Panea Definitely Missing Font" && !item.resolved })
+        );
+    }
+
+    #[test]
+    fn color_outline_pixels_are_converted_to_straight_alpha() {
+        let mut pixels = vec![64, 32, 16, 128, 0, 0, 0, 0];
+        unpremultiply_rgba(&mut pixels);
+        assert_eq!(&pixels[..4], &[127, 63, 31, 128]);
+        assert_eq!(&pixels[4..], &[0, 0, 0, 0]);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_color_emoji_fallback_rasterizes_rgba() {
+        let mut fonts = FontSystem::new(FontConfig::default());
+        let run = fonts.shape_text("😀", false, false).unwrap();
+        assert!(
+            run.families_used
+                .iter()
+                .any(|family| family == "Segoe UI Emoji")
+        );
+        assert!(run.glyphs.into_iter().any(|glyph| {
+            fonts
+                .rasterize_glyph(glyph.key)
+                .is_ok_and(|bitmap| bitmap.format == GlyphBitmapFormat::Rgba)
+        }));
     }
 }
