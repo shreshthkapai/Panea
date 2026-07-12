@@ -37,7 +37,7 @@ use render_core::{
 };
 use render_wgpu::{
     AnimatedCursorImageCache, AnimatedCursorImageRequest, AnimatedCursorImageStatus,
-    CursorAnimationRuntime, CursorAnimationSettings, FrameDecision, FrameScheduler,
+    CursorAnimationRuntime, CursorAnimationSettings, DamageTracker, FrameDecision, FrameScheduler,
     GpuTerminalRenderer, PresentMode, RendererError, RendererOptions,
 };
 use security::KeychainProvider;
@@ -426,7 +426,72 @@ struct LoadedDesktopConfig {
     config: AppConfig,
     diagnostics: Vec<ConfigDiagnostic>,
     source: String,
-    toml_watcher: Option<config_toml::ConfigWatcher>,
+    watcher: Option<DesktopConfigWatcher>,
+}
+
+enum DesktopConfigWatcher {
+    Toml(config_toml::ConfigWatcher),
+    Programmable(config_lua::ProgrammableConfigWatcher),
+}
+
+enum DesktopConfigWatchEvent {
+    Unchanged,
+    Pending {
+        path: Option<PathBuf>,
+    },
+    Reloaded {
+        config: Box<AppConfig>,
+        diagnostics: Vec<ConfigDiagnostic>,
+    },
+    Failed {
+        path: Option<PathBuf>,
+        error: String,
+    },
+}
+
+impl DesktopConfigWatcher {
+    fn poll(&mut self) -> DesktopConfigWatchEvent {
+        match self {
+            Self::Toml(watcher) => match watcher.poll() {
+                config_toml::ConfigWatchEvent::Unchanged => DesktopConfigWatchEvent::Unchanged,
+                config_toml::ConfigWatchEvent::Pending { path } => {
+                    DesktopConfigWatchEvent::Pending { path }
+                }
+                config_toml::ConfigWatchEvent::Reloaded(loaded) => {
+                    DesktopConfigWatchEvent::Reloaded {
+                        config: Box::new(loaded.config),
+                        diagnostics: loaded.diagnostics,
+                    }
+                }
+                config_toml::ConfigWatchEvent::Failed { path, error } => {
+                    DesktopConfigWatchEvent::Failed {
+                        path,
+                        error: error.to_string(),
+                    }
+                }
+            },
+            Self::Programmable(watcher) => match watcher.poll() {
+                config_lua::ProgrammableConfigWatchEvent::Unchanged => {
+                    DesktopConfigWatchEvent::Unchanged
+                }
+                config_lua::ProgrammableConfigWatchEvent::Pending { path } => {
+                    DesktopConfigWatchEvent::Pending { path: Some(path) }
+                }
+                config_lua::ProgrammableConfigWatchEvent::Reloaded(loaded) => {
+                    DesktopConfigWatchEvent::Reloaded {
+                        config: Box::new(loaded.config),
+                        diagnostics: loaded.diagnostics,
+                    }
+                }
+                config_lua::ProgrammableConfigWatchEvent::Failed { path, error } => {
+                    DesktopConfigWatchEvent::Failed {
+                        path: Some(path),
+                        error: error.to_string(),
+                    }
+                }
+            },
+        }
+    }
 }
 
 fn load_desktop_config() -> Result<LoadedDesktopConfig, Box<dyn Error>> {
@@ -439,7 +504,9 @@ fn load_desktop_config() -> Result<LoadedDesktopConfig, Box<dyn Error>> {
                 config: loaded.config,
                 diagnostics: loaded.diagnostics,
                 source: format!("explicit:{}", path.display()),
-                toml_watcher: None,
+                watcher: Some(DesktopConfigWatcher::Programmable(
+                    config_lua::ProgrammableConfigWatcher::new(path, platform),
+                )),
             });
         }
 
@@ -452,7 +519,9 @@ fn load_desktop_config() -> Result<LoadedDesktopConfig, Box<dyn Error>> {
             source: config_source_text(&loaded.source),
             config: loaded.config,
             diagnostics: loaded.diagnostics,
-            toml_watcher: Some(config_toml::ConfigWatcher::new(options)),
+            watcher: Some(DesktopConfigWatcher::Toml(config_toml::ConfigWatcher::new(
+                options,
+            ))),
         });
     }
 
@@ -469,7 +538,9 @@ fn load_desktop_config() -> Result<LoadedDesktopConfig, Box<dyn Error>> {
             source: config_source_text(&loaded.source),
             config: loaded.config,
             diagnostics: loaded.diagnostics,
-            toml_watcher: Some(config_toml::ConfigWatcher::new(options)),
+            watcher: Some(DesktopConfigWatcher::Toml(config_toml::ConfigWatcher::new(
+                options,
+            ))),
         });
     }
 
@@ -482,7 +553,9 @@ fn load_desktop_config() -> Result<LoadedDesktopConfig, Box<dyn Error>> {
             config: loaded.config,
             diagnostics: loaded.diagnostics,
             source: path.display().to_string(),
-            toml_watcher: None,
+            watcher: Some(DesktopConfigWatcher::Programmable(
+                config_lua::ProgrammableConfigWatcher::new(path, platform),
+            )),
         });
     }
 
@@ -495,7 +568,9 @@ fn load_desktop_config() -> Result<LoadedDesktopConfig, Box<dyn Error>> {
         source: config_source_text(&loaded.source),
         config: loaded.config,
         diagnostics: loaded.diagnostics,
-        toml_watcher: Some(config_toml::ConfigWatcher::new(options)),
+        watcher: Some(DesktopConfigWatcher::Toml(config_toml::ConfigWatcher::new(
+            options,
+        ))),
     })
 }
 
@@ -643,7 +718,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let loaded_config = load_desktop_config()?;
     log_config_diagnostics(&loaded_config.diagnostics);
     let mut config = loaded_config.config;
-    let mut config_watcher = loaded_config.toml_watcher;
+    let mut config_watcher = loaded_config.watcher;
     let _ssh_session_profiles: Vec<SshConnectionProfile> = config
         .ssh_profiles
         .iter()
@@ -670,6 +745,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         renderer_options(&config),
     ))?;
     let mut scheduler = FrameScheduler::new();
+    let mut damage_tracker = DamageTracker::new();
     let mut performance_overlay =
         PerformanceOverlay::new(config.diagnostics.performance_overlay, "wgpu");
     let mut performance_budget = performance_budget(&config);
@@ -703,6 +779,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                             performance_budget,
                             metrics,
                         );
+                        scene.damage_regions = damage_tracker.update(&scene, metrics);
                     }
                     let idle_wakeups = scheduler.take_idle_wakeups();
                     match catch_unwind(AssertUnwindSafe(|| {
@@ -995,8 +1072,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             Event::AboutToWait => {
                 if let Some(config_watcher) = config_watcher.as_mut() {
                     match config_watcher.poll() {
-                        config_toml::ConfigWatchEvent::Unchanged => {}
-                        config_toml::ConfigWatchEvent::Pending { path } => {
+                        DesktopConfigWatchEvent::Unchanged => {}
+                        DesktopConfigWatchEvent::Pending { path } => {
                             if matches!(
                                 config.diagnostics.log_level,
                                 LogLevel::Debug | LogLevel::Trace
@@ -1009,14 +1086,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 );
                             }
                         }
-                        config_toml::ConfigWatchEvent::Reloaded(loaded) => {
+                        DesktopConfigWatchEvent::Reloaded {
+                            config: loaded,
+                            diagnostics,
+                        } => {
                             let loaded = *loaded;
-                            log_config_diagnostics(&loaded.diagnostics);
-                            let plan = config.reload_plan_from(&loaded.config);
+                            log_config_diagnostics(&diagnostics);
+                            let plan = config.reload_plan_from(&loaded);
                             log_reload_plan(&plan);
                             match apply_live_config_reload(
                                 &mut config,
-                                loaded.config,
+                                loaded,
                                 &plan,
                                 &mut fonts,
                                 &mut clipboard_config,
@@ -1052,7 +1132,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                         }
-                        config_toml::ConfigWatchEvent::Failed { path, error } => {
+                        DesktopConfigWatchEvent::Failed { path, error } => {
                             eprintln!(
                                 "config reload failed{}: {error}; keeping previous valid config",
                                 path.as_ref()

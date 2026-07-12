@@ -27,8 +27,8 @@ static TOML remains supported and is still preferred when `config.toml` exists.
 Diagnostics: compile diagnostics identify script actions and validation errors
 reuse normal config diagnostics.
 Performance cost when disabled: none.
-Performance cost when enabled: one parse/compile/validate pass during config
-load or explicit reload planning; no script runs in render, input, PTY, or
+Performance cost when enabled: one parse/compile/validate pass during load or
+after a debounced file change; no program runs in render, input, PTY, or
 animation paths.
 Tests: config-lua unit tests cover successful compilation, platform
 conditionals, explicit platform overrides, validation failure, unsupported API
@@ -116,10 +116,10 @@ Renderer hot paths receive only precompiled config structs.
 
 ## Reload
 
-The static TOML watcher remains the desktop runtime watcher in this slice.
-Programmable config supports safe reload classification by compiling the next
-program into `AppConfig` and comparing it with the current config using
-`AppConfig::reload_plan_from`.
+The desktop runtime watches the active programmable file with the same
+debounce, validation, previous-valid retention, and reload classification used
+for TOML. The program is compiled into a fresh `AppConfig` before
+`AppConfig::reload_plan_from` is evaluated.
 
 Automatic runtime watching for `config.panea` is intentionally deferred until
 the cross-OS watcher behavior has the same previous-valid-config guarantees as

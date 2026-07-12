@@ -6,9 +6,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub const CURRENT_CONFIG_SCHEMA_VERSION: u16 = 2;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
+    pub schema_version: u16,
     pub window: WindowConfig,
     pub renderer: RendererConfig,
     #[serde(alias = "fonts")]
@@ -34,6 +37,35 @@ pub struct AppConfig {
     pub diagnostics: DiagnosticsConfig,
 }
 
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: CURRENT_CONFIG_SCHEMA_VERSION,
+            window: WindowConfig::default(),
+            renderer: RendererConfig::default(),
+            font: FontConfig::default(),
+            colors: ColorConfig::default(),
+            visual_theme: VisualThemeConfig::default(),
+            cursor: CursorConfig::default(),
+            scrollback: ScrollbackConfig::default(),
+            command_blocks: CommandBlocksConfig::default(),
+            prompt_decorations: PromptDecorationsConfig::default(),
+            shell_integration: ShellIntegrationConfig::default(),
+            keyboard: KeyboardConfig::default(),
+            mouse: MouseConfig::default(),
+            clipboard: ClipboardConfig::default(),
+            paste: PasteConfig::default(),
+            default_shell_profile: None,
+            shell_profiles: Vec::new(),
+            ssh_profiles: Vec::new(),
+            mux: MuxConfig::default(),
+            performance: PerformanceConfig::default(),
+            platform_overrides: PlatformOverrides::default(),
+            diagnostics: DiagnosticsConfig::default(),
+        }
+    }
+}
+
 impl AppConfig {
     #[must_use]
     pub fn resolved_for_platform(&self, platform: ConfigPlatform) -> Self {
@@ -47,6 +79,16 @@ impl AppConfig {
     #[must_use]
     pub fn validate(&self) -> ValidationReport {
         let mut report = ValidationReport::default();
+
+        if self.schema_version != CURRENT_CONFIG_SCHEMA_VERSION {
+            report.error(
+                "schema_version",
+                format!(
+                    "config schema version {} must be migrated to {} before use",
+                    self.schema_version, CURRENT_CONFIG_SCHEMA_VERSION
+                ),
+            );
+        }
 
         if self.window.title.trim().is_empty() {
             report.error("window.title", "window title cannot be empty");
@@ -2120,7 +2162,7 @@ pub struct ConfigSchemaField {
 pub fn export_schema() -> ConfigSchema {
     let default = AppConfig::default();
     ConfigSchema {
-        schema_version: 1,
+        schema_version: CURRENT_CONFIG_SCHEMA_VERSION,
         sections: vec![
             ConfigSchemaSection {
                 name: "window",
@@ -3040,7 +3082,7 @@ mod tests {
     fn schema_exports_machine_readable_fields() {
         let schema = export_schema();
 
-        assert_eq!(schema.schema_version, 1);
+        assert_eq!(schema.schema_version, CURRENT_CONFIG_SCHEMA_VERSION);
         assert!(
             schema
                 .sections

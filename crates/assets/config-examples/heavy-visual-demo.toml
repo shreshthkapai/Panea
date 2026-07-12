@@ -1,3 +1,5 @@
+schema_version = 2
+
 [visual_theme]
 name = "heavy-visual-demo"
 grouping_style = "custom_theme"

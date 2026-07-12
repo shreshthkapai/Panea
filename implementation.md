@@ -96,6 +96,12 @@ to more visible features before the dependencies they rely on are hardened.
   many panes, cursor animation, and command-block overlays, plus renderer
   batching documentation and unit coverage for batch grouping, cache reuse, and
   cursor-only damage.
+- Completed the daily-driver GPU hardening pass: WGPU batch buffers persist
+  across frames and grow geometrically, a retained renderer-owned frame makes
+  partial damage independent of swapchain preservation, unsupported
+  surface-copy backends fall back to full redraws, startup/resize/recovery force
+  full refreshes, desktop scenes carry incremental damage for changed/removed
+  cells and visual regions, and unchanged text/glyph/emoji data reuses caches.
 - Completed next-pass Phase 5 GPU device-loss recovery foundation: added
   renderer-independent recovery reason/status/event contracts, split disposable
   WGPU resources into a rebuildable backend, preserved terminal/session state
@@ -274,6 +280,11 @@ to more visible features before the dependencies they rely on are hardened.
   errors, and reload-plan tests without running in render/input/PTY hot paths;
   added `panea shell-smoke --json` and wired package smoke to run both packaged
   doctor and headless shell-session checks.
+- Completed the portable config hardening pass: `AppConfig` now has schema
+  version 2, TOML performs deterministic in-memory v1 migrations and rejects
+  unsupported future versions, generated config/schema output uses the current
+  version, and active programmable files receive the same debounced,
+  previous-valid desktop live-reload treatment as TOML.
 - Completed next-pass Phase 22 native iOS SSH companion path foundation:
   extended `apps/ios` with native app bridge contracts, damage-driven iOS GPU
   surface specs, SSH profile form validation, mobile connection planning,
@@ -317,7 +328,7 @@ to more visible features before the dependencies they rely on are hardened.
   Cross-OS screenshot automation now exists with a verified Windows baseline;
   macOS, Linux X11, and Linux Wayland baseline capture/verification, real GPU
   timing validation, real sleep/wake and monitor-change device-loss validation,
-  batch vector reuse/pooling, and deeper font fallback/shaping validation
+  and cross-OS font/render validation
   remain deferred render-performance work.
 - Phase 5 has build/test verification on the current Windows host. macOS,
   Linux X11, and Linux Wayland rendering remain unverified until run on those
@@ -340,8 +351,8 @@ to more visible features before the dependencies they rely on are hardened.
   compile into the same `AppConfig`, support generated themes, platform
   conditionals, explicit platform overrides, advanced keybindings, shell/SSH
   profiles, cursor mode styles, and mux label formats, and never run in
-  render/input/PTY hot paths. Automatic runtime watching for `.panea` files and
-  richer product UI around programmable config errors remain follow-up work.
+  render/input/PTY hot paths. Automatic safe runtime watching for `.panea`
+  files is now wired; richer product UI around errors remains follow-up work.
 - Phase 8 uses CPU-side timing plus WGPU submission wall-clock timing, and
   next-pass Phase 17 adds GPU timestamp status plumbing plus a developer
   in-window overlay. Real hardware timestamp validation, polished overlay UX,

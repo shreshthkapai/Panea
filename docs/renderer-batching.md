@@ -28,7 +28,7 @@ Tests: render-wgpu unit tests for batch grouping, glyph cache/atlas reuse, curso
 Does this run every frame? Yes, scene-to-batch preparation runs for frames that the scheduler requests.
 Does this run every input event? No, input only requests rendering through normal frame scheduling.
 Does this run every PTY output batch? Only after terminal state changes request a render frame.
-Does this allocate in the hot path? Batch vectors are currently rebuilt per prepared frame; reuse/pooling is a future optimization after the direct batching contract is stable.
+Does this allocate in the hot path? CPU damage batches are bounded per requested frame. GPU vertex/index buffers are persistent, grow geometrically, and are updated with `Queue::write_buffer`; they are not recreated every frame.
 Does this force full redraw? No; explicit damage regions filter generated cell, overlay, selection, and cursor batches.
 Does this require GPU uploads? Only newly cached glyphs produce RGBA atlas uploads; unchanged monochrome and color glyphs reuse atlas entries.
 Does this run script/user code? No.
@@ -59,6 +59,17 @@ emoji use the same bounded batched draw path.
 - uploads only new glyph atlas rows
 - submits indexed WGPU draws for non-empty batches
 - records batch draw counts and glyph atlas/cache stats
+- keeps a renderer-owned retained frame so damage-only draws never rely on
+  undefined swapchain content preservation
+- copies the retained frame to the acquired surface after each requested frame;
+  backends without surface `COPY_DST` support explicitly fall back to full draws
+- forces a full redraw after startup, resize, or device recovery
+
+The desktop runtime now feeds `DamageTracker` output into every scene. Damage
+includes changed and removed cells, old/new cursor positions, selections,
+semantic/search overlays, decorations, and animations. Unchanged text uses the
+glyph-run cache, so a cursor-only frame does not reshape the grid or re-upload
+resident glyphs.
 
 The CPU rasterizer remains in place for deterministic snapshot-style tests. It
 does not replace the normal WGPU batch submission path.

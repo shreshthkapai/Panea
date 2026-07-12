@@ -13,8 +13,8 @@ use std::{
 };
 
 use config_core::{
-    AppConfig, ConfigDiagnostic, ConfigDiagnosticSeverity, ConfigPlatform, ValidationReport,
-    export_schema,
+    AppConfig, CURRENT_CONFIG_SCHEMA_VERSION, ConfigDiagnostic, ConfigDiagnosticSeverity,
+    ConfigPlatform, ValidationReport, export_schema,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +185,10 @@ pub enum ConfigTomlError {
     Schema {
         message: String,
     },
+    UnsupportedSchema {
+        found: u16,
+        supported: u16,
+    },
 }
 
 impl fmt::Display for ConfigTomlError {
@@ -217,6 +221,10 @@ impl fmt::Display for ConfigTomlError {
                 )
             }
             Self::Schema { message } => write!(f, "failed to export config schema: {message}"),
+            Self::UnsupportedSchema { found, supported } => write!(
+                f,
+                "config schema version {found} is newer than supported version {supported}"
+            ),
         }
     }
 }
@@ -322,15 +330,20 @@ pub fn parse_str(
     path: Option<PathBuf>,
     platform: ConfigPlatform,
 ) -> Result<LoadedConfig, ConfigTomlError> {
-    let value = contents
+    let mut value = contents
         .parse::<toml::Value>()
+        .map_err(|error| parse_error(error, path.clone(), contents))?;
+    // Preserve source locations for type errors before the value-based migration pass.
+    let _ = toml::from_str::<AppConfig>(contents)
         .map_err(|error| parse_error(error, path.clone(), contents))?;
 
     let mut diagnostics = Vec::new();
-    diagnostics.extend(detect_unknown_settings(&value));
     diagnostics.extend(detect_deprecated_settings(&value));
+    diagnostics.extend(migrate_config_value(&mut value)?);
+    diagnostics.extend(detect_unknown_settings(&value));
 
-    let config = toml::from_str::<AppConfig>(contents)
+    let config = value
+        .try_into::<AppConfig>()
         .map_err(|error| parse_error(error, path.clone(), contents))?
         .resolved_for_platform(platform);
     let ValidationReport {
@@ -529,6 +542,74 @@ fn detect_deprecated_settings(value: &toml::Value) -> Vec<ConfigDiagnostic> {
     diagnostics
 }
 
+fn migrate_config_value(value: &mut toml::Value) -> Result<Vec<ConfigDiagnostic>, ConfigTomlError> {
+    let Some(root) = value.as_table_mut() else {
+        return Ok(Vec::new());
+    };
+    let found = root
+        .get("schema_version")
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(1);
+    let found = u16::try_from(found).unwrap_or(u16::MAX);
+    if found > CURRENT_CONFIG_SCHEMA_VERSION {
+        return Err(ConfigTomlError::UnsupportedSchema {
+            found,
+            supported: CURRENT_CONFIG_SCHEMA_VERSION,
+        });
+    }
+
+    let mut diagnostics = Vec::new();
+    if found < 2 {
+        migrate_table_key(root, "fonts", "font", &mut diagnostics);
+        migrate_table_key(root, "platform_overrides", "platform", &mut diagnostics);
+        migrate_table_key(root, "shells", "shell_profiles", &mut diagnostics);
+        if let Some(font) = root.get_mut("font").and_then(toml::Value::as_table_mut) {
+            migrate_table_key(font, "font_size", "size", &mut diagnostics);
+        }
+        if let Some(window) = root.get_mut("window").and_then(toml::Value::as_table_mut) {
+            migrate_table_key(
+                window,
+                "decorations",
+                "decoration_strategy",
+                &mut diagnostics,
+            );
+        }
+        diagnostics.push(ConfigDiagnostic {
+            severity: ConfigDiagnosticSeverity::Warning,
+            path: "schema_version".to_owned(),
+            message: format!(
+                "migrated config schema from version {found} to {} in memory; regenerate the config to persist the current schema",
+                CURRENT_CONFIG_SCHEMA_VERSION
+            ),
+        });
+    }
+    root.insert(
+        "schema_version".to_owned(),
+        toml::Value::Integer(i64::from(CURRENT_CONFIG_SCHEMA_VERSION)),
+    );
+    Ok(diagnostics)
+}
+
+fn migrate_table_key(
+    table: &mut toml::map::Map<String, toml::Value>,
+    old: &str,
+    new: &str,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    let Some(old_value) = table.remove(old) else {
+        return;
+    };
+    if table.contains_key(new) {
+        diagnostics.push(ConfigDiagnostic {
+            severity: ConfigDiagnosticSeverity::Warning,
+            path: old.to_owned(),
+            message: format!("ignored deprecated setting because {new} is also present"),
+        });
+    } else {
+        table.insert(new.to_owned(), old_value);
+    }
+}
+
 fn value_at_path<'a>(value: &'a toml::Value, path: &str) -> Option<&'a toml::Value> {
     let mut current = value;
     for part in path.split('.') {
@@ -539,6 +620,7 @@ fn value_at_path<'a>(value: &'a toml::Value, path: &str) -> Option<&'a toml::Val
 
 fn known_paths() -> BTreeSet<&'static str> {
     BTreeSet::from([
+        "schema_version",
         "window",
         "window.title",
         "window.columns",
@@ -811,6 +893,45 @@ mod tests {
     }
 
     #[test]
+    fn legacy_schema_is_migrated_before_deserialization() {
+        let loaded = parse_str(
+            r#"
+            schema_version = 1
+
+            [fonts]
+            font_size = 15.0
+
+            [platform_overrides.windows.window]
+            title = "Migrated"
+            "#,
+            None,
+            ConfigPlatform::Windows,
+        )
+        .expect("legacy config should migrate");
+
+        assert_eq!(loaded.config.schema_version, CURRENT_CONFIG_SCHEMA_VERSION);
+        assert_eq!(loaded.config.font.size, 15.0);
+        assert_eq!(loaded.config.window.title, "Migrated");
+        assert!(loaded.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == "schema_version" && diagnostic.message.contains("migrated")
+        }));
+    }
+
+    #[test]
+    fn future_schema_is_rejected_clearly() {
+        let error = parse_str("schema_version = 999\n", None, ConfigPlatform::Unknown)
+            .expect_err("future config cannot be interpreted safely");
+
+        assert!(matches!(
+            error,
+            ConfigTomlError::UnsupportedSchema {
+                found: 999,
+                supported: CURRENT_CONFIG_SCHEMA_VERSION
+            }
+        ));
+    }
+
+    #[test]
     fn parse_error_reports_line_and_column() {
         let error = parse_str(
             r#"
@@ -902,7 +1023,9 @@ mod tests {
 
         assert!(!loaded.config.clipboard.copy_on_select);
         assert_eq!(loaded.config.clipboard.osc52.max_bytes, 4096);
-        assert!(loaded.diagnostics.is_empty());
+        assert!(loaded.diagnostics.iter().all(|diagnostic| {
+            diagnostic.path == "schema_version" && diagnostic.message.contains("migrated")
+        }));
     }
 
     #[test]

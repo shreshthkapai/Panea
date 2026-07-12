@@ -3,7 +3,7 @@
 pub const LAYER: &str = "render performance";
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     error::Error,
     fmt,
     path::PathBuf,
@@ -25,7 +25,6 @@ use render_core::{
     RenderRecoveryReason, RenderRecoveryStatus, RenderRect, RenderScene, RenderSurfaceStatus,
     SelectionVisual,
 };
-use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,6 +253,14 @@ pub struct DamageTracker {
     previous_cells: HashMap<CellPosition, CellFingerprint>,
     previous_cursor: Option<CursorVisual>,
     previous_size: Option<(u16, u16)>,
+    previous_visuals: Vec<DamageRegion>,
+    previous_search_highlights: Vec<OverlayPrimitive>,
+    previous_semantic_overlays: Vec<OverlayPrimitive>,
+    previous_decorations: Vec<RenderDecoration>,
+    previous_selections: Vec<SelectionVisual>,
+    previous_animations: Vec<AnimationHandle>,
+    current_positions: HashSet<CellPosition>,
+    removed_positions: Vec<CellPosition>,
     force_full: bool,
 }
 
@@ -281,14 +288,35 @@ impl DamageTracker {
                 .map(|cell| (cell.position, CellFingerprint::from(cell)))
                 .collect();
             self.previous_cursor = scene.cursor;
+            self.previous_visuals = visual_regions(scene, metrics);
+            self.remember_visuals(scene);
             return vec![grid_region(&scene.grid, metrics)];
         }
 
+        self.current_positions.clear();
+        self.current_positions
+            .extend(scene.grid.cells.iter().map(|cell| cell.position));
+        self.removed_positions.clear();
+        self.removed_positions.extend(
+            self.previous_cells
+                .keys()
+                .filter(|position| !self.current_positions.contains(position))
+                .copied(),
+        );
+        for position in self.removed_positions.drain(..) {
+            regions.push(cell_region(position, metrics));
+            self.previous_cells.remove(&position);
+        }
+
         for cell in &scene.grid.cells {
-            let fingerprint = CellFingerprint::from(cell);
-            if self.previous_cells.get(&cell.position) != Some(&fingerprint) {
+            if !self
+                .previous_cells
+                .get(&cell.position)
+                .is_some_and(|fingerprint| fingerprint.matches(cell))
+            {
                 regions.push(cell_region(cell.position, metrics));
-                self.previous_cells.insert(cell.position, fingerprint);
+                self.previous_cells
+                    .insert(cell.position, CellFingerprint::from(cell));
             }
         }
 
@@ -302,8 +330,54 @@ impl DamageTracker {
             self.previous_cursor = scene.cursor;
         }
 
+        if self.visuals_changed(scene) {
+            regions.extend(self.previous_visuals.iter().copied());
+            self.previous_visuals = visual_regions(scene, metrics);
+            regions.extend(self.previous_visuals.iter().copied());
+            self.remember_visuals(scene);
+        }
+
         merge_regions(regions)
     }
+
+    fn visuals_changed(&self, scene: &RenderScene) -> bool {
+        self.previous_search_highlights != scene.search_highlights
+            || self.previous_semantic_overlays != scene.semantic_overlays
+            || self.previous_decorations != scene.decorations
+            || self.previous_selections != scene.selections
+            || self.previous_animations != scene.animations
+    }
+
+    fn remember_visuals(&mut self, scene: &RenderScene) {
+        self.previous_search_highlights = scene.search_highlights.clone();
+        self.previous_semantic_overlays = scene.semantic_overlays.clone();
+        self.previous_decorations = scene.decorations.clone();
+        self.previous_selections = scene.selections.clone();
+        self.previous_animations = scene.animations.clone();
+    }
+}
+
+fn visual_regions(scene: &RenderScene, metrics: CellMetrics) -> Vec<DamageRegion> {
+    let mut regions = scene
+        .search_highlights
+        .iter()
+        .chain(scene.semantic_overlays.iter())
+        .map(|overlay| overlay.bounds)
+        .chain(scene.decorations.iter().map(|decoration| decoration.bounds))
+        .chain(
+            scene
+                .animations
+                .iter()
+                .map(|animation| animation.affected_region),
+        )
+        .collect::<Vec<_>>();
+    regions.extend(scene.selections.iter().flat_map(|selection| {
+        selection
+            .cells
+            .iter()
+            .map(|position| cell_region(*position, metrics))
+    }));
+    regions
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,6 +396,15 @@ impl From<&RenderCell> for CellFingerprint {
             background: value.background,
             style: value.style,
         }
+    }
+}
+
+impl CellFingerprint {
+    fn matches(&self, cell: &RenderCell) -> bool {
+        self.text == cell.text
+            && self.foreground == cell.foreground
+            && self.background == cell.background
+            && self.style == cell.style
     }
 }
 
@@ -344,7 +427,20 @@ fn cell_region(position: CellPosition, metrics: CellMetrics) -> DamageRegion {
 }
 
 fn merge_regions(regions: Vec<DamageRegion>) -> Vec<DamageRegion> {
-    regions
+    let mut merged: Vec<DamageRegion> = Vec::with_capacity(regions.len());
+    for mut region in regions {
+        let mut index = 0;
+        while index < merged.len() {
+            if rects_intersect(region, merged[index]) {
+                region = union_region(region, merged.swap_remove(index));
+                index = 0;
+            } else {
+                index += 1;
+            }
+        }
+        merged.push(region);
+    }
+    merged
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2576,6 +2672,14 @@ impl TerminalRasterizer {
         self.batch_planner.prepare(scene, fonts)
     }
 
+    pub fn prepare_full_batches(
+        &mut self,
+        scene: &RenderScene,
+        fonts: &mut FontSystem,
+    ) -> Result<PreparedRenderBatches, RendererError> {
+        self.batch_planner.prepare_full(scene, fonts)
+    }
+
     #[must_use]
     pub fn atlas_dimensions(&self) -> (u32, u32) {
         self.batch_planner.atlas_dimensions()
@@ -2827,11 +2931,103 @@ impl GpuVertex {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct GpuBatchBuffers {
-    vertices: wgpu::Buffer,
-    indices: wgpu::Buffer,
+    vertices: Option<wgpu::Buffer>,
+    indices: Option<wgpu::Buffer>,
+    vertex_capacity: u64,
+    index_capacity: u64,
     index_count: u32,
+    staging_vertices: Vec<GpuVertex>,
+}
+
+impl GpuBatchBuffers {
+    fn upload(
+        &mut self,
+        context: &GpuUploadContext<'_>,
+        label: &'static str,
+        vertices: &[BatchVertex],
+        indices: &[u32],
+    ) {
+        if vertices.is_empty() || indices.is_empty() {
+            self.index_count = 0;
+            return;
+        }
+
+        self.staging_vertices.clear();
+        self.staging_vertices.extend(
+            vertices
+                .iter()
+                .map(|vertex| vertex_to_gpu(*vertex, context.width, context.height)),
+        );
+        let vertex_bytes = bytemuck::cast_slice(&self.staging_vertices);
+        let index_bytes = bytemuck::cast_slice(indices);
+        ensure_buffer_capacity(
+            context.device,
+            &mut self.vertices,
+            &mut self.vertex_capacity,
+            vertex_bytes.len() as u64,
+            wgpu::BufferUsages::VERTEX,
+            label,
+        );
+        ensure_buffer_capacity(
+            context.device,
+            &mut self.indices,
+            &mut self.index_capacity,
+            index_bytes.len() as u64,
+            wgpu::BufferUsages::INDEX,
+            label,
+        );
+        if let Some(buffer) = &self.vertices {
+            context.queue.write_buffer(buffer, 0, vertex_bytes);
+        }
+        if let Some(buffer) = &self.indices {
+            context.queue.write_buffer(buffer, 0, index_bytes);
+        }
+        self.index_count = indices.len() as u32;
+    }
+}
+
+struct GpuUploadContext<'a> {
+    device: &'a wgpu::Device,
+    queue: &'a wgpu::Queue,
+    width: u32,
+    height: u32,
+}
+
+fn ensure_buffer_capacity(
+    device: &wgpu::Device,
+    buffer: &mut Option<wgpu::Buffer>,
+    capacity: &mut u64,
+    required: u64,
+    usage: wgpu::BufferUsages,
+    label: &str,
+) {
+    if required == 0 || (*capacity >= required && buffer.is_some()) {
+        return;
+    }
+    let new_capacity = buffer_capacity(required);
+    *buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: new_capacity,
+        usage: usage | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    }));
+    *capacity = new_capacity;
+}
+
+fn buffer_capacity(required: u64) -> u64 {
+    required.next_power_of_two().max(256)
+}
+
+#[derive(Debug, Default)]
+struct PersistentBatchBuffers {
+    background: GpuBatchBuffers,
+    glyphs: GpuBatchBuffers,
+    overlay_glyphs: GpuBatchBuffers,
+    decorations: GpuBatchBuffers,
+    selections: GpuBatchBuffers,
+    cursor: GpuBatchBuffers,
 }
 
 fn fill_rect(frame: &mut CpuFrame, rect: RenderRect, color: RenderColor) {
@@ -3013,6 +3209,7 @@ pub struct GpuTerminalRenderer {
     recovery_status: RenderRecoveryStatus,
     recovery_attempts: u32,
     recovery_events: Vec<RenderRecoveryEvent>,
+    requires_full_redraw: bool,
 }
 
 struct GpuBackend {
@@ -3027,6 +3224,11 @@ struct GpuBackend {
     glyph_atlas_texture: Option<wgpu::Texture>,
     glyph_atlas_size: Option<(u32, u32)>,
     glyph_bind_group: Option<wgpu::BindGroup>,
+    retained_frame: Option<wgpu::Texture>,
+    retained_frame_size: Option<(u32, u32)>,
+    retained_frame_initialized: bool,
+    surface_copy_supported: bool,
+    batches: PersistentBatchBuffers,
     device_loss_signal: Arc<Mutex<Option<DeviceLossSignal>>>,
     gpu_timing: GpuTiming,
 }
@@ -3215,6 +3417,7 @@ impl GpuTerminalRenderer {
             recovery_status: RenderRecoveryStatus::Ready,
             recovery_attempts: 0,
             recovery_events: Vec::new(),
+            requires_full_redraw: true,
         })
     }
 
@@ -3222,6 +3425,7 @@ impl GpuTerminalRenderer {
         if let Some(backend) = self.backend.as_mut() {
             backend.resize(width, height);
         }
+        self.requires_full_redraw = true;
     }
 
     pub fn render_scene(
@@ -3245,7 +3449,11 @@ impl GpuTerminalRenderer {
 
         let frame_started = Instant::now();
         backend.poll_gpu_timing();
-        let mut batches = self.rasterizer.prepare_batches(scene, fonts)?;
+        let mut batches = if self.requires_full_redraw || !backend.supports_retained_damage() {
+            self.rasterizer.prepare_full_batches(scene, fonts)?
+        } else {
+            self.rasterizer.prepare_batches(scene, fonts)?
+        };
         batches.instrumentation.gpu_time = backend.gpu_timing.last_duration();
         batches.instrumentation.gpu_timing_status = backend.gpu_timing.timing_status();
         let gpu_started = Instant::now();
@@ -3256,7 +3464,11 @@ impl GpuTerminalRenderer {
         self.last_instrumentation = batches.instrumentation;
 
         match result {
-            Ok(PresentOutcome::Submitted | PresentOutcome::Timeout) => Ok(()),
+            Ok(PresentOutcome::Submitted) => {
+                self.requires_full_redraw = false;
+                Ok(())
+            }
+            Ok(PresentOutcome::Timeout) => Ok(()),
             Ok(PresentOutcome::SurfaceReconfigured(reason)) => {
                 self.record_surface_recovery(reason);
                 self.retry_present_after_surface_reconfigure(&batches)
@@ -3304,6 +3516,7 @@ impl GpuTerminalRenderer {
         match GpuBackend::new(Arc::clone(&self.window), self.options).await {
             Ok(backend) => {
                 self.backend = Some(backend);
+                self.requires_full_redraw = true;
                 self.recovery_status = RenderRecoveryStatus::Ready;
                 let event = RenderRecoveryEvent::success(reason, self.recovery_attempts);
                 self.recovery_events.push(event.clone());
@@ -3326,6 +3539,7 @@ impl GpuTerminalRenderer {
     fn invalidate_gpu_resident_resources(&mut self) {
         self.rasterizer.reset_gpu_resident_glyphs();
         self.last_instrumentation = RenderInstrumentation::default();
+        self.requires_full_redraw = true;
     }
 
     fn retry_present_after_surface_reconfigure(
@@ -3442,8 +3656,13 @@ impl GpuBackend {
                 .unwrap_or(wgpu::PresentMode::Fifo),
         };
         let alpha_mode = caps.alpha_modes[0];
+        let surface_copy_supported = caps.usages.contains(wgpu::TextureUsages::COPY_DST);
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: if surface_copy_supported {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+            },
             format,
             width: size.width,
             height: size.height,
@@ -3535,6 +3754,11 @@ impl GpuBackend {
             glyph_atlas_texture: None,
             glyph_atlas_size: None,
             glyph_bind_group: None,
+            retained_frame: None,
+            retained_frame_size: None,
+            retained_frame_initialized: false,
+            surface_copy_supported,
+            batches: PersistentBatchBuffers::default(),
             device_loss_signal,
             gpu_timing,
         })
@@ -3548,6 +3772,37 @@ impl GpuBackend {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        self.retained_frame = None;
+        self.retained_frame_size = None;
+        self.retained_frame_initialized = false;
+    }
+
+    fn supports_retained_damage(&self) -> bool {
+        self.surface_copy_supported
+    }
+
+    fn ensure_retained_frame(&mut self) {
+        if !self.surface_copy_supported
+            || self.retained_frame_size == Some((self.config.width, self.config.height))
+        {
+            return;
+        }
+        self.retained_frame = Some(self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("panea-retained-frame"),
+            size: wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        }));
+        self.retained_frame_size = Some((self.config.width, self.config.height));
+        self.retained_frame_initialized = false;
     }
 
     fn take_device_loss_signal(&self) -> Option<DeviceLossSignal> {
@@ -3654,6 +3909,7 @@ impl GpuBackend {
         &mut self,
         batches: &PreparedRenderBatches,
     ) -> Result<PresentOutcome, RendererError> {
+        self.ensure_retained_frame();
         let output = match self.surface.get_current_texture() {
             Ok(output) => output,
             Err(wgpu::SurfaceError::Lost) => {
@@ -3680,18 +3936,58 @@ impl GpuBackend {
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let background =
-            self.make_buffers(&batches.background.vertices, &batches.background.indices);
-        let decorations =
-            self.make_buffers(&batches.decorations.vertices, &batches.decorations.indices);
-        let selections =
-            self.make_buffers(&batches.selections.vertices, &batches.selections.indices);
-        let cursor = self.make_buffers(&batches.cursor.vertices, &batches.cursor.indices);
-        let glyphs = self.make_buffers(&batches.glyphs.vertices, &batches.glyphs.indices);
-        let overlay_glyphs = self.make_buffers(
+        let upload_context = GpuUploadContext {
+            device: &self.device,
+            queue: &self.queue,
+            width: self.config.width,
+            height: self.config.height,
+        };
+        self.batches.background.upload(
+            &upload_context,
+            "background",
+            &batches.background.vertices,
+            &batches.background.indices,
+        );
+        self.batches.decorations.upload(
+            &upload_context,
+            "decorations",
+            &batches.decorations.vertices,
+            &batches.decorations.indices,
+        );
+        self.batches.selections.upload(
+            &upload_context,
+            "selections",
+            &batches.selections.vertices,
+            &batches.selections.indices,
+        );
+        self.batches.cursor.upload(
+            &upload_context,
+            "cursor",
+            &batches.cursor.vertices,
+            &batches.cursor.indices,
+        );
+        self.batches.glyphs.upload(
+            &upload_context,
+            "glyphs",
+            &batches.glyphs.vertices,
+            &batches.glyphs.indices,
+        );
+        self.batches.overlay_glyphs.upload(
+            &upload_context,
+            "overlay-glyphs",
             &batches.overlay_glyphs.vertices,
             &batches.overlay_glyphs.indices,
         );
+        let retained_view = self
+            .retained_frame
+            .as_ref()
+            .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        let target_view = retained_view.as_ref().unwrap_or(&view);
+        let load = if retained_view.is_some() && self.retained_frame_initialized {
+            wgpu::LoadOp::Load
+        } else {
+            wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+        };
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3704,10 +4000,10 @@ impl GpuBackend {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("panea-batch-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: target_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -3717,24 +4013,47 @@ impl GpuBackend {
             });
 
             pass.set_pipeline(&self.quad_pipeline);
-            draw_buffers(&mut pass, background.as_ref());
-            draw_buffers(&mut pass, selections.as_ref());
+            draw_buffers(&mut pass, &self.batches.background);
+            draw_buffers(&mut pass, &self.batches.selections);
 
             if let Some(glyph_bind_group) = &self.glyph_bind_group {
                 pass.set_pipeline(&self.glyph_pipeline);
                 pass.set_bind_group(0, glyph_bind_group, &[]);
-                draw_buffers(&mut pass, glyphs.as_ref());
+                draw_buffers(&mut pass, &self.batches.glyphs);
             }
 
             pass.set_pipeline(&self.quad_pipeline);
-            draw_buffers(&mut pass, decorations.as_ref());
+            draw_buffers(&mut pass, &self.batches.decorations);
             if let Some(glyph_bind_group) = &self.glyph_bind_group {
                 pass.set_pipeline(&self.glyph_pipeline);
                 pass.set_bind_group(0, glyph_bind_group, &[]);
-                draw_buffers(&mut pass, overlay_glyphs.as_ref());
+                draw_buffers(&mut pass, &self.batches.overlay_glyphs);
             }
             pass.set_pipeline(&self.quad_pipeline);
-            draw_buffers(&mut pass, cursor.as_ref());
+            draw_buffers(&mut pass, &self.batches.cursor);
+        }
+
+        if let Some(retained_frame) = self.retained_frame.as_ref() {
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: retained_frame,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: &output.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: self.config.width,
+                    height: self.config.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.retained_frame_initialized = true;
         }
 
         if timestamp_written {
@@ -3746,37 +4065,6 @@ impl GpuBackend {
         }
         output.present();
         Ok(PresentOutcome::Submitted)
-    }
-
-    fn make_buffers(&self, vertices: &[BatchVertex], indices: &[u32]) -> Option<GpuBatchBuffers> {
-        if vertices.is_empty() || indices.is_empty() {
-            return None;
-        }
-
-        let vertices = vertices
-            .iter()
-            .map(|vertex| vertex_to_gpu(*vertex, self.config.width, self.config.height))
-            .collect::<Vec<_>>();
-        let vertex_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("panea-batch-vertices"),
-                contents: bytemuck::cast_slice(&vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        let index_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("panea-batch-indices"),
-                contents: bytemuck::cast_slice(indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-
-        Some(GpuBatchBuffers {
-            vertices: vertex_buffer,
-            indices: index_buffer,
-            index_count: indices.len() as u32,
-        })
     }
 }
 
@@ -3798,13 +4086,16 @@ fn map_device_lost_reason(reason: wgpu::DeviceLostReason) -> Option<RenderRecove
     }
 }
 
-fn draw_buffers<'a>(pass: &mut wgpu::RenderPass<'a>, buffers: Option<&'a GpuBatchBuffers>) {
-    let Some(buffers) = buffers else {
+fn draw_buffers<'a>(pass: &mut wgpu::RenderPass<'a>, buffers: &'a GpuBatchBuffers) {
+    let (Some(vertices), Some(indices)) = (&buffers.vertices, &buffers.indices) else {
         return;
     };
+    if buffers.index_count == 0 {
+        return;
+    }
 
-    pass.set_vertex_buffer(0, buffers.vertices.slice(..));
-    pass.set_index_buffer(buffers.indices.slice(..), wgpu::IndexFormat::Uint32);
+    pass.set_vertex_buffer(0, vertices.slice(..));
+    pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
     pass.draw_indexed(0..buffers.index_count, 0, 0..1);
 }
 
@@ -3908,6 +4199,13 @@ mod tests {
             descent: -3.0,
             line_gap: 1.0,
         }
+    }
+
+    #[test]
+    fn persistent_buffer_growth_is_geometric_and_never_shrinks() {
+        assert_eq!(buffer_capacity(1), 256);
+        assert_eq!(buffer_capacity(300), 512);
+        assert_eq!(buffer_capacity(4096), 4096);
     }
 
     fn cell(row: i64, col: u16, text: &str) -> RenderCell {
@@ -4014,6 +4312,33 @@ mod tests {
         assert!(damage.iter().any(|region| region.x == 8 && region.y == 0));
         assert!(damage.iter().any(|region| region.x == 0 && region.y == 0));
         assert!(damage.iter().any(|region| region.x == 8 && region.y == 16));
+    }
+
+    #[test]
+    fn damage_tracks_removed_cells_and_removed_overlays() {
+        let mut tracker = DamageTracker::new();
+        let mut first = scene(vec![cell(0, 0, "a"), cell(0, 1, "b")]);
+        first.semantic_overlays.push(OverlayPrimitive {
+            kind: OverlayKind::CommandBlock,
+            bounds: RenderRect {
+                x: 0,
+                y: 16,
+                width: 16,
+                height: 16,
+            },
+            color: RenderColor::rgb(20, 20, 20),
+            border_color: None,
+            corner_radius_px: 0,
+            z_index: 0,
+            label: None,
+        });
+        let _ = tracker.update(&first, metrics());
+
+        let second = scene(vec![cell(0, 0, "a")]);
+        let damage = tracker.update(&second, metrics());
+
+        assert!(damage.iter().any(|region| region.x == 8 && region.y == 0));
+        assert!(damage.iter().any(|region| region.y == 16));
     }
 
     #[test]

@@ -4,6 +4,13 @@ Panea has one portable internal config model: `config-core::AppConfig`.
 Frontend formats compile into that model. Runtime code should not invent
 parallel config structs unless they are backend adapters.
 
+The current schema version is `2`. Generated configs include
+`schema_version = 2`. Version-1 or unversioned files are migrated in memory
+before deserialization; deprecated `fonts`, `platform_overrides`, `shells`,
+`font.font_size`, and `window.decorations` spellings map to current fields with
+diagnostics. Configs from a newer unsupported schema fail clearly instead of
+being guessed.
+
 ## Static TOML
 
 The static frontend lives in `config-toml`.
@@ -308,8 +315,8 @@ The deprecated spelling `battery_conscious` is still accepted as an alias.
   major window settings/backend changes, shell profile startup settings, SSH
   profiles, scrollback storage policy, and platform override changes
 
-The desktop runtime watches the active TOML config path with a debounced
-portable polling watcher. Valid live-reloadable changes are applied without
+The desktop runtime watches the active TOML or programmable config path with a
+debounced portable polling watcher. Valid live-reloadable changes are applied without
 restarting the shell session. Invalid config or runtime apply failures keep the
 previous valid config active and report diagnostics.
 

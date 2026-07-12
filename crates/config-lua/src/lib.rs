@@ -7,9 +7,12 @@
 pub const LAYER: &str = "config portability";
 
 use std::{
+    collections::hash_map::DefaultHasher,
     error::Error,
     fmt, fs,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    time::{Duration, Instant, SystemTime},
 };
 
 use config_core::{
@@ -52,6 +55,116 @@ pub enum ProgrammableConfigSource {
     File(PathBuf),
     ExplicitFile(PathBuf),
     Inline,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProgrammableConfigWatcher {
+    path: PathBuf,
+    platform: ConfigPlatform,
+    poll_interval: Duration,
+    debounce: Duration,
+    last_poll: Option<Instant>,
+    last_seen: Option<ProgrammableFingerprint>,
+    pending: Option<(Option<ProgrammableFingerprint>, Instant)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProgrammableConfigWatchEvent {
+    Unchanged,
+    Pending {
+        path: PathBuf,
+    },
+    Reloaded(Box<LoadedProgrammableConfig>),
+    Failed {
+        path: PathBuf,
+        error: ProgrammableConfigError,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProgrammableFingerprint {
+    modified: Option<SystemTime>,
+    len: u64,
+    content_hash: u64,
+}
+
+impl ProgrammableConfigWatcher {
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>, platform: ConfigPlatform) -> Self {
+        let path = path.into();
+        Self {
+            last_seen: programmable_fingerprint(&path).ok(),
+            path,
+            platform,
+            poll_interval: Duration::from_millis(500),
+            debounce: Duration::from_millis(150),
+            last_poll: None,
+            pending: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_poll_interval(mut self, interval: Duration) -> Self {
+        self.poll_interval = interval;
+        self
+    }
+
+    #[must_use]
+    pub fn with_debounce(mut self, debounce: Duration) -> Self {
+        self.debounce = debounce;
+        self
+    }
+
+    pub fn poll(&mut self) -> ProgrammableConfigWatchEvent {
+        let now = Instant::now();
+        if self
+            .last_poll
+            .is_some_and(|last| now.duration_since(last) < self.poll_interval)
+        {
+            return ProgrammableConfigWatchEvent::Unchanged;
+        }
+        self.last_poll = Some(now);
+        let fingerprint = programmable_fingerprint(&self.path).ok();
+        if fingerprint == self.last_seen {
+            self.pending = None;
+            return ProgrammableConfigWatchEvent::Unchanged;
+        }
+        if let Some((pending, first_seen)) = &self.pending
+            && *pending == fingerprint
+        {
+            if now.duration_since(*first_seen) < self.debounce {
+                return ProgrammableConfigWatchEvent::Pending {
+                    path: self.path.clone(),
+                };
+            }
+        } else {
+            self.pending = Some((fingerprint.clone(), now));
+            return ProgrammableConfigWatchEvent::Pending {
+                path: self.path.clone(),
+            };
+        }
+        self.pending = None;
+        self.last_seen = fingerprint;
+        match load_path(self.path.clone(), true, self.platform) {
+            Ok(loaded) => ProgrammableConfigWatchEvent::Reloaded(Box::new(loaded)),
+            Err(error) => ProgrammableConfigWatchEvent::Failed {
+                path: self.path.clone(),
+                error,
+            },
+        }
+    }
+}
+
+fn programmable_fingerprint(path: &Path) -> Result<ProgrammableFingerprint, std::io::Error> {
+    let metadata = fs::metadata(path)?;
+    let contents = fs::read(path)?;
+    let mut hasher = DefaultHasher::new();
+    contents.hash(&mut hasher);
+    Ok(ProgrammableFingerprint {
+        modified: metadata.modified().ok(),
+        len: metadata.len(),
+        content_hash: hasher.finish(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1238,6 +1351,17 @@ fn normalized(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn temp_program(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "panea-{name}-{}-{}.panea",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
+
     #[test]
     fn programmable_config_compiles_into_app_config() {
         let loaded = parse_str(
@@ -1426,5 +1550,35 @@ mod tests {
             "windows platform override should resolve"
         );
         assert!(loaded.config.command_blocks.enabled);
+    }
+
+    #[test]
+    fn programmable_watcher_reloads_and_reports_invalid_edits() {
+        let path = temp_program("programmable-watcher");
+        fs::write(&path, r#"panea.set("window.title", "A")"#).expect("write initial");
+        let mut watcher = ProgrammableConfigWatcher::new(&path, ConfigPlatform::Unknown)
+            .with_poll_interval(Duration::ZERO)
+            .with_debounce(Duration::ZERO);
+
+        fs::write(&path, r#"panea.set("window.title", "B")"#).expect("write update");
+        assert!(matches!(
+            watcher.poll(),
+            ProgrammableConfigWatchEvent::Pending { .. }
+        ));
+        let ProgrammableConfigWatchEvent::Reloaded(loaded) = watcher.poll() else {
+            panic!("expected compiled programmable reload");
+        };
+        assert_eq!(loaded.config.window.title, "B");
+
+        fs::write(&path, "panea.os.exec(\"bad\")").expect("write invalid update");
+        assert!(matches!(
+            watcher.poll(),
+            ProgrammableConfigWatchEvent::Pending { .. }
+        ));
+        assert!(matches!(
+            watcher.poll(),
+            ProgrammableConfigWatchEvent::Failed { .. }
+        ));
+        let _ = fs::remove_file(path);
     }
 }

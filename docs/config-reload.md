@@ -2,7 +2,7 @@
 
 Feature name: runtime config watching and live reload
 Layer: config portability, diagnostics, platform parity
-User-facing behavior: Panea watches the active TOML config path, debounces file changes, reloads valid edits, applies safe settings live, and keeps the previous active config when parsing, validation, or runtime apply fails.
+User-facing behavior: Panea watches the active TOML or programmable config path, debounces file changes, reloads valid edits, applies safe settings live, and keeps the previous active config when parsing, validation, or runtime apply fails.
 Config keys: no new keys in this slice; existing `diagnostics.log_level` controls debug reload-pending logs and existing reloadable sections retain their normal keys.
 macOS behavior: same polling watcher and reload policy; real filesystem/runtime validation remains unverified.
 Windows behavior: same polling watcher and reload policy; unit and desktop binary tests pass on the current Windows host.
@@ -16,7 +16,10 @@ Tests: config watcher unit tests cover valid reload, invalid reload failure, and
 
 ## Contract
 
-The watcher lives in `config-toml`, not `config-core`. `config-core` remains the portable internal model and reload-impact classifier.
+Frontend-specific watchers live in `config-toml` and `config-lua`, not
+`config-core`. `config-core` remains the portable internal model and
+reload-impact classifier. The desktop app normalizes both watcher event types
+at its config-provider boundary.
 
 The current implementation uses a conservative polling watcher based on file metadata plus content hash. This avoids OS-specific watcher behavior during the foundation phase and works for:
 
@@ -26,10 +29,10 @@ The current implementation uses a conservative polling watcher based on file met
 - deletion fallback to defaults for non-explicit discovered configs
 - explicit-path deletion as a reload failure
 
-Programmable `config.panea` files compile into the same `AppConfig` and can use
-the same reload-impact classifier in tests or explicit reload planning.
-Automatic runtime watching for programmable config is deferred until it can
-preserve the same previous-valid-config behavior on every supported desktop OS.
+Programmable `config.panea` files compile into the same `AppConfig`, use the
+same reload-impact classifier, and are watched automatically when active. A bad
+edit is reported once per changed fingerprint and the previous compiled config
+remains active.
 
 ## Live-Applied Sections
 
@@ -61,8 +64,6 @@ These are diagnosed but not silently applied to the running app in this phase:
 ## Deferred
 
 - Native OS filesystem watcher backends may be added later if polling is not good enough, but they must preserve the same config contract.
-- Automatic runtime watching for programmable `config.panea` files is not wired
-  into the desktop app yet.
 - macOS, Linux X11, and Linux Wayland runtime validation has not been run.
 - User-facing error UI is still stderr/diagnostic text in the desktop runtime.
 - Existing sessions do not receive shell-profile or scrollback policy mutations live.

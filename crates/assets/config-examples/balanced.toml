@@ -1,3 +1,5 @@
+schema_version = 2
+
 [visual_theme]
 name = "balanced"
 grouping_style = "subtle_separators"

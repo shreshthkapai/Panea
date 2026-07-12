@@ -28,7 +28,7 @@ Tests: render-core recovery contract tests; render-wgpu atlas invalidation/re-up
 Does this run every frame? Only a cheap ready-state check and normal render error match run during rendered frames.
 Does this run every input event? No.
 Does this run every PTY output batch? No.
-Does this allocate in the hot path? No new steady-state allocations beyond existing batch preparation.
+Does this allocate in the hot path? Recovery allocates replacement resources only after loss. Steady-state GPU batch buffers and the retained frame are reused.
 Does this force full redraw? Recovery requests a redraw after backend recreation; normal surface reconfigure does not rewrite terminal state.
 Does this require GPU uploads? Only after recovery, when the glyph atlas texture is rebuilt and cached glyphs are uploaded again as needed.
 Does this run script/user code? No.
@@ -51,6 +51,8 @@ WGPU resources:
 - WGPU device-lost callbacks and out-of-memory surface failures drop the
   backend and move the renderer to a lost or failed recovery status
 - recovery recreates the surface, device, queue, pipelines, and glyph atlas
+- recovery also recreates persistent batch buffers and the retained damage
+  target, then requires one full redraw from preserved application state
   texture
 - CPU glyph cache entries are preserved, but GPU atlas residency is reset so
   glyph uploads happen again after recovery
