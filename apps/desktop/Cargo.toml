@@ -31,6 +31,7 @@ term-parser = { path = "../../crates/term-parser" }
 transport-core = { path = "../../crates/transport-core" }
 transport-pty = { path = "../../crates/transport-pty" }
 transport-ssh = { path = "../../crates/transport-ssh" }
+unicode-segmentation.workspace = true
 winit.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]

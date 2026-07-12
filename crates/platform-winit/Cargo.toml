@@ -11,4 +11,5 @@ workspace = true
 [dependencies]
 arboard.workspace = true
 platform-core = { path = "../platform-core" }
+webbrowser.workspace = true
 winit.workspace = true

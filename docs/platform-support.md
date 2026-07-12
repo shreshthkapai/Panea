@@ -27,7 +27,7 @@ considered verified until that matrix has real X11 and Wayland host evidence.
 | window modes | partial | partial | partial | partial | Windowed, maximized, borderless fullscreen, and frameless states are modeled; real compositor validation remains open. |
 | frameless modes | partial | partial | fallback | fallback | Implemented through winit decorations with Linux decoration negotiation still requiring compositor tests. |
 | fullscreen modes | partial | partial | partial | fallback | Exclusive fullscreen currently falls back to borderless fullscreen. |
-| clipboard | partial | partial | partial | partial | System clipboard bridge, pane-aware mouse selection, keyboard copy/paste, paste protection, and OSC 52 policy exist; primary selection and cross-OS smoke remain later compatibility work. |
+| clipboard | partial | partial | partial | partial | System clipboard bridge, pane-aware mouse/keyboard selection, portable Ctrl/Super copy/paste, Linux Primary selection provider, paste protection, and OSC 52 policy exist; real cross-OS and Linux compositor smoke remain. |
 | IME | partial | partial | partial | partial | Platform-neutral IME events are represented; real composed-input validation is still required. |
 | DPI/fractional scaling | partial | partial | partial | partial | Monitor scale snapshots exist; fractional behavior needs real host verification. |
 | font fallback | partial | partial | partial | partial | Fallback chains are configurable; per-OS font availability validation is not automated yet. |

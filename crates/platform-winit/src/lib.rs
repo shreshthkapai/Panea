@@ -10,7 +10,8 @@ use platform_core::{
     CompositorInfo, DecorationMode, DesktopPlatform, DpiBehavior, DpiInfo, ImeEvent, ImeSupport,
     InputEvent, KeyEvent, KeyModifiers, KeyState, LinuxWindowBackend, LinuxWindowBackendDiagnostic,
     MonitorInfo, MouseButton, MouseEvent, MouseEventKind, PlatformCapabilities, PlatformFallback,
-    ShellEnvironmentInfo, WindowAction, WindowMode, WindowModeDiagnostic,
+    ShellEnvironmentInfo, UrlOpenDiagnostic, UrlOpener, WindowAction, WindowMode,
+    WindowModeDiagnostic,
 };
 use winit::{
     dpi::LogicalSize,
@@ -273,6 +274,90 @@ impl ClipboardBridge {
         })
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn copy_primary_text(&mut self, text: &str) -> Result<(), ClipboardDiagnostic> {
+        use arboard::{LinuxClipboardKind, SetExtLinux};
+
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            return Err(clipboard_diagnostic(
+                ClipboardOperation::Copy,
+                ClipboardAvailability::Unavailable,
+                Some("clipboard backend is unavailable".to_owned()),
+            ));
+        };
+        let result = clipboard
+            .set()
+            .clipboard(LinuxClipboardKind::Primary)
+            .text(text.to_owned())
+            .map_err(|error| {
+                clipboard_diagnostic(
+                    ClipboardOperation::Copy,
+                    ClipboardAvailability::Unavailable,
+                    Some(format!("Linux primary selection unavailable: {error}")),
+                )
+            });
+        self.last_diagnostic = match &result {
+            Ok(()) => clipboard_diagnostic(
+                ClipboardOperation::Copy,
+                ClipboardAvailability::Available,
+                None,
+            ),
+            Err(diagnostic) => diagnostic.clone(),
+        };
+        result
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn copy_primary_text(&mut self, _text: &str) -> Result<(), ClipboardDiagnostic> {
+        Err(clipboard_diagnostic(
+            ClipboardOperation::Copy,
+            ClipboardAvailability::Unavailable,
+            Some("primary selection is available only on Linux".to_owned()),
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn paste_primary_text(&mut self) -> Result<String, ClipboardDiagnostic> {
+        use arboard::{GetExtLinux, LinuxClipboardKind};
+
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            return Err(clipboard_diagnostic(
+                ClipboardOperation::Paste,
+                ClipboardAvailability::Unavailable,
+                Some("clipboard backend is unavailable".to_owned()),
+            ));
+        };
+        let result = clipboard
+            .get()
+            .clipboard(LinuxClipboardKind::Primary)
+            .text()
+            .map_err(|error| {
+                clipboard_diagnostic(
+                    ClipboardOperation::Paste,
+                    ClipboardAvailability::Unavailable,
+                    Some(format!("Linux primary selection unavailable: {error}")),
+                )
+            });
+        self.last_diagnostic = match &result {
+            Ok(_) => clipboard_diagnostic(
+                ClipboardOperation::Paste,
+                ClipboardAvailability::Available,
+                None,
+            ),
+            Err(diagnostic) => diagnostic.clone(),
+        };
+        result
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn paste_primary_text(&mut self) -> Result<String, ClipboardDiagnostic> {
+        Err(clipboard_diagnostic(
+            ClipboardOperation::Paste,
+            ClipboardAvailability::Unavailable,
+            Some("primary selection is available only on Linux".to_owned()),
+        ))
+    }
+
     #[must_use]
     pub fn last_diagnostic(&self) -> &ClipboardDiagnostic {
         &self.last_diagnostic
@@ -281,15 +366,48 @@ impl ClipboardBridge {
 
 impl ClipboardProvider for ClipboardBridge {
     fn copy_text(&mut self, text: &str) -> Result<(), ClipboardDiagnostic> {
-        ClipboardBridge::copy_text(self, text)
+        Self::copy_text(self, text)
     }
 
     fn paste_text(&mut self) -> Result<String, ClipboardDiagnostic> {
-        ClipboardBridge::paste_text(self)
+        Self::paste_text(self)
     }
 
     fn last_diagnostic(&self) -> ClipboardDiagnostic {
-        self.last_diagnostic.clone()
+        Self::last_diagnostic(self).clone()
+    }
+
+    fn copy_primary_text(&mut self, text: &str) -> Result<(), ClipboardDiagnostic> {
+        Self::copy_primary_text(self, text)
+    }
+
+    fn paste_primary_text(&mut self) -> Result<String, ClipboardDiagnostic> {
+        Self::paste_primary_text(self)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct DesktopUrlOpener;
+
+impl DesktopUrlOpener {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl UrlOpener for DesktopUrlOpener {
+    fn open_url(&mut self, url: &str) -> Result<(), UrlOpenDiagnostic> {
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return Err(UrlOpenDiagnostic {
+                url: url.to_owned(),
+                message: Some("only http:// and https:// URL actions are allowed".to_owned()),
+            });
+        }
+        webbrowser::open(url).map_err(|error| UrlOpenDiagnostic {
+            url: url.to_owned(),
+            message: Some(error.to_string()),
+        })
     }
 }
 
@@ -367,7 +485,7 @@ pub fn platform_capabilities(
             DecorationMode::None,
             DecorationMode::FallbackDecorated,
         ],
-        clipboard_capabilities: vec![platform_core::ClipboardCapability::System],
+        clipboard_capabilities: clipboard_capabilities(),
         gpu_backends_available: Vec::new(),
         ime_supported: ImeSupport::Basic,
         dpi_behavior: dpi_behavior_for_platform(),
@@ -376,6 +494,14 @@ pub fn platform_capabilities(
         shell_environment_info: shell_environment_info(),
         fallbacks: Vec::new(),
     }
+}
+
+fn clipboard_capabilities() -> Vec<platform_core::ClipboardCapability> {
+    let mut capabilities = vec![platform_core::ClipboardCapability::System];
+    if cfg!(target_os = "linux") {
+        capabilities.push(platform_core::ClipboardCapability::PrimarySelection);
+    }
+    capabilities
 }
 
 fn key_event_from_winit(event: &winit::event::KeyEvent, modifiers: KeyModifiers) -> KeyEvent {
@@ -616,5 +742,23 @@ mod tests {
 
         assert_eq!(diagnostic.operation, ClipboardOperation::Paste);
         assert_eq!(diagnostic.availability, ClipboardAvailability::Unavailable);
+    }
+
+    #[test]
+    fn url_opener_rejects_non_web_schemes_before_platform_launch() {
+        let mut opener = DesktopUrlOpener::new();
+        let diagnostic = opener
+            .open_url("file:///tmp/not-allowed")
+            .expect_err("file URL must be rejected");
+        assert!(diagnostic.message.unwrap().contains("http"));
+    }
+
+    #[test]
+    fn primary_selection_capability_is_linux_only() {
+        assert_eq!(
+            clipboard_capabilities()
+                .contains(&platform_core::ClipboardCapability::PrimarySelection),
+            cfg!(target_os = "linux")
+        );
     }
 }

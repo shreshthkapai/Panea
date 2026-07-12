@@ -24,11 +24,11 @@ use mux::{
 };
 use platform_core::{
     DecorationMode, InputEvent, KeyEvent, KeyModifiers, KeyState, LinuxWindowBackend, MouseButton,
-    MouseEvent, MouseEventKind, WindowAction, WindowMode,
+    MouseEvent, MouseEventKind, UrlOpener, WindowAction, WindowMode,
 };
 use platform_winit::{
-    ClipboardBridge, DesktopWindow, InputTranslator, WindowSettings, apply_window_mode,
-    platform_capabilities,
+    ClipboardBridge, DesktopUrlOpener, DesktopWindow, InputTranslator, WindowSettings,
+    apply_window_mode, platform_capabilities,
 };
 use render_core::{
     CellPosition, CursorVisual, OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle,
@@ -64,6 +64,7 @@ use term_parser::TerminalEmulator;
 use transport_core::{TerminalSize as TransportSize, TerminalTransport, TransportState};
 use transport_pty::{LocalPtyTransport, LocalShellKind, LocalShellProfile};
 use transport_ssh::SshConnectionProfile;
+use unicode_segmentation::UnicodeSegmentation;
 use winit::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
@@ -662,6 +663,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         DesktopDiagnosticsPlaceholder::new(desktop_window.diagnostics().clone(), capabilities);
     let mut input_translator = InputTranslator::new();
     let mut clipboard = ClipboardBridge::new();
+    let mut url_opener = DesktopUrlOpener::new();
     let mut current_window_mode = map_window_mode(config.window.mode);
     let mut clipboard_config = config.clipboard.clone();
     let mut paste_config = config.paste.clone();
@@ -788,6 +790,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                                     continue;
                                 }
 
+                                if let Some(changed) = mux_runtime.handle_modal_key(&key) {
+                                    if changed {
+                                        scheduler.terminal_content_changed();
+                                        window.request_redraw();
+                                    }
+                                    continue;
+                                }
+
                                 if let Some(action) = keybinding_action(&key, &config) {
                                     match action.as_str() {
                                         "copy" => {
@@ -838,6 +848,25 @@ fn run() -> Result<(), Box<dyn Error>> {
                                                 scheduler.terminal_content_changed();
                                                 window.request_redraw();
                                             }
+                                        }
+                                        "search_scrollback" => {
+                                            mux_runtime.start_search();
+                                            scheduler.terminal_content_changed();
+                                            window.request_redraw();
+                                        }
+                                        "keyboard_select" => {
+                                            mux_runtime.start_keyboard_selection(
+                                                SelectionKind::Normal,
+                                            );
+                                            scheduler.terminal_content_changed();
+                                            window.request_redraw();
+                                        }
+                                        "keyboard_select_rectangular" => {
+                                            mux_runtime.start_keyboard_selection(
+                                                SelectionKind::Rectangular,
+                                            );
+                                            scheduler.terminal_content_changed();
+                                            window.request_redraw();
                                         }
                                         "toggle_fullscreen" => {
                                             current_window_mode = if matches!(
@@ -897,23 +926,34 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                             InputEvent::Mouse(mouse) => {
-                                if let Ok(metrics) = fonts.cell_metrics()
-                                    && mux_runtime.handle_mouse(
+                                if let Ok(metrics) = fonts.cell_metrics() {
+                                    let outcome = mux_runtime.handle_mouse(
                                         mouse,
                                         metrics,
                                         &config,
                                         &clipboard_config,
                                         &paste_config,
                                         &mut clipboard,
-                                    )
-                                {
-                                    scheduler.terminal_content_changed();
-                                    window.request_redraw();
+                                    );
+                                    if let Some(url) = outcome.open_url
+                                        && let Err(diagnostic) = url_opener.open_url(&url)
+                                    {
+                                        eprintln!("URL action failed: {diagnostic:?}");
+                                    }
+                                    if outcome.changed {
+                                        scheduler.terminal_content_changed();
+                                        window.request_redraw();
+                                    }
                                 }
                             }
                             InputEvent::Ime(platform_core::ImeEvent::Commit { text }) => {
-                                cursor_animator.record_typing();
-                                mux_runtime.write_active(text.as_bytes());
+                                if mux_runtime.append_search_text(&text) {
+                                    scheduler.terminal_content_changed();
+                                    window.request_redraw();
+                                } else {
+                                    cursor_animator.record_typing();
+                                    mux_runtime.write_active(text.as_bytes());
+                                }
                             }
                             InputEvent::Focused(focused) => {
                                 mux_runtime.send_focus_event(focused);
@@ -1711,10 +1751,34 @@ fn should_middle_click_paste(
         && matches!(mouse.kind, MouseEventKind::Pressed(MouseButton::Middle))
 }
 
+fn paste_for_middle_click(
+    clipboard: &mut ClipboardBridge,
+    config: &ClipboardConfig,
+) -> Result<String, platform_core::ClipboardDiagnostic> {
+    if cfg!(target_os = "linux") && config.prefer_primary_selection_on_linux {
+        match clipboard.paste_primary_text() {
+            Ok(text) => return Ok(text),
+            Err(diagnostic) => {
+                eprintln!(
+                    "Linux primary selection paste unavailable; falling back to system clipboard: {diagnostic:?}"
+                );
+            }
+        }
+    }
+    clipboard.paste_text()
+}
+
 fn mouse_reporting_enabled(modes: &BTreeSet<TerminalMode>) -> bool {
     modes.contains(&TerminalMode::MouseReporting)
         || modes.contains(&TerminalMode::MouseCellMotion)
         || modes.contains(&TerminalMode::MouseAllMotion)
+}
+
+fn focus_report_bytes(focused: bool, modes: &BTreeSet<TerminalMode>) -> Option<&'static [u8]> {
+    if !modes.contains(&TerminalMode::FocusEvents) {
+        return None;
+    }
+    Some(if focused { b"\x1b[I" } else { b"\x1b[O" })
 }
 
 fn copy_text_with_diagnostics(
@@ -2143,6 +2207,27 @@ impl MuxRuntime {
         encode_terminal_key(&key, terminal_modifiers(event.modifiers), &modes)
     }
 
+    fn start_search(&mut self) {
+        if let Some(pane) = self.active_pane_mut() {
+            pane.search.start();
+        }
+    }
+
+    fn append_search_text(&mut self, text: &str) -> bool {
+        self.active_pane_mut()
+            .is_some_and(|pane| pane.append_search_text(text))
+    }
+
+    fn start_keyboard_selection(&mut self, kind: SelectionKind) {
+        if let Some(pane) = self.active_pane_mut() {
+            pane.start_keyboard_selection(kind);
+        }
+    }
+
+    fn handle_modal_key(&mut self, event: &KeyEvent) -> Option<bool> {
+        self.active_pane_mut()?.handle_modal_key(event)
+    }
+
     fn scroll_active_page(&mut self, toward_older: bool) -> bool {
         let Some(pane) = self.active_pane_mut() else {
             return false;
@@ -2187,9 +2272,8 @@ impl MuxRuntime {
 
     fn send_focus_event(&mut self, focused: bool) {
         if let Some(pane) = self.active_pane_mut()
-            && pane.terminal.modes().contains(&TerminalMode::FocusEvents)
+            && let Some(bytes) = focus_report_bytes(focused, &pane.terminal.modes())
         {
-            let bytes = if focused { b"\x1b[I" } else { b"\x1b[O" };
             pane.write_input(bytes);
         }
     }
@@ -2202,16 +2286,34 @@ impl MuxRuntime {
         clipboard_config: &ClipboardConfig,
         paste_config: &PasteConfig,
         clipboard: &mut ClipboardBridge,
-    ) -> bool {
+    ) -> MouseHandling {
         let Some((pane_id, local_mouse)) = self.local_mouse_event(mouse, metrics, config) else {
-            return false;
+            return MouseHandling::default();
         };
         if matches!(mouse.kind, MouseEventKind::Pressed(_)) {
             let _ = self.model.focus_pane(pane_id);
         }
         let Some(pane) = self.panes.get_mut(&pane_id) else {
-            return false;
+            return MouseHandling::default();
         };
+        if local_mouse.modifiers.ctrl
+            && matches!(local_mouse.kind, MouseEventKind::Pressed(MouseButton::Left))
+            && pane.url_at_mouse(local_mouse, metrics).is_some()
+        {
+            return MouseHandling::default();
+        }
+        if local_mouse.modifiers.ctrl
+            && matches!(
+                local_mouse.kind,
+                MouseEventKind::Released(MouseButton::Left)
+            )
+            && let Some(url) = pane.url_at_mouse(local_mouse, metrics)
+        {
+            return MouseHandling {
+                changed: false,
+                open_url: Some(url),
+            };
+        }
         let modes = pane.terminal.modes();
         if !local_mouse.modifiers.shift
             && let Some(bytes) = pane
@@ -2219,13 +2321,13 @@ impl MuxRuntime {
                 .report_bytes(local_mouse, metrics, &modes)
         {
             pane.write_input(&bytes);
-            return false;
+            return MouseHandling::default();
         } else if should_middle_click_paste(&local_mouse, &modes, clipboard_config)
-            && let Ok(text) = clipboard.paste_text()
+            && let Ok(text) = paste_for_middle_click(clipboard, clipboard_config)
         {
             let bytes = paste_bytes(&text, clipboard_config, paste_config, false);
             pane.write_input(&bytes);
-            return false;
+            return MouseHandling::default();
         }
 
         let selection_completed = matches!(
@@ -2235,13 +2337,22 @@ impl MuxRuntime {
         let changed = pane.handle_selection_or_scrollback(local_mouse, metrics);
         if changed
             && selection_completed
-            && clipboard_config.enabled
-            && clipboard_config.copy_on_select
             && let Some(text) = pane.terminal.state().selected_text()
         {
-            copy_text_with_diagnostics(clipboard, &text, clipboard_config, "copy-on-select");
+            if cfg!(target_os = "linux")
+                && clipboard_config.prefer_primary_selection_on_linux
+                && let Err(diagnostic) = clipboard.copy_primary_text(&text)
+            {
+                eprintln!("Linux primary selection copy failed: {diagnostic:?}");
+            }
+            if clipboard_config.enabled && clipboard_config.copy_on_select {
+                copy_text_with_diagnostics(clipboard, &text, clipboard_config, "copy-on-select");
+            }
         }
-        changed
+        MouseHandling {
+            changed,
+            open_url: None,
+        }
     }
 
     fn local_mouse_event(
@@ -2347,6 +2458,48 @@ struct PaneRuntime {
     mouse_protocol: MouseProtocolState,
     selection_anchor: Option<GridPosition>,
     selection_kind: SelectionKind,
+    keyboard_selection: Option<KeyboardSelection>,
+    search: PaneSearch,
+}
+
+#[derive(Debug, Default)]
+struct MouseHandling {
+    changed: bool,
+    open_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct KeyboardSelection {
+    anchor: GridPosition,
+    focus: GridPosition,
+    kind: SelectionKind,
+}
+
+#[derive(Debug, Default)]
+struct PaneSearch {
+    input_active: bool,
+    query: String,
+    matches: Vec<Selection>,
+    active_match: usize,
+}
+
+fn refresh_search_state(search: &mut PaneSearch, terminal: &mut TerminalEmulator) {
+    search.matches = terminal.state().search(&search.query, false);
+    search.active_match = search
+        .active_match
+        .min(search.matches.len().saturating_sub(1));
+    if let Some(selection) = search.matches.get(search.active_match) {
+        terminal.state_mut().reveal_position(selection.start);
+    }
+}
+
+impl PaneSearch {
+    fn start(&mut self) {
+        self.input_active = true;
+        self.query.clear();
+        self.matches.clear();
+        self.active_match = 0;
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2448,7 +2601,162 @@ impl PaneRuntime {
             mouse_protocol: MouseProtocolState::default(),
             selection_anchor: None,
             selection_kind: SelectionKind::Normal,
+            keyboard_selection: None,
+            search: PaneSearch::default(),
         }
+    }
+
+    fn start_keyboard_selection(&mut self, kind: SelectionKind) {
+        let position = self.terminal.state().cursor_buffer_position();
+        self.keyboard_selection = Some(KeyboardSelection {
+            anchor: position,
+            focus: position,
+            kind,
+        });
+        self.terminal.state_mut().set_selection(Selection {
+            start: position,
+            end: position,
+            kind,
+        });
+    }
+
+    fn handle_modal_key(&mut self, event: &KeyEvent) -> Option<bool> {
+        if self.search.input_active {
+            return Some(self.handle_search_key(event));
+        }
+        if self.keyboard_selection.is_some() {
+            return Some(self.handle_keyboard_selection_key(event));
+        }
+        None
+    }
+
+    fn append_search_text(&mut self, text: &str) -> bool {
+        if !self.search.input_active || text.is_empty() {
+            return false;
+        }
+        self.search.query.push_str(text);
+        self.refresh_search();
+        true
+    }
+
+    fn handle_search_key(&mut self, event: &KeyEvent) -> bool {
+        match event.logical_key.as_str() {
+            "Escape" => {
+                self.search.input_active = false;
+                self.search.matches.clear();
+                true
+            }
+            "Backspace" => {
+                if let Some((index, _)) = self.search.query.grapheme_indices(true).next_back() {
+                    self.search.query.truncate(index);
+                    self.refresh_search();
+                }
+                true
+            }
+            "Enter" | "ArrowDown" => {
+                self.advance_search(!event.modifiers.shift);
+                true
+            }
+            "ArrowUp" => {
+                self.advance_search(false);
+                true
+            }
+            _ if !event.modifiers.ctrl
+                && !event.modifiers.super_key
+                && (!event.modifiers.alt || event.modifiers.alt_graph) =>
+            {
+                if let Some(text) = event.text.as_deref().filter(|text| !text.is_empty()) {
+                    self.search.query.push_str(text);
+                    self.refresh_search();
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
+    fn refresh_search(&mut self) {
+        refresh_search_state(&mut self.search, &mut self.terminal);
+    }
+
+    fn advance_search(&mut self, forward: bool) {
+        if self.search.matches.is_empty() {
+            return;
+        }
+        if forward {
+            self.search.active_match = (self.search.active_match + 1) % self.search.matches.len();
+        } else {
+            self.search.active_match = self
+                .search
+                .active_match
+                .checked_sub(1)
+                .unwrap_or(self.search.matches.len() - 1);
+        }
+        self.reveal_active_search_match();
+    }
+
+    fn reveal_active_search_match(&mut self) {
+        if let Some(selection) = self.search.matches.get(self.search.active_match) {
+            self.terminal.state_mut().reveal_position(selection.start);
+        }
+    }
+
+    fn handle_keyboard_selection_key(&mut self, event: &KeyEvent) -> bool {
+        if event.logical_key == "Escape" {
+            self.keyboard_selection = None;
+            self.terminal.state_mut().clear_selection();
+            return true;
+        }
+        if event.logical_key == "Enter" {
+            self.keyboard_selection = None;
+            return true;
+        }
+
+        let Some(mut selection) = self.keyboard_selection else {
+            return false;
+        };
+        let max_row = self.terminal.state().buffer_line_count().saturating_sub(1) as i64;
+        let max_col = self
+            .terminal
+            .visible_grid()
+            .viewport
+            .size
+            .cols
+            .saturating_sub(1);
+        let page = i64::from(self.terminal.visible_grid().viewport.size.rows).max(1);
+        match event.logical_key.as_str() {
+            "ArrowLeft" => selection.focus.col = selection.focus.col.saturating_sub(1),
+            "ArrowRight" => {
+                selection.focus.col = selection.focus.col.saturating_add(1).min(max_col)
+            }
+            "ArrowUp" => selection.focus.row = selection.focus.row.saturating_sub(1),
+            "ArrowDown" => selection.focus.row = (selection.focus.row + 1).min(max_row),
+            "Home" => selection.focus.col = 0,
+            "End" => selection.focus.col = max_col,
+            "PageUp" => selection.focus.row = selection.focus.row.saturating_sub(page),
+            "PageDown" => selection.focus.row = (selection.focus.row + page).min(max_row),
+            _ => return true,
+        }
+        self.keyboard_selection = Some(selection);
+        self.terminal.state_mut().set_selection(Selection {
+            start: selection.anchor,
+            end: selection.focus,
+            kind: selection.kind,
+        });
+        self.terminal.state_mut().reveal_position(selection.focus);
+        true
+    }
+
+    fn url_at_mouse(&self, mouse: MouseEvent, metrics: CellMetrics) -> Option<String> {
+        let viewport = self.terminal.visible_grid().viewport;
+        let row = ((mouse.y / f64::from(metrics.cell_height)).floor() as u16)
+            .min(viewport.size.rows.saturating_sub(1));
+        let col = ((mouse.x / f64::from(metrics.cell_width)).floor() as u16)
+            .min(viewport.size.cols.saturating_sub(1));
+        visible_url_hints(&self.terminal, row)
+            .into_iter()
+            .find(|hint| col >= hint.start.col && col < hint.end.col)
+            .map(|hint| hint.text)
     }
 
     fn handle_selection_or_scrollback(&mut self, mouse: MouseEvent, metrics: CellMetrics) -> bool {
@@ -2704,8 +3012,13 @@ fn append_pane_scene(
     metrics: Option<CellMetrics>,
     config: &AppConfig,
 ) {
-    let mut pane_scene =
-        scene_from_terminal(&pane.terminal, &pane.semantic_timeline, metrics, config);
+    let mut pane_scene = scene_from_terminal(
+        &pane.terminal,
+        &pane.semantic_timeline,
+        &pane.search,
+        metrics,
+        config,
+    );
     let row_offset = layout.rect.y.floor() as i64;
     let col_offset = layout.rect.x.floor() as u16;
 
@@ -2896,6 +3209,7 @@ fn offset_rect(
 fn scene_from_terminal(
     terminal: &TerminalEmulator,
     semantic_timeline: &SemanticTimelineStore,
+    search: &PaneSearch,
     metrics: Option<CellMetrics>,
     config: &AppConfig,
 ) -> RenderScene {
@@ -2929,6 +3243,9 @@ fn scene_from_terminal(
         ));
         overlays
     });
+    let search_highlights = metrics.map_or_else(Vec::new, |metrics| {
+        search_overlays(search, visible.viewport, metrics, config)
+    });
 
     let selections = selection_visual(terminal, visible.viewport, config)
         .into_iter()
@@ -2958,9 +3275,96 @@ fn scene_from_terminal(
             inactive: false,
         }),
         semantic_overlays,
+        search_highlights,
         selections,
         ..RenderScene::default()
     }
+}
+
+fn search_overlays(
+    search: &PaneSearch,
+    viewport: term_core::Viewport,
+    metrics: CellMetrics,
+    config: &AppConfig,
+) -> Vec<OverlayPrimitive> {
+    let mut overlays = Vec::new();
+    for (index, selection) in search.matches.iter().enumerate() {
+        let (start, end) = if selection.start <= selection.end {
+            (selection.start, selection.end)
+        } else {
+            (selection.end, selection.start)
+        };
+        for visible_row in 0..viewport.size.rows {
+            let row = viewport.origin_row + i64::from(visible_row);
+            if row < start.row || row > end.row {
+                continue;
+            }
+            let start_col = if row == start.row { start.col } else { 0 };
+            let end_col = if row == end.row {
+                end.col
+            } else {
+                viewport.size.cols.saturating_sub(1)
+            };
+            overlays.push(OverlayPrimitive {
+                kind: OverlayKind::SearchHighlight,
+                bounds: RenderRect {
+                    x: (f32::from(start_col) * metrics.cell_width).floor() as i32,
+                    y: (f32::from(visible_row) * metrics.cell_height).floor() as i32,
+                    width: (f32::from(end_col.saturating_sub(start_col).saturating_add(1))
+                        * metrics.cell_width)
+                        .ceil() as u32,
+                    height: metrics.cell_height.ceil() as u32,
+                },
+                color: if index == search.active_match {
+                    render_color(config.colors.selection_background)
+                } else {
+                    RenderColor {
+                        red: 240,
+                        green: 190,
+                        blue: 50,
+                        alpha: 90,
+                    }
+                },
+                border_color: None,
+                corner_radius_px: 1,
+                z_index: 12,
+                label: None,
+            });
+        }
+    }
+
+    if search.input_active {
+        let status = if search.matches.is_empty() {
+            "0/0".to_owned()
+        } else {
+            format!("{}/{}", search.active_match + 1, search.matches.len())
+        };
+        let panel_cols = usize::from(viewport.size.cols).clamp(1, 42);
+        let label = truncate_overlay_label(
+            &format!("Find: {}  {status}", search.query),
+            panel_cols.saturating_sub(2).max(1),
+        );
+        overlays.push(OverlayPrimitive {
+            kind: OverlayKind::SearchHighlight,
+            bounds: RenderRect {
+                x: 6,
+                y: 6,
+                width: (metrics.cell_width * panel_cols as f32).ceil() as u32,
+                height: (metrics.cell_height + 8.0).ceil() as u32,
+            },
+            color: RenderColor {
+                red: 20,
+                green: 24,
+                blue: 30,
+                alpha: 235,
+            },
+            border_color: Some(render_color(config.colors.selection_background)),
+            corner_radius_px: 4,
+            z_index: 100,
+            label: Some(label),
+        });
+    }
+    overlays
 }
 
 fn selection_visual(
@@ -3026,20 +3430,8 @@ fn url_hint_overlays(
     rows: u16,
     metrics: CellMetrics,
 ) -> Vec<OverlayPrimitive> {
-    let mut lines = Vec::new();
-    for row in 0..rows {
-        if let Some(line) = terminal.state().visible_line(row) {
-            lines.push((i64::from(row), line.raw_text()));
-        }
-    }
-
-    let borrowed = lines
-        .iter()
-        .map(|(row, text)| (*row, text.as_str()))
-        .collect::<Vec<_>>();
-
-    detect_url_hints(borrowed)
-        .into_iter()
+    (0..rows)
+        .flat_map(|row| visible_url_hints(terminal, row))
         .map(|hint| OverlayPrimitive {
             kind: OverlayKind::Semantic,
             bounds: RenderRect {
@@ -3061,6 +3453,39 @@ fn url_hint_overlays(
             label: Some(hint.text),
         })
         .collect()
+}
+
+fn visible_url_hints(terminal: &TerminalEmulator, row: u16) -> Vec<semantics::DetectedHint> {
+    let Some(line) = terminal.state().visible_line(row) else {
+        return Vec::new();
+    };
+    let text = line.raw_text();
+    let mut hints = detect_url_hints([(i64::from(row), text.as_str())]);
+    for hint in &mut hints {
+        hint.start.col = line_column_for_char_offset(line, usize::from(hint.start.col));
+        hint.end.col = line_column_for_char_offset(line, usize::from(hint.end.col));
+    }
+    hints
+}
+
+fn line_column_for_char_offset(line: &term_core::Line, offset: usize) -> u16 {
+    let mut chars = 0usize;
+    let mut col = 0u16;
+    for cell in &line.cells {
+        if cell.wide_continuation {
+            continue;
+        }
+        if offset <= chars {
+            return col;
+        }
+        let next_chars = chars.saturating_add(cell.text.chars().count());
+        if offset < next_chars {
+            return col;
+        }
+        chars = next_chars;
+        col = col.saturating_add(u16::from(cell.width.max(1)));
+    }
+    col
 }
 
 fn semantic_visual_overlays(
@@ -3825,6 +4250,21 @@ mod tests {
         }
     }
 
+    fn test_pane(cols: u16, rows: u16) -> PaneRuntime {
+        PaneRuntime {
+            terminal: TerminalEmulator::new(CoreTerminalSize::new(cols, rows)),
+            semantic_parser: SemanticEscapeParser::new(),
+            semantic_timeline: SemanticTimelineStore::new(),
+            parse_semantic_events: false,
+            transport: None,
+            mouse_protocol: MouseProtocolState::default(),
+            selection_anchor: None,
+            selection_kind: SelectionKind::Normal,
+            keyboard_selection: None,
+            search: PaneSearch::default(),
+        }
+    }
+
     fn smoke_size() -> TransportSize {
         TransportSize::new(80, 24, 640, 384)
     }
@@ -3866,6 +4306,19 @@ mod tests {
             &modes,
             &ClipboardConfig::default()
         ));
+    }
+
+    #[test]
+    fn focus_reports_are_emitted_only_when_requested() {
+        let mut modes = BTreeSet::new();
+        assert_eq!(focus_report_bytes(true, &modes), None);
+
+        modes.insert(TerminalMode::FocusEvents);
+        assert_eq!(focus_report_bytes(true, &modes), Some(b"\x1b[I".as_slice()));
+        assert_eq!(
+            focus_report_bytes(false, &modes),
+            Some(b"\x1b[O".as_slice())
+        );
     }
 
     #[test]
@@ -3979,6 +4432,90 @@ mod tests {
 
         modes.clear();
         assert_eq!(protocol.report_bytes(press, metrics, &modes), None);
+    }
+
+    #[test]
+    fn keyboard_selection_mode_extends_normal_and_rectangular_ranges() {
+        let mut pane = test_pane(10, 2);
+        pane.terminal.apply_bytes(b"abc").unwrap();
+        pane.start_keyboard_selection(SelectionKind::Normal);
+
+        assert!(
+            pane.handle_keyboard_selection_key(&key_event("ArrowLeft", KeyModifiers::default()))
+        );
+        assert_eq!(pane.terminal.state().selected_text().as_deref(), Some("c"));
+        assert_eq!(
+            pane.terminal
+                .state()
+                .selection_state()
+                .map(|value| value.kind),
+            Some(SelectionKind::Normal)
+        );
+
+        pane.start_keyboard_selection(SelectionKind::Rectangular);
+        pane.handle_keyboard_selection_key(&key_event("ArrowLeft", KeyModifiers::default()));
+        assert_eq!(
+            pane.terminal
+                .state()
+                .selection_state()
+                .map(|value| value.kind),
+            Some(SelectionKind::Rectangular)
+        );
+        pane.handle_keyboard_selection_key(&key_event("Escape", KeyModifiers::default()));
+        assert!(pane.terminal.state().selection_state().is_none());
+    }
+
+    #[test]
+    fn interactive_search_updates_navigates_and_closes_without_pty_input() {
+        let mut pane = test_pane(20, 3);
+        pane.terminal
+            .apply_bytes(b"needle one\r\nneedle two")
+            .unwrap();
+        pane.search.start();
+
+        assert!(pane.append_search_text("needle"));
+        assert_eq!(pane.search.matches.len(), 2);
+        assert_eq!(pane.search.active_match, 0);
+
+        pane.handle_search_key(&key_event("Enter", KeyModifiers::default()));
+        assert_eq!(pane.search.active_match, 1);
+        pane.handle_search_key(&key_event("ArrowUp", KeyModifiers::default()));
+        assert_eq!(pane.search.active_match, 0);
+        pane.handle_search_key(&key_event("Escape", KeyModifiers::default()));
+        assert!(!pane.search.input_active);
+        assert!(pane.search.matches.is_empty());
+    }
+
+    #[test]
+    fn search_overlay_and_url_hit_testing_use_visible_terminal_content() {
+        let mut pane = test_pane(40, 2);
+        pane.terminal
+            .apply_bytes("\u{754c} https://example.com now".as_bytes())
+            .unwrap();
+        pane.search.start();
+        pane.append_search_text("example");
+        let viewport = pane.terminal.visible_grid().viewport;
+
+        let overlays = search_overlays(
+            &pane.search,
+            viewport,
+            test_metrics(),
+            &AppConfig::default(),
+        );
+        assert!(
+            overlays
+                .iter()
+                .any(|overlay| overlay.kind == OverlayKind::SearchHighlight)
+        );
+
+        let mut mouse = mouse_event(MouseEventKind::Released(MouseButton::Left));
+        mouse.x = 8.0 * 10.0;
+        mouse.y = 2.0;
+        assert_eq!(
+            pane.url_at_mouse(mouse, test_metrics()).as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(visible_url_hints(&pane.terminal, 0)[0].start.col, 3);
     }
 
     #[test]

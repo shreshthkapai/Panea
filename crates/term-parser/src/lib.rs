@@ -138,6 +138,20 @@ impl Parser {
                         actions.push(TerminalAction::SetTabStop);
                         self.state = ParserState::Ground;
                     }
+                    b'=' => {
+                        actions.push(TerminalAction::SetMode {
+                            mode: TerminalMode::ApplicationKeypad,
+                            enabled: true,
+                        });
+                        self.state = ParserState::Ground;
+                    }
+                    b'>' => {
+                        actions.push(TerminalAction::SetMode {
+                            mode: TerminalMode::ApplicationKeypad,
+                            enabled: false,
+                        });
+                        self.state = ParserState::Ground;
+                    }
                     b'c' => {
                         actions.push(TerminalAction::Reset);
                         self.state = ParserState::Ground;
@@ -728,6 +742,16 @@ mod tests {
         assert!(terminal.modes().contains(&TerminalMode::BracketedPaste));
         assert!(!terminal.cursor_state().visible);
         assert_eq!(terminal.cursor_state().shape, CursorShape::Beam);
+    }
+
+    #[test]
+    fn dec_application_keypad_escape_sequences_toggle_mode() {
+        let mut terminal = TerminalEmulator::new(TerminalSize::new(10, 2));
+        terminal.apply_bytes(b"\x1b=").unwrap();
+        assert!(terminal.modes().contains(&TerminalMode::ApplicationKeypad));
+
+        terminal.apply_bytes(b"\x1b>").unwrap();
+        assert!(!terminal.modes().contains(&TerminalMode::ApplicationKeypad));
     }
 
     #[test]

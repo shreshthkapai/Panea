@@ -37,7 +37,7 @@ unsafe_code = "forbid"
 
 [workspace.dependencies]
 ab_glyph = "0.2"
-arboard = "3"
+arboard = { version = "3", features = ["wayland-data-control"] }
 base64 = "0.22"
 bytemuck = { version = "1", features = ["derive"] }
 fontdb = "0.23"
@@ -54,4 +54,5 @@ unicode-width = "0.2"
 unicode-segmentation = "1.12"
 wgpu = "0.20"
 winit = "0.29"
+webbrowser = "1"
 zeroize = "1"

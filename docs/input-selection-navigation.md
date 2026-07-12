@@ -41,3 +41,40 @@ Tests: key/control/modifier/application-mode tables, mouse and focus protocol te
 Each item is accepted independently with focused tests. Real macOS, Linux X11,
 and Linux Wayland input behavior remains unverified until exercised on those
 hosts.
+
+## Default Controls
+
+```text
+Ctrl+Shift+C / Super+C       copy selection
+Ctrl+Shift+V / Super+V       paste
+Shift+PageUp/PageDown        scroll one viewport
+Ctrl+Shift+Home/End          oldest scrollback / live bottom
+Ctrl+Shift+S                 interactive scrollback search
+Ctrl+Shift+Space             keyboard normal selection mode
+Ctrl+Alt+Shift+Space         keyboard rectangular selection mode
+Alt+mouse drag               rectangular mouse selection
+Shift+mouse drag             bypass application mouse reporting
+Ctrl+left click URL          open validated HTTP(S) URL
+```
+
+While search is active, typing updates the query, Enter/Down selects the next
+match, Shift+Enter/Up selects the previous match, Backspace edits by grapheme,
+and Escape closes search. While keyboard selection is active, arrows,
+Home/End, and PageUp/PageDown extend the range; Enter keeps the selection and
+leaves selection mode, while Escape clears it.
+
+## Implementation Status
+
+- Shared key encoding covers printable/control text, Alt/AltGr, navigation,
+  editing keys, F1-F12, normal/application cursor keys, and normal/application
+  keypad keys.
+- Mouse reporting covers normal, button-motion, all-motion, wheel, legacy, and
+  SGR reports. Focus reports are emitted only when requested by terminal mode.
+- Mouse and keyboard normal/rectangular selection use absolute buffer positions.
+- Scrollback wheel, page, top, bottom, anchored viewport, and search navigation
+  are implemented without PTY-output-loop search work.
+- URL hit testing accounts for wide terminal cells and only permits HTTP(S).
+- Linux primary selection uses the Linux clipboard provider and falls back with
+  diagnostics when a compositor does not expose the required protocol.
+- Windows focused tests pass. Real macOS, Linux X11, and Linux Wayland runtime
+  verification remains a Step 16 platform-verification gate.

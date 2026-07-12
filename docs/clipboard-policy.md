@@ -45,6 +45,7 @@ write the local clipboard.
 - Normal and rectangular extraction uses absolute buffer positions and remains valid across scrollback.
 - Pane-aware mouse drag selection is wired; hold Alt while beginning a drag for rectangular selection, or Shift to bypass application mouse reporting.
 - Selection visuals are projected as renderer overlays and never mutate terminal cells.
+- Linux copy-on-selection and middle-click paste use the Primary selection when configured; unavailable Wayland compositor support reports a diagnostic and paste falls back to the system clipboard.
 - Keyboard copy/paste is wired through the desktop clipboard bridge.
 - Paste protection normalizes newlines and strips control characters when enabled.
 - Bracketed paste is emitted when the terminal has bracketed paste mode enabled.
@@ -52,8 +53,6 @@ write the local clipboard.
 
 ## Still Open
 
-- Keyboard-driven selection extension and search-result selection UX.
-- Linux primary selection provider support.
 - Remote OSC 52 confirmation UI.
 - Real clipboard smoke tests on macOS, Linux X11, and Linux Wayland.
 - OSC 52 behavior inside first-class SSH sessions once SSH tabs/panes are runtime-wired.

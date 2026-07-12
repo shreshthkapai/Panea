@@ -84,7 +84,7 @@ These areas are real foundations but must not be called complete:
 | GPU renderer | tested | WGPU surface/device setup, glyph atlas/cache policy, damage-aware batch preparation, indexed background/glyph/decoration/selection/cursor batches, row-scoped atlas uploads, renderer benchmarks, recovery status/event contracts, WGPU device-lost callback detection, disposable WGPU backend recreation, GPU atlas invalidation after recovery, screenshot verification infrastructure, and GPU timestamp status plumbing exist; real GPU timing samples, sleep/wake/monitor-loss validation, macOS/Linux screenshot baselines, and cross-OS render validation remain. |
 | Font system | partial | Deeper shaping, full fallback validation across installed font sets, emoji fallback, and grapheme-aware metrics. |
 | Unicode support | tested | Core/parser Unicode hardening is covered by automated tests; renderer font fallback, shaping, screenshot parity, and real app conformance remain later phases. |
-| Clipboard and selection | partial | Absolute normal/rectangular extraction, pane-aware mouse drag selection and overlays, copy-on-release, keyboard copy/paste, scrollback wheel/page navigation, paste protection, bracketed paste, middle-click paste guard, and OSC 52 policy exist; keyboard selection extension, search UX, URL launching, Linux primary selection, remote confirmation UI, and full app compatibility coverage remain. |
+| Input, clipboard, selection, and scrollback UX | tested | Shared key/application-mode encoding, mouse/focus protocols, absolute normal/rectangular mouse and keyboard selection, selection overlays, anchored wheel/page scrollback, interactive search, portable HTTP(S) URL activation, keyboard copy/paste, Linux primary-selection provider behavior, paste protection, bracketed paste, middle-click paste, and OSC 52 policy exist. Real macOS/Linux runtime verification, remote OSC 52 confirmation UI, and full app compatibility coverage remain. |
 | Baseline compatibility | partial | App compatibility runner and required Windows smoke exist; full interactive verification for shells, editors, pagers, TUIs, tmux, screen, zellij, SSH, WSL, and command-line tools remains incomplete. |
 | Shell integration | partial | Local runtime activation planning and desktop injection exist for supported shells, with Windows PowerShell semantic smoke verified. Remote install flows, heuristic command detection, WSL-specific coverage, and real bash/zsh/fish/macOS/Linux session verification remain. |
 | Visual overlays | partial | Semantic command-block overlay projection, badge glyph batching, cursor animation quads, and image cursor metadata caching exist; collapse/expand behavior, polished interactive UI, full image cursor frame upload/draw, real shell-driven verification, and cross-OS visual verification remain. |
@@ -125,8 +125,7 @@ The following major accepted features have no complete product behavior yet:
 - Cross-OS runtime verification of the batched GPU glyph renderer.
 - Real GPU device-loss validation for sleep/wake, monitor attach/detach, DPI
   changes, and backend failure simulation across desktop OSes.
-- Linux primary selection provider and remote OSC 52 confirmation UI.
-- Keyboard selection extension, interactive scrollback search, and a portable URL-opening action/provider.
+- Remote OSC 52 confirmation UI and real Linux primary-selection compositor verification.
 - Native OS config watcher backends, automatic programmable-config runtime watching, and real macOS/Linux runtime reload validation.
 - Product-complete desktop tabs/panes/sessions/workspaces runtime, including
   startup layouts, SSH panes, polished chrome, and cross-OS smoke tests.

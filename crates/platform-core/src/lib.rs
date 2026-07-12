@@ -271,6 +271,33 @@ pub trait ClipboardProvider {
     fn paste_text(&mut self) -> Result<String, ClipboardDiagnostic>;
 
     fn last_diagnostic(&self) -> ClipboardDiagnostic;
+
+    fn copy_primary_text(&mut self, _text: &str) -> Result<(), ClipboardDiagnostic> {
+        Err(ClipboardDiagnostic {
+            operation: ClipboardOperation::Copy,
+            availability: ClipboardAvailability::Unavailable,
+            message: Some("primary selection is unsupported by this platform provider".to_owned()),
+        })
+    }
+
+    fn paste_primary_text(&mut self) -> Result<String, ClipboardDiagnostic> {
+        Err(ClipboardDiagnostic {
+            operation: ClipboardOperation::Paste,
+            availability: ClipboardAvailability::Unavailable,
+            message: Some("primary selection is unsupported by this platform provider".to_owned()),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UrlOpenDiagnostic {
+    pub url: String,
+    pub message: Option<String>,
+}
+
+/// Opens validated URLs without exposing OS-specific launch mechanics to the app runtime.
+pub trait UrlOpener {
+    fn open_url(&mut self, url: &str) -> Result<(), UrlOpenDiagnostic>;
 }
 
 /// Window contract exposed to the application without exposing winit or OS APIs.
@@ -352,6 +379,13 @@ mod tests {
         assert_eq!(
             clipboard.last_diagnostic().availability,
             ClipboardAvailability::Available
+        );
+        assert_eq!(
+            clipboard
+                .paste_primary_text()
+                .expect_err("fake provider has no primary selection")
+                .availability,
+            ClipboardAvailability::Unavailable
         );
     }
 }

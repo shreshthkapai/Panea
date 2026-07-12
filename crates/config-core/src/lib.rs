@@ -1125,6 +1125,8 @@ impl Default for KeyboardConfig {
             keybindings: vec![
                 KeyBinding::new("Ctrl+Shift+C", "copy"),
                 KeyBinding::new("Ctrl+Shift+V", "paste"),
+                KeyBinding::new("Super+C", "copy"),
+                KeyBinding::new("Super+V", "paste"),
                 KeyBinding::new("Ctrl+Shift+F", "toggle_fullscreen"),
                 KeyBinding::new("Ctrl+Shift+D", "restore_window_decorations"),
                 KeyBinding::new("Ctrl+Shift+M", "toggle_frameless"),
@@ -1157,6 +1159,9 @@ impl Default for KeyboardConfig {
                 KeyBinding::new("Shift+PageDown", "scroll_page_down"),
                 KeyBinding::new("Ctrl+Shift+Home", "scroll_to_top"),
                 KeyBinding::new("Ctrl+Shift+End", "scroll_to_bottom"),
+                KeyBinding::new("Ctrl+Shift+S", "search_scrollback"),
+                KeyBinding::new("Ctrl+Shift+Space", "keyboard_select"),
+                KeyBinding::new("Ctrl+Alt+Shift+Space", "keyboard_select_rectangular"),
             ],
         }
     }

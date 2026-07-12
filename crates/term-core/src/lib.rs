@@ -792,6 +792,115 @@ impl TerminalState {
     }
 
     #[must_use]
+    pub fn cursor_buffer_position(&self) -> GridPosition {
+        let cursor = self.active().cursor_position();
+        if self.active_is_primary() {
+            GridPosition {
+                row: self.primary.scrollback.len() as i64 + cursor.row,
+                col: cursor.col,
+            }
+        } else {
+            cursor
+        }
+    }
+
+    #[must_use]
+    pub fn buffer_line_count(&self) -> usize {
+        if self.active_is_primary() {
+            self.primary.scrollback.len() + self.primary.lines.len()
+        } else {
+            self.active().lines.len()
+        }
+    }
+
+    pub fn reveal_position(&mut self, position: GridPosition) -> bool {
+        if !self.active_is_primary() {
+            return false;
+        }
+        let rows = i64::from(self.primary.size.rows);
+        let max_origin = self.primary.scrollback.len() as i64;
+        let current = self.viewport().origin_row;
+        let desired = if position.row < current {
+            position.row
+        } else if position.row >= current + rows {
+            position.row - rows + 1
+        } else {
+            current
+        }
+        .clamp(0, max_origin);
+        let next_offset = usize::try_from(max_origin - desired).unwrap_or(0);
+        let changed = next_offset != self.viewport_offset;
+        self.viewport_offset = next_offset;
+        changed
+    }
+
+    #[must_use]
+    pub fn search(&self, query: &str, case_sensitive: bool) -> Vec<Selection> {
+        let query = query
+            .graphemes(true)
+            .map(|grapheme| search_key(grapheme, case_sensitive))
+            .collect::<Vec<_>>();
+        if query.is_empty() {
+            return Vec::new();
+        }
+
+        let mut searchable = Vec::<Option<SearchCell<'_>>>::new();
+        let line_count = self.buffer_line_count();
+        for row in 0..line_count {
+            let Some(line) = self.buffer_line(row) else {
+                continue;
+            };
+            let content_end = line
+                .cells
+                .iter()
+                .rposition(|cell| cell.text != " ")
+                .map_or(0, |index| index + 1);
+            for (col, cell) in line.cells.iter().take(content_end).enumerate() {
+                if !cell.wide_continuation {
+                    searchable.push(Some(SearchCell {
+                        text: &cell.text,
+                        position: GridPosition::new(row as i64, col as u16),
+                        width: cell.width.max(1),
+                    }));
+                }
+            }
+            if !line.hard_wrapped {
+                searchable.push(None);
+            }
+        }
+
+        let mut results = Vec::new();
+        for start in 0..searchable.len() {
+            let Some(first) = searchable[start] else {
+                continue;
+            };
+            let mut matched = true;
+            let mut end = first;
+            for (offset, expected) in query.iter().enumerate() {
+                let Some(Some(candidate)) = searchable.get(start + offset) else {
+                    matched = false;
+                    break;
+                };
+                if search_key(candidate.text, case_sensitive) != *expected {
+                    matched = false;
+                    break;
+                }
+                end = *candidate;
+            }
+            if matched {
+                results.push(Selection::normal(
+                    first.position,
+                    GridPosition::new(
+                        end.position.row,
+                        end.position.col.saturating_add(u16::from(end.width) - 1),
+                    ),
+                ));
+            }
+        }
+        results
+    }
+
+    #[must_use]
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
     }
@@ -856,7 +965,6 @@ impl TerminalState {
         let use_scrollback = self.active_is_primary();
         self.active_mut()
             .print(ch, attributes, autowrap, insert, use_scrollback);
-        self.selection = None;
     }
 
     fn line_feed(&mut self) {
@@ -1073,6 +1181,21 @@ impl TerminalState {
                 .lines
                 .get(absolute_row - self.primary.scrollback.len())
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SearchCell<'a> {
+    text: &'a str,
+    position: GridPosition,
+    width: u8,
+}
+
+fn search_key(text: &str, case_sensitive: bool) -> String {
+    if case_sensitive {
+        text.to_owned()
+    } else {
+        text.to_lowercase()
     }
 }
 
@@ -2410,6 +2533,55 @@ mod tests {
         ));
 
         assert_eq!(terminal.selected_text().as_deref(), Some("cd\nef"));
+    }
+
+    #[test]
+    fn selection_remains_anchored_while_new_output_arrives() {
+        let mut terminal = TerminalState::new(TerminalSize::new(8, 2));
+        terminal
+            .apply_actions("selected".chars().map(TerminalAction::Print))
+            .unwrap();
+        terminal.set_selection(Selection::normal(
+            GridPosition::new(0, 0),
+            GridPosition::new(0, 7),
+        ));
+
+        terminal.apply_action(TerminalAction::LineFeed).unwrap();
+        terminal.apply_action(TerminalAction::Print('x')).unwrap();
+
+        assert_eq!(terminal.selected_text().as_deref(), Some("selected"));
+    }
+
+    #[test]
+    fn search_finds_unicode_and_text_across_hard_wrapped_lines() {
+        let mut terminal = TerminalState::new(TerminalSize::new(5, 3));
+        terminal
+            .apply_actions("hello\u{754c}world".chars().map(TerminalAction::Print))
+            .unwrap();
+
+        let matches = terminal.search("O\u{754c}W", false);
+
+        assert_eq!(matches.len(), 1);
+        terminal.set_selection(matches[0]);
+        assert_eq!(terminal.selected_text().as_deref(), Some("o\u{754c}w"));
+    }
+
+    #[test]
+    fn search_does_not_cross_hard_line_breaks_and_reveals_match() {
+        let mut terminal = TerminalState::new(TerminalSize::new(8, 2));
+        terminal
+            .apply_actions("first\r\nneedle\r\nlast".chars().map(|ch| match ch {
+                '\r' => TerminalAction::CarriageReturn,
+                '\n' => TerminalAction::LineFeed,
+                _ => TerminalAction::Print(ch),
+            }))
+            .unwrap();
+
+        assert!(terminal.search("tneedle", false).is_empty());
+        let found = terminal.search("first", false);
+        assert_eq!(found.len(), 1);
+        assert!(terminal.reveal_position(found[0].start));
+        assert_eq!(terminal.visible_grid().viewport.origin_row, 0);
     }
 
     fn visible_line_text(visible: &VisibleGrid, row: usize) -> String {
