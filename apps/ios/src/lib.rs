@@ -447,6 +447,7 @@ impl IosAppShellConfig {
                 fallback_families: config.font.fallback_families.clone(),
                 size: config.font.size as f32,
                 line_height: config.font.line_height as f32,
+                ligatures: config.font.ligatures,
             },
             visual_theme: config.visual_theme.clone(),
         }

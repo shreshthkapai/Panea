@@ -21,7 +21,7 @@ use winit::{
     window::{Fullscreen, Window, WindowBuilder},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WindowSettings {
     pub title: String,
     pub initial_width: u32,
@@ -29,6 +29,7 @@ pub struct WindowSettings {
     pub mode: WindowMode,
     pub linux_backend: LinuxWindowBackend,
     pub decoration_mode: DecorationMode,
+    pub opacity: f64,
 }
 
 impl Default for WindowSettings {
@@ -40,6 +41,7 @@ impl Default for WindowSettings {
             mode: WindowMode::Windowed,
             linux_backend: LinuxWindowBackend::Auto,
             decoration_mode: DecorationMode::Auto,
+            opacity: 1.0,
         }
     }
 }
@@ -67,6 +69,7 @@ impl DesktopWindow {
                 settings.initial_height,
             ))
             .with_decorations(decorations)
+            .with_transparent(settings.opacity < 1.0)
             .with_maximized(matches!(settings.mode, WindowMode::Maximized))
             .build(event_loop)?;
 

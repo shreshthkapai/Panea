@@ -11,10 +11,10 @@ use std::{
 
 use config_core::{
     AppConfig, ClipboardConfig, CommandBlockStyle, ConfigDiagnostic, ConfigDiagnosticSeverity,
-    DecorationStrategyConfig, InputOutputGroupingStyle, LinuxBackendConfig, LogLevel, PasteConfig,
-    PresentModePreference, PromptDecorationStyle, ReloadPlan, ReloadableSection,
-    ShellIntegrationActivationConfig, ShellProfile, ShellProfileKind, SshAuthMethod,
-    SshKnownHostsPolicy, SshProfile, WindowModeConfig,
+    ConfigPlatform, DecorationStrategyConfig, InputOutputGroupingStyle, LinuxBackendConfig,
+    LogLevel, PasteConfig, PresentModePreference, PromptDecorationStyle, ReloadPlan,
+    ReloadableSection, ShellIntegrationActivationConfig, ShellProfile, ShellProfileKind,
+    SshAuthMethod, SshKnownHostsPolicy, SshProfile, WindowModeConfig,
 };
 use diagnostics::{PerformanceBudget, PerformanceOverlay};
 use font_system::{CellMetrics, FontConfig as RuntimeFontConfig, FontSource, FontSystem};
@@ -32,13 +32,14 @@ use platform_winit::{
 };
 use render_core::{
     CellPosition, CursorVisual, OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle,
-    RenderColor, RenderCursorShape, RenderGrid, RenderInstrumentation, RenderRect, RenderScene,
-    SelectionVisual,
+    RenderColor, RenderCursorShape, RenderGrid, RenderInstrumentation, RenderOffset, RenderRect,
+    RenderScene, SelectionVisual,
 };
 use render_wgpu::{
     AnimatedCursorImageCache, AnimatedCursorImageRequest, AnimatedCursorImageStatus,
-    CursorAnimationRuntime, CursorAnimationSettings, DamageTracker, FrameDecision, FrameScheduler,
-    GpuTerminalRenderer, PresentMode, RendererError, RendererOptions,
+    CursorAnimationRuntime, CursorAnimationSettings, CursorBlinkRuntime, DamageTracker,
+    FrameDecision, FrameScheduler, GpuTerminalRenderer, PresentMode, RendererError,
+    RendererOptions,
 };
 use security::KeychainProvider;
 use security::{
@@ -744,12 +745,20 @@ fn run() -> Result<(), Box<dyn Error>> {
         Arc::clone(&window),
         renderer_options(&config),
     ))?;
+    if config.window.opacity < 1.0 && !renderer.transparency_active() {
+        eprintln!(
+            "window opacity fallback: GPU/window backend exposes only opaque composition; rendering remains fully opaque"
+        );
+    }
     let mut scheduler = FrameScheduler::new();
     let mut damage_tracker = DamageTracker::new();
     let mut performance_overlay =
         PerformanceOverlay::new(config.diagnostics.performance_overlay, "wgpu");
     let mut performance_budget = performance_budget(&config);
     let mut cursor_animator = CursorAnimationRuntime::new();
+    let mut cursor_blink = CursorBlinkRuntime::new();
+    let mut window_focused = true;
+    let mut pointer_visible = true;
     let mut cursor_image_cache = AnimatedCursorImageCache::new();
     let mut cursor_image_status_reported: Option<String> = None;
     request_cursor_image_if_enabled(&mut cursor_image_cache, &config);
@@ -771,6 +780,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                         metrics,
                         &config,
                         Some(&mut cursor_animator),
+                        CursorPresentation {
+                            blink_visible: cursor_blink.visible(),
+                            window_focused,
+                        },
                     );
                     if let Some(metrics) = metrics {
                         append_performance_overlay(
@@ -860,6 +873,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 if key.state != KeyState::Pressed {
                                     continue;
                                 }
+                                if config.mouse.hide_cursor_when_typing && pointer_visible {
+                                    window.set_cursor_visible(false);
+                                    pointer_visible = false;
+                                }
 
                                 if let Some(changed) = mux_runtime.handle_modal_key(&key) {
                                     if changed {
@@ -889,6 +906,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                                                 && let Ok(text) = clipboard.paste_text()
                                             {
                                                 cursor_animator.record_typing();
+                                                if cursor_blink.record_activity() {
+                                                    scheduler.cursor_blink_changed();
+                                                }
                                                 mux_runtime.paste_into_active(
                                                     &text,
                                                     &clipboard_config,
@@ -993,10 +1013,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                                     }
                                 } else if let Some(bytes) = mux_runtime.input_bytes(&key) {
                                     cursor_animator.record_typing();
+                                    if cursor_blink.record_activity() {
+                                        scheduler.cursor_blink_changed();
+                                    }
                                     mux_runtime.write_active(&bytes);
                                 }
                             }
                             InputEvent::Mouse(mouse) => {
+                                if !pointer_visible {
+                                    window.set_cursor_visible(true);
+                                    pointer_visible = true;
+                                }
                                 if let Ok(metrics) = fonts.cell_metrics() {
                                     let outcome = mux_runtime.handle_mouse(
                                         mouse,
@@ -1023,11 +1050,20 @@ fn run() -> Result<(), Box<dyn Error>> {
                                     window.request_redraw();
                                 } else {
                                     cursor_animator.record_typing();
+                                    if cursor_blink.record_activity() {
+                                        scheduler.cursor_blink_changed();
+                                    }
                                     mux_runtime.write_active(text.as_bytes());
                                 }
                             }
                             InputEvent::Focused(focused) => {
+                                window_focused = focused;
+                                if cursor_blink.record_activity() {
+                                    scheduler.cursor_blink_changed();
+                                }
                                 mux_runtime.send_focus_event(focused);
+                                scheduler.cursor_blink_changed();
+                                window.request_redraw();
                             }
                             InputEvent::WindowAction(action) => match action {
                                 WindowAction::ToggleFullscreen => {
@@ -1104,6 +1140,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 &mut osc52_policy,
                                 &mut performance_overlay,
                                 &mut performance_budget,
+                                &mut renderer,
                                 &window,
                             ) {
                                 Ok(reloaded) => {
@@ -1169,8 +1206,26 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
 
                 let cursor_settings = cursor_animation_settings(&config);
-                if let Some(delay) = cursor_animator.next_frame_after(cursor_settings) {
-                    scheduler.animation_changed();
+                let blink_enabled = window_focused
+                    && config.cursor.blink
+                    && mux_runtime.active_cursor_blinks();
+                if cursor_blink.update(
+                    blink_enabled,
+                    Duration::from_millis(u64::from(config.cursor.blink_interval_ms)),
+                ) {
+                    scheduler.cursor_blink_changed();
+                }
+                let animation_delay = cursor_animator.next_frame_after(cursor_settings);
+                let blink_delay = cursor_blink.next_frame_after();
+                let next_delay = match (animation_delay, blink_delay) {
+                    (Some(animation), Some(blink)) => Some(animation.min(blink)),
+                    (Some(delay), None) | (None, Some(delay)) => Some(delay),
+                    (None, None) => None,
+                };
+                if let Some(delay) = next_delay {
+                    if animation_delay.is_some() {
+                        scheduler.animation_changed();
+                    }
                     target.set_control_flow(ControlFlow::WaitUntil(Instant::now() + delay));
                 }
 
@@ -1221,6 +1276,7 @@ fn apply_live_config_reload(
     runtime_osc52_policy: &mut Osc52ClipboardPolicy,
     performance_overlay: &mut PerformanceOverlay,
     runtime_performance_budget: &mut PerformanceBudget,
+    renderer: &mut GpuTerminalRenderer,
     window: &winit::window::Window,
 ) -> Result<bool, String> {
     if plan.live.is_empty() {
@@ -1255,6 +1311,7 @@ fn apply_live_config_reload(
             ReloadableSection::Keybindings => current.keyboard = next.keyboard.clone(),
             ReloadableSection::Mux => current.mux = next.mux.clone(),
             ReloadableSection::Performance => {
+                renderer.set_glyph_cache_capacity(next.performance.glyph_cache_entries);
                 current.performance = next.performance.clone();
                 *runtime_performance_budget = performance_budget(current);
             }
@@ -1267,6 +1324,9 @@ fn apply_live_config_reload(
             ReloadableSection::WindowPadding => {
                 current.window.padding_x = next.window.padding_x;
                 current.window.padding_y = next.window.padding_y;
+                current.window.margin_x = next.window.margin_x;
+                current.window.margin_y = next.window.margin_y;
+                renderer.request_full_redraw();
             }
             ReloadableSection::WindowTitle => {
                 current.window.title = next.window.title.clone();
@@ -1285,6 +1345,7 @@ fn font_config(config: &config_core::FontConfig) -> RuntimeFontConfig {
         fallback_families: config.fallback_families.clone(),
         size: config.size as f32,
         line_height: config.line_height as f32,
+        ligatures: config.ligatures,
     }
 }
 
@@ -1298,10 +1359,18 @@ fn renderer_options(config: &AppConfig) -> RendererOptions {
         },
         damage_tracking: config.renderer.damage_tracking,
         gpu_timestamps: config.renderer.gpu_timestamps,
+        transparent: config.window.opacity < 1.0,
+        glyph_cache_entries: config.performance.glyph_cache_entries,
     }
 }
 
 fn cursor_animation_settings(config: &AppConfig) -> CursorAnimationSettings {
+    let fps = config
+        .performance
+        .frame_rate_limit
+        .map_or(config.performance.max_animation_fps, |limit| {
+            limit.min(config.performance.max_animation_fps)
+        });
     CursorAnimationSettings {
         enabled: config.cursor.animations_enabled,
         smooth_movement: config.cursor.smooth_movement,
@@ -1310,7 +1379,7 @@ fn cursor_animation_settings(config: &AppConfig) -> CursorAnimationSettings {
         trail: config.cursor.trail,
         blink_easing: config.cursor.blink_easing,
         short_lived_glow: config.cursor.short_lived_glow,
-        fps: config.performance.max_animation_fps,
+        fps,
     }
 }
 
@@ -1386,6 +1455,7 @@ fn initial_local_shell_profile(
 }
 
 fn local_shell_profile(profile: &ShellProfile) -> LocalShellProfile {
+    let profile = resolved_shell_profile(profile);
     let kind = match profile.kind {
         ShellProfileKind::Default => LocalShellKind::Default,
         ShellProfileKind::PowerShell => LocalShellKind::PowerShell,
@@ -1420,6 +1490,44 @@ fn local_shell_profile(profile: &ShellProfile) -> LocalShellProfile {
         working_directory: profile.working_directory.as_ref().map(PathBuf::from),
         startup_command: profile.startup_command.clone(),
     }
+}
+
+fn resolved_shell_profile(profile: &ShellProfile) -> ShellProfile {
+    let mut resolved = profile.clone();
+    let override_config = match ConfigPlatform::current() {
+        ConfigPlatform::MacOs => profile.platform_overrides.macos.as_ref(),
+        ConfigPlatform::Windows => profile.platform_overrides.windows.as_ref(),
+        ConfigPlatform::Linux => profile.platform_overrides.linux.as_ref(),
+        ConfigPlatform::LinuxX11 => profile
+            .platform_overrides
+            .linux_x11
+            .as_ref()
+            .or(profile.platform_overrides.linux.as_ref()),
+        ConfigPlatform::LinuxWayland => profile
+            .platform_overrides
+            .linux_wayland
+            .as_ref()
+            .or(profile.platform_overrides.linux.as_ref()),
+        ConfigPlatform::Unknown => None,
+    };
+    if let Some(override_config) = override_config {
+        if let Some(program) = &override_config.program {
+            resolved.program = program.clone();
+        }
+        if let Some(args) = &override_config.args {
+            resolved.args = args.clone();
+        }
+        if let Some(env) = &override_config.env {
+            resolved.env.extend(env.clone());
+        }
+        if let Some(working_directory) = &override_config.working_directory {
+            resolved.working_directory = Some(working_directory.clone());
+        }
+        if let Some(startup_command) = &override_config.startup_command {
+            resolved.startup_command = Some(startup_command.clone());
+        }
+    }
+    resolved
 }
 
 fn shell_integration_policy(config: &AppConfig) -> ShellIntegrationPolicy {
@@ -1635,6 +1743,18 @@ fn cols_for_width(width: u32, metrics: CellMetrics) -> u16 {
     ((width as f32 / metrics.cell_width).floor() as u16).max(1)
 }
 
+fn horizontal_content_inset(config: &AppConfig) -> u32 {
+    u32::from(config.window.padding_x).saturating_add(u32::from(config.window.margin_x))
+}
+
+fn vertical_content_inset(config: &AppConfig) -> u32 {
+    u32::from(config.window.padding_y).saturating_add(u32::from(config.window.margin_y))
+}
+
+fn content_extent(extent: u32, inset: u32) -> u32 {
+    extent.saturating_sub(inset.saturating_mul(2)).max(1)
+}
+
 fn rows_for_height(height: u32, metrics: CellMetrics) -> u16 {
     ((height as f32 / metrics.cell_height).floor() as u16).max(1)
 }
@@ -1726,6 +1846,86 @@ fn keybinding_action(event: &KeyEvent, config: &AppConfig) -> Option<String> {
         .iter()
         .find(|binding| canonical_key_spec(&binding.keys) == event_key)
         .map(|binding| binding.action.clone())
+}
+
+fn mousebinding_action(event: &MouseEvent, config: &config_core::MouseConfig) -> Option<String> {
+    let event_gesture = canonical_mouse_event(event)?;
+    config
+        .bindings
+        .iter()
+        .find(|binding| canonical_mouse_spec(&binding.gesture).as_deref() == Some(&event_gesture))
+        .map(|binding| binding.action.trim().to_ascii_lowercase())
+}
+
+fn canonical_mouse_event(event: &MouseEvent) -> Option<String> {
+    let name = match event.kind {
+        MouseEventKind::Pressed(button) => format!("{}press", mouse_button_name(button)?),
+        MouseEventKind::Released(button) => format!("{}release", mouse_button_name(button)?),
+        MouseEventKind::Wheel {
+            delta_x: _,
+            delta_y,
+        } if delta_y > 0.0 => "wheelup".to_owned(),
+        MouseEventKind::Wheel {
+            delta_x: _,
+            delta_y,
+        } if delta_y < 0.0 => "wheeldown".to_owned(),
+        MouseEventKind::Wheel {
+            delta_x,
+            delta_y: _,
+        } if delta_x > 0.0 => "wheelright".to_owned(),
+        MouseEventKind::Wheel {
+            delta_x,
+            delta_y: _,
+        } if delta_x < 0.0 => "wheelleft".to_owned(),
+        MouseEventKind::Moved | MouseEventKind::Wheel { .. } => return None,
+    };
+    Some(canonical_mouse_parts(event.modifiers, &name))
+}
+
+fn canonical_mouse_spec(spec: &str) -> Option<String> {
+    let mut modifiers = KeyModifiers::default();
+    let mut event = None;
+    for part in spec.split('+') {
+        let normalized = part.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "ctrl" | "control" => modifiers.ctrl = true,
+            "alt" | "option" => modifiers.alt = true,
+            "shift" => modifiers.shift = true,
+            "super" | "cmd" | "command" | "meta" => modifiers.super_key = true,
+            _ if event.is_none() => event = Some(normalized),
+            _ => return None,
+        }
+    }
+    event.map(|event| canonical_mouse_parts(modifiers, &event))
+}
+
+fn canonical_mouse_parts(modifiers: KeyModifiers, event: &str) -> String {
+    let mut parts = Vec::new();
+    if modifiers.ctrl {
+        parts.push("ctrl");
+    }
+    if modifiers.alt {
+        parts.push("alt");
+    }
+    if modifiers.shift {
+        parts.push("shift");
+    }
+    if modifiers.super_key {
+        parts.push("super");
+    }
+    parts.push(event);
+    parts.join("+")
+}
+
+fn mouse_button_name(button: MouseButton) -> Option<&'static str> {
+    match button {
+        MouseButton::Left => Some("left"),
+        MouseButton::Middle => Some("middle"),
+        MouseButton::Right => Some("right"),
+        MouseButton::Back => Some("back"),
+        MouseButton::Forward => Some("forward"),
+        MouseButton::Other(_) => None,
+    }
 }
 
 fn canonical_key_event(event: &KeyEvent) -> String {
@@ -1987,6 +2187,7 @@ fn window_settings(config: &AppConfig) -> WindowSettings {
         mode: map_window_mode(config.window.mode),
         linux_backend: map_linux_backend(config.window.linux_backend),
         decoration_mode: map_decoration_mode(config.window.decoration_strategy),
+        opacity: config.window.opacity,
     }
 }
 
@@ -2050,8 +2251,16 @@ impl MuxRuntime {
         let mut model = MuxModel::new(session_spec_for_config(config));
         model.active_workspace_mut().name = config.mux.default_workspace.clone();
 
-        let surface_cols = cols_for_width(width, metrics).max(1);
-        let surface_rows = rows_for_height(height, metrics).max(1);
+        let surface_cols = cols_for_width(
+            content_extent(width, horizontal_content_inset(config)),
+            metrics,
+        )
+        .max(1);
+        let surface_rows = rows_for_height(
+            content_extent(height, vertical_content_inset(config)),
+            metrics,
+        )
+        .max(1);
         let pane_id = model.active_tab().active_pane;
         let pane_size = TerminalGridSize::new(
             surface_cols,
@@ -2076,8 +2285,16 @@ impl MuxRuntime {
     }
 
     fn resize_all(&mut self, width: u32, height: u32, metrics: CellMetrics, config: &AppConfig) {
-        self.surface_cols = cols_for_width(width, metrics).max(1);
-        self.surface_rows = rows_for_height(height, metrics).max(1);
+        self.surface_cols = cols_for_width(
+            content_extent(width, horizontal_content_inset(config)),
+            metrics,
+        )
+        .max(1);
+        self.surface_rows = rows_for_height(
+            content_extent(height, vertical_content_inset(config)),
+            metrics,
+        )
+        .max(1);
         self.resize_active_tab(metrics, config);
     }
 
@@ -2370,22 +2587,13 @@ impl MuxRuntime {
         let Some(pane) = self.panes.get_mut(&pane_id) else {
             return MouseHandling::default();
         };
-        if local_mouse.modifiers.ctrl
-            && matches!(local_mouse.kind, MouseEventKind::Pressed(MouseButton::Left))
-            && pane.url_at_mouse(local_mouse, metrics).is_some()
-        {
-            return MouseHandling::default();
-        }
-        if local_mouse.modifiers.ctrl
-            && matches!(
-                local_mouse.kind,
-                MouseEventKind::Released(MouseButton::Left)
-            )
-            && let Some(url) = pane.url_at_mouse(local_mouse, metrics)
-        {
+        let binding_action = mousebinding_action(&local_mouse, &config.mouse);
+        if binding_action.as_deref() == Some("open_url") {
             return MouseHandling {
                 changed: false,
-                open_url: Some(url),
+                open_url: matches!(local_mouse.kind, MouseEventKind::Released(_))
+                    .then(|| pane.url_at_mouse(local_mouse, metrics))
+                    .flatten(),
             };
         }
         let modes = pane.terminal.modes();
@@ -2396,6 +2604,38 @@ impl MuxRuntime {
         {
             pane.write_input(&bytes);
             return MouseHandling::default();
+        }
+
+        match binding_action.as_deref() {
+            Some("ignore") => return MouseHandling::default(),
+            Some("paste") if matches!(local_mouse.kind, MouseEventKind::Pressed(_)) => {
+                if let Ok(text) = clipboard.paste_text() {
+                    let bytes = paste_bytes(&text, clipboard_config, paste_config, false);
+                    pane.write_input(&bytes);
+                }
+                return MouseHandling::default();
+            }
+            Some("paste_primary") if matches!(local_mouse.kind, MouseEventKind::Pressed(_)) => {
+                if let Ok(text) = paste_for_middle_click(clipboard, clipboard_config) {
+                    let bytes = paste_bytes(&text, clipboard_config, paste_config, false);
+                    pane.write_input(&bytes);
+                }
+                return MouseHandling::default();
+            }
+            Some("copy") if matches!(local_mouse.kind, MouseEventKind::Released(_)) => {
+                if let Some(text) = pane.terminal.state().selected_text() {
+                    copy_text_with_diagnostics(clipboard, &text, clipboard_config, "mouse copy");
+                }
+                return MouseHandling::default();
+            }
+            _ => {}
+        }
+
+        let mut local_mouse = local_mouse;
+        if binding_action.as_deref() == Some("select_rectangular") {
+            local_mouse.modifiers.alt = true;
+        } else if binding_action.as_deref() == Some("select") {
+            local_mouse.modifiers.alt = false;
         } else if should_middle_click_paste(&local_mouse, &modes, clipboard_config)
             && let Ok(text) = paste_for_middle_click(clipboard, clipboard_config)
         {
@@ -2419,7 +2659,9 @@ impl MuxRuntime {
             {
                 eprintln!("Linux primary selection copy failed: {diagnostic:?}");
             }
-            if clipboard_config.enabled && clipboard_config.copy_on_select {
+            if clipboard_config.enabled
+                && (clipboard_config.copy_on_select || config.mouse.copy_on_select)
+            {
                 copy_text_with_diagnostics(clipboard, &text, clipboard_config, "copy-on-select");
             }
         }
@@ -2435,8 +2677,15 @@ impl MuxRuntime {
         metrics: CellMetrics,
         config: &AppConfig,
     ) -> Option<(PaneId, MouseEvent)> {
-        let x_cells = (mouse.x as f32 / metrics.cell_width).floor();
-        let y_cells = (mouse.y as f32 / metrics.cell_height).floor();
+        let inset_x = f64::from(horizontal_content_inset(config));
+        let inset_y = f64::from(vertical_content_inset(config));
+        if mouse.x < inset_x || mouse.y < inset_y {
+            return None;
+        }
+        let content_x = mouse.x - inset_x;
+        let content_y = mouse.y - inset_y;
+        let x_cells = (content_x as f32 / metrics.cell_width).floor();
+        let y_cells = (content_y as f32 / metrics.cell_height).floor();
         self.active_layouts(config)
             .into_iter()
             .find(|layout| {
@@ -2447,8 +2696,8 @@ impl MuxRuntime {
             })
             .map(|layout| {
                 let local = MouseEvent {
-                    x: (mouse.x as f32 - layout.rect.x * metrics.cell_width).max(0.0) as f64,
-                    y: (mouse.y as f32 - layout.rect.y * metrics.cell_height).max(0.0) as f64,
+                    x: (content_x as f32 - layout.rect.x * metrics.cell_width).max(0.0) as f64,
+                    y: (content_y as f32 - layout.rect.y * metrics.cell_height).max(0.0) as f64,
                     ..mouse
                 };
                 (layout.pane_id, local)
@@ -2495,6 +2744,11 @@ impl MuxRuntime {
     fn active_selected_text(&self) -> Option<String> {
         self.active_pane()
             .and_then(|pane| pane.terminal.state().selected_text())
+    }
+
+    fn active_cursor_blinks(&self) -> bool {
+        self.active_pane()
+            .is_some_and(|pane| pane.terminal.cursor_state().blinking)
     }
 
     fn active_pane(&self) -> Option<&PaneRuntime> {
@@ -3002,9 +3256,10 @@ fn mark_session_status(model: &mut MuxModel, pane_id: PaneId, status: SessionSta
 }
 
 fn session_spec_for_config(config: &AppConfig) -> SessionSpec {
-    let profile = selected_shell_profile(config);
+    let profile = selected_shell_profile(config).map(resolved_shell_profile);
     let mut spec = SessionSpec::local(
         profile
+            .as_ref()
             .map(|profile| profile.name.clone())
             .unwrap_or_else(|| "default".to_owned()),
     );
@@ -3040,17 +3295,28 @@ fn tab_bar_rows(model: &MuxModel, config: &AppConfig) -> u16 {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CursorPresentation {
+    blink_visible: bool,
+    window_focused: bool,
+}
+
 fn scene_from_mux(
     runtime: &MuxRuntime,
     metrics: Option<CellMetrics>,
     config: &AppConfig,
     cursor_animator: Option<&mut CursorAnimationRuntime>,
+    cursor: CursorPresentation,
 ) -> RenderScene {
     let mut scene = RenderScene {
         grid: RenderGrid {
             columns: runtime.surface_cols,
             rows: runtime.surface_rows,
             cells: Vec::new(),
+        },
+        content_offset: RenderOffset {
+            x: horizontal_content_inset(config).min(i32::MAX as u32) as i32,
+            y: vertical_content_inset(config).min(i32::MAX as u32) as i32,
         },
         ..RenderScene::default()
     };
@@ -3065,7 +3331,15 @@ fn scene_from_mux(
         let Some(pane) = runtime.panes.get(&layout.pane_id) else {
             continue;
         };
-        append_pane_scene(&mut scene, pane, layout, active_pane, metrics, config);
+        append_pane_scene(
+            &mut scene,
+            pane,
+            layout,
+            active_pane,
+            metrics,
+            config,
+            cursor,
+        );
     }
 
     if let Some(metrics) = metrics {
@@ -3085,6 +3359,7 @@ fn append_pane_scene(
     active_pane: PaneId,
     metrics: Option<CellMetrics>,
     config: &AppConfig,
+    cursor: CursorPresentation,
 ) {
     let mut pane_scene = scene_from_terminal(
         &pane.terminal,
@@ -3092,6 +3367,7 @@ fn append_pane_scene(
         &pane.search,
         metrics,
         config,
+        cursor,
     );
     let row_offset = layout.rect.y.floor() as i64;
     let col_offset = layout.rect.x.floor() as u16;
@@ -3286,18 +3562,52 @@ fn scene_from_terminal(
     search: &PaneSearch,
     metrics: Option<CellMetrics>,
     config: &AppConfig,
+    presentation: CursorPresentation,
 ) -> RenderScene {
     let visible = terminal.visible_grid();
     let cursor = terminal.cursor_state();
+    let modes = terminal.modes();
+    let configured_cursor_shape =
+        resolved_cursor_shape(config, cursor.shape, &modes, presentation.window_focused);
+    let cursor_visible = cursor.visible
+        && terminal.state().viewport_offset() == 0
+        && (!presentation.window_focused || presentation.blink_visible);
+    let selection = terminal.selection_state();
     let mut cells = Vec::with_capacity(visible.cells.len());
     let cols = visible.viewport.size.cols;
 
     for (index, cell) in visible.cells.iter().enumerate() {
         let row = (index / usize::from(cols)) as i64;
         let col = (index % usize::from(cols)) as u16;
-        let (foreground, background) = colors_for_attributes(cell.attributes, config);
+        let (mut foreground, background) = colors_for_attributes(cell.attributes, config);
+        let position = CellPosition { row, col };
+        if config.colors.selection_foreground.is_some_and(|_| {
+            selection.is_some_and(|selection| {
+                selection_contains(selection, visible.viewport.origin_row + row, col)
+            })
+        }) {
+            foreground = render_color(
+                config
+                    .colors
+                    .selection_foreground
+                    .expect("selection foreground was checked"),
+            );
+        }
+        if cursor_visible
+            && row == cursor.position.row
+            && col == cursor.position.col
+            && matches!(
+                configured_cursor_shape,
+                RenderCursorShape::Block
+                    | RenderCursorShape::Custom
+                    | RenderCursorShape::CustomStaticShape
+            )
+            && let Some(cursor_text) = config.colors.cursor_text
+        {
+            foreground = render_color(cursor_text);
+        }
         cells.push(RenderCell {
-            position: CellPosition { row, col },
+            position,
             text: cell.text.clone(),
             foreground,
             background,
@@ -3324,8 +3634,6 @@ fn scene_from_terminal(
     let selections = selection_visual(terminal, visible.viewport, config)
         .into_iter()
         .collect();
-    let cursor_visible = cursor.visible && terminal.state().viewport_offset() == 0;
-
     RenderScene {
         grid: RenderGrid {
             columns: visible.viewport.size.cols,
@@ -3337,21 +3645,82 @@ fn scene_from_terminal(
                 row: cursor.position.row,
                 col: cursor.position.col,
             },
-            shape: match cursor.shape {
-                CursorShape::Block => render_cursor_shape(config.cursor.shape),
-                CursorShape::Beam => RenderCursorShape::Beam,
-                CursorShape::Underline => RenderCursorShape::Underline,
-            },
-            color: render_color(config.cursor.color.unwrap_or(config.colors.cursor)),
+            shape: configured_cursor_shape,
+            color: render_color(if presentation.window_focused {
+                config.cursor.color.unwrap_or(config.colors.cursor)
+            } else {
+                config
+                    .cursor
+                    .inactive_color
+                    .or(config.cursor.color)
+                    .unwrap_or(config.colors.cursor)
+            }),
             visible: cursor_visible,
             thickness_percent: (config.cursor.thickness.clamp(0.05, 1.0) * 100.0).round() as u8,
-            corner_radius_px: cursor_radius_px(config),
-            inactive: false,
+            corner_radius_px: cursor_radius_px(config, metrics),
+            inactive: !presentation.window_focused,
         }),
         semantic_overlays,
         search_highlights,
         selections,
         ..RenderScene::default()
+    }
+}
+
+fn selection_contains(selection: Selection, row: i64, col: u16) -> bool {
+    let (start, end) = if selection.start <= selection.end {
+        (selection.start, selection.end)
+    } else {
+        (selection.end, selection.start)
+    };
+    if row < start.row || row > end.row {
+        return false;
+    }
+    match selection.kind {
+        SelectionKind::Rectangular => {
+            col >= start.col.min(end.col) && col <= start.col.max(end.col)
+        }
+        SelectionKind::Normal if start.row == end.row => col >= start.col && col <= end.col,
+        SelectionKind::Normal if row == start.row => col >= start.col,
+        SelectionKind::Normal if row == end.row => col <= end.col,
+        SelectionKind::Normal => true,
+    }
+}
+
+fn resolved_cursor_shape(
+    config: &AppConfig,
+    terminal_shape: CursorShape,
+    modes: &BTreeSet<TerminalMode>,
+    focused: bool,
+) -> RenderCursorShape {
+    if !focused {
+        return render_cursor_shape(config.cursor.inactive_shape);
+    }
+    let mode = if modes.contains(&TerminalMode::AlternateScreen) {
+        Some("alternate_screen")
+    } else if modes.contains(&TerminalMode::Insert) {
+        Some("insert")
+    } else if modes.contains(&TerminalMode::ApplicationCursorKeys) {
+        Some("application_cursor")
+    } else if modes.contains(&TerminalMode::ApplicationKeypad) {
+        Some("application_keypad")
+    } else {
+        Some("normal")
+    };
+    if let Some(shape) = mode.and_then(|mode| {
+        config
+            .cursor
+            .mode_specific_styles
+            .iter()
+            .find(|(configured, _)| configured.eq_ignore_ascii_case(mode))
+            .map(|(_, shape)| shape)
+    }) {
+        return render_cursor_shape(*shape);
+    }
+    match terminal_shape {
+        CursorShape::Beam => RenderCursorShape::Beam,
+        CursorShape::Underline => RenderCursorShape::Underline,
+        CursorShape::Block => render_cursor_shape(config.cursor.shape),
     }
 }
 
@@ -3494,8 +3863,9 @@ fn render_cursor_shape(shape: config_core::CursorShape) -> RenderCursorShape {
     }
 }
 
-fn cursor_radius_px(config: &AppConfig) -> u8 {
-    let radius = config.cursor.corner_radius.clamp(0.0, 0.5) * 16.0;
+fn cursor_radius_px(config: &AppConfig, metrics: Option<CellMetrics>) -> u8 {
+    let cell_edge = metrics.map_or(16.0, |metrics| metrics.cell_width.min(metrics.cell_height));
+    let radius = config.cursor.corner_radius.clamp(0.0, 0.5) * f64::from(cell_edge);
     radius.round() as u8
 }
 
@@ -4086,10 +4456,12 @@ fn colors_for_attributes(
         render_color(config.colors.background),
         config,
     );
-
     if attributes.inverse {
         std::mem::swap(&mut foreground, &mut background);
     }
+    background.alpha = ((f64::from(background.alpha) * config.window.opacity)
+        .round()
+        .clamp(0.0, 255.0)) as u8;
 
     (foreground, background)
 }
@@ -4289,14 +4661,27 @@ fn ansi_color(index: u8, config: &AppConfig) -> RenderColor {
         RenderColor::rgb(242, 242, 242),
     ];
 
-    config
-        .colors
-        .palette
-        .get(usize::from(index.min(15)))
-        .copied()
-        .map(render_color)
-        .or_else(|| PALETTE.get(usize::from(index.min(15))).copied())
-        .unwrap_or(PALETTE[7])
+    if index < 16 {
+        return config
+            .colors
+            .palette
+            .get(usize::from(index))
+            .copied()
+            .map(render_color)
+            .or_else(|| PALETTE.get(usize::from(index)).copied())
+            .unwrap_or(PALETTE[7]);
+    }
+    if index < 232 {
+        const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+        let cube = index - 16;
+        return RenderColor::rgb(
+            LEVELS[usize::from(cube / 36)],
+            LEVELS[usize::from((cube / 6) % 6)],
+            LEVELS[usize::from(cube % 6)],
+        );
+    }
+    let gray = 8u8.saturating_add((index - 232).saturating_mul(10));
+    RenderColor::rgb(gray, gray, gray)
 }
 
 #[cfg(test)]
@@ -4864,6 +5249,82 @@ mod tests {
                 .all(|overlay| overlay.kind == OverlayKind::PerformanceOverlay)
         );
         assert!(scene.grid.cells.is_empty());
+    }
+
+    #[test]
+    fn static_cursor_resolution_honors_modes_terminal_requests_and_focus() {
+        let mut config = AppConfig::default();
+        config.cursor.shape = config_core::CursorShape::HollowBlock;
+        config
+            .cursor
+            .mode_specific_styles
+            .insert("insert".to_owned(), config_core::CursorShape::Beam);
+        let mut modes = BTreeSet::new();
+
+        assert_eq!(
+            resolved_cursor_shape(&config, CursorShape::Block, &modes, true),
+            RenderCursorShape::HollowBlock
+        );
+        assert_eq!(
+            resolved_cursor_shape(&config, CursorShape::Underline, &modes, true),
+            RenderCursorShape::Underline
+        );
+        modes.insert(TerminalMode::Insert);
+        assert_eq!(
+            resolved_cursor_shape(&config, CursorShape::Block, &modes, true),
+            RenderCursorShape::Beam
+        );
+        assert_eq!(
+            resolved_cursor_shape(&config, CursorShape::Block, &modes, false),
+            RenderCursorShape::HollowBlock
+        );
+    }
+
+    #[test]
+    fn mouse_bindings_are_modifier_order_independent() {
+        let config = config_core::MouseConfig {
+            bindings: vec![config_core::MouseBinding::new(
+                "Shift+Ctrl+LeftRelease",
+                "copy",
+            )],
+            ..config_core::MouseConfig::default()
+        };
+        let event = MouseEvent {
+            kind: MouseEventKind::Released(MouseButton::Left),
+            x: 0.0,
+            y: 0.0,
+            modifiers: KeyModifiers {
+                ctrl: true,
+                shift: true,
+                ..KeyModifiers::default()
+            },
+        };
+
+        assert_eq!(
+            mousebinding_action(&event, &config).as_deref(),
+            Some("copy")
+        );
+    }
+
+    #[test]
+    fn indexed_color_mapping_covers_ansi_cube_and_grayscale() {
+        let config = AppConfig::default();
+        assert_eq!(
+            ansi_color(1, &config),
+            render_color(config.colors.palette[1])
+        );
+        assert_eq!(ansi_color(16, &config), RenderColor::rgb(0, 0, 0));
+        assert_eq!(ansi_color(196, &config), RenderColor::rgb(255, 0, 0));
+        assert_eq!(ansi_color(255, &config), RenderColor::rgb(238, 238, 238));
+    }
+
+    #[test]
+    fn window_padding_and_margin_reduce_the_terminal_extent() {
+        let mut config = AppConfig::default();
+        config.window.padding_x = 8;
+        config.window.margin_x = 4;
+        assert_eq!(horizontal_content_inset(&config), 12);
+        assert_eq!(content_extent(100, horizontal_content_inset(&config)), 76);
     }
 
     #[test]

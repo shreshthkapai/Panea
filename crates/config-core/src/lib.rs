@@ -67,6 +67,71 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// Applies a built-in portable visual profile. Frontends should apply the
+    /// profile before explicit user fields so direct settings remain authoritative.
+    pub fn apply_visual_profile(&mut self, name: &str) -> bool {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "balanced" => {
+                self.colors = ColorConfig::default();
+                self.visual_theme = VisualThemeConfig::default();
+                self.cursor = CursorConfig::default();
+                true
+            }
+            "plain-fast" | "plain_fast" => {
+                self.colors = ColorConfig::default();
+                self.visual_theme = VisualThemeConfig {
+                    name: "plain-fast".to_owned(),
+                    grouping_style: InputOutputGroupingStyle::Traditional,
+                    animation_profile: "off".to_owned(),
+                    ..VisualThemeConfig::default()
+                };
+                self.cursor = CursorConfig {
+                    blink: false,
+                    ..CursorConfig::default()
+                };
+                self.prompt_decorations.enabled = false;
+                self.command_blocks.enabled = false;
+                true
+            }
+            "minimal-aesthetic" | "minimal_aesthetic" => {
+                self.colors = ColorConfig {
+                    foreground: RgbaColor::rgb(224, 229, 235),
+                    background: RgbaColor::rgb(18, 21, 24),
+                    cursor: RgbaColor::rgb(83, 190, 176),
+                    selection_background: RgbaColor {
+                        red: 83,
+                        green: 190,
+                        blue: 176,
+                        alpha: 96,
+                    },
+                    ..ColorConfig::default()
+                };
+                self.visual_theme = VisualThemeConfig {
+                    name: "minimal-aesthetic".to_owned(),
+                    cursor_profile: "thin".to_owned(),
+                    grouping_style: InputOutputGroupingStyle::MinimalHeaders,
+                    ..VisualThemeConfig::default()
+                };
+                self.cursor = CursorConfig {
+                    shape: CursorShape::Beam,
+                    thickness: 0.08,
+                    ..CursorConfig::default()
+                };
+                true
+            }
+            "command-blocks" | "command_blocks" => {
+                self.apply_visual_profile("balanced");
+                self.visual_theme.name = "command-blocks".to_owned();
+                self.visual_theme.grouping_style = InputOutputGroupingStyle::CommandCards;
+                self.command_blocks.enabled = true;
+                self.command_blocks.style = CommandBlockStyle::Card;
+                self.prompt_decorations.enabled = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
     #[must_use]
     pub fn resolved_for_platform(&self, platform: ConfigPlatform) -> Self {
         let mut resolved = self.clone();
@@ -107,6 +172,16 @@ impl AppConfig {
         }
         if !(0.2..=1.0).contains(&self.window.opacity) {
             report.error("window.opacity", "opacity must be between 0.2 and 1.0");
+        }
+        if self.window.padding_x > 256
+            || self.window.padding_y > 256
+            || self.window.margin_x > 256
+            || self.window.margin_y > 256
+        {
+            report.error(
+                "window",
+                "window padding and margins must be between 0 and 256 pixels",
+            );
         }
         if matches!(
             self.window.mode,
@@ -165,11 +240,26 @@ impl AppConfig {
                 "cursor thickness must be between 0.05 and 1.0",
             );
         }
-        if self.cursor.corner_radius > 0.5 {
+        if !(0.0..=0.5).contains(&self.cursor.corner_radius) {
             report.error(
                 "cursor.corner_radius",
                 "cursor corner radius must be between 0.0 and 0.5 terminal cells",
             );
+        }
+        for mode in self.cursor.mode_specific_styles.keys() {
+            if !matches!(
+                mode.trim().to_ascii_lowercase().as_str(),
+                "normal"
+                    | "insert"
+                    | "alternate_screen"
+                    | "application_cursor"
+                    | "application_keypad"
+            ) {
+                report.error(
+                    format!("cursor.mode_specific_styles.{mode}"),
+                    "cursor mode must be normal, insert, alternate_screen, application_cursor, or application_keypad",
+                );
+            }
         }
         if self.cursor.image.enabled {
             if self.cursor.image.path.trim().is_empty() {
@@ -201,6 +291,7 @@ impl AppConfig {
 
         self.validate_clipboard(&mut report);
         self.validate_keybindings(&mut report);
+        self.validate_mouse_bindings(&mut report);
         self.validate_shell_integration(&mut report);
         self.validate_shell_profiles(&mut report);
         self.validate_ssh_profiles(&mut report);
@@ -226,6 +317,8 @@ impl AppConfig {
         }
         if self.window.padding_x != next.window.padding_x
             || self.window.padding_y != next.window.padding_y
+            || self.window.margin_x != next.window.margin_x
+            || self.window.margin_y != next.window.margin_y
         {
             plan.live.push(ReloadableSection::WindowPadding);
         }
@@ -336,11 +429,57 @@ impl AppConfig {
             if action.is_empty() {
                 report.error("keyboard.keybindings", "keybinding action cannot be empty");
             }
-            if let Some(previous_action) = seen.insert(keys.to_ascii_lowercase(), action.to_owned())
+            if let Some(previous_action) =
+                seen.insert(canonical_binding_spec(keys), action.to_owned())
             {
                 report.error(
                     "keyboard.keybindings",
                     format!("keybinding conflict for {keys}: {previous_action} and {action}"),
+                );
+            }
+        }
+    }
+
+    fn validate_mouse_bindings(&self, report: &mut ValidationReport) {
+        const ACTIONS: &[&str] = &[
+            "copy",
+            "ignore",
+            "open_url",
+            "paste",
+            "paste_primary",
+            "scroll",
+            "select",
+            "select_rectangular",
+        ];
+        let mut seen = BTreeMap::<String, String>::new();
+        for binding in &self.mouse.bindings {
+            let gesture = binding.gesture.trim().to_ascii_lowercase();
+            let action = binding.action.trim().to_ascii_lowercase();
+            if gesture.is_empty() {
+                report.error("mouse.bindings", "mouse binding gesture cannot be empty");
+            }
+            let canonical_gesture = canonical_mouse_gesture(&gesture);
+            if canonical_gesture.is_none() {
+                report.error(
+                    "mouse.bindings",
+                    format!("unsupported mouse gesture '{}'", binding.gesture),
+                );
+            }
+            if !ACTIONS.contains(&action.as_str()) {
+                report.error(
+                    "mouse.bindings",
+                    format!("unsupported mouse action '{}'", binding.action),
+                );
+            }
+            if let Some(previous_action) =
+                canonical_gesture.and_then(|gesture| seen.insert(gesture, action.clone()))
+            {
+                report.error(
+                    "mouse.bindings",
+                    format!(
+                        "mouse binding conflict for {}: {previous_action} and {action}",
+                        binding.gesture
+                    ),
                 );
             }
         }
@@ -643,6 +782,69 @@ fn is_supported_shell_integration_name(shell: &str) -> bool {
     )
 }
 
+fn canonical_binding_spec(spec: &str) -> String {
+    let mut modifiers = BTreeSet::new();
+    let mut key = String::new();
+    for part in spec.split('+') {
+        match part.trim().to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => {
+                modifiers.insert("ctrl");
+            }
+            "alt" | "option" => {
+                modifiers.insert("alt");
+            }
+            "shift" => {
+                modifiers.insert("shift");
+            }
+            "super" | "cmd" | "command" | "meta" => {
+                modifiers.insert("super");
+            }
+            other => key = other.to_owned(),
+        }
+    }
+    modifiers
+        .into_iter()
+        .chain(std::iter::once(key.as_str()))
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+fn canonical_mouse_gesture(gesture: &str) -> Option<String> {
+    let mut modifiers = BTreeSet::new();
+    let mut event = None;
+    for part in gesture.split('+') {
+        match part.trim().to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => {
+                modifiers.insert("ctrl");
+            }
+            "alt" | "option" => {
+                modifiers.insert("alt");
+            }
+            "shift" => {
+                modifiers.insert("shift");
+            }
+            "super" | "cmd" | "command" | "meta" => {
+                modifiers.insert("super");
+            }
+            "leftpress" | "leftrelease" | "middlepress" | "middlerelease" | "rightpress"
+            | "rightrelease" | "backpress" | "backrelease" | "forwardpress" | "forwardrelease"
+            | "wheelup" | "wheeldown" | "wheelleft" | "wheelright" => {
+                if event.replace(part.trim().to_ascii_lowercase()).is_some() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    event.map(|event| {
+        modifiers
+            .into_iter()
+            .chain(std::iter::once(event.as_str()))
+            .collect::<Vec<_>>()
+            .join("+")
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WindowConfig {
@@ -653,6 +855,8 @@ pub struct WindowConfig {
     pub initial_height: u32,
     pub padding_x: u16,
     pub padding_y: u16,
+    pub margin_x: u16,
+    pub margin_y: u16,
     pub opacity: f64,
     pub mode: WindowModeConfig,
     pub linux_backend: LinuxBackendConfig,
@@ -669,6 +873,8 @@ impl Default for WindowConfig {
             initial_height: 560,
             padding_x: 8,
             padding_y: 6,
+            margin_x: 0,
+            margin_y: 0,
             opacity: 1.0,
             mode: WindowModeConfig::Windowed,
             linux_backend: LinuxBackendConfig::Auto,
@@ -801,6 +1007,8 @@ pub struct ColorConfig {
     pub foreground: RgbaColor,
     pub background: RgbaColor,
     pub cursor: RgbaColor,
+    pub cursor_text: Option<RgbaColor>,
+    pub selection_foreground: Option<RgbaColor>,
     pub selection_background: RgbaColor,
     pub palette: Vec<RgbaColor>,
 }
@@ -811,6 +1019,8 @@ impl Default for ColorConfig {
             foreground: RgbaColor::rgb(230, 230, 230),
             background: RgbaColor::rgb(12, 12, 12),
             cursor: RgbaColor::rgb(235, 235, 235),
+            cursor_text: None,
+            selection_foreground: None,
             selection_background: RgbaColor {
                 red: 80,
                 green: 150,
@@ -975,6 +1185,7 @@ pub struct CursorConfig {
     pub corner_radius: f64,
     pub color: Option<RgbaColor>,
     pub inactive_shape: CursorShape,
+    pub inactive_color: Option<RgbaColor>,
     pub mode_specific_styles: BTreeMap<String, CursorShape>,
     pub animations_enabled: bool,
     pub smooth_movement: bool,
@@ -996,6 +1207,7 @@ impl Default for CursorConfig {
             corner_radius: 0.0,
             color: None,
             inactive_shape: CursorShape::HollowBlock,
+            inactive_color: None,
             mode_specific_styles: BTreeMap::new(),
             animations_enabled: false,
             smooth_movement: false,
@@ -1225,7 +1437,7 @@ impl KeyBinding {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MouseConfig {
     pub bindings: Vec<MouseBinding>,
@@ -1233,10 +1445,33 @@ pub struct MouseConfig {
     pub hide_cursor_when_typing: bool,
 }
 
+impl Default for MouseConfig {
+    fn default() -> Self {
+        Self {
+            bindings: vec![
+                MouseBinding::new("Ctrl+LeftRelease", "open_url"),
+                MouseBinding::new("MiddlePress", "paste_primary"),
+            ],
+            copy_on_select: false,
+            hide_cursor_when_typing: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MouseBinding {
     pub gesture: String,
     pub action: String,
+}
+
+impl MouseBinding {
+    #[must_use]
+    pub fn new(gesture: impl Into<String>, action: impl Into<String>) -> Self {
+        Self {
+            gesture: gesture.into(),
+            action: action.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1340,6 +1575,7 @@ impl Default for ShellProfile {
 pub enum ShellProfileKind {
     #[default]
     Default,
+    #[serde(alias = "powershell", alias = "pwsh")]
     PowerShell,
     Cmd,
     Wsl,
@@ -1497,6 +1733,45 @@ impl Default for PerformanceConfig {
     }
 }
 
+impl PerformanceConfig {
+    pub fn apply_profile(&mut self, profile: PerformanceProfile) {
+        *self = match profile {
+            PerformanceProfile::MaximumPerformance => Self {
+                profile,
+                frame_rate_limit: None,
+                glyph_cache_entries: 16_384,
+                max_frame_time_ms: 12,
+                max_animation_fps: 1,
+                max_active_animations: 0,
+                max_animated_region_pixels: 0,
+                disable_expensive_effects_on_battery: true,
+                ..Self::default()
+            },
+            PerformanceProfile::Balanced => Self::default(),
+            PerformanceProfile::Visual => Self {
+                profile,
+                glyph_cache_entries: 16_384,
+                max_frame_time_ms: 16,
+                max_animation_fps: 60,
+                max_active_animations: 16,
+                max_animated_region_pixels: 500_000,
+                ..Self::default()
+            },
+            PerformanceProfile::BatterySaver => Self {
+                profile,
+                frame_rate_limit: Some(30),
+                glyph_cache_entries: 4096,
+                max_frame_time_ms: 33,
+                max_animation_fps: 30,
+                max_active_animations: 2,
+                max_animated_region_pixels: 80_000,
+                disable_expensive_effects_on_battery: true,
+                ..Self::default()
+            },
+        };
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PlatformOverrides {
@@ -1548,6 +1823,7 @@ pub struct PlatformOverride {
     pub window: Option<WindowConfigPatch>,
     pub renderer: Option<RendererConfigPatch>,
     pub font: Option<FontConfigPatch>,
+    pub colors: Option<ColorConfigPatch>,
     pub visual_theme: Option<VisualThemeConfigPatch>,
     pub cursor: Option<CursorConfigPatch>,
     pub command_blocks: Option<CommandBlocksConfigPatch>,
@@ -1571,6 +1847,9 @@ impl PlatformOverride {
         }
         if let Some(font) = &self.font {
             font.apply_to(&mut config.font);
+        }
+        if let Some(colors) = &self.colors {
+            colors.apply_to(&mut config.colors);
         }
         if let Some(visual_theme) = &self.visual_theme {
             visual_theme.apply_to(&mut config.visual_theme);
@@ -1599,7 +1878,7 @@ impl PlatformOverride {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct WindowConfigPatch {
     pub title: Option<String>,
@@ -1609,6 +1888,9 @@ pub struct WindowConfigPatch {
     pub initial_height: Option<u32>,
     pub padding_x: Option<u16>,
     pub padding_y: Option<u16>,
+    pub margin_x: Option<u16>,
+    pub margin_y: Option<u16>,
+    pub opacity: Option<f64>,
     pub mode: Option<WindowModeConfig>,
     pub linux_backend: Option<LinuxBackendConfig>,
     pub decoration_strategy: Option<DecorationStrategyConfig>,
@@ -1623,6 +1905,9 @@ impl WindowConfigPatch {
         apply_opt(&mut config.initial_height, &self.initial_height);
         apply_opt(&mut config.padding_x, &self.padding_x);
         apply_opt(&mut config.padding_y, &self.padding_y);
+        apply_opt(&mut config.margin_x, &self.margin_x);
+        apply_opt(&mut config.margin_y, &self.margin_y);
+        apply_opt(&mut config.opacity, &self.opacity);
         apply_opt(&mut config.mode, &self.mode);
         apply_opt(&mut config.linux_backend, &self.linux_backend);
         apply_opt(&mut config.decoration_strategy, &self.decoration_strategy);
@@ -1666,6 +1951,34 @@ impl FontConfigPatch {
         apply_opt(&mut config.line_height, &self.line_height);
         apply_opt(&mut config.fallback_families, &self.fallback_families);
         apply_opt(&mut config.ligatures, &self.ligatures);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ColorConfigPatch {
+    pub foreground: Option<RgbaColor>,
+    pub background: Option<RgbaColor>,
+    pub cursor: Option<RgbaColor>,
+    pub cursor_text: Option<Option<RgbaColor>>,
+    pub selection_foreground: Option<Option<RgbaColor>>,
+    pub selection_background: Option<RgbaColor>,
+    pub palette: Option<Vec<RgbaColor>>,
+}
+
+impl ColorConfigPatch {
+    fn apply_to(&self, config: &mut ColorConfig) {
+        apply_opt(&mut config.foreground, &self.foreground);
+        apply_opt(&mut config.background, &self.background);
+        apply_opt(&mut config.cursor, &self.cursor);
+        if let Some(cursor_text) = self.cursor_text {
+            config.cursor_text = cursor_text;
+        }
+        if let Some(selection_foreground) = self.selection_foreground {
+            config.selection_foreground = selection_foreground;
+        }
+        apply_opt(&mut config.selection_background, &self.selection_background);
+        apply_opt(&mut config.palette, &self.palette);
     }
 }
 
@@ -1717,6 +2030,7 @@ pub struct CursorConfigPatch {
     pub corner_radius: Option<f64>,
     pub color: Option<Option<RgbaColor>>,
     pub inactive_shape: Option<CursorShape>,
+    pub inactive_color: Option<Option<RgbaColor>>,
     pub mode_specific_styles: Option<BTreeMap<String, CursorShape>>,
     pub animations_enabled: Option<bool>,
     pub smooth_movement: Option<bool>,
@@ -1739,6 +2053,9 @@ impl CursorConfigPatch {
             config.color = color;
         }
         apply_opt(&mut config.inactive_shape, &self.inactive_shape);
+        if let Some(inactive_color) = self.inactive_color {
+            config.inactive_color = inactive_color;
+        }
         apply_opt(&mut config.mode_specific_styles, &self.mode_specific_styles);
         apply_opt(&mut config.animations_enabled, &self.animations_enabled);
         apply_opt(&mut config.smooth_movement, &self.smooth_movement);
@@ -1943,7 +2260,9 @@ pub struct PerformanceConfigPatch {
 
 impl PerformanceConfigPatch {
     fn apply_to(&self, config: &mut PerformanceConfig) {
-        apply_opt(&mut config.profile, &self.profile);
+        if let Some(profile) = self.profile {
+            config.apply_profile(profile);
+        }
         if let Some(frame_rate_limit) = self.frame_rate_limit {
             config.frame_rate_limit = frame_rate_limit;
         }
@@ -2211,6 +2530,27 @@ pub fn export_schema() -> ConfigSchema {
                         false,
                     ),
                     field(
+                        "window.margin_x",
+                        "integer",
+                        default.window.margin_x,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "window.margin_y",
+                        "integer",
+                        default.window.margin_y,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "window.opacity",
+                        "number",
+                        default.window.opacity,
+                        false,
+                        true,
+                    ),
+                    field(
                         "window.mode",
                         "window_mode",
                         format!("{:?}", default.window.mode),
@@ -2239,6 +2579,13 @@ pub fn export_schema() -> ConfigSchema {
                         false,
                     ),
                     field("font.fallback_families", "array<string>", "[]", true, false),
+                    field(
+                        "font.ligatures",
+                        "boolean",
+                        default.font.ligatures,
+                        true,
+                        false,
+                    ),
                 ],
             },
             ConfigSchemaSection {
@@ -2262,6 +2609,16 @@ pub fn export_schema() -> ConfigSchema {
                         "colors.palette",
                         "array<rgba>",
                         "16 ANSI colors",
+                        true,
+                        false,
+                    ),
+                    field("colors.cursor", "rgba", "cursor", true, false),
+                    field("colors.cursor_text", "rgba?", "none", true, false),
+                    field("colors.selection_foreground", "rgba?", "none", true, false),
+                    field(
+                        "colors.selection_background",
+                        "rgba",
+                        "selection",
                         true,
                         false,
                     ),
@@ -2336,6 +2693,27 @@ pub fn export_schema() -> ConfigSchema {
                         "cursor.corner_radius",
                         "number",
                         default.cursor.corner_radius,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "cursor.blink_interval_ms",
+                        "integer",
+                        default.cursor.blink_interval_ms,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "cursor.inactive_shape",
+                        "cursor_shape",
+                        format!("{:?}", default.cursor.inactive_shape),
+                        true,
+                        false,
+                    ),
+                    field(
+                        "cursor.mode_specific_styles",
+                        "map<cursor_shape>",
+                        "{}",
                         true,
                         false,
                     ),
@@ -2607,6 +2985,39 @@ pub fn export_schema() -> ConfigSchema {
                 ],
             },
             ConfigSchemaSection {
+                name: "input_bindings",
+                fields: vec![
+                    field(
+                        "keyboard.keybindings",
+                        "array<key_binding>",
+                        "portable defaults",
+                        true,
+                        false,
+                    ),
+                    field(
+                        "mouse.bindings",
+                        "array<mouse_binding>",
+                        "portable defaults",
+                        true,
+                        false,
+                    ),
+                    field(
+                        "mouse.copy_on_select",
+                        "boolean",
+                        default.mouse.copy_on_select,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "mouse.hide_cursor_when_typing",
+                        "boolean",
+                        default.mouse.hide_cursor_when_typing,
+                        true,
+                        false,
+                    ),
+                ],
+            },
+            ConfigSchemaSection {
                 name: "renderer",
                 fields: vec![
                     field(
@@ -2660,7 +3071,7 @@ pub fn export_schema() -> ConfigSchema {
                         "performance.glyph_cache_entries",
                         "integer",
                         default.performance.glyph_cache_entries,
-                        false,
+                        true,
                         false,
                     ),
                     field(
@@ -3151,6 +3562,87 @@ mod tests {
                 .reload_plan(&loaded.config)
                 .unwrap()
                 .requires_restart()
+        );
+    }
+
+    #[test]
+    fn built_in_customization_profiles_compile_to_runtime_values() {
+        let mut config = AppConfig::default();
+        assert!(config.apply_visual_profile("minimal-aesthetic"));
+        assert_eq!(config.cursor.shape, CursorShape::Beam);
+        assert_eq!(
+            config.visual_theme.grouping_style,
+            InputOutputGroupingStyle::MinimalHeaders
+        );
+        assert_eq!(config.colors.cursor, RgbaColor::rgb(83, 190, 176));
+
+        config
+            .performance
+            .apply_profile(PerformanceProfile::BatterySaver);
+        assert_eq!(config.performance.frame_rate_limit, Some(30));
+        assert_eq!(config.performance.max_animation_fps, 30);
+        assert!(
+            config.performance.glyph_cache_entries
+                < PerformanceConfig::default().glyph_cache_entries
+        );
+    }
+
+    #[test]
+    fn cursor_modes_and_mouse_bindings_are_validated() {
+        let config = AppConfig::default();
+        assert!(!config.validate().has_errors());
+
+        let mut invalid = config;
+        invalid
+            .cursor
+            .mode_specific_styles
+            .insert("unknown-mode".to_owned(), CursorShape::Beam);
+        invalid
+            .mouse
+            .bindings
+            .push(MouseBinding::new("Ctrl+DragonPress", "launch"));
+        let report = invalid.validate();
+        assert!(report.has_errors());
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|item| item.path.starts_with("cursor.mode_specific_styles"))
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|item| item.path == "mouse.bindings")
+        );
+    }
+
+    #[test]
+    fn platform_override_refines_colors_margins_and_inactive_cursor() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            [platform.windows.window]
+            margin_x = 12
+            opacity = 0.9
+
+            [platform.windows.colors]
+            foreground = { red = 1, green = 2, blue = 3, alpha = 255 }
+
+            [platform.windows.cursor]
+            inactive_shape = "underline"
+            inactive_color = { red = 4, green = 5, blue = 6, alpha = 255 }
+            "#,
+        )
+        .expect("portable customization override should parse");
+
+        let resolved = config.resolved_for_platform(ConfigPlatform::Windows);
+        assert_eq!(resolved.window.margin_x, 12);
+        assert_eq!(resolved.window.opacity, 0.9);
+        assert_eq!(resolved.colors.foreground, RgbaColor::rgb(1, 2, 3));
+        assert_eq!(resolved.cursor.inactive_shape, CursorShape::Underline);
+        assert_eq!(
+            resolved.cursor.inactive_color,
+            Some(RgbaColor::rgb(4, 5, 6))
         );
     }
 }

@@ -38,6 +38,8 @@ pub struct RendererOptions {
     pub present_mode: PresentMode,
     pub damage_tracking: bool,
     pub gpu_timestamps: bool,
+    pub transparent: bool,
+    pub glyph_cache_entries: usize,
 }
 
 impl Default for RendererOptions {
@@ -46,6 +48,8 @@ impl Default for RendererOptions {
             present_mode: PresentMode::Vsync,
             damage_tracking: true,
             gpu_timestamps: false,
+            transparent: false,
+            glyph_cache_entries: 8192,
         }
     }
 }
@@ -253,6 +257,7 @@ pub struct DamageTracker {
     previous_cells: HashMap<CellPosition, CellFingerprint>,
     previous_cursor: Option<CursorVisual>,
     previous_size: Option<(u16, u16)>,
+    previous_offset: render_core::RenderOffset,
     previous_visuals: Vec<DamageRegion>,
     previous_search_highlights: Vec<OverlayPrimitive>,
     previous_semantic_overlays: Vec<OverlayPrimitive>,
@@ -278,9 +283,13 @@ impl DamageTracker {
         let size = (scene.grid.columns, scene.grid.rows);
         let mut regions = Vec::new();
 
-        if self.force_full || self.previous_size != Some(size) {
+        if self.force_full
+            || self.previous_size != Some(size)
+            || self.previous_offset != scene.content_offset
+        {
             self.force_full = false;
             self.previous_size = Some(size);
+            self.previous_offset = scene.content_offset;
             self.previous_cells = scene
                 .grid
                 .cells
@@ -290,7 +299,7 @@ impl DamageTracker {
             self.previous_cursor = scene.cursor;
             self.previous_visuals = visual_regions(scene, metrics);
             self.remember_visuals(scene);
-            return vec![grid_region(&scene.grid, metrics)];
+            return vec![scene_grid_region(scene, metrics)];
         }
 
         self.current_positions.clear();
@@ -304,7 +313,7 @@ impl DamageTracker {
                 .copied(),
         );
         for position in self.removed_positions.drain(..) {
-            regions.push(cell_region(position, metrics));
+            regions.push(cell_region_at(position, metrics, scene.content_offset));
             self.previous_cells.remove(&position);
         }
 
@@ -314,7 +323,7 @@ impl DamageTracker {
                 .get(&cell.position)
                 .is_some_and(|fingerprint| fingerprint.matches(cell))
             {
-                regions.push(cell_region(cell.position, metrics));
+                regions.push(cell_region_at(cell.position, metrics, scene.content_offset));
                 self.previous_cells
                     .insert(cell.position, CellFingerprint::from(cell));
             }
@@ -322,10 +331,18 @@ impl DamageTracker {
 
         if self.previous_cursor != scene.cursor {
             if let Some(cursor) = self.previous_cursor {
-                regions.push(cell_region(cursor.position, metrics));
+                regions.push(cell_region_at(
+                    cursor.position,
+                    metrics,
+                    scene.content_offset,
+                ));
             }
             if let Some(cursor) = scene.cursor {
-                regions.push(cell_region(cursor.position, metrics));
+                regions.push(cell_region_at(
+                    cursor.position,
+                    metrics,
+                    scene.content_offset,
+                ));
             }
             self.previous_cursor = scene.cursor;
         }
@@ -362,20 +379,25 @@ fn visual_regions(scene: &RenderScene, metrics: CellMetrics) -> Vec<DamageRegion
         .search_highlights
         .iter()
         .chain(scene.semantic_overlays.iter())
-        .map(|overlay| overlay.bounds)
-        .chain(scene.decorations.iter().map(|decoration| decoration.bounds))
+        .map(|overlay| offset_region(overlay.bounds, scene.content_offset))
+        .chain(
+            scene
+                .decorations
+                .iter()
+                .map(|decoration| offset_region(decoration.bounds, scene.content_offset)),
+        )
         .chain(
             scene
                 .animations
                 .iter()
-                .map(|animation| animation.affected_region),
+                .map(|animation| offset_region(animation.affected_region, scene.content_offset)),
         )
         .collect::<Vec<_>>();
     regions.extend(scene.selections.iter().flat_map(|selection| {
         selection
             .cells
             .iter()
-            .map(|position| cell_region(*position, metrics))
+            .map(|position| cell_region_at(*position, metrics, scene.content_offset))
     }));
     regions
 }
@@ -417,6 +439,17 @@ fn grid_region(grid: &RenderGrid, metrics: CellMetrics) -> DamageRegion {
     }
 }
 
+fn scene_grid_region(scene: &RenderScene, metrics: CellMetrics) -> DamageRegion {
+    let mut region = grid_region(&scene.grid, metrics);
+    region.width = region
+        .width
+        .saturating_add(scene.content_offset.x.max(0) as u32 * 2);
+    region.height = region
+        .height
+        .saturating_add(scene.content_offset.y.max(0) as u32 * 2);
+    region
+}
+
 fn cell_region(position: CellPosition, metrics: CellMetrics) -> DamageRegion {
     RenderRect {
         x: (f32::from(position.col) * metrics.cell_width).floor() as i32,
@@ -424,6 +457,20 @@ fn cell_region(position: CellPosition, metrics: CellMetrics) -> DamageRegion {
         width: metrics.cell_width.ceil() as u32,
         height: metrics.cell_height.ceil() as u32,
     }
+}
+
+fn cell_region_at(
+    position: CellPosition,
+    metrics: CellMetrics,
+    offset: render_core::RenderOffset,
+) -> DamageRegion {
+    offset_region(cell_region(position, metrics), offset)
+}
+
+fn offset_region(mut region: RenderRect, offset: render_core::RenderOffset) -> RenderRect {
+    region.x = region.x.saturating_add(offset.x);
+    region.y = region.y.saturating_add(offset.y);
+    region
 }
 
 fn merge_regions(regions: Vec<DamageRegion>) -> Vec<DamageRegion> {
@@ -505,6 +552,78 @@ impl FrameScheduler {
         let idle_wakeups = self.idle_wakeups;
         self.idle_wakeups = 0;
         idle_wakeups
+    }
+}
+
+#[derive(Debug)]
+pub struct CursorBlinkRuntime {
+    phase_started: Instant,
+    visible: bool,
+    enabled: bool,
+    interval: Duration,
+}
+
+impl Default for CursorBlinkRuntime {
+    fn default() -> Self {
+        Self {
+            phase_started: Instant::now(),
+            visible: true,
+            enabled: false,
+            interval: Duration::from_millis(600),
+        }
+    }
+}
+
+impl CursorBlinkRuntime {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub const fn visible(&self) -> bool {
+        self.visible
+    }
+
+    pub fn record_activity(&mut self) -> bool {
+        self.phase_started = Instant::now();
+        let changed = !self.visible;
+        self.visible = true;
+        changed
+    }
+
+    pub fn update(&mut self, enabled: bool, interval: Duration) -> bool {
+        self.update_at(Instant::now(), enabled, interval)
+    }
+
+    #[must_use]
+    pub fn next_frame_after(&self) -> Option<Duration> {
+        if !self.enabled {
+            return None;
+        }
+        Some(
+            self.interval
+                .saturating_sub(Instant::now().saturating_duration_since(self.phase_started))
+                .max(Duration::from_millis(1)),
+        )
+    }
+
+    fn update_at(&mut self, now: Instant, enabled: bool, interval: Duration) -> bool {
+        let interval = interval.max(Duration::from_millis(1));
+        if self.enabled != enabled || self.interval != interval {
+            self.enabled = enabled;
+            self.interval = interval;
+            self.phase_started = now;
+            let changed = !self.visible;
+            self.visible = true;
+            return changed;
+        }
+        if !enabled || now.saturating_duration_since(self.phase_started) < interval {
+            return false;
+        }
+        self.phase_started = now;
+        self.visible = !self.visible;
+        true
     }
 }
 
@@ -1042,12 +1161,14 @@ impl RenderBatchPlanner {
     ) -> Result<PreparedRenderBatches, RendererError> {
         let started = Instant::now();
         let metrics = fonts.cell_metrics()?;
-        let frame_width = (f32::from(scene.grid.columns) * metrics.cell_width)
+        let frame_width = ((f32::from(scene.grid.columns) * metrics.cell_width)
             .ceil()
-            .max(1.0) as u32;
-        let frame_height = (f32::from(scene.grid.rows) * metrics.cell_height)
+            .max(1.0) as u32)
+            .saturating_add(scene.content_offset.x.max(0) as u32 * 2);
+        let frame_height = ((f32::from(scene.grid.rows) * metrics.cell_height)
             .ceil()
-            .max(1.0) as u32;
+            .max(1.0) as u32)
+            .saturating_add(scene.content_offset.y.max(0) as u32 * 2);
         let damage_regions = effective_damage_regions(scene, metrics);
 
         let mut background = QuadBatch::new(QuadBatchKind::Background);
@@ -1074,7 +1195,7 @@ impl RenderBatchPlanner {
         instrumentation.glyphs.atlas_capacity_bytes = self.atlas.capacity_bytes();
 
         for cell in &scene.grid.cells {
-            let rect = cell_region(cell.position, metrics);
+            let rect = cell_region_at(cell.position, metrics, scene.content_offset);
             if !intersects_any(rect, &damage_regions) {
                 continue;
             }
@@ -1084,7 +1205,7 @@ impl RenderBatchPlanner {
         }
 
         for cell in terminal_text_runs(&scene.grid.cells) {
-            let rect = cell_region(cell.position, metrics);
+            let rect = cell_region_at(cell.position, metrics, scene.content_offset);
             if !intersects_any(text_run_region(&cell, metrics), &damage_regions) {
                 continue;
             }
@@ -1106,51 +1227,64 @@ impl RenderBatchPlanner {
         overlays.sort_by_key(|overlay| overlay.z_index);
 
         for overlay in overlays {
-            if intersects_any(overlay.bounds, &damage_regions) {
+            let bounds = offset_region(overlay.bounds, scene.content_offset);
+            if intersects_any(bounds, &damage_regions) {
                 let batch = if overlay_draws_behind_terminal_text(overlay.kind) {
                     &mut background
                 } else {
                     &mut decorations
                 };
-                push_solid_quad(batch, overlay.bounds, overlay.color);
+                push_solid_quad(batch, bounds, overlay.color);
                 if let Some(border_color) = overlay.border_color {
-                    push_stroke_quads(batch, overlay.bounds, border_color);
+                    push_stroke_quads(batch, bounds, border_color);
                 }
                 let mut glyph_context = GlyphBatchContext {
                     atlas_uploads: &mut atlas_uploads,
                     instrumentation: &mut instrumentation,
                     fonts,
                     metrics,
-                    rect: overlay_label_rect(overlay, metrics),
+                    rect: offset_region(overlay_label_rect(overlay, metrics), scene.content_offset),
                 };
                 self.push_overlay_label_glyphs(&mut overlay_glyphs, overlay, &mut glyph_context)?;
             }
         }
 
         for decoration in &scene.decorations {
-            if intersects_any(decoration.bounds, &damage_regions) {
-                push_solid_quad(&mut decorations, decoration.bounds, decoration.color);
+            let bounds = offset_region(decoration.bounds, scene.content_offset);
+            if intersects_any(bounds, &damage_regions) {
+                push_solid_quad(&mut decorations, bounds, decoration.color);
                 if let Some(border_color) = decoration.border_color {
-                    push_stroke_quads(&mut decorations, decoration.bounds, border_color);
+                    push_stroke_quads(&mut decorations, bounds, border_color);
                 }
             }
         }
 
         for selection in &scene.selections {
             for position in &selection.cells {
-                let rect = cell_region(*position, metrics);
+                let rect = cell_region_at(*position, metrics, scene.content_offset);
                 if intersects_any(rect, &damage_regions) {
                     push_solid_quad(&mut selections, rect, selection.color);
                 }
             }
         }
 
-        push_animation_quads(&mut decorations, &scene.animations, &damage_regions);
+        push_animation_quads(
+            &mut decorations,
+            &scene.animations,
+            &damage_regions,
+            scene.content_offset,
+        );
 
         if let Some(cursor_visual) = scene.cursor
             && cursor_visual.visible
         {
-            push_cursor_quads(&mut cursor, cursor_visual, metrics, &damage_regions);
+            push_cursor_quads(
+                &mut cursor,
+                cursor_visual,
+                metrics,
+                &damage_regions,
+                scene.content_offset,
+            );
         }
 
         instrumentation.draw_call_count = count_non_empty_batches([
@@ -1188,7 +1322,7 @@ impl RenderBatchPlanner {
     ) -> Result<PreparedRenderBatches, RendererError> {
         let metrics = fonts.cell_metrics()?;
         let mut scene = scene.clone();
-        scene.damage_regions = vec![grid_region(&scene.grid, metrics)];
+        scene.damage_regions = vec![scene_grid_region(&scene, metrics)];
         self.prepare(&scene, fonts)
     }
 
@@ -1377,7 +1511,7 @@ fn count_non_empty_batches<const N: usize>(batches: [bool; N]) -> u32 {
 
 fn effective_damage_regions(scene: &RenderScene, metrics: CellMetrics) -> Vec<DamageRegion> {
     if scene.damage_regions.is_empty() {
-        vec![grid_region(&scene.grid, metrics)]
+        vec![scene_grid_region(scene, metrics)]
     } else {
         merge_regions(scene.damage_regions.clone())
     }
@@ -1588,15 +1722,17 @@ fn push_animation_quads(
     batch: &mut QuadBatch,
     animations: &[AnimationHandle],
     damage_regions: &[DamageRegion],
+    offset: render_core::RenderOffset,
 ) {
     for animation in animations {
-        if !intersects_any(animation.affected_region, damage_regions) {
+        let affected_region = offset_region(animation.affected_region, offset);
+        if !intersects_any(affected_region, damage_regions) {
             continue;
         }
         let color = animation_color(*animation);
         match animation.kind {
             AnimationKind::CursorTypingStretch => {
-                push_solid_quad(batch, stretch_region(animation.affected_region), color);
+                push_solid_quad(batch, stretch_region(affected_region), color);
             }
             AnimationKind::CursorTrail
             | AnimationKind::CursorTypingPulse
@@ -1604,7 +1740,7 @@ fn push_animation_quads(
             | AnimationKind::CursorBlinkEasing
             | AnimationKind::CursorGlow
             | AnimationKind::OverlayTransition => {
-                push_solid_quad(batch, animation.affected_region, color);
+                push_solid_quad(batch, affected_region, color);
             }
         }
     }
@@ -1653,8 +1789,9 @@ fn push_cursor_quads(
     cursor: CursorVisual,
     metrics: CellMetrics,
     damage_regions: &[DamageRegion],
+    offset: render_core::RenderOffset,
 ) {
-    let mut rect = cell_region(cursor.position, metrics);
+    let mut rect = cell_region_at(cursor.position, metrics, offset);
     if !intersects_any(rect, damage_regions) {
         return;
     }
@@ -1666,38 +1803,11 @@ fn push_cursor_quads(
         | RenderCursorShape::CustomStaticShape => {}
         RenderCursorShape::HollowBlock => {
             let line = ((rect.width.min(rect.height) * thickness) / 100).max(1);
-            push_solid_quad(
+            push_rounded_stroke_quads(
                 batch,
-                RenderRect {
-                    height: line,
-                    ..rect
-                },
-                cursor.color,
-            );
-            push_solid_quad(
-                batch,
-                RenderRect {
-                    y: rect.y + rect.height.saturating_sub(line) as i32,
-                    height: line,
-                    ..rect
-                },
-                cursor.color,
-            );
-            push_solid_quad(
-                batch,
-                RenderRect {
-                    width: line,
-                    ..rect
-                },
-                cursor.color,
-            );
-            push_solid_quad(
-                batch,
-                RenderRect {
-                    x: rect.x + rect.width.saturating_sub(line) as i32,
-                    width: line,
-                    ..rect
-                },
+                rect,
+                line,
+                u32::from(cursor.corner_radius_px),
                 cursor.color,
             );
             return;
@@ -1711,7 +1821,102 @@ fn push_cursor_quads(
             rect.y += cell_height.saturating_sub(rect.height) as i32;
         }
     }
-    push_solid_quad(batch, rect, cursor.color);
+    push_rounded_quads(
+        batch,
+        rect,
+        u32::from(cursor.corner_radius_px),
+        cursor.color,
+    );
+}
+
+fn push_rounded_quads(batch: &mut QuadBatch, rect: RenderRect, radius: u32, color: RenderColor) {
+    let radius = radius.min(rect.width / 2).min(rect.height / 2);
+    if radius == 0 {
+        push_solid_quad(batch, rect, color);
+        return;
+    }
+    for y in 0..rect.height {
+        let inset = rounded_inset(radius, y, rect.height);
+        push_solid_quad(
+            batch,
+            RenderRect {
+                x: rect.x.saturating_add(inset as i32),
+                y: rect.y.saturating_add(y as i32),
+                width: rect.width.saturating_sub(inset.saturating_mul(2)),
+                height: 1,
+            },
+            color,
+        );
+    }
+}
+
+fn push_rounded_stroke_quads(
+    batch: &mut QuadBatch,
+    rect: RenderRect,
+    line: u32,
+    radius: u32,
+    color: RenderColor,
+) {
+    let radius = radius.min(rect.width / 2).min(rect.height / 2);
+    let line = line.min(rect.width / 2).min(rect.height / 2).max(1);
+    for y in 0..rect.height {
+        let outer = rounded_inset(radius, y, rect.height);
+        if y < line || y >= rect.height.saturating_sub(line) {
+            push_solid_quad(
+                batch,
+                RenderRect {
+                    x: rect.x.saturating_add(outer as i32),
+                    y: rect.y.saturating_add(y as i32),
+                    width: rect.width.saturating_sub(outer.saturating_mul(2)),
+                    height: 1,
+                },
+                color,
+            );
+            continue;
+        }
+        let inner_height = rect.height.saturating_sub(line.saturating_mul(2));
+        let inner_radius = radius.saturating_sub(line);
+        let inner = line.saturating_add(rounded_inset(inner_radius, y - line, inner_height));
+        if inner > outer {
+            let side = inner - outer;
+            push_solid_quad(
+                batch,
+                RenderRect {
+                    x: rect.x.saturating_add(outer as i32),
+                    y: rect.y.saturating_add(y as i32),
+                    width: side,
+                    height: 1,
+                },
+                color,
+            );
+            push_solid_quad(
+                batch,
+                RenderRect {
+                    x: rect
+                        .x
+                        .saturating_add(rect.width.saturating_sub(inner) as i32),
+                    y: rect.y.saturating_add(y as i32),
+                    width: side,
+                    height: 1,
+                },
+                color,
+            );
+        }
+    }
+}
+
+fn rounded_inset(radius: u32, y: u32, height: u32) -> u32 {
+    if radius == 0 || height == 0 {
+        return 0;
+    }
+    let edge_y = y.min(height.saturating_sub(1).saturating_sub(y));
+    if edge_y >= radius {
+        return 0;
+    }
+    let center = f64::from(radius) - 0.5;
+    let dy = center - (f64::from(edge_y) + 0.5);
+    let inside = (center * center - dy * dy).max(0.0).sqrt();
+    (center - inside).ceil().max(0.0) as u32
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2598,6 +2803,7 @@ fn cursor_decoration(row: i64, col: u16, shape: RenderCursorShape) -> RenderDeco
             width: 1000,
             height: 1000,
         }],
+        render_core::RenderOffset::default(),
     );
     let first = batch
         .vertices
@@ -2706,12 +2912,14 @@ impl TerminalRasterizer {
         let started = Instant::now();
         let batches = self.batch_planner.prepare_full(scene, fonts)?;
         let metrics = fonts.cell_metrics()?;
-        let width = (f32::from(scene.grid.columns) * metrics.cell_width)
+        let width = ((f32::from(scene.grid.columns) * metrics.cell_width)
             .ceil()
-            .max(1.0) as u32;
-        let height = (f32::from(scene.grid.rows) * metrics.cell_height)
+            .max(1.0) as u32)
+            .saturating_add(scene.content_offset.x.max(0) as u32 * 2);
+        let height = ((f32::from(scene.grid.rows) * metrics.cell_height)
             .ceil()
-            .max(1.0) as u32;
+            .max(1.0) as u32)
+            .saturating_add(scene.content_offset.y.max(0) as u32 * 2);
         let mut frame = CpuFrame {
             width,
             height,
@@ -2738,47 +2946,67 @@ impl TerminalRasterizer {
         overlays.sort_by_key(|overlay| overlay.z_index);
 
         for cell in &scene.grid.cells {
-            draw_cell_background(&mut frame, cell, metrics);
+            draw_cell_background(&mut frame, cell, metrics, scene.content_offset);
         }
 
         for overlay in &overlays {
             if !overlay_draws_behind_terminal_text(overlay.kind) {
                 continue;
             }
-            blend_rect(&mut frame, overlay.bounds, overlay.color);
+            let bounds = offset_region(overlay.bounds, scene.content_offset);
+            blend_rect(&mut frame, bounds, overlay.color);
             instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
             if let Some(border_color) = overlay.border_color {
-                stroke_rect(&mut frame, overlay.bounds, border_color);
+                stroke_rect(&mut frame, bounds, border_color);
                 instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
             }
         }
 
         for selection in &scene.selections {
             for position in &selection.cells {
-                fill_rect(&mut frame, cell_region(*position, metrics), selection.color);
+                fill_rect(
+                    &mut frame,
+                    cell_region_at(*position, metrics, scene.content_offset),
+                    selection.color,
+                );
                 instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
             }
         }
 
+        if let Some(cursor) = scene.cursor {
+            draw_cursor(&mut frame, cursor, metrics, scene.content_offset);
+        }
+
         for cell in terminal_text_runs(&scene.grid.cells) {
-            self.draw_cell_foreground(&mut frame, &cell, fonts, metrics, &mut instrumentation)?;
+            self.draw_cell_foreground(
+                &mut frame,
+                &cell,
+                fonts,
+                metrics,
+                scene.content_offset,
+                &mut instrumentation,
+            )?;
         }
 
         for overlay in overlays {
             if overlay_draws_behind_terminal_text(overlay.kind) {
                 continue;
             }
-            blend_rect(&mut frame, overlay.bounds, overlay.color);
+            let bounds = offset_region(overlay.bounds, scene.content_offset);
+            blend_rect(&mut frame, bounds, overlay.color);
             instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
             if let Some(border_color) = overlay.border_color {
-                stroke_rect(&mut frame, overlay.bounds, border_color);
+                stroke_rect(&mut frame, bounds, border_color);
                 instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
             }
-            self.draw_overlay_label(&mut frame, overlay, fonts, metrics, &mut instrumentation)?;
-        }
-
-        if let Some(cursor) = scene.cursor {
-            draw_cursor(&mut frame, cursor, metrics);
+            self.draw_overlay_label(
+                &mut frame,
+                overlay,
+                fonts,
+                metrics,
+                scene.content_offset,
+                &mut instrumentation,
+            )?;
         }
 
         instrumentation.cpu_prepare_time = started.elapsed();
@@ -2796,9 +3024,10 @@ impl TerminalRasterizer {
         cell: &RenderCell,
         fonts: &mut FontSystem,
         metrics: CellMetrics,
+        offset: render_core::RenderOffset,
         _instrumentation: &mut RenderInstrumentation,
     ) -> Result<(), RendererError> {
-        let rect = text_run_region(cell, metrics);
+        let rect = offset_region(text_run_region(cell, metrics), offset);
 
         let mut pen_x = rect.x;
         let mut pen_y = rect.y;
@@ -2856,6 +3085,7 @@ impl TerminalRasterizer {
         overlay: &OverlayPrimitive,
         fonts: &mut FontSystem,
         metrics: CellMetrics,
+        offset: render_core::RenderOffset,
         instrumentation: &mut RenderInstrumentation,
     ) -> Result<(), RendererError> {
         let Some(label) = &overlay.label else {
@@ -2877,7 +3107,7 @@ impl TerminalRasterizer {
             },
             style: RenderCellStyle::default(),
         };
-        let rect = overlay_label_rect(overlay, metrics);
+        let rect = offset_region(overlay_label_rect(overlay, metrics), offset);
         let mut pen_x = rect.x;
         let mut pen_y = rect.y;
         let shaped = fonts.shape_text(&cell.text, false, false)?;
@@ -2906,8 +3136,17 @@ impl TerminalRasterizer {
     }
 }
 
-fn draw_cell_background(frame: &mut CpuFrame, cell: &RenderCell, metrics: CellMetrics) {
-    fill_rect(frame, cell_region(cell.position, metrics), cell.background);
+fn draw_cell_background(
+    frame: &mut CpuFrame,
+    cell: &RenderCell,
+    metrics: CellMetrics,
+    offset: render_core::RenderOffset,
+) {
+    fill_rect(
+        frame,
+        cell_region_at(cell.position, metrics, offset),
+        cell.background,
+    );
 }
 
 #[repr(C)]
@@ -3139,12 +3378,17 @@ fn blend_pixel(pixel: &mut [u8], color: RenderColor, alpha: u8) {
     pixel[3] = u8::MAX;
 }
 
-fn draw_cursor(frame: &mut CpuFrame, cursor: CursorVisual, metrics: CellMetrics) {
+fn draw_cursor(
+    frame: &mut CpuFrame,
+    cursor: CursorVisual,
+    metrics: CellMetrics,
+    offset: render_core::RenderOffset,
+) {
     if !cursor.visible {
         return;
     }
 
-    let mut rect = cell_region(cursor.position, metrics);
+    let mut rect = cell_region_at(cursor.position, metrics, offset);
     let thickness = u32::from(cursor.thickness_percent.clamp(1, 100));
     match cursor.shape {
         RenderCursorShape::Block
@@ -3152,38 +3396,11 @@ fn draw_cursor(frame: &mut CpuFrame, cursor: CursorVisual, metrics: CellMetrics)
         | RenderCursorShape::CustomStaticShape => {}
         RenderCursorShape::HollowBlock => {
             let line = ((rect.width.min(rect.height) * thickness) / 100).max(1);
-            fill_rect(
+            draw_rounded_stroke(
                 frame,
-                RenderRect {
-                    height: line,
-                    ..rect
-                },
-                cursor.color,
-            );
-            fill_rect(
-                frame,
-                RenderRect {
-                    y: rect.y + rect.height.saturating_sub(line) as i32,
-                    height: line,
-                    ..rect
-                },
-                cursor.color,
-            );
-            fill_rect(
-                frame,
-                RenderRect {
-                    width: line,
-                    ..rect
-                },
-                cursor.color,
-            );
-            fill_rect(
-                frame,
-                RenderRect {
-                    x: rect.x + rect.width.saturating_sub(line) as i32,
-                    width: line,
-                    ..rect
-                },
+                rect,
+                line,
+                u32::from(cursor.corner_radius_px),
                 cursor.color,
             );
             return;
@@ -3197,7 +3414,60 @@ fn draw_cursor(frame: &mut CpuFrame, cursor: CursorVisual, metrics: CellMetrics)
             rect.y += cell_height.saturating_sub(rect.height) as i32;
         }
     }
-    fill_rect(frame, rect, cursor.color);
+    draw_rounded_rect(
+        frame,
+        rect,
+        u32::from(cursor.corner_radius_px),
+        cursor.color,
+    );
+}
+
+fn draw_rounded_rect(frame: &mut CpuFrame, rect: RenderRect, radius: u32, color: RenderColor) {
+    let radius = radius.min(rect.width / 2).min(rect.height / 2);
+    if radius == 0 {
+        fill_rect(frame, rect, color);
+        return;
+    }
+    for y in 0..rect.height {
+        let inset = rounded_inset(radius, y, rect.height);
+        fill_rect(
+            frame,
+            RenderRect {
+                x: rect.x.saturating_add(inset as i32),
+                y: rect.y.saturating_add(y as i32),
+                width: rect.width.saturating_sub(inset.saturating_mul(2)),
+                height: 1,
+            },
+            color,
+        );
+    }
+}
+
+fn draw_rounded_stroke(
+    frame: &mut CpuFrame,
+    rect: RenderRect,
+    line: u32,
+    radius: u32,
+    color: RenderColor,
+) {
+    let mut batch = QuadBatch::new(QuadBatchKind::Cursor);
+    push_rounded_stroke_quads(&mut batch, rect, line, radius, color);
+    for vertices in batch.vertices.chunks_exact(4) {
+        let x0 = vertices[0].position_px[0].floor() as i32;
+        let y0 = vertices[0].position_px[1].floor() as i32;
+        let x1 = vertices[2].position_px[0].ceil() as i32;
+        let y1 = vertices[2].position_px[1].ceil() as i32;
+        fill_rect(
+            frame,
+            RenderRect {
+                x: x0,
+                y: y0,
+                width: x1.saturating_sub(x0) as u32,
+                height: y1.saturating_sub(y0) as u32,
+            },
+            color,
+        );
+    }
 }
 
 pub struct GpuTerminalRenderer {
@@ -3231,6 +3501,7 @@ struct GpuBackend {
     batches: PersistentBatchBuffers,
     device_loss_signal: Arc<Mutex<Option<DeviceLossSignal>>>,
     gpu_timing: GpuTiming,
+    transparent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3412,7 +3683,7 @@ impl GpuTerminalRenderer {
             window,
             options,
             backend: Some(backend),
-            rasterizer: TerminalRasterizer::default(),
+            rasterizer: TerminalRasterizer::new(options.glyph_cache_entries.max(1), 2048, 2048),
             last_instrumentation: RenderInstrumentation::default(),
             recovery_status: RenderRecoveryStatus::Ready,
             recovery_attempts: 0,
@@ -3426,6 +3697,27 @@ impl GpuTerminalRenderer {
             backend.resize(width, height);
         }
         self.requires_full_redraw = true;
+    }
+
+    pub fn set_glyph_cache_capacity(&mut self, entries: usize) {
+        let entries = entries.max(1);
+        if self.options.glyph_cache_entries == entries {
+            return;
+        }
+        self.options.glyph_cache_entries = entries;
+        self.rasterizer = TerminalRasterizer::new(entries, 2048, 2048);
+        self.requires_full_redraw = true;
+    }
+
+    pub fn request_full_redraw(&mut self) {
+        self.requires_full_redraw = true;
+    }
+
+    #[must_use]
+    pub fn transparency_active(&self) -> bool {
+        self.backend
+            .as_ref()
+            .is_some_and(|backend| backend.transparent)
     }
 
     pub fn render_scene(
@@ -3449,6 +3741,9 @@ impl GpuTerminalRenderer {
 
         let frame_started = Instant::now();
         backend.poll_gpu_timing();
+        if self.requires_full_redraw {
+            backend.retained_frame_initialized = false;
+        }
         let mut batches = if self.requires_full_redraw || !backend.supports_retained_damage() {
             self.rasterizer.prepare_full_batches(scene, fonts)?
         } else {
@@ -3655,7 +3950,21 @@ impl GpuBackend {
                 .find(|mode| *mode == wgpu::PresentMode::Immediate)
                 .unwrap_or(wgpu::PresentMode::Fifo),
         };
-        let alpha_mode = caps.alpha_modes[0];
+        let alpha_mode = if options.transparent {
+            caps.alpha_modes
+                .iter()
+                .copied()
+                .find(|mode| {
+                    matches!(
+                        mode,
+                        wgpu::CompositeAlphaMode::PreMultiplied
+                            | wgpu::CompositeAlphaMode::PostMultiplied
+                    )
+                })
+                .unwrap_or(caps.alpha_modes[0])
+        } else {
+            caps.alpha_modes[0]
+        };
         let surface_copy_supported = caps.usages.contains(wgpu::TextureUsages::COPY_DST);
         let config = wgpu::SurfaceConfiguration {
             usage: if surface_copy_supported {
@@ -3761,6 +4070,7 @@ impl GpuBackend {
             batches: PersistentBatchBuffers::default(),
             device_loss_signal,
             gpu_timing,
+            transparent: options.transparent && alpha_mode != wgpu::CompositeAlphaMode::Opaque,
         })
     }
 
@@ -3986,7 +4296,11 @@ impl GpuBackend {
         let load = if retained_view.is_some() && self.retained_frame_initialized {
             wgpu::LoadOp::Load
         } else {
-            wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+            wgpu::LoadOp::Clear(if self.transparent {
+                wgpu::Color::TRANSPARENT
+            } else {
+                wgpu::Color::BLACK
+            })
         };
         let mut encoder = self
             .device
@@ -4015,6 +4329,7 @@ impl GpuBackend {
             pass.set_pipeline(&self.quad_pipeline);
             draw_buffers(&mut pass, &self.batches.background);
             draw_buffers(&mut pass, &self.batches.selections);
+            draw_buffers(&mut pass, &self.batches.cursor);
 
             if let Some(glyph_bind_group) = &self.glyph_bind_group {
                 pass.set_pipeline(&self.glyph_pipeline);
@@ -4029,8 +4344,6 @@ impl GpuBackend {
                 pass.set_bind_group(0, glyph_bind_group, &[]);
                 draw_buffers(&mut pass, &self.batches.overlay_glyphs);
             }
-            pass.set_pipeline(&self.quad_pipeline);
-            draw_buffers(&mut pass, &self.batches.cursor);
         }
 
         if let Some(retained_frame) = self.retained_frame.as_ref() {
@@ -4541,6 +4854,63 @@ mod tests {
         assert!(test_scene.animations.is_empty());
         assert!(test_scene.damage_regions.is_empty());
         assert!(!runtime.needs_frame());
+    }
+
+    #[test]
+    fn cursor_blink_runtime_is_bounded_and_activity_restores_visibility() {
+        let mut runtime = CursorBlinkRuntime::new();
+        let started = runtime.phase_started;
+        let interval = Duration::from_millis(500);
+
+        assert!(!runtime.update_at(started, true, interval));
+        assert!(runtime.visible());
+        assert!(runtime.update_at(started + interval, true, interval));
+        assert!(!runtime.visible());
+        assert!(runtime.record_activity());
+        assert!(runtime.visible());
+        assert!(!runtime.update(false, interval));
+        assert!(runtime.next_frame_after().is_none());
+    }
+
+    #[test]
+    fn rounded_static_cursor_stays_in_the_cursor_batch() {
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let mut planner = RenderBatchPlanner::default();
+        let mut test_scene = scene(vec![cell(0, 0, "a")]);
+        test_scene.cursor = Some(CursorVisual {
+            position: CellPosition { row: 0, col: 0 },
+            shape: RenderCursorShape::Block,
+            color: RenderColor::rgb(255, 255, 255),
+            visible: true,
+            thickness_percent: 15,
+            corner_radius_px: 4,
+            inactive: false,
+        });
+
+        let batches = planner
+            .prepare_full(&test_scene, &mut fonts)
+            .expect("rounded cursor should prepare");
+
+        assert!(batches.cursor.quad_count() > 1);
+        assert_eq!(batches.instrumentation.draw_call_count, 3);
+    }
+
+    #[test]
+    fn content_offset_applies_to_damage_without_expanding_cell_damage() {
+        let mut tracker = DamageTracker::new();
+        let mut first = scene(vec![cell(0, 0, "a")]);
+        first.content_offset = render_core::RenderOffset { x: 12, y: 8 };
+        let initial = tracker.update(&first, metrics());
+        assert_eq!(initial[0].x, 0);
+        assert_eq!(initial[0].y, 0);
+
+        let mut second = first.clone();
+        second.grid.cells[0].text = "b".to_owned();
+        let damage = tracker.update(&second, metrics());
+        assert_eq!(damage.len(), 1);
+        assert_eq!(damage[0].x, 12);
+        assert_eq!(damage[0].y, 8);
+        assert!(damage[0].width <= metrics().cell_width.ceil() as u32);
     }
 
     #[test]

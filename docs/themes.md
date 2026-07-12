@@ -14,6 +14,22 @@ Current theme-related config lives under:
 
 Example configs are in `crates/assets/config-examples`.
 
+Built-in profile names are:
+
+- `balanced`
+- `plain-fast`
+- `minimal-aesthetic`
+- `command-blocks`
+
+TOML expands a recognized profile before applying explicit values. An explicit
+`colors`, `cursor`, or visual setting therefore wins over the profile default.
+Unrecognized names remain valid labels for fully explicit custom themes.
+
+The complete example is
+`crates/assets/config-examples/foundational-customization.toml`. Runtime and
+cross-OS behavior are documented in
+[foundational-customization.md](foundational-customization.md).
+
 Rules:
 
 - disabled visuals must have near-zero runtime cost

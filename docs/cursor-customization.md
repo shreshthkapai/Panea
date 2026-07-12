@@ -11,6 +11,47 @@ Supported shape model:
 - `hollow_block`
 - `custom_static_shape`
 
+The production static renderer currently implements `block`, `beam`,
+`underline`, and `hollow_block`. `custom` and `custom_static_shape` remain
+reserved compatibility values and fall back to block geometry until the
+user-authored static asset/shape contract is implemented. They must not be
+described as complete custom cursor support.
+
+## Static Cursor Design Note
+
+Feature name: static cursor customization
+Layer: config-core, render-core, render-wgpu, desktop app
+User-facing behavior: block, beam, underline, and hollow block shapes with
+thickness, cell-relative corner radius, color, blink interval, inactive style,
+and terminal-mode styles.
+Config keys: `cursor.shape`, `cursor.blink`, `cursor.blink_interval_ms`,
+`cursor.thickness`, `cursor.corner_radius`, `cursor.color`,
+`cursor.inactive_shape`, `cursor.inactive_color`, and
+`cursor.mode_specific_styles`.
+macOS behavior: same config and WGPU cursor batches; runtime visual verification
+is pending on a macOS host.
+Windows behavior: config, renderer, damage, screenshot, and desktop unit tests
+pass on the current Windows host.
+Linux X11 behavior: same config and renderer batches; real X11 verification is
+pending.
+Linux Wayland behavior: same config and renderer batches; real Wayland
+verification is pending.
+Fallback behavior: unsupported reserved custom shapes use static block geometry;
+an unfocused window uses the configured inactive style; terminal DECSCUSR shape
+requests are honored unless a matching mode-specific style overrides them.
+Diagnostics: invalid thickness, radius, blink intervals, and mode names fail
+config validation.
+Performance cost when disabled: no animation state or wakeups; a visible static
+cursor is one persistent batch and one cursor-local damage region.
+Performance cost when enabled: blinking wakes only at the configured interval
+and damages only the old/new cursor cell; rounded geometry adds scanline quads
+inside the existing cursor batch without adding draw calls.
+Tests: shape/mode/focus resolution, deterministic blink, rounded batching,
+cursor-local damage, config validation, and cursor screenshots.
+
+Mode style keys are `normal`, `insert`, `alternate_screen`,
+`application_cursor`, and `application_keypad`.
+
 ## Phase 13 Design Note
 
 Feature name: cursor animation and animated image cursor pipeline

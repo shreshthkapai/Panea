@@ -184,6 +184,21 @@ Baseline visual sections:
 - `performance`: animation FPS, cursor asset size, active animation, and
   animated-region budgets
 
+Recognized visual profiles are `balanced`, `plain-fast`,
+`minimal-aesthetic`, and `command-blocks`. Recognized performance profiles are
+`maximum_performance`, `balanced`, `visual`, and `battery_saver`. Profiles are
+expanded before explicit TOML values, so explicit values win.
+
+The color model includes foreground/background, cursor/cursor text,
+selection foreground/background, a configurable 16-color ANSI palette, the
+standard indexed 256-color cube/grayscale range, and truecolor. Font config
+includes family, size, line height, ordered fallback families, and OpenType
+ligature control.
+
+Window `padding_x`/`padding_y` and `margin_x`/`margin_y` are exact pixel insets.
+Opacity requests transparent window/surface composition and reports an opaque
+fallback if the active backend cannot provide it.
+
 Renderer diagnostics can optionally request GPU timestamp queries:
 
 ```toml
@@ -244,6 +259,7 @@ Shipped example configs live in `crates/assets/config-examples`:
 - `command-blocks.toml`
 - `minimal-aesthetic.toml`
 - `heavy-visual-demo.toml`
+- `foundational-customization.toml`
 
 ## Platform Overrides
 

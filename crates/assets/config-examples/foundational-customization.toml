@@ -1,0 +1,78 @@
+schema_version = 2
+
+[window]
+title = "Panea"
+initial_width = 1100
+initial_height = 680
+padding_x = 10
+padding_y = 8
+margin_x = 2
+margin_y = 2
+opacity = 0.96
+mode = "windowed"
+
+[font]
+family = "Cascadia Mono"
+fallback_families = ["Noto Sans Mono CJK JP", "Segoe UI Emoji", "Noto Color Emoji"]
+size = 13.0
+line_height = 1.2
+ligatures = true
+
+[colors]
+foreground = { red = 224, green = 229, blue = 235, alpha = 255 }
+background = { red = 18, green = 21, blue = 24, alpha = 255 }
+cursor = { red = 83, green = 190, blue = 176, alpha = 255 }
+cursor_text = { red = 18, green = 21, blue = 24, alpha = 255 }
+selection_foreground = { red = 255, green = 255, blue = 255, alpha = 255 }
+selection_background = { red = 83, green = 190, blue = 176, alpha = 96 }
+
+[visual_theme]
+name = "minimal-aesthetic"
+
+[cursor]
+shape = "beam"
+blink = true
+blink_interval_ms = 600
+thickness = 0.12
+corner_radius = 0.15
+inactive_shape = "hollow_block"
+inactive_color = { red = 130, green = 140, blue = 150, alpha = 220 }
+mode_specific_styles = { insert = "beam", alternate_screen = "block" }
+
+[[keyboard.keybindings]]
+keys = "Ctrl+Shift+C"
+action = "copy"
+
+[[keyboard.keybindings]]
+keys = "Ctrl+Shift+V"
+action = "paste"
+
+[mouse]
+copy_on_select = false
+hide_cursor_when_typing = true
+
+[[mouse.bindings]]
+gesture = "Ctrl+LeftRelease"
+action = "open_url"
+
+[[mouse.bindings]]
+gesture = "MiddlePress"
+action = "paste_primary"
+
+[[shell_profiles]]
+name = "pwsh"
+kind = "powershell"
+program = "pwsh"
+args = ["-NoLogo"]
+
+[performance]
+profile = "balanced"
+
+[platform.macos.font]
+family = "Menlo"
+
+[platform.windows.font]
+family = "Cascadia Mono"
+
+[platform.linux.font]
+family = "DejaVu Sans Mono"

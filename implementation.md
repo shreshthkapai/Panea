@@ -353,6 +353,18 @@ to more visible features before the dependencies they rely on are hardened.
   profiles, cursor mode styles, and mux label formats, and never run in
   render/input/PTY hot paths. Automatic safe runtime watching for `.panea`
   files is now wired; richer product UI around errors remains follow-up work.
+- Foundational customization now resolves built-in visual/performance profiles
+  into `AppConfig` before runtime, preserves explicit-setting precedence,
+  applies platform shell refinements before PTY spawn, and wires complete
+  ANSI/indexed/truecolor roles, cursor/selection colors, ligature control,
+  pixel padding/margins, opacity fallback diagnostics, portable keyboard/mouse
+  bindings, glyph-cache sizing, and animation frame budgets into the desktop.
+- Static cursor customization now renders block, beam, underline, and hollow
+  block shapes with thickness, cell-relative rounded geometry, color, inactive
+  styles, terminal-mode styles, terminal DECSCUSR requests, deterministic
+  config-driven blink scheduling, and cursor-local retained-frame damage.
+  User-authored static geometry and full animated image frame rendering remain
+  explicitly deferred to the later custom/animated cursor pipeline.
 - Phase 8 uses CPU-side timing plus WGPU submission wall-clock timing, and
   next-pass Phase 17 adds GPU timestamp status plumbing plus a developer
   in-window overlay. Real hardware timestamp validation, polished overlay UX,

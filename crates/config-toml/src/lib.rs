@@ -14,7 +14,7 @@ use std::{
 
 use config_core::{
     AppConfig, CURRENT_CONFIG_SCHEMA_VERSION, ConfigDiagnostic, ConfigDiagnosticSeverity,
-    ConfigPlatform, ValidationReport, export_schema,
+    ConfigPlatform, PerformanceProfile, ValidationReport, export_schema,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,6 +340,7 @@ pub fn parse_str(
     let mut diagnostics = Vec::new();
     diagnostics.extend(detect_deprecated_settings(&value));
     diagnostics.extend(migrate_config_value(&mut value)?);
+    apply_profile_defaults(&mut value);
     diagnostics.extend(detect_unknown_settings(&value));
 
     let config = value
@@ -363,6 +364,58 @@ pub fn parse_str(
         source: ConfigSource::Default,
         diagnostics,
     })
+}
+
+fn apply_profile_defaults(value: &mut toml::Value) {
+    let visual_name = value
+        .get("visual_theme")
+        .and_then(|theme| theme.get("name"))
+        .and_then(toml::Value::as_str);
+    let performance_profile = value
+        .get("performance")
+        .and_then(|performance| performance.get("profile"))
+        .and_then(toml::Value::as_str)
+        .and_then(parse_performance_profile);
+
+    let mut resolved = AppConfig::default();
+    let visual_applied = visual_name.is_some_and(|name| resolved.apply_visual_profile(name));
+    if let Some(profile) = performance_profile {
+        resolved.performance.apply_profile(profile);
+    }
+    if !visual_applied && performance_profile.is_none() {
+        return;
+    }
+
+    let Ok(mut defaults) = toml::Value::try_from(resolved) else {
+        return;
+    };
+    merge_toml(&mut defaults, value.clone());
+    *value = defaults;
+}
+
+fn merge_toml(target: &mut toml::Value, explicit: toml::Value) {
+    match (target, explicit) {
+        (toml::Value::Table(target), toml::Value::Table(explicit)) => {
+            for (key, value) in explicit {
+                if let Some(existing) = target.get_mut(&key) {
+                    merge_toml(existing, value);
+                } else {
+                    target.insert(key, value);
+                }
+            }
+        }
+        (target, explicit) => *target = explicit,
+    }
+}
+
+fn parse_performance_profile(value: &str) -> Option<PerformanceProfile> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "maximum_performance" => Some(PerformanceProfile::MaximumPerformance),
+        "balanced" => Some(PerformanceProfile::Balanced),
+        "visual" => Some(PerformanceProfile::Visual),
+        "battery_saver" | "battery_conscious" => Some(PerformanceProfile::BatterySaver),
+        _ => None,
+    }
 }
 
 pub fn default_config_toml() -> Result<String, ConfigTomlError> {
@@ -629,6 +682,8 @@ fn known_paths() -> BTreeSet<&'static str> {
         "window.initial_height",
         "window.padding_x",
         "window.padding_y",
+        "window.margin_x",
+        "window.margin_y",
         "window.opacity",
         "window.mode",
         "window.linux_backend",
@@ -638,6 +693,7 @@ fn known_paths() -> BTreeSet<&'static str> {
         "renderer.vsync",
         "renderer.damage_tracking",
         "renderer.present_mode",
+        "renderer.gpu_timestamps",
         "font",
         "font.family",
         "font.size",
@@ -666,6 +722,8 @@ fn known_paths() -> BTreeSet<&'static str> {
         "colors.cursor.green",
         "colors.cursor.blue",
         "colors.cursor.alpha",
+        "colors.cursor_text",
+        "colors.selection_foreground",
         "colors.selection_background",
         "colors.selection_background.red",
         "colors.selection_background.green",
@@ -706,6 +764,7 @@ fn known_paths() -> BTreeSet<&'static str> {
         "cursor.corner_radius",
         "cursor.color",
         "cursor.inactive_shape",
+        "cursor.inactive_color",
         "cursor.mode_specific_styles",
         "cursor.animations_enabled",
         "cursor.smooth_movement",
@@ -837,6 +896,9 @@ fn is_known_dynamic_path(path: &str) -> bool {
         "clipboard.osc52.",
         "colors.palette.",
         "cursor.color.",
+        "cursor.inactive_color.",
+        "colors.cursor_text.",
+        "colors.selection_foreground.",
         "cursor.mode_specific_styles.",
         "visual_theme.borders.color.",
         "visual_theme.success_color.",
@@ -1116,10 +1178,48 @@ mod tests {
                 "heavy-visual-demo.toml",
                 include_str!("../../assets/config-examples/heavy-visual-demo.toml"),
             ),
+            (
+                "foundational-customization.toml",
+                include_str!("../../assets/config-examples/foundational-customization.toml"),
+            ),
         ] {
             parse_str(contents, None, ConfigPlatform::Unknown)
                 .unwrap_or_else(|error| panic!("{name} should parse: {error}"));
         }
+    }
+
+    #[test]
+    fn named_profiles_expand_once_and_explicit_values_win() {
+        let loaded = parse_str(
+            r#"
+            schema_version = 2
+
+            [visual_theme]
+            name = "minimal-aesthetic"
+
+            [colors]
+            background = { red = 1, green = 2, blue = 3, alpha = 255 }
+
+            [cursor]
+            thickness = 0.2
+
+            [performance]
+            profile = "battery_saver"
+            max_animation_fps = 12
+            "#,
+            None,
+            ConfigPlatform::Windows,
+        )
+        .expect("profiles should compile into AppConfig");
+
+        assert_eq!(loaded.config.cursor.shape, config_core::CursorShape::Beam);
+        assert_eq!(loaded.config.cursor.thickness, 0.2);
+        assert_eq!(
+            loaded.config.colors.background,
+            config_core::RgbaColor::rgb(1, 2, 3)
+        );
+        assert_eq!(loaded.config.performance.frame_rate_limit, Some(30));
+        assert_eq!(loaded.config.performance.max_animation_fps, 12);
     }
 
     #[test]

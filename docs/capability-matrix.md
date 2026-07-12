@@ -32,11 +32,14 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Windows PowerShell/cmd/WSL profiles | partial | planned | planned | planned | Windows profile groundwork exists; WSL smoke is unverified. |
 | Desktop window creation | partial | partial | partial | partial | Winit path exists; real OS/window manager behavior needs validation. |
 | Window modes | partial | partial | partial | partial | Windowed/maximized/fullscreen/frameless states are modeled; cross-OS behavior not verified. |
+| Window padding/margins/opacity | tested | implemented | implemented | implemented | Pixel insets affect grid sizing, PTY resize, rendering, mouse mapping, and live reload. Opacity requests transparent WGPU composition and diagnoses an opaque fallback; real macOS/Linux compositor verification remains open. |
 | Linux backend selection | planned | planned | partial | partial | X11/Wayland preferences and diagnostics are modeled; real compositor verification is open. |
 | Linux compositor verification matrix | planned | planned | tested | tested | Target matrix, runtime environment snapshot, fallback checklist, and `cargo xtask linux-compositor` exist; actual Linux host runs remain unverified. |
 | Decoration strategy | partial | partial | partial | partial | Requested/effective diagnostics exist; Linux negotiation needs real tests. |
 | Emergency restore shortcuts | partial | partial | partial | partial | Actions/keybinding concepts exist; full titlebarless UX validation remains open. |
 | Keyboard input translation | tested | implemented | implemented | implemented | Shared terminal encoding covers text/control input, navigation/editing/function/keypad keys, xterm modifiers, AltGr preservation, and application cursor/keypad modes; real layout, Command/Option, and IME testing remains off Windows. |
+| Keyboard and mouse bindings | tested | implemented | implemented | implemented | Portable modifier/gesture matching and validated actions drive keyboard, selection, copy/paste, URL, wheel, and primary-selection behavior while preserving application mouse protocol priority. Real non-Windows input verification remains open. |
+| Themes and terminal colors | tested | implemented | implemented | implemented | Built-in profiles compile once into AppConfig; explicit values win. Foreground/background, cursor/text, selection, configurable ANSI-16, indexed-256, and truecolor paths are implemented. Cross-OS screenshot baselines remain open. |
 | Mouse input translation | tested | implemented | implemented | implemented | Normal, button-motion, all-motion, SGR encoding, focus reports, pane-aware selection, and scrollback wheel navigation exist; real cross-OS protocol and selection UX verification remains. |
 | IME/composed text | partial | partial | partial | partial | Event contract exists; real composed-input verification is not complete. |
 | System clipboard | tested | implemented | implemented | implemented | Clipboard bridge, portable Ctrl/Super copy/paste bindings, paste protection, and middle-click behavior exist; real OS clipboard smoke remains incomplete off Windows. |
@@ -47,9 +50,9 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Screenshot verification | tested | partial | partial | partial | Deterministic fixtures, PPM baselines, tolerance diffing, and reports exist. Windows baselines verify on the current host; macOS/Linux X11/Linux Wayland baselines remain uncaptured. |
 | Damage tracking | tested | implemented | implemented | implemented | Renderer-independent tracking exists; real GPU partial-update behavior needs hardening. |
 | Frame scheduler | tested | implemented | implemented | implemented | Scheduler distinctions exist; idle behavior still needs platform profiling. |
-| Font discovery/fallback | partial | tested | partial | partial | Configured/system per-grapheme fallback, real style faces, CJK/emoji candidates, COLR/bitmap color rendering, and doctor source diagnostics exist; installed-font variance still needs non-Windows reports. |
+| Font discovery/fallback | partial | tested | partial | partial | Configured/system per-grapheme fallback, size/line-height/ligature control, real style faces, CJK/emoji candidates, COLR/bitmap color rendering, and doctor source diagnostics exist; installed-font variance still needs non-Windows reports. |
 | Static TOML config | tested | implemented | implemented | implemented | Portable model and parser exist; non-Windows file-location behavior needs runtime validation. |
-| Platform config overrides | tested | implemented | implemented | implemented | Model exists for macOS/Windows/Linux/X11/Wayland refinement. |
+| Platform config overrides | tested | implemented | implemented | implemented | Model exists for macOS/Windows/Linux/X11/Wayland refinement, including window, font, colors, cursor, shell, performance, visuals, clipboard, and diagnostics. |
 | Config validation diagnostics | tested | implemented | implemented | implemented | Validation exists; runtime UX still needs product integration. |
 | Config live reload | tested | partial | partial | partial | Debounced TOML and programmable watchers, validation, live apply, and previous-config retention exist. Windows unit/desktop tests pass; macOS/Linux runtime validation remains open. |
 | Config schema export | tested | implemented | implemented | implemented | Xtask helper exists. |
@@ -68,7 +71,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Command navigation/copy actions | tested | implemented | implemented | implemented | Semantic actions exist; desktop UX integration remains partial. |
 | Prompt decorations | partial | partial | partial | partial | Overlay projection, alternate-screen suppression, and config policy exist; cross-OS visual smoke and polished UI remain. |
 | Command blocks | tested | partial | partial | partial | Windows-host tests cover command-block backgrounds, input/output grouping, metadata badges, alternate-screen suppression, and renderer overlay glyph batching. Real shell-driven and cross-OS visual verification remain. |
-| Static cursor styles | partial | partial | partial | partial | Config/render contracts exist; visual polish needs renderer hardening. |
+| Static cursor styles | tested | implemented | implemented | implemented | Block, beam, underline, and hollow block rendering, thickness, rounded geometry, colors, deterministic blink, inactive and terminal-mode styles, retained-frame-safe cursor damage, and config validation are implemented. Real macOS/Linux visual verification and user-authored custom geometry remain open. |
 | Cursor animations | tested | partial | partial | partial | Windows-host tests cover opt-in config, bounded cursor-neighborhood damage, desktop runtime wiring, and batched animation quads; cross-OS visual verification remains. |
 | Animated image cursor | partial | partial | partial | partial | Opt-in config, nonblocking asset read/header decode, metadata cache, and budget warnings exist; pixel-frame decode/upload/draw and cross-OS verification remain. |
 | SSH profile config | tested | implemented | implemented | implemented | Portable config model exists. |

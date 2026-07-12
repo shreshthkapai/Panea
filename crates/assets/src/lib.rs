@@ -32,6 +32,10 @@ pub const CONFIG_EXAMPLES: &[ConfigExample] = &[
         name: "heavy-visual-demo.toml",
         contents: include_str!("../config-examples/heavy-visual-demo.toml"),
     },
+    ConfigExample {
+        name: "foundational-customization.toml",
+        contents: include_str!("../config-examples/foundational-customization.toml"),
+    },
 ];
 
 pub const PROGRAMMABLE_CONFIG_EXAMPLES: &[ConfigExample] = &[ConfigExample {
@@ -53,8 +57,9 @@ mod tests {
 
     #[test]
     fn config_examples_are_shipped() {
-        assert_eq!(CONFIG_EXAMPLES.len(), 5);
+        assert_eq!(CONFIG_EXAMPLES.len(), 6);
         assert!(config_example("balanced.toml").is_some());
+        assert!(config_example("foundational-customization.toml").is_some());
         assert_eq!(PROGRAMMABLE_CONFIG_EXAMPLES.len(), 1);
     }
 

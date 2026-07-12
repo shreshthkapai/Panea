@@ -16,15 +16,16 @@ use std::{
 };
 
 use config_core::{
-    AppConfig, ClipboardConfigPatch, CommandBlockStyle, CommandBlocksConfigPatch, ConfigDiagnostic,
-    ConfigDiagnosticSeverity, ConfigPlatform, ConfigProvider, ConfigProviderError,
-    CursorConfigPatch, CursorShape, DecorationStrategyConfig, DiagnosticsConfigPatch,
-    FontConfigPatch, InputOutputGroupingStyle, KeyBinding, LinuxBackendConfig, LoadedAppConfig,
-    LogLevel, Osc52ClipboardConfigPatch, PerformanceConfigPatch, PerformanceProfile,
-    PlatformOverride, PlatformOverrides, PresentModePreference, PromptDecorationStyle,
-    PromptDecorationsConfigPatch, RendererBackendPreference, RendererConfigPatch, RgbaColor,
-    ShellIntegrationActivationConfig, ShellIntegrationConfigPatch, ShellProfile, ShellProfileKind,
-    SshProfile, WindowConfigPatch, WindowModeConfig,
+    AppConfig, ClipboardConfigPatch, ColorConfigPatch, CommandBlockStyle, CommandBlocksConfigPatch,
+    ConfigDiagnostic, ConfigDiagnosticSeverity, ConfigPlatform, ConfigProvider,
+    ConfigProviderError, CursorConfigPatch, CursorShape, DecorationStrategyConfig,
+    DiagnosticsConfigPatch, FontConfigPatch, InputOutputGroupingStyle, KeyBinding,
+    LinuxBackendConfig, LoadedAppConfig, LogLevel, MouseBinding, Osc52ClipboardConfigPatch,
+    PerformanceConfigPatch, PerformanceProfile, PlatformOverride, PlatformOverrides,
+    PresentModePreference, PromptDecorationStyle, PromptDecorationsConfigPatch,
+    RendererBackendPreference, RendererConfigPatch, RgbaColor, ShellIntegrationActivationConfig,
+    ShellIntegrationConfigPatch, ShellProfile, ShellProfileKind, SshProfile, WindowConfigPatch,
+    WindowModeConfig,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -509,6 +510,14 @@ impl ProgramState {
                     .keybindings
                     .push(KeyBinding::new(keys, action));
             }
+            "mouse" => {
+                let gesture = expect_string_arg(&args, 0, function)?;
+                let action = expect_string_arg(&args, 1, function)?;
+                self.config
+                    .mouse
+                    .bindings
+                    .push(MouseBinding::new(gesture, action));
+            }
             "cursor_mode" => {
                 let mode = expect_string_arg(&args, 0, function)?;
                 let shape = parse_cursor_shape(expect_string_arg(&args, 1, function)?)?;
@@ -547,7 +556,7 @@ impl ProgramState {
             }
             other => {
                 return Err(format!(
-                    "unsupported programmable config API panea.{other}; allowed APIs are set, platform_set, theme, key, cursor_mode, shell_profile, ssh_profile, when_platform, end"
+                    "unsupported programmable config API panea.{other}; allowed APIs are set, platform_set, theme, key, mouse, cursor_mode, shell_profile, ssh_profile, when_platform, end"
                 ));
             }
         }
@@ -841,6 +850,8 @@ fn set_config_value(config: &mut AppConfig, path: &str, value: &ConfigValue) -> 
         "window.initial_height" => config.window.initial_height = value_as_u32(value)?,
         "window.padding_x" => config.window.padding_x = value_as_u16(value)?,
         "window.padding_y" => config.window.padding_y = value_as_u16(value)?,
+        "window.margin_x" => config.window.margin_x = value_as_u16(value)?,
+        "window.margin_y" => config.window.margin_y = value_as_u16(value)?,
         "window.opacity" => config.window.opacity = value_as_f64(value)?,
         "window.mode" => config.window.mode = parse_window_mode(value_as_string_ref(value)?)?,
         "window.linux_backend" => {
@@ -867,10 +878,19 @@ fn set_config_value(config: &mut AppConfig, path: &str, value: &ConfigValue) -> 
         "colors.foreground" => config.colors.foreground = value_as_color(value)?,
         "colors.background" => config.colors.background = value_as_color(value)?,
         "colors.cursor" => config.colors.cursor = value_as_color(value)?,
+        "colors.cursor_text" => config.colors.cursor_text = Some(value_as_color(value)?),
+        "colors.selection_foreground" => {
+            config.colors.selection_foreground = Some(value_as_color(value)?);
+        }
         "colors.selection_background" => {
             config.colors.selection_background = value_as_color(value)?
         }
-        "visual_theme.name" => config.visual_theme.name = value_as_string(value)?,
+        "visual_theme.name" => {
+            let name = value_as_string(value)?;
+            if !config.apply_visual_profile(&name) {
+                config.visual_theme.name = name;
+            }
+        }
         "visual_theme.cursor_profile" => {
             config.visual_theme.cursor_profile = value_as_string(value)?;
         }
@@ -897,6 +917,7 @@ fn set_config_value(config: &mut AppConfig, path: &str, value: &ConfigValue) -> 
         "cursor.inactive_shape" => {
             config.cursor.inactive_shape = parse_cursor_shape(value_as_string_ref(value)?)?;
         }
+        "cursor.inactive_color" => config.cursor.inactive_color = Some(value_as_color(value)?),
         "cursor.animations_enabled" => config.cursor.animations_enabled = value_as_bool(value)?,
         "cursor.smooth_movement" => config.cursor.smooth_movement = value_as_bool(value)?,
         "cursor.typing_pulse" => config.cursor.typing_pulse = value_as_bool(value)?,
@@ -984,7 +1005,8 @@ fn set_config_value(config: &mut AppConfig, path: &str, value: &ConfigValue) -> 
             config.mux.remember_working_directory = value_as_bool(value)?;
         }
         "performance.profile" => {
-            config.performance.profile = parse_performance_profile(value_as_string_ref(value)?)?;
+            let profile = parse_performance_profile(value_as_string_ref(value)?)?;
+            config.performance.apply_profile(profile);
         }
         "performance.frame_rate_limit" => {
             config.performance.frame_rate_limit = Some(value_as_u16(value)?);
@@ -1043,6 +1065,36 @@ fn set_platform_override_value(
                 .get_or_insert_with(WindowConfigPatch::default)
                 .title = Some(value_as_string(value)?);
         }
+        "window.padding_x" => {
+            entry
+                .window
+                .get_or_insert_with(WindowConfigPatch::default)
+                .padding_x = Some(value_as_u16(value)?);
+        }
+        "window.padding_y" => {
+            entry
+                .window
+                .get_or_insert_with(WindowConfigPatch::default)
+                .padding_y = Some(value_as_u16(value)?);
+        }
+        "window.margin_x" => {
+            entry
+                .window
+                .get_or_insert_with(WindowConfigPatch::default)
+                .margin_x = Some(value_as_u16(value)?);
+        }
+        "window.margin_y" => {
+            entry
+                .window
+                .get_or_insert_with(WindowConfigPatch::default)
+                .margin_y = Some(value_as_u16(value)?);
+        }
+        "window.opacity" => {
+            entry
+                .window
+                .get_or_insert_with(WindowConfigPatch::default)
+                .opacity = Some(value_as_f64(value)?);
+        }
         "window.mode" => {
             entry
                 .window
@@ -1084,6 +1136,24 @@ fn set_platform_override_value(
                 .get_or_insert_with(FontConfigPatch::default)
                 .fallback_families = Some(value_as_string_array(value)?);
         }
+        "colors.foreground" => {
+            entry
+                .colors
+                .get_or_insert_with(ColorConfigPatch::default)
+                .foreground = Some(value_as_color(value)?);
+        }
+        "colors.background" => {
+            entry
+                .colors
+                .get_or_insert_with(ColorConfigPatch::default)
+                .background = Some(value_as_color(value)?);
+        }
+        "colors.cursor" => {
+            entry
+                .colors
+                .get_or_insert_with(ColorConfigPatch::default)
+                .cursor = Some(value_as_color(value)?);
+        }
         "cursor.shape" => {
             entry
                 .cursor
@@ -1095,6 +1165,12 @@ fn set_platform_override_value(
                 .cursor
                 .get_or_insert_with(CursorConfigPatch::default)
                 .animations_enabled = Some(value_as_bool(value)?);
+        }
+        "cursor.inactive_shape" => {
+            entry
+                .cursor
+                .get_or_insert_with(CursorConfigPatch::default)
+                .inactive_shape = Some(parse_cursor_shape(value_as_string_ref(value)?)?);
         }
         "command_blocks.enabled" => {
             entry

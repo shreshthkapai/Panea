@@ -87,6 +87,12 @@ pub struct RenderRect {
 
 pub type DamageRegion = RenderRect;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RenderOffset {
+    pub x: i32,
+    pub y: i32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlayKind {
     Selection,
@@ -276,6 +282,9 @@ pub struct FeatureCostSample {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RenderScene {
     pub grid: RenderGrid,
+    /// Pixel offset of terminal content inside the surface. Window margins and
+    /// padding are resolved before reaching the renderer.
+    pub content_offset: RenderOffset,
     pub cursor: Option<CursorVisual>,
     pub selections: Vec<SelectionVisual>,
     pub search_highlights: Vec<OverlayPrimitive>,

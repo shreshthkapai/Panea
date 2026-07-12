@@ -8,6 +8,7 @@ use std::{
     fmt, fs,
     hash::{Hash, Hasher},
     path::PathBuf,
+    str::FromStr,
     sync::Arc,
 };
 
@@ -26,6 +27,7 @@ pub struct FontConfig {
     pub fallback_families: Vec<String>,
     pub size: f32,
     pub line_height: f32,
+    pub ligatures: bool,
 }
 
 impl Default for FontConfig {
@@ -35,6 +37,7 @@ impl Default for FontConfig {
             fallback_families: Vec::new(),
             size: 13.0,
             line_height: 1.2,
+            ligatures: true,
         }
     }
 }
@@ -238,6 +241,7 @@ impl FontSystem {
         self.config.fallback_families.hash(&mut hasher);
         self.config.size.to_bits().hash(&mut hasher);
         self.config.line_height.to_bits().hash(&mut hasher);
+        self.config.ligatures.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -307,7 +311,14 @@ impl FontSystem {
             if !families_used.contains(&font.family) {
                 families_used.push(font.family.clone());
             }
-            let shaped = font.shape(&segment, size, bold, italic, byte_offset as u32)?;
+            let shaped = font.shape(
+                &segment,
+                size,
+                bold,
+                italic,
+                byte_offset as u32,
+                self.config.ligatures,
+            )?;
             advance_width += shaped.iter().map(|glyph| glyph.x_advance).sum::<f32>();
             glyphs.extend(shaped);
         }
@@ -623,6 +634,7 @@ impl LoadedFont {
         bold: bool,
         italic: bool,
         cluster_offset: u32,
+        ligatures: bool,
     ) -> Result<Vec<ShapedGlyph>, FontError> {
         let Some(face) = rustybuzz::Face::from_slice(&self.bytes, self.face_index) else {
             return Err(FontError::FontLoadFailed {
@@ -635,7 +647,15 @@ impl LoadedFont {
         let mut buffer = rustybuzz::UnicodeBuffer::new();
         buffer.push_str(text);
         buffer.guess_segment_properties();
-        let glyph_buffer = rustybuzz::shape(&face, &[], buffer);
+        let features = if ligatures {
+            Vec::new()
+        } else {
+            ["liga=0", "clig=0", "calt=0"]
+                .into_iter()
+                .filter_map(|feature| rustybuzz::Feature::from_str(feature).ok())
+                .collect::<Vec<_>>()
+        };
+        let glyph_buffer = rustybuzz::shape(&face, &features, buffer);
 
         Ok(glyph_buffer
             .glyph_infos()
