@@ -46,7 +46,7 @@ stated scope:
 | Rust workspace | tested | Workspace members compile under the existing standard gates on the Windows host. |
 | Layer skeleton | tested | Crates exist for core, parser, renderer, transport, platform, config, mux, semantics, diagnostics, security, assets, desktop, iOS, xtask, and bench. |
 | Architecture boundary enforcement | tested | `cargo xtask layer-check` validates allowed workspace dependencies, `cargo xtask ci` runs it, and GitHub Actions runs the architecture boundary subset on Windows, macOS, and Ubuntu. |
-| Terminal core baseline | tested | Grid, cells, cursor, scrollback, alternate screen, resize, modes, selection extraction, and baseline golden coverage exist. |
+| Terminal core baseline | tested | Grid, cells, cursor, anchored scrollback viewport, alternate screen, resize, modes, absolute normal/rectangular selection extraction, terminal key encoding, and baseline golden coverage exist. |
 | Unicode/grapheme cell model | tested | UTF-8 scalar buffering, grapheme clustering, combining marks, wide CJK cells, emoji modifiers, ZWJ emoji, variation selectors, selection, cursor movement, overwrite/delete/erase, resize, and scrollback tests exist in `term-core` and `term-parser`. |
 | Parser baseline | tested | ANSI/VT parser adapter handles printable text, common controls, SGR colors/styles, alternate screen, clears, insert/delete groundwork, tab stops, title OSC, mouse/focus/bracketed-paste mode state, and pending responses. |
 | Fuzzing harness | tested | `fuzz/` contains cargo-fuzz targets for parser, grid, resize, Unicode, selection, OSC/DCS, and shell markers; property smoke tests run through `cargo xtask fuzz-smoke` and scheduled CI. |
@@ -84,7 +84,7 @@ These areas are real foundations but must not be called complete:
 | GPU renderer | tested | WGPU surface/device setup, glyph atlas/cache policy, damage-aware batch preparation, indexed background/glyph/decoration/selection/cursor batches, row-scoped atlas uploads, renderer benchmarks, recovery status/event contracts, WGPU device-lost callback detection, disposable WGPU backend recreation, GPU atlas invalidation after recovery, screenshot verification infrastructure, and GPU timestamp status plumbing exist; real GPU timing samples, sleep/wake/monitor-loss validation, macOS/Linux screenshot baselines, and cross-OS render validation remain. |
 | Font system | partial | Deeper shaping, full fallback validation across installed font sets, emoji fallback, and grapheme-aware metrics. |
 | Unicode support | tested | Core/parser Unicode hardening is covered by automated tests; renderer font fallback, shaping, screenshot parity, and real app conformance remain later phases. |
-| Clipboard and selection | partial | Raw selection extraction, keyboard copy/paste, paste protection, bracketed paste, middle-click paste guard, and OSC 52 policy exist; mouse-driven selection UX, Linux primary selection provider, remote confirmation UI, and full copy/paste app compatibility coverage remain. |
+| Clipboard and selection | partial | Absolute normal/rectangular extraction, pane-aware mouse drag selection and overlays, copy-on-release, keyboard copy/paste, scrollback wheel/page navigation, paste protection, bracketed paste, middle-click paste guard, and OSC 52 policy exist; keyboard selection extension, search UX, URL launching, Linux primary selection, remote confirmation UI, and full app compatibility coverage remain. |
 | Baseline compatibility | partial | App compatibility runner and required Windows smoke exist; full interactive verification for shells, editors, pagers, TUIs, tmux, screen, zellij, SSH, WSL, and command-line tools remains incomplete. |
 | Shell integration | partial | Local runtime activation planning and desktop injection exist for supported shells, with Windows PowerShell semantic smoke verified. Remote install flows, heuristic command detection, WSL-specific coverage, and real bash/zsh/fish/macOS/Linux session verification remain. |
 | Visual overlays | partial | Semantic command-block overlay projection, badge glyph batching, cursor animation quads, and image cursor metadata caching exist; collapse/expand behavior, polished interactive UI, full image cursor frame upload/draw, real shell-driven verification, and cross-OS visual verification remain. |
@@ -126,6 +126,7 @@ The following major accepted features have no complete product behavior yet:
 - Real GPU device-loss validation for sleep/wake, monitor attach/detach, DPI
   changes, and backend failure simulation across desktop OSes.
 - Linux primary selection provider and remote OSC 52 confirmation UI.
+- Keyboard selection extension, interactive scrollback search, and a portable URL-opening action/provider.
 - Native OS config watcher backends, automatic programmable-config runtime watching, and real macOS/Linux runtime reload validation.
 - Product-complete desktop tabs/panes/sessions/workspaces runtime, including
   startup layouts, SSH panes, polished chrome, and cross-OS smoke tests.

@@ -33,6 +33,7 @@ use platform_winit::{
 use render_core::{
     CellPosition, CursorVisual, OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle,
     RenderColor, RenderCursorShape, RenderGrid, RenderInstrumentation, RenderRect, RenderScene,
+    SelectionVisual,
 };
 use render_wgpu::{
     AnimatedCursorImageCache, AnimatedCursorImageRequest, AnimatedCursorImageStatus,
@@ -55,8 +56,9 @@ use shell_integration::{
     detect_shell_kind,
 };
 use term_core::{
-    CellAttributes, ClipboardTarget, Color, CursorShape, Osc52ClipboardRequest, TerminalCore,
-    TerminalMode, TerminalSize as CoreTerminalSize,
+    CellAttributes, ClipboardTarget, Color, CursorShape, GridPosition, KeypadKey,
+    Osc52ClipboardRequest, Selection, SelectionKind, TerminalCore, TerminalKey,
+    TerminalKeyModifiers, TerminalMode, TerminalSize as CoreTerminalSize, encode_terminal_key,
 };
 use term_parser::TerminalEmulator;
 use transport_core::{TerminalSize as TransportSize, TerminalTransport, TransportState};
@@ -813,6 +815,30 @@ fn run() -> Result<(), Box<dyn Error>> {
                                                 );
                                             }
                                         }
+                                        "scroll_page_up" => {
+                                            if mux_runtime.scroll_active_page(true) {
+                                                scheduler.terminal_content_changed();
+                                                window.request_redraw();
+                                            }
+                                        }
+                                        "scroll_page_down" => {
+                                            if mux_runtime.scroll_active_page(false) {
+                                                scheduler.terminal_content_changed();
+                                                window.request_redraw();
+                                            }
+                                        }
+                                        "scroll_to_top" => {
+                                            if mux_runtime.scroll_active_to_top() {
+                                                scheduler.terminal_content_changed();
+                                                window.request_redraw();
+                                            }
+                                        }
+                                        "scroll_to_bottom" => {
+                                            if mux_runtime.scroll_active_to_bottom() {
+                                                scheduler.terminal_content_changed();
+                                                window.request_redraw();
+                                            }
+                                        }
                                         "toggle_fullscreen" => {
                                             current_window_mode = if matches!(
                                                 current_window_mode,
@@ -865,21 +891,24 @@ fn run() -> Result<(), Box<dyn Error>> {
                                             }
                                         }
                                     }
-                                } else if let Some(bytes) = input_bytes(&key) {
+                                } else if let Some(bytes) = mux_runtime.input_bytes(&key) {
                                     cursor_animator.record_typing();
                                     mux_runtime.write_active(&bytes);
                                 }
                             }
                             InputEvent::Mouse(mouse) => {
-                                if let Ok(metrics) = fonts.cell_metrics() {
-                                    mux_runtime.handle_mouse(
+                                if let Ok(metrics) = fonts.cell_metrics()
+                                    && mux_runtime.handle_mouse(
                                         mouse,
                                         metrics,
                                         &config,
                                         &clipboard_config,
                                         &paste_config,
                                         &mut clipboard,
-                                    );
+                                    )
+                                {
+                                    scheduler.terminal_content_changed();
+                                    window.request_redraw();
                                 }
                             }
                             InputEvent::Ime(platform_core::ImeEvent::Commit { text }) => {
@@ -1496,25 +1525,79 @@ fn rows_for_height(height: u32, metrics: CellMetrics) -> u16 {
     ((height as f32 / metrics.cell_height).floor() as u16).max(1)
 }
 
-fn input_bytes(event: &KeyEvent) -> Option<Vec<u8>> {
-    if event.state != KeyState::Pressed
-        || event.modifiers.ctrl
-        || event.modifiers.alt
-        || event.modifiers.super_key
-    {
+fn terminal_key(event: &KeyEvent) -> Option<TerminalKey> {
+    if event.state != KeyState::Pressed {
         return None;
     }
 
-    match event.logical_key.as_str() {
-        "Enter" => Some(b"\r".to_vec()),
-        "Backspace" => Some(vec![0x08]),
-        "Tab" => Some(b"\t".to_vec()),
-        "Escape" => Some(vec![0x1b]),
-        _ => event
-            .text
-            .as_ref()
-            .filter(|text| !text.is_empty())
-            .map(|text| text.as_bytes().to_vec()),
+    if let Some(keypad) = event.physical_key.as_deref().and_then(keypad_key) {
+        return Some(TerminalKey::Keypad(keypad));
+    }
+
+    let key = match event.logical_key.as_str() {
+        "Enter" => TerminalKey::Enter,
+        "Backspace" => TerminalKey::Backspace,
+        "Tab" => TerminalKey::Tab,
+        "Escape" => TerminalKey::Escape,
+        "ArrowUp" => TerminalKey::Up,
+        "ArrowDown" => TerminalKey::Down,
+        "ArrowLeft" => TerminalKey::Left,
+        "ArrowRight" => TerminalKey::Right,
+        "Home" => TerminalKey::Home,
+        "End" => TerminalKey::End,
+        "Insert" => TerminalKey::Insert,
+        "Delete" => TerminalKey::Delete,
+        "PageUp" => TerminalKey::PageUp,
+        "PageDown" => TerminalKey::PageDown,
+        logical if logical.len() > 1 && logical.starts_with('F') => {
+            TerminalKey::Function(logical[1..].parse().ok()?)
+        }
+        _ => TerminalKey::Character(
+            event
+                .text
+                .as_ref()
+                .filter(|text| !text.is_empty())
+                .unwrap_or(&event.logical_key)
+                .clone(),
+        ),
+    };
+    Some(key)
+}
+
+fn keypad_key(physical_key: &str) -> Option<KeypadKey> {
+    let name = physical_key
+        .strip_prefix("Code(")
+        .and_then(|value| value.strip_suffix(')'))
+        .unwrap_or(physical_key);
+    match name {
+        "Numpad0" => Some(KeypadKey::Digit(0)),
+        "Numpad1" => Some(KeypadKey::Digit(1)),
+        "Numpad2" => Some(KeypadKey::Digit(2)),
+        "Numpad3" => Some(KeypadKey::Digit(3)),
+        "Numpad4" => Some(KeypadKey::Digit(4)),
+        "Numpad5" => Some(KeypadKey::Digit(5)),
+        "Numpad6" => Some(KeypadKey::Digit(6)),
+        "Numpad7" => Some(KeypadKey::Digit(7)),
+        "Numpad8" => Some(KeypadKey::Digit(8)),
+        "Numpad9" => Some(KeypadKey::Digit(9)),
+        "NumpadDecimal" => Some(KeypadKey::Decimal),
+        "NumpadDivide" => Some(KeypadKey::Divide),
+        "NumpadMultiply" => Some(KeypadKey::Multiply),
+        "NumpadSubtract" => Some(KeypadKey::Subtract),
+        "NumpadAdd" => Some(KeypadKey::Add),
+        "NumpadEnter" => Some(KeypadKey::Enter),
+        "NumpadEqual" => Some(KeypadKey::Equal),
+        _ => None,
+    }
+}
+
+fn terminal_modifiers(modifiers: KeyModifiers) -> TerminalKeyModifiers {
+    TerminalKeyModifiers {
+        shift: modifiers.shift,
+        alt: modifiers.alt,
+        ctrl: modifiers.ctrl,
+        super_key: modifiers.super_key,
+        alt_graph: modifiers.alt_graph,
     }
 }
 
@@ -2054,6 +2137,35 @@ impl MuxRuntime {
         }
     }
 
+    fn input_bytes(&self, event: &KeyEvent) -> Option<Vec<u8>> {
+        let key = terminal_key(event)?;
+        let modes = self.active_pane()?.terminal.modes();
+        encode_terminal_key(&key, terminal_modifiers(event.modifiers), &modes)
+    }
+
+    fn scroll_active_page(&mut self, toward_older: bool) -> bool {
+        let Some(pane) = self.active_pane_mut() else {
+            return false;
+        };
+        let rows = i64::from(pane.terminal.visible_grid().viewport.size.rows).max(1);
+        pane.terminal
+            .state_mut()
+            .scroll_viewport(if toward_older { rows } else { -rows })
+    }
+
+    fn scroll_active_to_top(&mut self) -> bool {
+        let Some(pane) = self.active_pane_mut() else {
+            return false;
+        };
+        let lines = i64::try_from(pane.terminal.scrollback().lines.len()).unwrap_or(i64::MAX);
+        pane.terminal.state_mut().scroll_viewport(lines)
+    }
+
+    fn scroll_active_to_bottom(&mut self) -> bool {
+        self.active_pane_mut()
+            .is_some_and(|pane| pane.terminal.state_mut().scroll_to_bottom())
+    }
+
     fn paste_into_active(
         &mut self,
         text: &str,
@@ -2090,28 +2202,46 @@ impl MuxRuntime {
         clipboard_config: &ClipboardConfig,
         paste_config: &PasteConfig,
         clipboard: &mut ClipboardBridge,
-    ) {
+    ) -> bool {
         let Some((pane_id, local_mouse)) = self.local_mouse_event(mouse, metrics, config) else {
-            return;
+            return false;
         };
         if matches!(mouse.kind, MouseEventKind::Pressed(_)) {
             let _ = self.model.focus_pane(pane_id);
         }
         let Some(pane) = self.panes.get_mut(&pane_id) else {
-            return;
+            return false;
         };
         let modes = pane.terminal.modes();
-        if let Some(bytes) = pane
-            .mouse_protocol
-            .report_bytes(local_mouse, metrics, &modes)
+        if !local_mouse.modifiers.shift
+            && let Some(bytes) = pane
+                .mouse_protocol
+                .report_bytes(local_mouse, metrics, &modes)
         {
             pane.write_input(&bytes);
+            return false;
         } else if should_middle_click_paste(&local_mouse, &modes, clipboard_config)
             && let Ok(text) = clipboard.paste_text()
         {
             let bytes = paste_bytes(&text, clipboard_config, paste_config, false);
             pane.write_input(&bytes);
+            return false;
         }
+
+        let selection_completed = matches!(
+            local_mouse.kind,
+            MouseEventKind::Released(MouseButton::Left)
+        );
+        let changed = pane.handle_selection_or_scrollback(local_mouse, metrics);
+        if changed
+            && selection_completed
+            && clipboard_config.enabled
+            && clipboard_config.copy_on_select
+            && let Some(text) = pane.terminal.state().selected_text()
+        {
+            copy_text_with_diagnostics(clipboard, &text, clipboard_config, "copy-on-select");
+        }
+        changed
     }
 
     fn local_mouse_event(
@@ -2215,6 +2345,8 @@ struct PaneRuntime {
     parse_semantic_events: bool,
     transport: Option<LocalPtyTransport>,
     mouse_protocol: MouseProtocolState,
+    selection_anchor: Option<GridPosition>,
+    selection_kind: SelectionKind,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2314,6 +2446,66 @@ impl PaneRuntime {
             parse_semantic_events,
             transport,
             mouse_protocol: MouseProtocolState::default(),
+            selection_anchor: None,
+            selection_kind: SelectionKind::Normal,
+        }
+    }
+
+    fn handle_selection_or_scrollback(&mut self, mouse: MouseEvent, metrics: CellMetrics) -> bool {
+        if let MouseEventKind::Wheel { delta_y, .. } = mouse.kind {
+            let lines = if delta_y.abs() <= 10.0 {
+                (delta_y * 3.0).round() as i64
+            } else {
+                (delta_y / f64::from(metrics.cell_height)).round() as i64
+            };
+            return self.terminal.state_mut().scroll_viewport(lines);
+        }
+
+        let visible = self.terminal.visible_grid().viewport;
+        let row = ((mouse.y / f64::from(metrics.cell_height)).floor() as u16)
+            .min(visible.size.rows.saturating_sub(1));
+        let col = ((mouse.x / f64::from(metrics.cell_width)).floor() as u16)
+            .min(visible.size.cols.saturating_sub(1));
+        let position = self.terminal.state().viewport_position(row, col);
+
+        match mouse.kind {
+            MouseEventKind::Pressed(MouseButton::Left) => {
+                self.selection_anchor = Some(position);
+                self.selection_kind = if mouse.modifiers.alt {
+                    SelectionKind::Rectangular
+                } else {
+                    SelectionKind::Normal
+                };
+                self.terminal.state_mut().set_selection(Selection {
+                    start: position,
+                    end: position,
+                    kind: self.selection_kind,
+                });
+                true
+            }
+            MouseEventKind::Moved => {
+                let Some(anchor) = self.selection_anchor else {
+                    return false;
+                };
+                self.terminal.state_mut().set_selection(Selection {
+                    start: anchor,
+                    end: position,
+                    kind: self.selection_kind,
+                });
+                true
+            }
+            MouseEventKind::Released(MouseButton::Left) => {
+                let Some(anchor) = self.selection_anchor.take() else {
+                    return false;
+                };
+                self.terminal.state_mut().set_selection(Selection {
+                    start: anchor,
+                    end: position,
+                    kind: self.selection_kind,
+                });
+                true
+            }
+            _ => false,
         }
     }
 
@@ -2738,6 +2930,11 @@ fn scene_from_terminal(
         overlays
     });
 
+    let selections = selection_visual(terminal, visible.viewport, config)
+        .into_iter()
+        .collect();
+    let cursor_visible = cursor.visible && terminal.state().viewport_offset() == 0;
+
     RenderScene {
         grid: RenderGrid {
             columns: visible.viewport.size.cols,
@@ -2755,14 +2952,57 @@ fn scene_from_terminal(
                 CursorShape::Underline => RenderCursorShape::Underline,
             },
             color: render_color(config.cursor.color.unwrap_or(config.colors.cursor)),
-            visible: cursor.visible,
+            visible: cursor_visible,
             thickness_percent: (config.cursor.thickness.clamp(0.05, 1.0) * 100.0).round() as u8,
             corner_radius_px: cursor_radius_px(config),
             inactive: false,
         }),
         semantic_overlays,
+        selections,
         ..RenderScene::default()
     }
+}
+
+fn selection_visual(
+    terminal: &TerminalEmulator,
+    viewport: term_core::Viewport,
+    config: &AppConfig,
+) -> Option<SelectionVisual> {
+    let selection = terminal.selection_state()?;
+    let (start, end) = if selection.start <= selection.end {
+        (selection.start, selection.end)
+    } else {
+        (selection.end, selection.start)
+    };
+    let mut cells = Vec::new();
+    for visible_row in 0..viewport.size.rows {
+        let absolute_row = viewport.origin_row + i64::from(visible_row);
+        if absolute_row < start.row || absolute_row > end.row {
+            continue;
+        }
+        for col in 0..viewport.size.cols {
+            let selected = match selection.kind {
+                SelectionKind::Rectangular => {
+                    col >= start.col.min(end.col) && col <= start.col.max(end.col)
+                }
+                SelectionKind::Normal if start.row == end.row => col >= start.col && col <= end.col,
+                SelectionKind::Normal if absolute_row == start.row => col >= start.col,
+                SelectionKind::Normal if absolute_row == end.row => col <= end.col,
+                SelectionKind::Normal => true,
+            };
+            if selected {
+                cells.push(CellPosition {
+                    row: i64::from(visible_row),
+                    col,
+                });
+            }
+        }
+    }
+
+    (!cells.is_empty()).then_some(SelectionVisual {
+        cells,
+        color: render_color(config.colors.selection_background),
+    })
 }
 
 fn render_cursor_shape(shape: config_core::CursorShape) -> RenderCursorShape {
@@ -2788,7 +3028,7 @@ fn url_hint_overlays(
 ) -> Vec<OverlayPrimitive> {
     let mut lines = Vec::new();
     for row in 0..rows {
-        if let Some(line) = terminal.state().line(row) {
+        if let Some(line) = terminal.state().visible_line(row) {
             lines.push((i64::from(row), line.raw_text()));
         }
     }
@@ -3664,6 +3904,81 @@ mod tests {
             canonical_key_spec("Shift+Ctrl+T"),
             canonical_key_event(&event)
         );
+    }
+
+    #[test]
+    fn desktop_key_mapping_preserves_terminal_protocol_keys() {
+        let mut event = key_event("ArrowUp", KeyModifiers::default());
+        assert_eq!(terminal_key(&event), Some(TerminalKey::Up));
+
+        event.logical_key = "F12".to_owned();
+        assert_eq!(terminal_key(&event), Some(TerminalKey::Function(12)));
+
+        event.physical_key = Some("Code(NumpadEnter)".to_owned());
+        event.logical_key = "Enter".to_owned();
+        assert_eq!(
+            terminal_key(&event),
+            Some(TerminalKey::Keypad(KeypadKey::Enter))
+        );
+    }
+
+    #[test]
+    fn selection_visual_projects_only_visible_selected_cells() {
+        let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(4, 2));
+        terminal
+            .apply_bytes(b"abc\r\ndef\r\nghi")
+            .expect("terminal input");
+        terminal.state_mut().scroll_viewport(1);
+        terminal.state_mut().set_selection(Selection::normal(
+            GridPosition::new(0, 2),
+            GridPosition::new(1, 1),
+        ));
+        let viewport = terminal.visible_grid().viewport;
+
+        let visual =
+            selection_visual(&terminal, viewport, &AppConfig::default()).expect("selection visual");
+
+        assert_eq!(
+            visual.cells,
+            vec![
+                CellPosition { row: 0, col: 2 },
+                CellPosition { row: 0, col: 3 },
+                CellPosition { row: 1, col: 0 },
+                CellPosition { row: 1, col: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn sgr_mouse_reports_press_drag_release_and_modifiers() {
+        let mut protocol = MouseProtocolState::default();
+        let mut modes = BTreeSet::from([TerminalMode::MouseCellMotion, TerminalMode::SgrMouse]);
+        let metrics = test_metrics();
+        let mut press = mouse_event(MouseEventKind::Pressed(MouseButton::Left));
+        press.x = 15.0;
+        press.y = 25.0;
+        press.modifiers.shift = true;
+        assert_eq!(
+            protocol.report_bytes(press, metrics, &modes),
+            Some(b"\x1b[<4;2;2M".to_vec())
+        );
+
+        let mut drag = press;
+        drag.kind = MouseEventKind::Moved;
+        assert_eq!(
+            protocol.report_bytes(drag, metrics, &modes),
+            Some(b"\x1b[<36;2;2M".to_vec())
+        );
+
+        let mut release = press;
+        release.kind = MouseEventKind::Released(MouseButton::Left);
+        assert_eq!(
+            protocol.report_bytes(release, metrics, &modes),
+            Some(b"\x1b[<4;2;2m".to_vec())
+        );
+
+        modes.clear();
+        assert_eq!(protocol.report_bytes(press, metrics, &modes), None);
     }
 
     #[test]

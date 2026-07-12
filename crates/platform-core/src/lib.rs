@@ -113,6 +113,7 @@ pub struct KeyModifiers {
     pub ctrl: bool,
     pub alt: bool,
     pub super_key: bool,
+    pub alt_graph: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

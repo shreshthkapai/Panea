@@ -25,7 +25,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Parser baseline | tested | implemented | implemented | implemented | Lower-level tests and a compatibility smoke runner exist; full interactive app verification remains incomplete. |
 | Fuzz/property harness | tested | implemented | implemented | implemented | cargo-fuzz targets and proptest smoke tests exist; scheduled CI runs smoke properties, but long-running fuzz history has not accumulated yet. |
 | Scrollback/alternate screen/resize | tested | implemented | implemented | implemented | Core behavior exists; full app smoke remains open per OS. |
-| Selection extraction | tested | implemented | implemented | implemented | Raw normal and rectangular extraction exists; mouse-driven selection UX remains partial. |
+| Selection extraction | tested | implemented | implemented | implemented | Absolute-buffer normal and rectangular extraction, pane-aware mouse drag selection, and renderer selection overlays exist; keyboard extension and real off-Windows UX verification remain. |
 | Unicode/grapheme cell model | tested | implemented | implemented | implemented | Platform-neutral parser/core tests cover split UTF-8, combining marks, CJK width, emoji modifiers, ZWJ emoji, variation selectors, selection, cursor movement, resize, and scrollback; cross-OS renderer/font screenshots remain open. |
 | Local PTY transport | tested | partial | partial | partial | Windows ConPTY smoke passed; macOS/Linux real PTY smoke is unverified. |
 | Local PTY lifecycle contract | tested | implemented | implemented | implemented | Shared bounded lifecycle exists; non-Windows real shell validation remains open. |
@@ -36,8 +36,8 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Linux compositor verification matrix | planned | planned | tested | tested | Target matrix, runtime environment snapshot, fallback checklist, and `cargo xtask linux-compositor` exist; actual Linux host runs remain unverified. |
 | Decoration strategy | partial | partial | partial | partial | Requested/effective diagnostics exist; Linux negotiation needs real tests. |
 | Emergency restore shortcuts | partial | partial | partial | partial | Actions/keybinding concepts exist; full titlebarless UX validation remains open. |
-| Keyboard input translation | partial | partial | partial | partial | Platform-neutral events exist; layout, AltGr, Command/Option, and IME testing remain. |
-| Mouse input translation | partial | partial | partial | partial | Events and terminal reporting groundwork exist; selection UX and full protocol coverage remain. |
+| Keyboard input translation | tested | implemented | implemented | implemented | Shared terminal encoding covers text/control input, navigation/editing/function/keypad keys, xterm modifiers, AltGr preservation, and application cursor/keypad modes; real layout, Command/Option, and IME testing remains off Windows. |
+| Mouse input translation | tested | implemented | implemented | implemented | Normal, button-motion, all-motion, SGR encoding, focus reports, pane-aware selection, and scrollback wheel navigation exist; real cross-OS protocol and selection UX verification remains. |
 | IME/composed text | partial | partial | partial | partial | Event contract exists; real composed-input verification is not complete. |
 | System clipboard | partial | partial | partial | partial | Clipboard bridge, keyboard copy/paste, paste protection, and middle-click paste guard exist; real OS clipboard smoke remains incomplete off Windows. |
 | Linux primary selection | planned | planned | partial | partial | Config preference and target modeling exist; provider support and real Linux verification remain open. |

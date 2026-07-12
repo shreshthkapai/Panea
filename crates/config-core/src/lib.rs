@@ -1153,6 +1153,10 @@ impl Default for KeyboardConfig {
                 KeyBinding::new("Ctrl+Shift+Y", "select_current_command_output"),
                 KeyBinding::new("Ctrl+Shift+U", "copy_current_command_output"),
                 KeyBinding::new("Ctrl+Shift+A", "copy_command_and_output"),
+                KeyBinding::new("Shift+PageUp", "scroll_page_up"),
+                KeyBinding::new("Shift+PageDown", "scroll_page_down"),
+                KeyBinding::new("Ctrl+Shift+Home", "scroll_to_top"),
+                KeyBinding::new("Ctrl+Shift+End", "scroll_to_bottom"),
             ],
         }
     }

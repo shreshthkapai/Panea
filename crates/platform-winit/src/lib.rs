@@ -16,7 +16,7 @@ use winit::{
     dpi::LogicalSize,
     event::{ElementState, Ime, MouseScrollDelta, WindowEvent},
     event_loop::EventLoopWindowTarget,
-    keyboard::{Key, ModifiersState},
+    keyboard::{Key, ModifiersState, NamedKey},
     window::{Fullscreen, Window, WindowBuilder},
 };
 
@@ -138,17 +138,20 @@ impl InputTranslator {
                 Vec::new()
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if matches!(event.logical_key, Key::Named(NamedKey::AltGraph)) {
+                    self.modifiers.alt_graph = event.state == ElementState::Pressed;
+                }
                 if event.state != ElementState::Pressed {
                     return vec![InputEvent::Key(key_event_from_winit(event, self.modifiers))];
                 }
 
                 let key = key_event_from_winit(event, self.modifiers);
                 let action = recovery_action(&key);
-                let mut events = vec![InputEvent::Key(key)];
                 if let Some(action) = action {
-                    events.push(InputEvent::WindowAction(action));
+                    vec![InputEvent::WindowAction(action)]
+                } else {
+                    vec![InputEvent::Key(key)]
                 }
-                events
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position = (position.x, position.y);
@@ -415,6 +418,7 @@ fn modifiers_from_winit(modifiers: ModifiersState) -> KeyModifiers {
         ctrl: modifiers.control_key(),
         alt: modifiers.alt_key(),
         super_key: modifiers.super_key(),
+        alt_graph: false,
     }
 }
 
@@ -591,6 +595,7 @@ mod tests {
                 ctrl: true,
                 alt: false,
                 super_key: false,
+                alt_graph: false,
             },
             repeat: false,
         };

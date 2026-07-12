@@ -34,6 +34,206 @@ pub struct GridPosition {
     pub col: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalKey {
+    Character(String),
+    Enter,
+    Backspace,
+    Tab,
+    Escape,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    Insert,
+    Delete,
+    PageUp,
+    PageDown,
+    Function(u8),
+    Keypad(KeypadKey),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeypadKey {
+    Digit(u8),
+    Decimal,
+    Divide,
+    Multiply,
+    Subtract,
+    Add,
+    Enter,
+    Equal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TerminalKeyModifiers {
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+    pub super_key: bool,
+    pub alt_graph: bool,
+}
+
+/// Encodes a platform-neutral key as the byte sequence expected by terminal applications.
+#[must_use]
+pub fn encode_terminal_key(
+    key: &TerminalKey,
+    modifiers: TerminalKeyModifiers,
+    modes: &BTreeSet<TerminalMode>,
+) -> Option<Vec<u8>> {
+    if modifiers.super_key {
+        return None;
+    }
+
+    let effective_ctrl = modifiers.ctrl && !modifiers.alt_graph;
+    let effective_alt = modifiers.alt && !modifiers.alt_graph;
+    let modifier_parameter =
+        1 + u8::from(modifiers.shift) + 2 * u8::from(effective_alt) + 4 * u8::from(effective_ctrl);
+
+    let mut encoded = match key {
+        TerminalKey::Character(text) => {
+            if text.is_empty() {
+                return None;
+            }
+            if effective_ctrl {
+                encode_control_character(text)?
+            } else {
+                text.as_bytes().to_vec()
+            }
+        }
+        TerminalKey::Enter => vec![b'\r'],
+        TerminalKey::Backspace => vec![0x7f],
+        TerminalKey::Tab if modifiers.shift => b"\x1b[Z".to_vec(),
+        TerminalKey::Tab => vec![b'\t'],
+        TerminalKey::Escape => vec![0x1b],
+        TerminalKey::Up => encode_cursor_key('A', modifier_parameter, modes),
+        TerminalKey::Down => encode_cursor_key('B', modifier_parameter, modes),
+        TerminalKey::Right => encode_cursor_key('C', modifier_parameter, modes),
+        TerminalKey::Left => encode_cursor_key('D', modifier_parameter, modes),
+        TerminalKey::Home => encode_cursor_key('H', modifier_parameter, modes),
+        TerminalKey::End => encode_cursor_key('F', modifier_parameter, modes),
+        TerminalKey::Insert => encode_tilde_key(2, modifier_parameter),
+        TerminalKey::Delete => encode_tilde_key(3, modifier_parameter),
+        TerminalKey::PageUp => encode_tilde_key(5, modifier_parameter),
+        TerminalKey::PageDown => encode_tilde_key(6, modifier_parameter),
+        TerminalKey::Function(number) => encode_function_key(*number, modifier_parameter)?,
+        TerminalKey::Keypad(key) => {
+            encode_keypad_key(*key, modes.contains(&TerminalMode::ApplicationKeypad))?
+        }
+    };
+
+    if effective_alt
+        && matches!(
+            key,
+            TerminalKey::Character(_)
+                | TerminalKey::Enter
+                | TerminalKey::Backspace
+                | TerminalKey::Tab
+                | TerminalKey::Escape
+                | TerminalKey::Keypad(_)
+        )
+    {
+        encoded.insert(0, 0x1b);
+    }
+    Some(encoded)
+}
+
+fn encode_control_character(text: &str) -> Option<Vec<u8>> {
+    let ch = text.chars().next()?;
+    if text.chars().nth(1).is_some() {
+        return None;
+    }
+    let byte = match ch {
+        '@' | ' ' | '2' => 0x00,
+        'a'..='z' => ch as u8 - b'a' + 1,
+        'A'..='Z' => ch as u8 - b'A' + 1,
+        '[' | '3' => 0x1b,
+        '\\' | '4' => 0x1c,
+        ']' | '5' => 0x1d,
+        '^' | '6' => 0x1e,
+        '_' | '7' | '/' => 0x1f,
+        '?' | '8' => 0x7f,
+        _ => return None,
+    };
+    Some(vec![byte])
+}
+
+fn encode_cursor_key(final_byte: char, modifier: u8, modes: &BTreeSet<TerminalMode>) -> Vec<u8> {
+    if modifier == 1 {
+        let prefix = if modes.contains(&TerminalMode::ApplicationCursorKeys) {
+            "\x1bO"
+        } else {
+            "\x1b["
+        };
+        format!("{prefix}{final_byte}").into_bytes()
+    } else {
+        format!("\x1b[1;{modifier}{final_byte}").into_bytes()
+    }
+}
+
+fn encode_tilde_key(number: u8, modifier: u8) -> Vec<u8> {
+    if modifier == 1 {
+        format!("\x1b[{number}~").into_bytes()
+    } else {
+        format!("\x1b[{number};{modifier}~").into_bytes()
+    }
+}
+
+fn encode_function_key(number: u8, modifier: u8) -> Option<Vec<u8>> {
+    if (1..=4).contains(&number) {
+        let final_byte = char::from(b'P' + number - 1);
+        return Some(if modifier == 1 {
+            format!("\x1bO{final_byte}").into_bytes()
+        } else {
+            format!("\x1b[1;{modifier}{final_byte}").into_bytes()
+        });
+    }
+    let number = match number {
+        5 => 15,
+        6 => 17,
+        7 => 18,
+        8 => 19,
+        9 => 20,
+        10 => 21,
+        11 => 23,
+        12 => 24,
+        _ => return None,
+    };
+    Some(encode_tilde_key(number, modifier))
+}
+
+fn encode_keypad_key(key: KeypadKey, application: bool) -> Option<Vec<u8>> {
+    if !application {
+        let text = match key {
+            KeypadKey::Digit(value @ 0..=9) => value.to_string(),
+            KeypadKey::Digit(_) => return None,
+            KeypadKey::Decimal => ".".to_owned(),
+            KeypadKey::Divide => "/".to_owned(),
+            KeypadKey::Multiply => "*".to_owned(),
+            KeypadKey::Subtract => "-".to_owned(),
+            KeypadKey::Add => "+".to_owned(),
+            KeypadKey::Enter => "\r".to_owned(),
+            KeypadKey::Equal => "=".to_owned(),
+        };
+        return Some(text.into_bytes());
+    }
+
+    let final_byte = match key {
+        KeypadKey::Digit(value @ 0..=9) => char::from(b'p' + value),
+        KeypadKey::Digit(_) => return None,
+        KeypadKey::Decimal => 'n',
+        KeypadKey::Divide => 'o',
+        KeypadKey::Multiply => 'j',
+        KeypadKey::Subtract => 'm',
+        KeypadKey::Add => 'k',
+        KeypadKey::Enter => 'M',
+        KeypadKey::Equal => 'X',
+    };
+    Some(format!("\x1bO{final_byte}").into_bytes())
+}
+
 impl GridPosition {
     #[must_use]
     pub const fn new(row: i64, col: u16) -> Self {
@@ -390,6 +590,7 @@ pub struct TerminalState {
     cursor_blinking: bool,
     modes: BTreeSet<TerminalMode>,
     selection: Option<Selection>,
+    viewport_offset: usize,
     saved_cursor: Option<SavedCursor>,
     tab_stops: BTreeSet<u16>,
     tab_stops_modified: bool,
@@ -414,6 +615,7 @@ impl TerminalState {
             cursor_blinking: true,
             modes,
             selection: None,
+            viewport_offset: 0,
             saved_cursor: None,
             tab_stops: default_tab_stops(size.cols),
             tab_stops_modified: false,
@@ -424,6 +626,7 @@ impl TerminalState {
     }
 
     pub fn apply_action(&mut self, action: TerminalAction) -> TerminalResult<()> {
+        let scrollback_before = self.primary.scrollback.len();
         match action {
             TerminalAction::Print(ch) => self.print(ch),
             TerminalAction::CarriageReturn => self.active_mut().carriage_return(),
@@ -475,6 +678,18 @@ impl TerminalState {
             TerminalAction::Reset => self.reset(),
         }
 
+        if self.viewport_offset > 0 {
+            self.viewport_offset = self
+                .viewport_offset
+                .saturating_add(
+                    self.primary
+                        .scrollback
+                        .len()
+                        .saturating_sub(scrollback_before),
+                )
+                .min(self.primary.scrollback.len());
+        }
+
         Ok(())
     }
 
@@ -513,6 +728,17 @@ impl TerminalState {
     }
 
     #[must_use]
+    pub fn visible_line(&self, row: u16) -> Option<&Line> {
+        if row >= self.viewport().size.rows {
+            return None;
+        }
+        let absolute_row = self.viewport().origin_row + i64::from(row);
+        usize::try_from(absolute_row)
+            .ok()
+            .and_then(|row| self.buffer_line(row))
+    }
+
+    #[must_use]
     pub fn selected_text(&self) -> Option<String> {
         let selection = self.selection?;
         Some(self.extract_selection(selection))
@@ -524,6 +750,45 @@ impl TerminalState {
 
     pub fn clear_selection(&mut self) {
         self.selection = None;
+    }
+
+    /// Scrolls the visible primary-screen viewport. Positive values move toward older lines.
+    pub fn scroll_viewport(&mut self, lines: i64) -> bool {
+        if !self.active_is_primary() || lines == 0 {
+            return false;
+        }
+        let previous = self.viewport_offset;
+        if lines > 0 {
+            self.viewport_offset = self
+                .viewport_offset
+                .saturating_add(lines as usize)
+                .min(self.primary.scrollback.len());
+        } else {
+            self.viewport_offset = self
+                .viewport_offset
+                .saturating_sub(lines.unsigned_abs() as usize);
+        }
+        previous != self.viewport_offset
+    }
+
+    pub fn scroll_to_bottom(&mut self) -> bool {
+        let changed = self.viewport_offset != 0;
+        self.viewport_offset = 0;
+        changed
+    }
+
+    #[must_use]
+    pub const fn viewport_offset(&self) -> usize {
+        self.viewport_offset
+    }
+
+    #[must_use]
+    pub fn viewport_position(&self, visible_row: u16, col: u16) -> GridPosition {
+        let viewport = self.viewport();
+        GridPosition {
+            row: viewport.origin_row + i64::from(visible_row.min(viewport.size.rows - 1)),
+            col: col.min(viewport.size.cols - 1),
+        }
     }
 
     #[must_use]
@@ -569,7 +834,10 @@ impl TerminalState {
     fn viewport(&self) -> Viewport {
         Viewport {
             origin_row: if self.active_is_primary() {
-                self.primary.scrollback.len() as i64
+                self.primary
+                    .scrollback
+                    .len()
+                    .saturating_sub(self.viewport_offset) as i64
             } else {
                 0
             },
@@ -739,32 +1007,36 @@ impl TerminalState {
     }
 
     fn extract_selection(&self, selection: Selection) -> String {
-        let start_row = selection.start.row.min(selection.end.row).max(0) as usize;
-        let end_row = selection.start.row.max(selection.end.row).max(0) as usize;
-        let start_col = selection.start.col.min(selection.end.col);
-        let end_col = selection.start.col.max(selection.end.col);
-        let lines = &self.active().lines;
+        let (start, end) = if selection.start <= selection.end {
+            (selection.start, selection.end)
+        } else {
+            (selection.end, selection.start)
+        };
+        let start_row = start.row.max(0) as usize;
+        let end_row = end.row.max(0) as usize;
+        let rectangular_start_col = start.col.min(end.col);
+        let rectangular_end_col = start.col.max(end.col);
         let mut out = String::new();
 
         for row in start_row..=end_row {
-            let Some(line) = lines.get(row) else {
+            let Some(line) = self.buffer_line(row) else {
                 continue;
             };
 
             let line_end = line.cells.len().saturating_sub(1);
             let (from, to) = match selection.kind {
                 SelectionKind::Rectangular => (
-                    usize::from(start_col).min(line_end),
-                    usize::from(end_col).min(line_end),
+                    usize::from(rectangular_start_col).min(line_end),
+                    usize::from(rectangular_end_col).min(line_end),
                 ),
                 SelectionKind::Normal if row == start_row && row == end_row => (
-                    usize::from(start_col).min(line_end),
-                    usize::from(end_col).min(line_end),
+                    usize::from(start.col).min(line_end),
+                    usize::from(end.col).min(line_end),
                 ),
                 SelectionKind::Normal if row == start_row => {
-                    (usize::from(start_col).min(line_end), line_end)
+                    (usize::from(start.col).min(line_end), line_end)
                 }
-                SelectionKind::Normal if row == end_row => (0, usize::from(end_col).min(line_end)),
+                SelectionKind::Normal if row == end_row => (0, usize::from(end.col).min(line_end)),
                 SelectionKind::Normal => (0, line_end),
             };
             let Some((from, to)) = expand_range_to_graphemes(line, from, to) else {
@@ -776,6 +1048,11 @@ impl TerminalState {
                     out.push_str(&cell.text);
                 }
             }
+            if selection.kind == SelectionKind::Normal && to == line_end {
+                while out.ends_with(' ') {
+                    out.pop();
+                }
+            }
 
             let should_join_wrapped =
                 selection.kind == SelectionKind::Normal && line.hard_wrapped && row < end_row;
@@ -785,6 +1062,17 @@ impl TerminalState {
         }
 
         trim_selection_text(out)
+    }
+
+    fn buffer_line(&self, absolute_row: usize) -> Option<&Line> {
+        if !self.active_is_primary() {
+            return self.active().lines.get(absolute_row);
+        }
+        self.primary.scrollback.get(absolute_row).or_else(|| {
+            self.primary
+                .lines
+                .get(absolute_row - self.primary.scrollback.len())
+        })
     }
 }
 
@@ -807,6 +1095,7 @@ impl TerminalCore for TerminalState {
     fn resize(&mut self, size: TerminalSize) -> TerminalResult<()> {
         let size = size.normalized();
         self.primary.resize_reflow(size);
+        self.viewport_offset = self.viewport_offset.min(self.primary.scrollback.len());
 
         if let Some(alternate) = &mut self.alternate {
             alternate.resize_visible(size);
@@ -819,12 +1108,13 @@ impl TerminalCore for TerminalState {
     }
 
     fn visible_grid(&self) -> VisibleGrid {
+        let viewport = self.viewport();
+        let start = usize::try_from(viewport.origin_row).unwrap_or(0);
+        let rows = usize::from(viewport.size.rows);
         VisibleGrid {
-            viewport: self.viewport(),
-            cells: self
-                .active()
-                .lines
-                .iter()
+            viewport,
+            cells: (start..start.saturating_add(rows))
+                .filter_map(|row| self.buffer_line(row))
                 .flat_map(|line| line.cells.iter().cloned())
                 .collect(),
         }
@@ -2068,6 +2358,191 @@ mod tests {
         );
         assert_eq!(line_text(&terminal, 0), "x");
         assert_eq!(line_text(&terminal, 1), "y");
+    }
+
+    #[test]
+    fn viewport_scrolls_through_scrollback_and_stays_anchored() {
+        let mut terminal = TerminalState::new(TerminalSize::new(6, 2));
+        terminal
+            .apply_actions("one\r\ntwo\r\nthree".chars().map(|ch| match ch {
+                '\r' => TerminalAction::CarriageReturn,
+                '\n' => TerminalAction::LineFeed,
+                _ => TerminalAction::Print(ch),
+            }))
+            .unwrap();
+
+        assert!(terminal.scroll_viewport(1));
+        let visible = terminal.visible_grid();
+        assert_eq!(visible.viewport.origin_row, 0);
+        assert_eq!(visible_line_text(&visible, 0), "one");
+        assert_eq!(visible_line_text(&visible, 1), "two");
+
+        terminal
+            .apply_actions("\r\nfour".chars().map(|ch| match ch {
+                '\r' => TerminalAction::CarriageReturn,
+                '\n' => TerminalAction::LineFeed,
+                _ => TerminalAction::Print(ch),
+            }))
+            .unwrap();
+
+        let visible = terminal.visible_grid();
+        assert_eq!(visible.viewport.origin_row, 0);
+        assert_eq!(visible_line_text(&visible, 0), "one");
+        assert_eq!(terminal.viewport_offset(), 2);
+        assert!(terminal.scroll_to_bottom());
+        assert_eq!(terminal.visible_grid().viewport.origin_row, 2);
+    }
+
+    #[test]
+    fn selection_uses_absolute_scrollback_positions_and_reverse_drag_order() {
+        let mut terminal = TerminalState::new(TerminalSize::new(5, 2));
+        terminal
+            .apply_actions("abcd\r\nefgh\r\nijkl".chars().map(|ch| match ch {
+                '\r' => TerminalAction::CarriageReturn,
+                '\n' => TerminalAction::LineFeed,
+                _ => TerminalAction::Print(ch),
+            }))
+            .unwrap();
+
+        terminal.set_selection(Selection::normal(
+            GridPosition::new(1, 1),
+            GridPosition::new(0, 2),
+        ));
+
+        assert_eq!(terminal.selected_text().as_deref(), Some("cd\nef"));
+    }
+
+    fn visible_line_text(visible: &VisibleGrid, row: usize) -> String {
+        let cols = usize::from(visible.viewport.size.cols);
+        visible.cells[row * cols..(row + 1) * cols]
+            .iter()
+            .filter(|cell| !cell.wide_continuation)
+            .map(|cell| cell.text.as_str())
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    }
+
+    #[test]
+    fn terminal_key_encoder_handles_text_controls_and_alt() {
+        let modes = BTreeSet::new();
+
+        assert_eq!(
+            encode_terminal_key(
+                &TerminalKey::Character("a".to_owned()),
+                TerminalKeyModifiers::default(),
+                &modes,
+            ),
+            Some(b"a".to_vec())
+        );
+        assert_eq!(
+            encode_terminal_key(
+                &TerminalKey::Character("c".to_owned()),
+                TerminalKeyModifiers {
+                    ctrl: true,
+                    ..TerminalKeyModifiers::default()
+                },
+                &modes,
+            ),
+            Some(vec![0x03])
+        );
+        assert_eq!(
+            encode_terminal_key(
+                &TerminalKey::Character("x".to_owned()),
+                TerminalKeyModifiers {
+                    alt: true,
+                    ..TerminalKeyModifiers::default()
+                },
+                &modes,
+            ),
+            Some(b"\x1bx".to_vec())
+        );
+    }
+
+    #[test]
+    fn terminal_key_encoder_honors_application_and_modifier_modes() {
+        let mut modes = BTreeSet::new();
+        modes.insert(TerminalMode::ApplicationCursorKeys);
+        modes.insert(TerminalMode::ApplicationKeypad);
+
+        assert_eq!(
+            encode_terminal_key(&TerminalKey::Up, TerminalKeyModifiers::default(), &modes),
+            Some(b"\x1bOA".to_vec())
+        );
+        assert_eq!(
+            encode_terminal_key(
+                &TerminalKey::Left,
+                TerminalKeyModifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..TerminalKeyModifiers::default()
+                },
+                &modes,
+            ),
+            Some(b"\x1b[1;6D".to_vec())
+        );
+        assert_eq!(
+            encode_terminal_key(
+                &TerminalKey::Keypad(KeypadKey::Digit(1)),
+                TerminalKeyModifiers::default(),
+                &modes,
+            ),
+            Some(b"\x1bOq".to_vec())
+        );
+    }
+
+    #[test]
+    fn terminal_key_encoder_supports_function_and_editing_keys() {
+        let modes = BTreeSet::new();
+
+        assert_eq!(
+            encode_terminal_key(
+                &TerminalKey::Function(5),
+                TerminalKeyModifiers::default(),
+                &modes,
+            ),
+            Some(b"\x1b[15~".to_vec())
+        );
+        assert_eq!(
+            encode_terminal_key(
+                &TerminalKey::Delete,
+                TerminalKeyModifiers {
+                    alt: true,
+                    ..TerminalKeyModifiers::default()
+                },
+                &modes,
+            ),
+            Some(b"\x1b[3;3~".to_vec())
+        );
+        assert_eq!(
+            encode_terminal_key(
+                &TerminalKey::Tab,
+                TerminalKeyModifiers {
+                    shift: true,
+                    ..TerminalKeyModifiers::default()
+                },
+                &modes,
+            ),
+            Some(b"\x1b[Z".to_vec())
+        );
+    }
+
+    #[test]
+    fn alt_graph_preserves_printable_text() {
+        let modes = BTreeSet::new();
+        assert_eq!(
+            encode_terminal_key(
+                &TerminalKey::Character("@".to_owned()),
+                TerminalKeyModifiers {
+                    ctrl: true,
+                    alt: true,
+                    alt_graph: true,
+                    ..TerminalKeyModifiers::default()
+                },
+                &modes,
+            ),
+            Some(b"@".to_vec())
+        );
     }
 
     proptest! {

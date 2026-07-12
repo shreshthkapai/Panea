@@ -42,7 +42,9 @@ write the local clipboard.
 
 ## Current State
 
-- Normal and rectangular raw selection extraction exist in `term-core`.
+- Normal and rectangular extraction uses absolute buffer positions and remains valid across scrollback.
+- Pane-aware mouse drag selection is wired; hold Alt while beginning a drag for rectangular selection, or Shift to bypass application mouse reporting.
+- Selection visuals are projected as renderer overlays and never mutate terminal cells.
 - Keyboard copy/paste is wired through the desktop clipboard bridge.
 - Paste protection normalizes newlines and strips control characters when enabled.
 - Bracketed paste is emitted when the terminal has bracketed paste mode enabled.
@@ -50,7 +52,7 @@ write the local clipboard.
 
 ## Still Open
 
-- Mouse-driven selection creation and drag UX.
+- Keyboard-driven selection extension and search-result selection UX.
 - Linux primary selection provider support.
 - Remote OSC 52 confirmation UI.
 - Real clipboard smoke tests on macOS, Linux X11, and Linux Wayland.
