@@ -855,6 +855,28 @@ fn known_paths() -> BTreeSet<&'static str> {
         "mux.status_format",
         "mux.pane_resize_step",
         "mux.remember_working_directory",
+        "mux.startup_workspaces",
+        "mux.startup_workspaces.name",
+        "mux.startup_workspaces.tabs",
+        "mux.startup_workspaces.tabs.name",
+        "mux.startup_workspaces.tabs.layout",
+        "mux.startup_workspaces.tabs.layout.kind",
+        "mux.startup_workspaces.tabs.layout.profile",
+        "mux.startup_workspaces.tabs.layout.transport",
+        "mux.startup_workspaces.tabs.layout.working_directory",
+        "mux.startup_workspaces.tabs.layout.axis",
+        "mux.startup_workspaces.tabs.layout.ratio",
+        "mux.startup_workspaces.tabs.layout.first",
+        "mux.startup_workspaces.tabs.layout.second",
+        "mux.appearance",
+        "mux.appearance.tab_bar_background",
+        "mux.appearance.active_tab_foreground",
+        "mux.appearance.active_tab_background",
+        "mux.appearance.inactive_tab_foreground",
+        "mux.appearance.inactive_tab_background",
+        "mux.appearance.active_pane_border",
+        "mux.appearance.inactive_pane_border",
+        "mux.appearance.pane_border_width",
         "performance",
         "performance.profile",
         "performance.frame_rate_limit",
@@ -903,6 +925,14 @@ fn is_known_dynamic_path(path: &str) -> bool {
         "visual_theme.borders.color.",
         "visual_theme.success_color.",
         "visual_theme.error_color.",
+        "mux.startup_workspaces.",
+        "mux.appearance.tab_bar_background.",
+        "mux.appearance.active_tab_foreground.",
+        "mux.appearance.active_tab_background.",
+        "mux.appearance.inactive_tab_foreground.",
+        "mux.appearance.inactive_tab_background.",
+        "mux.appearance.active_pane_border.",
+        "mux.appearance.inactive_pane_border.",
     ];
 
     dynamic_prefixes
@@ -1220,6 +1250,53 @@ mod tests {
         );
         assert_eq!(loaded.config.performance.frame_rate_limit, Some(30));
         assert_eq!(loaded.config.performance.max_animation_fps, 12);
+    }
+
+    #[test]
+    fn recursive_startup_mux_layout_parses_without_unknown_diagnostics() {
+        let loaded = parse_str(
+            r#"
+            [[shell_profiles]]
+            name = "dev"
+
+            [[ssh_profiles]]
+            name = "prod"
+            host = "example.test"
+            known_hosts_policy = "require_known"
+
+            [[mux.startup_workspaces]]
+            name = "work"
+
+            [[mux.startup_workspaces.tabs]]
+            name = "mixed"
+
+            [mux.startup_workspaces.tabs.layout]
+            kind = "split"
+            axis = "horizontal"
+            ratio = 0.6
+
+            [mux.startup_workspaces.tabs.layout.first]
+            kind = "pane"
+            profile = "dev"
+            transport = "local"
+
+            [mux.startup_workspaces.tabs.layout.second]
+            kind = "pane"
+            profile = "prod"
+            transport = "ssh"
+            "#,
+            None,
+            ConfigPlatform::Unknown,
+        )
+        .expect("startup mux config");
+
+        assert_eq!(loaded.config.mux.startup_workspaces.len(), 1);
+        assert!(
+            !loaded
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.message.contains("unknown config setting") })
+        );
     }
 
     #[test]

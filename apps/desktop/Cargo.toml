@@ -24,6 +24,7 @@ pollster.workspace = true
 render-core = { path = "../../crates/render-core" }
 render-wgpu = { path = "../../crates/render-wgpu" }
 security = { path = "../../crates/security" }
+serde_json.workspace = true
 semantics = { path = "../../crates/semantics" }
 shell-integration = { path = "../../crates/shell-integration" }
 term-core = { path = "../../crates/term-core" }

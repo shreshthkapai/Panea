@@ -61,14 +61,14 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Renderer instrumentation | tested | implemented | implemented | implemented | CPU, submission, glyph/cache, atlas, PTY/parser throughput, memory estimate, and GPU timestamp status metrics exist; real timestamp samples need cross-OS backend validation. |
 | In-window performance overlay | tested | partial | partial | partial | Developer overlay projection exists through renderer overlay primitives; polished installed toggle/UX and cross-OS visual verification remain. |
 | Native mux model | tested | implemented | implemented | implemented | Workspace/tab/pane/session/layout model exists. |
-| Native tabs runtime | partial | partial | partial | partial | Desktop runtime switching and basic tab chrome exist; real GUI smoke and polished tab UI remain. |
-| Native panes/splits runtime | partial | partial | partial | partial | Desktop split rendering, per-pane local transports, focus, resize, zoom, and close are wired; cross-OS smoke, SSH panes, and startup layouts remain. |
+| Native tabs/workspaces runtime | tested | partial | partial | partial | Windows-host tests cover workspace/tab lifecycle, clickable configurable tab chrome, startup layouts and fresh-process restore; real GUI and non-Windows smoke remain. |
+| Native panes/splits runtime | tested | partial | partial | partial | Windows-host tests cover nested layouts, per-pane local/SSH ownership, focus, resize, zoom, move, swap, close, transport resize and pane-aware rendering; real GUI/non-Windows smoke remains. |
 | External tmux/screen/zellij compatibility | partial | partial | partial | partial | Compatibility runner records binary availability; nested PTY behavior still needs manual or future automated checks. |
 | App compatibility runner | tested | partial | partial | partial | `cargo xtask compat` exists with required Windows PowerShell/cmd/protocol smoke passing on the current host. macOS, Linux X11, and Linux Wayland reports remain unverified. |
 | Semantic timeline | tested | implemented | implemented | implemented | Storage and command-region model exist. |
 | Semantic escape parser | tested | implemented | implemented | implemented | OSC 133, OSC 633, OSC 7, and private OSC 777 foundations exist. |
-| Shell integration activation | partial | partial | partial | partial | Activation plans, desktop hook injection, config modes, and ignored real-shell tests exist; Windows PowerShell smoke passed, while bash/zsh/fish, WSL, remote, macOS, and Linux verification remain. |
-| Command navigation/copy actions | tested | implemented | implemented | implemented | Semantic actions exist; desktop UX integration remains partial. |
+| Shell integration activation | tested | partial | partial | partial | Complete marker scripts, desktop injection, config modes and bounded real-shell tests exist; PowerShell is verified on Windows while bash/zsh/fish, WSL, remote, macOS and Linux verification remain. |
+| Command navigation/copy actions | tested | implemented | implemented | implemented | Active-pane navigation, raw output selection, output copy, and command-plus-output copy are wired and unit tested. |
 | Prompt decorations | partial | partial | partial | partial | Overlay projection, alternate-screen suppression, and config policy exist; cross-OS visual smoke and polished UI remain. |
 | Command blocks | tested | partial | partial | partial | Windows-host tests cover command-block backgrounds, input/output grouping, metadata badges, alternate-screen suppression, and renderer overlay glyph batching. Real shell-driven and cross-OS visual verification remain. |
 | Static cursor styles | tested | implemented | implemented | implemented | Block, beam, underline, and hollow block rendering, thickness, rounded geometry, colors, deterministic blink, inactive and terminal-mode styles, retained-frame-safe cursor damage, and config validation are implemented. Real macOS/Linux visual verification and user-authored custom geometry remain open. |
@@ -78,7 +78,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | SSH host-key policy | tested | implemented | implemented | implemented | Security contract exists with explicit unknown/changed-host trust decisions; desktop UI remains. |
 | SSH transport | partial | partial | partial | partial | Backend and `cargo xtask ssh-smoke` real-server harness exist; collected server reports remain unverified. |
 | SSH secret handling | tested | partial | partial | partial | Secret/keychain provider contracts, redaction, prompt persistence flow, and platform capability reporting exist; native OS backend wiring and prompts remain. |
-| SSH in mux | partial | partial | partial | partial | Session specs exist; direct SSH tab/pane runtime actions remain deferred until SSH trust/secret UI is ready. |
+| SSH in mux | tested | partial | partial | partial | Startup layouts and `action:profile` commands create nonblocking first-class SSH pane transports with remote resize, semantic context and remote OSC 52 policy. Interactive trust/secret and reconnect UI remain separate. |
 | Doctor diagnostics | tested | implemented | implemented | implemented | Installed `panea doctor` and `cargo xtask doctor` share one diagnostics model with human-readable and JSON output; macOS/Linux runtime output still needs host verification. |
 | Bug-report snapshot | tested | implemented | implemented | implemented | Privacy-aware model exists; product export UX remains. |
 | Native notifications | planned | planned | planned | planned | Not implemented. |

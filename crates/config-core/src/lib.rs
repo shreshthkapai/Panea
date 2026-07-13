@@ -403,8 +403,26 @@ impl AppConfig {
                 reason: "SSH profile changes only affect new sessions".to_owned(),
             });
         }
-        if self.mux != next.mux {
+        if self.mux.enabled != next.mux.enabled
+            || self.mux.show_tab_bar != next.mux.show_tab_bar
+            || self.mux.tab_title_format != next.mux.tab_title_format
+            || self.mux.status_format != next.mux.status_format
+            || self.mux.pane_resize_step != next.mux.pane_resize_step
+            || self.mux.remember_working_directory != next.mux.remember_working_directory
+            || self.mux.appearance != next.mux.appearance
+        {
             plan.live.push(ReloadableSection::Mux);
+        }
+        if self.mux.restore_sessions != next.mux.restore_sessions
+            || self.mux.default_workspace != next.mux.default_workspace
+            || self.mux.startup_workspaces != next.mux.startup_workspaces
+        {
+            plan.restart_required.push(RestartRequiredChange {
+                path: "mux.startup_workspaces".to_owned(),
+                reason:
+                    "workspace restoration and startup layouts apply when the application starts"
+                        .to_owned(),
+            });
         }
         if self.platform_overrides != next.platform_overrides {
             plan.restart_required.push(RestartRequiredChange {
@@ -707,6 +725,37 @@ impl AppConfig {
                 "mux.pane_resize_step",
                 "pane resize step must be between 0.01 and 0.5",
             );
+        }
+        if self.mux.appearance.pane_border_width > 8 {
+            report.error(
+                "mux.appearance.pane_border_width",
+                "pane border width must be between 0 and 8 pixels",
+            );
+        }
+        let mut workspace_names = BTreeSet::new();
+        for workspace in &self.mux.startup_workspaces {
+            if workspace.name.trim().is_empty() {
+                report.error("mux.startup_workspaces", "workspace name cannot be empty");
+            } else if !workspace_names.insert(workspace.name.as_str()) {
+                report.error(
+                    "mux.startup_workspaces",
+                    format!("duplicate startup workspace '{}'", workspace.name),
+                );
+            }
+            if workspace.tabs.is_empty() {
+                report.error(
+                    format!("mux.startup_workspaces.{}", workspace.name),
+                    "startup workspace must contain at least one tab",
+                );
+            }
+            for tab in &workspace.tabs {
+                validate_mux_layout(
+                    &tab.layout,
+                    &format!("mux.startup_workspaces.{}.{}", workspace.name, tab.name),
+                    self,
+                    report,
+                );
+            }
         }
     }
 
@@ -1387,6 +1436,10 @@ impl Default for KeyboardConfig {
                 KeyBinding::new("Ctrl+Shift+W", "close_window"),
                 KeyBinding::new("Ctrl+Shift+P", "open_command_palette_later"),
                 KeyBinding::new("Ctrl+Shift+T", "new_tab"),
+                KeyBinding::new("Ctrl+Alt+Shift+N", "new_workspace"),
+                KeyBinding::new("Ctrl+Alt+Shift+W", "close_workspace"),
+                KeyBinding::new("Ctrl+Alt+PageDown", "next_workspace"),
+                KeyBinding::new("Ctrl+Alt+PageUp", "previous_workspace"),
                 KeyBinding::new("Ctrl+Shift+Q", "close_tab"),
                 KeyBinding::new("Ctrl+PageDown", "next_tab"),
                 KeyBinding::new("Ctrl+PageUp", "previous_tab"),
@@ -1403,7 +1456,10 @@ impl Default for KeyboardConfig {
                 KeyBinding::new("Alt+Shift+Down", "resize_pane_down"),
                 KeyBinding::new("Ctrl+Shift+Z", "zoom_pane"),
                 KeyBinding::new("Ctrl+Shift+R", "rename_tab"),
-                KeyBinding::new("Ctrl+Shift+O", "move_pane"),
+                KeyBinding::new("Ctrl+Alt+Left", "move_pane_left"),
+                KeyBinding::new("Ctrl+Alt+Right", "move_pane_right"),
+                KeyBinding::new("Ctrl+Alt+Up", "move_pane_up"),
+                KeyBinding::new("Ctrl+Alt+Down", "move_pane_down"),
                 KeyBinding::new("Ctrl+Shift+Up", "jump_to_previous_command"),
                 KeyBinding::new("Ctrl+Shift+Down", "jump_to_next_command"),
                 KeyBinding::new("Ctrl+Shift+Y", "select_current_command_output"),
@@ -1673,6 +1729,8 @@ pub struct MuxConfig {
     pub status_format: String,
     pub pane_resize_step: f64,
     pub remember_working_directory: bool,
+    pub startup_workspaces: Vec<MuxWorkspaceConfig>,
+    pub appearance: MuxAppearanceConfig,
 }
 
 impl Default for MuxConfig {
@@ -1686,6 +1744,171 @@ impl Default for MuxConfig {
             status_format: "{workspace} {shell}".to_owned(),
             pane_resize_step: 0.05,
             remember_working_directory: true,
+            startup_workspaces: Vec::new(),
+            appearance: MuxAppearanceConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MuxAppearanceConfig {
+    pub tab_bar_background: RgbaColor,
+    pub active_tab_foreground: RgbaColor,
+    pub active_tab_background: RgbaColor,
+    pub inactive_tab_foreground: RgbaColor,
+    pub inactive_tab_background: RgbaColor,
+    pub active_pane_border: RgbaColor,
+    pub inactive_pane_border: RgbaColor,
+    pub pane_border_width: u8,
+}
+
+impl Default for MuxAppearanceConfig {
+    fn default() -> Self {
+        Self {
+            tab_bar_background: RgbaColor::rgb(20, 22, 26),
+            active_tab_foreground: RgbaColor::rgb(245, 245, 245),
+            active_tab_background: RgbaColor::rgb(54, 62, 75),
+            inactive_tab_foreground: RgbaColor::rgb(170, 176, 188),
+            inactive_tab_background: RgbaColor::rgb(20, 22, 26),
+            active_pane_border: RgbaColor::rgb(80, 150, 255),
+            inactive_pane_border: RgbaColor {
+                red: 120,
+                green: 130,
+                blue: 145,
+                alpha: 120,
+            },
+            pane_border_width: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MuxWorkspaceConfig {
+    pub name: String,
+    pub tabs: Vec<MuxTabConfig>,
+}
+
+impl Default for MuxWorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            name: "default".to_owned(),
+            tabs: vec![MuxTabConfig::default()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MuxTabConfig {
+    pub name: String,
+    pub layout: MuxLayoutConfig,
+}
+
+impl Default for MuxTabConfig {
+    fn default() -> Self {
+        Self {
+            name: "1".to_owned(),
+            layout: MuxLayoutConfig::Pane {
+                profile: "default".to_owned(),
+                transport: MuxTransportConfig::Local,
+                working_directory: None,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MuxLayoutConfig {
+    Pane {
+        profile: String,
+        #[serde(default)]
+        transport: MuxTransportConfig,
+        #[serde(default)]
+        working_directory: Option<String>,
+    },
+    Split {
+        axis: MuxSplitAxisConfig,
+        #[serde(default = "default_mux_split_ratio")]
+        ratio: f32,
+        first: Box<MuxLayoutConfig>,
+        second: Box<MuxLayoutConfig>,
+    },
+}
+
+impl Default for MuxLayoutConfig {
+    fn default() -> Self {
+        Self::Pane {
+            profile: "default".to_owned(),
+            transport: MuxTransportConfig::Local,
+            working_directory: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MuxTransportConfig {
+    #[default]
+    Local,
+    Ssh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MuxSplitAxisConfig {
+    Horizontal,
+    Vertical,
+}
+
+const fn default_mux_split_ratio() -> f32 {
+    0.5
+}
+
+fn validate_mux_layout(
+    layout: &MuxLayoutConfig,
+    path: &str,
+    config: &AppConfig,
+    report: &mut ValidationReport,
+) {
+    match layout {
+        MuxLayoutConfig::Pane {
+            profile, transport, ..
+        } => {
+            if profile.trim().is_empty() {
+                report.error(path, "pane profile cannot be empty");
+                return;
+            }
+            let exists = match transport {
+                MuxTransportConfig::Local => {
+                    config
+                        .shell_profiles
+                        .iter()
+                        .any(|candidate| candidate.name == *profile)
+                        || (profile == "default" && config.shell_profiles.is_empty())
+                }
+                MuxTransportConfig::Ssh => config
+                    .ssh_profiles
+                    .iter()
+                    .any(|candidate| candidate.name == *profile),
+            };
+            if !exists {
+                report.error(path, format!("pane profile '{profile}' does not exist"));
+            }
+        }
+        MuxLayoutConfig::Split {
+            ratio,
+            first,
+            second,
+            ..
+        } => {
+            if !(0.05..=0.95).contains(ratio) {
+                report.error(path, "split ratio must be between 0.05 and 0.95");
+            }
+            validate_mux_layout(first, path, config, report);
+            validate_mux_layout(second, path, config, report);
         }
     }
 }
@@ -3150,6 +3373,55 @@ pub fn export_schema() -> ConfigSchema {
                         false,
                         false,
                     ),
+                    field(
+                        "mux.startup_workspaces",
+                        "array<mux_workspace>",
+                        "[]",
+                        false,
+                        true,
+                    ),
+                    field(
+                        "mux.appearance.tab_bar_background",
+                        "rgba",
+                        "theme default",
+                        true,
+                        false,
+                    ),
+                    field(
+                        "mux.appearance.active_tab_foreground",
+                        "rgba",
+                        "theme default",
+                        true,
+                        false,
+                    ),
+                    field(
+                        "mux.appearance.active_tab_background",
+                        "rgba",
+                        "theme default",
+                        true,
+                        false,
+                    ),
+                    field(
+                        "mux.appearance.inactive_pane_border",
+                        "rgba",
+                        "theme default",
+                        true,
+                        false,
+                    ),
+                    field(
+                        "mux.appearance.active_pane_border",
+                        "rgba",
+                        "theme default",
+                        true,
+                        false,
+                    ),
+                    field(
+                        "mux.appearance.pane_border_width",
+                        "integer",
+                        default.mux.appearance.pane_border_width,
+                        true,
+                        false,
+                    ),
                 ],
             },
         ],
@@ -3643,6 +3915,73 @@ mod tests {
         assert_eq!(
             resolved.cursor.inactive_color,
             Some(RgbaColor::rgb(4, 5, 6))
+        );
+    }
+
+    #[test]
+    fn startup_mux_layouts_validate_local_and_ssh_profiles() {
+        let mut config = AppConfig {
+            shell_profiles: vec![ShellProfile {
+                name: "dev".to_owned(),
+                ..ShellProfile::default()
+            }],
+            ssh_profiles: vec![SshProfile {
+                name: "prod".to_owned(),
+                host: "example.test".to_owned(),
+                known_hosts_policy: SshKnownHostsPolicy::RequireKnown,
+                ..SshProfile::default()
+            }],
+            ..AppConfig::default()
+        };
+        config.mux.startup_workspaces = vec![MuxWorkspaceConfig {
+            name: "work".to_owned(),
+            tabs: vec![MuxTabConfig {
+                name: "mixed".to_owned(),
+                layout: MuxLayoutConfig::Split {
+                    axis: MuxSplitAxisConfig::Horizontal,
+                    ratio: 0.6,
+                    first: Box::new(MuxLayoutConfig::Pane {
+                        profile: "dev".to_owned(),
+                        transport: MuxTransportConfig::Local,
+                        working_directory: None,
+                    }),
+                    second: Box::new(MuxLayoutConfig::Pane {
+                        profile: "prod".to_owned(),
+                        transport: MuxTransportConfig::Ssh,
+                        working_directory: None,
+                    }),
+                },
+            }],
+        }];
+
+        assert!(!config.validate().has_errors());
+        if let MuxLayoutConfig::Split { ratio, .. } =
+            &mut config.mux.startup_workspaces[0].tabs[0].layout
+        {
+            *ratio = 1.2;
+        }
+        assert!(config.validate().has_errors());
+    }
+
+    #[test]
+    fn startup_mux_changes_require_restart_but_appearance_reloads_live() {
+        let config = AppConfig::default();
+        let mut appearance = config.clone();
+        appearance.mux.appearance.pane_border_width = 2;
+        assert!(
+            config
+                .reload_plan_from(&appearance)
+                .live
+                .contains(&ReloadableSection::Mux)
+        );
+
+        let mut startup = config.clone();
+        startup.mux.startup_workspaces = vec![MuxWorkspaceConfig::default()];
+        assert!(
+            !config
+                .reload_plan_from(&startup)
+                .restart_required
+                .is_empty()
         );
     }
 }

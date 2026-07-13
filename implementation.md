@@ -369,21 +369,23 @@ to more visible features before the dependencies they rely on are hardened.
   next-pass Phase 17 adds GPU timestamp status plumbing plus a developer
   in-window overlay. Real hardware timestamp validation, polished overlay UX,
   and CI regression gates remain follow-up work.
-- Next-pass Phase 10 wires the native mux model into the desktop app for local
-  sessions: tabs, horizontal/vertical splits, focus, resize, close, zoom,
-  per-pane terminal/semantic/PTY ownership, active-pane input routing,
-  split-aware render scene composition, basic tab chrome, and pane borders now
-  exist. Declarative startup layouts, SSH panes, polished tab/move UI, and
-  cross-OS native mux GUI smoke tests remain follow-up work.
-- Next-pass Phase 11 wires local shell integration activation into desktop
+- Steps 9 and 10 complete the native mux runtime contract: workspaces, clickable
+  tabs, nested horizontal/vertical splits, focus, resize, close, zoom,
+  directional move/swap, per-pane terminal/semantic/local-or-SSH ownership,
+  startup layouts, validated fresh-process restoration, configurable tab/pane
+  appearance, active-pane input routing, and per-transport resize are wired.
+  SSH connection setup is off the UI thread and remote clipboard policy remains
+  restrictive. Drag UI, reconnect/trust UI, cross-OS native GUI smoke, and
+  automated nested tmux/screen/zellij runs remain separate verification/polish.
+- Step 10 also wires shell integration activation into desktop
   session startup through a shared activation plan, supports full/auto/manual/
   heuristic/off config modes, injects runtime hooks for bash/zsh/fish/
-  PowerShell where safe, disables semantic parsing for off mode, and adds
-  bounded real-shell verification tests. The PowerShell semantic smoke passed
-  on the current Windows host. Real bash/zsh/fish, WSL, remote, macOS, Linux
-  X11, and Linux Wayland verification, plus heuristic command detection and
-  remote install flows, remain follow-up work before command blocks can be
-  considered product-complete.
+  PowerShell where safe, positions markers incrementally within output batches,
+  measures missing command durations, disables semantic parsing for off mode,
+  and wires command navigation and raw output selection/copy. Bounded real-shell
+  verification exists. Real bash/zsh/fish, WSL, remote, macOS, Linux X11, and
+  Linux Wayland verification, plus heuristic command detection and remote
+  install helpers, remain follow-up work.
 - Next-pass Phase 12 establishes command-block visual overlay projection and
   badge glyph batching, but collapse/expand long output UI, command-block copy
   mode UI, real shell-driven command-block verification beyond the Windows

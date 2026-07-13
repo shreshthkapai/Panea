@@ -792,7 +792,12 @@ impl TerminalState {
     #[must_use]
     pub fn selected_text(&self) -> Option<String> {
         let selection = self.selection?;
-        Some(self.extract_selection(selection))
+        Some(self.text_for_selection(selection))
+    }
+
+    #[must_use]
+    pub fn text_for_selection(&self, selection: Selection) -> String {
+        self.extract_selection(selection)
     }
 
     pub fn set_selection(&mut self, selection: Selection) {

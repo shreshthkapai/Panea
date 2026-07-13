@@ -625,12 +625,17 @@ impl SemanticTimeline for SemanticTimelineStore {
         &mut self,
         position: BufferPosition,
         exit_status: CommandStatus,
-        duration: Duration,
+        mut duration: Duration,
     ) {
         self.output_ended(position);
         self.mark_event(SemanticEventKind::CommandFinished);
         if let Some(region_id) = self.open_command.take() {
             self.close_region(region_id, position);
+        }
+        if duration.is_zero()
+            && let Some(started) = self.active_command_started
+        {
+            duration = started.elapsed();
         }
         if let Some(block) = self.command_blocks.last_mut()
             && matches!(block.status, CommandStatus::Running)
@@ -644,6 +649,56 @@ impl SemanticTimeline for SemanticTimelineStore {
 }
 
 impl SemanticEvent {
+    #[must_use]
+    pub fn in_remote_session(self) -> Self {
+        match self {
+            Self::CurrentWorkingDirectoryChanged {
+                position,
+                directory,
+                ..
+            } => Self::CurrentWorkingDirectoryChanged {
+                position,
+                directory,
+                remote: true,
+            },
+            other => other,
+        }
+    }
+
+    #[must_use]
+    pub fn at_position(self, position: BufferPosition) -> Self {
+        match self {
+            Self::PromptStarted { metadata, .. } => Self::PromptStarted { position, metadata },
+            Self::PromptEnded { .. } => Self::PromptEnded { position },
+            Self::InputStarted { .. } => Self::InputStarted { position },
+            Self::InputEnded { .. } => Self::InputEnded { position },
+            Self::OutputStarted { .. } => Self::OutputStarted { position },
+            Self::OutputEnded { .. } => Self::OutputEnded { position },
+            Self::CommandFinished {
+                exit_status,
+                duration,
+                ..
+            } => Self::CommandFinished {
+                position,
+                exit_status,
+                duration,
+            },
+            Self::CurrentWorkingDirectoryChanged {
+                directory, remote, ..
+            } => Self::CurrentWorkingDirectoryChanged {
+                position,
+                directory,
+                remote,
+            },
+            Self::ShellMetadataChanged { metadata, .. } => {
+                Self::ShellMetadataChanged { position, metadata }
+            }
+            Self::RemoteMetadataChanged { metadata, .. } => {
+                Self::RemoteMetadataChanged { position, metadata }
+            }
+        }
+    }
+
     #[must_use]
     pub const fn kind(&self) -> SemanticEventKind {
         match self {

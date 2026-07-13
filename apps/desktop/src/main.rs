@@ -5,22 +5,28 @@ use std::{
     fs,
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, TryRecvError},
+    },
+    thread,
     time::{Duration, Instant},
 };
 
 use config_core::{
     AppConfig, ClipboardConfig, CommandBlockStyle, ConfigDiagnostic, ConfigDiagnosticSeverity,
     ConfigPlatform, DecorationStrategyConfig, InputOutputGroupingStyle, LinuxBackendConfig,
-    LogLevel, PasteConfig, PresentModePreference, PromptDecorationStyle, ReloadPlan,
-    ReloadableSection, ShellIntegrationActivationConfig, ShellProfile, ShellProfileKind,
-    SshAuthMethod, SshKnownHostsPolicy, SshProfile, WindowModeConfig,
+    LogLevel, MuxLayoutConfig, MuxSplitAxisConfig, MuxTransportConfig, PasteConfig,
+    PresentModePreference, PromptDecorationStyle, ReloadPlan, ReloadableSection,
+    ShellIntegrationActivationConfig, ShellProfile, ShellProfileKind, SshAuthMethod,
+    SshKnownHostsPolicy, SshProfile, WindowModeConfig,
 };
 use diagnostics::{PerformanceBudget, PerformanceOverlay};
 use font_system::{CellMetrics, FontConfig as RuntimeFontConfig, FontSource, FontSystem};
 use mux::{
-    LogicalRect, MuxAction, MuxModel, PaneId, PaneLayout, SessionSpec, SessionStatus, SplitAxis,
-    TerminalGridSize,
+    LogicalRect, MuxAction, MuxModel, PaneId, PaneLayout, PaneRestore, RestoreSnapshot,
+    SessionSpec, SessionStatus, SessionTransportKind, SplitAxis, SplitTree, TabId, TabRestore,
+    TerminalGridSize, WindowRestore, WorkspaceRestore,
 };
 use platform_core::{
     DecorationMode, InputEvent, KeyEvent, KeyModifiers, KeyState, LinuxWindowBackend, MouseButton,
@@ -48,8 +54,9 @@ use security::{
 };
 use semantics::detect_url_hints;
 use semantics::{
-    BufferPosition, CommandStatus, IntegrationMode, SemanticMetadata, SemanticRegionKind,
-    SemanticTimelineStore,
+    BufferPosition, CommandStatus, IntegrationMode, RemoteMetadata, SemanticAction,
+    SemanticActionResult, SemanticMetadata, SemanticRegionKind, SemanticSpan,
+    SemanticTimelineStore, TerminalTextProvider,
 };
 use shell_integration::{
     IntegrationActivation, SemanticEscapeParser, ShellIntegrationActivationAction,
@@ -62,9 +69,12 @@ use term_core::{
     TerminalKeyModifiers, TerminalMode, TerminalSize as CoreTerminalSize, encode_terminal_key,
 };
 use term_parser::TerminalEmulator;
-use transport_core::{TerminalSize as TransportSize, TerminalTransport, TransportState};
+use transport_core::{
+    TerminalSize as TransportSize, TerminalTransport, TransportOutput, TransportResult,
+    TransportState,
+};
 use transport_pty::{LocalPtyTransport, LocalShellKind, LocalShellProfile};
-use transport_ssh::SshConnectionProfile;
+use transport_ssh::{SshConnectionProfile, SshTransport};
 use unicode_segmentation::UnicodeSegmentation;
 use winit::{
     event::{Event, WindowEvent},
@@ -959,6 +969,55 @@ fn run() -> Result<(), Box<dyn Error>> {
                                             scheduler.terminal_content_changed();
                                             window.request_redraw();
                                         }
+                                        "jump_to_previous_command" => {
+                                            let _ = mux_runtime.run_semantic_action(
+                                                SemanticAction::JumpToPreviousCommand,
+                                            );
+                                            scheduler.terminal_content_changed();
+                                            window.request_redraw();
+                                        }
+                                        "jump_to_next_command" => {
+                                            let _ = mux_runtime.run_semantic_action(
+                                                SemanticAction::JumpToNextCommand,
+                                            );
+                                            scheduler.terminal_content_changed();
+                                            window.request_redraw();
+                                        }
+                                        "select_current_command_output" => {
+                                            let _ = mux_runtime.run_semantic_action(
+                                                SemanticAction::SelectCurrentCommandOutput,
+                                            );
+                                            scheduler.terminal_content_changed();
+                                            window.request_redraw();
+                                        }
+                                        "copy_current_command_output" => {
+                                            if let SemanticActionResult::Text(text) = mux_runtime
+                                                .run_semantic_action(
+                                                    SemanticAction::CopyCurrentCommandOutput,
+                                                )
+                                            {
+                                                copy_text_with_diagnostics(
+                                                    &mut clipboard,
+                                                    &text,
+                                                    &clipboard_config,
+                                                    "semantic command output copy",
+                                                );
+                                            }
+                                        }
+                                        "copy_command_and_output" => {
+                                            if let SemanticActionResult::Text(text) = mux_runtime
+                                                .run_semantic_action(
+                                                    SemanticAction::CopyCommandAndOutput,
+                                                )
+                                            {
+                                                copy_text_with_diagnostics(
+                                                    &mut clipboard,
+                                                    &text,
+                                                    &clipboard_config,
+                                                    "semantic command and output copy",
+                                                );
+                                            }
+                                        }
                                         "toggle_fullscreen" => {
                                             current_window_mode = if matches!(
                                                 current_window_mode,
@@ -995,7 +1054,16 @@ fn run() -> Result<(), Box<dyn Error>> {
                                             );
                                         }
                                         _ => {
-                                            if let Some(action) = MuxAction::named(&action) {
+                                            if mux_runtime.handle_profile_mux_action(
+                                                &action,
+                                                &config,
+                                                metrics,
+                                                surface_size.width,
+                                                surface_size.height,
+                                            ) {
+                                                scheduler.terminal_content_changed();
+                                                window.request_redraw();
+                                            } else if let Some(action) = MuxAction::named(&action) {
                                                 if mux_runtime.handle_mux_action(
                                                     action,
                                                     &config,
@@ -1404,21 +1472,90 @@ fn performance_budget(config: &AppConfig) -> PerformanceBudget {
     }
 }
 
-fn spawn_initial_transport(
+fn spawn_session_transport(
     config: &AppConfig,
+    spec: &SessionSpec,
     size: TransportSize,
 ) -> transport_core::TransportResult<InitialTransport> {
-    let (profile, activation) = initial_local_shell_profile(config);
-    let parse_semantic_events = activation.parses_escape_sequences();
-    let semantic_mode = semantic_mode_for_activation(&activation);
-
-    let transport = LocalPtyTransport::spawn(profile, size)?;
-    Ok(InitialTransport {
-        transport,
-        semantic_mode,
-        parse_semantic_events,
-        activation_diagnostics: activation.diagnostics,
-    })
+    match spec.transport {
+        SessionTransportKind::LocalPty | SessionTransportKind::WindowsPseudoconsole => {
+            if spec.profile_name != "default"
+                && !config
+                    .shell_profiles
+                    .iter()
+                    .any(|profile| profile.name == spec.profile_name)
+            {
+                return Err(transport_core::TransportError::new(format!(
+                    "local shell profile '{}' does not exist",
+                    spec.profile_name
+                )));
+            }
+            let (mut profile, activation) =
+                initial_local_shell_profile(config, Some(&spec.profile_name));
+            if let Some(directory) = &spec.working_directory {
+                profile.working_directory = Some(PathBuf::from(directory));
+            }
+            let transport = LocalPtyTransport::spawn(profile, size)?;
+            Ok(InitialTransport {
+                transport: PaneTransport::Local(transport),
+                semantic_mode: semantic_mode_for_activation(&activation),
+                parse_semantic_events: activation.parses_escape_sequences(),
+                activation_diagnostics: activation.diagnostics,
+                remote_metadata: None,
+            })
+        }
+        SessionTransportKind::Ssh => {
+            let profile = config
+                .ssh_profiles
+                .iter()
+                .find(|profile| profile.name == spec.profile_name)
+                .ok_or_else(|| {
+                    transport_core::TransportError::new(format!(
+                        "SSH profile '{}' does not exist",
+                        spec.profile_name
+                    ))
+                })?;
+            let parse_semantic_events = config.shell_integration.enabled
+                && profile.shell_integration
+                && !matches!(
+                    config.shell_integration.activation,
+                    ShellIntegrationActivationConfig::Disabled
+                );
+            let mut connection = ssh_connection_profile(profile);
+            if let Some(directory) = &spec.working_directory {
+                connection.remote_working_directory = Some(directory.clone());
+            }
+            Ok(InitialTransport {
+                transport: PaneTransport::connecting_ssh(connection, size),
+                semantic_mode: if parse_semantic_events {
+                    IntegrationMode::EscapeSequences
+                } else {
+                    IntegrationMode::Disabled
+                },
+                parse_semantic_events,
+                activation_diagnostics: vec![if parse_semantic_events {
+                    format!(
+                        "SSH profile '{}' accepts remote semantic markers; remote hooks must be installed",
+                        profile.name
+                    )
+                } else {
+                    format!(
+                        "SSH semantic integration disabled for profile '{}'",
+                        profile.name
+                    )
+                }],
+                remote_metadata: Some(RemoteMetadata {
+                    transport: Some("ssh".to_owned()),
+                    remote_host: Some(profile.host.clone()),
+                    remote_user: profile.username.clone(),
+                    remote_current_working_directory: profile.remote_working_directory.clone(),
+                }),
+            })
+        }
+        SessionTransportKind::FutureMobileSsh => Err(transport_core::TransportError::new(
+            "future mobile SSH transport cannot run in the desktop application",
+        )),
+    }
 }
 
 fn selected_shell_profile(config: &AppConfig) -> Option<&ShellProfile> {
@@ -1435,16 +1572,148 @@ fn selected_shell_profile(config: &AppConfig) -> Option<&ShellProfile> {
 }
 
 struct InitialTransport {
-    transport: LocalPtyTransport,
+    transport: PaneTransport,
     semantic_mode: IntegrationMode,
     parse_semantic_events: bool,
     activation_diagnostics: Vec<String>,
+    remote_metadata: Option<RemoteMetadata>,
+}
+
+const MAX_PENDING_SSH_INPUT_BYTES: usize = 64 * 1024;
+
+struct PendingSshTransport {
+    result: Receiver<TransportResult<SshTransport>>,
+    requested_size: TransportSize,
+    pending_input: Vec<u8>,
+}
+
+enum PaneTransport {
+    Local(LocalPtyTransport),
+    ConnectingSsh(PendingSshTransport),
+    Ssh(SshTransport),
+    Failed { message: String, reported: bool },
+}
+
+impl PaneTransport {
+    fn connecting_ssh(profile: SshConnectionProfile, size: TransportSize) -> Self {
+        let (sender, result) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let transport = SshTransport::connect(profile, size);
+            let _ = sender.send(transport);
+        });
+        Self::ConnectingSsh(PendingSshTransport {
+            result,
+            requested_size: size,
+            pending_input: Vec::new(),
+        })
+    }
+
+    fn promote_ssh(&mut self) -> TransportResult<()> {
+        let Self::ConnectingSsh(pending) = self else {
+            return Ok(());
+        };
+        let result = match pending.result.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return Ok(()),
+            Err(TryRecvError::Disconnected) => Err(transport_core::TransportError::new(
+                "SSH connection worker stopped without a result",
+            )),
+        };
+        match result {
+            Ok(mut transport) => {
+                transport.resize(pending.requested_size)?;
+                if !pending.pending_input.is_empty() {
+                    transport.write_input(&pending.pending_input)?;
+                }
+                *self = Self::Ssh(transport);
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                *self = Self::Failed {
+                    message: message.clone(),
+                    reported: false,
+                };
+                Err(transport_core::TransportError::new(message))
+            }
+        }
+    }
+
+    fn write_input(&mut self, bytes: &[u8]) -> TransportResult<()> {
+        self.promote_ssh()?;
+        match self {
+            Self::Local(transport) => transport.write_input(bytes),
+            Self::Ssh(transport) => transport.write_input(bytes),
+            Self::ConnectingSsh(pending) => {
+                if pending.pending_input.len().saturating_add(bytes.len())
+                    > MAX_PENDING_SSH_INPUT_BYTES
+                {
+                    return Err(transport_core::TransportError::new(
+                        "SSH input queue is full while connection is pending",
+                    ));
+                }
+                pending.pending_input.extend_from_slice(bytes);
+                Ok(())
+            }
+            Self::Failed { message, .. } => {
+                Err(transport_core::TransportError::new(message.clone()))
+            }
+        }
+    }
+
+    fn resize(&mut self, size: TransportSize) -> TransportResult<()> {
+        self.promote_ssh()?;
+        match self {
+            Self::Local(transport) => transport.resize(size),
+            Self::Ssh(transport) => transport.resize(size),
+            Self::ConnectingSsh(pending) => {
+                pending.requested_size = size;
+                Ok(())
+            }
+            Self::Failed { message, .. } => {
+                Err(transport_core::TransportError::new(message.clone()))
+            }
+        }
+    }
+
+    fn poll_output(&mut self) -> TransportResult<TransportOutput> {
+        self.promote_ssh()?;
+        match self {
+            Self::Local(transport) => transport.poll_output(),
+            Self::Ssh(transport) => transport.poll_output(),
+            Self::ConnectingSsh(_) => Ok(TransportOutput::bytes(Vec::new())),
+            Self::Failed { message, reported } => {
+                if *reported {
+                    Ok(TransportOutput::closed())
+                } else {
+                    *reported = true;
+                    Err(transport_core::TransportError::new(message.clone()))
+                }
+            }
+        }
+    }
+
+    fn shutdown(&mut self) -> TransportResult<()> {
+        match self {
+            Self::Local(transport) => transport.shutdown(),
+            Self::Ssh(transport) => transport.shutdown(),
+            Self::ConnectingSsh(_) | Self::Failed { .. } => Ok(()),
+        }
+    }
 }
 
 fn initial_local_shell_profile(
     config: &AppConfig,
+    requested_profile: Option<&str>,
 ) -> (LocalShellProfile, ShellIntegrationActivationPlan) {
-    let mut profile = selected_shell_profile(config)
+    let mut profile = requested_profile
+        .and_then(|name| {
+            config
+                .shell_profiles
+                .iter()
+                .find(|profile| profile.name == name)
+        })
+        .or_else(|| selected_shell_profile(config))
         .map(local_shell_profile)
         .unwrap_or_else(LocalShellProfile::default_for_platform);
     let shell = shell_kind_for_local_profile(&profile);
@@ -1643,7 +1912,13 @@ fn apply_shell_integration_activation(
             profile.args = vec!["-C".to_owned(), hook];
         }
         ShellKind::PowerShell | ShellKind::Pwsh => {
-            profile.startup_command = Some(hook);
+            profile.args = vec![
+                "-NoLogo".to_owned(),
+                "-NoExit".to_owned(),
+                "-Command".to_owned(),
+                hook,
+            ];
+            profile.startup_command = None;
         }
         ShellKind::Cmd | ShellKind::Nushell | ShellKind::Unknown => {
             profile.startup_command = existing_startup;
@@ -2141,7 +2416,7 @@ fn osc52_policy(config: &ClipboardConfig) -> Osc52ClipboardPolicy {
     }
 }
 
-fn shutdown_transport(transport: Option<&mut LocalPtyTransport>) {
+fn shutdown_transport(transport: Option<&mut PaneTransport>) {
     if let Some(transport) = transport {
         match catch_unwind(AssertUnwindSafe(|| transport.shutdown())) {
             Ok(Ok(())) => {}
@@ -2154,14 +2429,14 @@ fn shutdown_transport(transport: Option<&mut LocalPtyTransport>) {
     }
 }
 
-fn flush_terminal_responses(terminal: &mut TerminalEmulator, transport: &mut LocalPtyTransport) {
+fn flush_terminal_responses(terminal: &mut TerminalEmulator, transport: &mut PaneTransport) {
     let responses = terminal.state_mut().take_pending_output();
     if !responses.is_empty() {
         write_transport_input(transport, &responses);
     }
 }
 
-fn write_transport_input(transport: &mut LocalPtyTransport, bytes: &[u8]) {
+fn write_transport_input(transport: &mut PaneTransport, bytes: &[u8]) {
     match catch_unwind(AssertUnwindSafe(|| transport.write_input(bytes))) {
         Ok(Ok(())) => {}
         Ok(Err(error)) => eprintln!("transport input error: {error}"),
@@ -2238,18 +2513,184 @@ impl DesktopDiagnosticsPlaceholder {
     }
 }
 
+fn mux_state_path() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        return std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("Panea")
+            .join("mux-state.json");
+    }
+    if cfg!(target_os = "macos") {
+        return std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("Library")
+            .join("Application Support")
+            .join("Panea")
+            .join("mux-state.json");
+    }
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("state"))
+        })
+        .unwrap_or_else(std::env::temp_dir)
+        .join("panea")
+        .join("mux-state.json")
+}
+
+fn initial_mux_model(config: &AppConfig, state_path: &PathBuf) -> MuxModel {
+    let fallback = session_spec_for_config(config);
+    if config.mux.restore_sessions {
+        match fs::read_to_string(state_path) {
+            Ok(contents) => match serde_json::from_str::<RestoreSnapshot>(&contents)
+                .map_err(|error| error.to_string())
+                .and_then(|snapshot| {
+                    MuxModel::from_restore_snapshot(&snapshot, fallback.clone())
+                        .map_err(|error| error.to_string())
+                }) {
+                Ok(model) => return model,
+                Err(error) => eprintln!(
+                    "mux restore fallback: {} could not be restored: {error}",
+                    state_path.display()
+                ),
+            },
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => eprintln!(
+                "mux restore fallback: {} could not be read: {error}",
+                state_path.display()
+            ),
+            Err(_) => {}
+        }
+    }
+
+    if let Some(snapshot) = startup_mux_snapshot(config) {
+        match MuxModel::from_restore_snapshot(&snapshot, fallback.clone()) {
+            Ok(model) => return model,
+            Err(error) => eprintln!("startup mux layout rejected: {error}"),
+        }
+    }
+
+    let mut model = MuxModel::new(fallback);
+    model.active_workspace_mut().name = config.mux.default_workspace.clone();
+    model
+}
+
+fn startup_mux_snapshot(config: &AppConfig) -> Option<RestoreSnapshot> {
+    if config.mux.startup_workspaces.is_empty() {
+        return None;
+    }
+    let mut next_pane_id = 1u64;
+    let workspaces = config
+        .mux
+        .startup_workspaces
+        .iter()
+        .map(|workspace| WorkspaceRestore {
+            name: workspace.name.clone(),
+            windows: vec![WindowRestore {
+                active_tab_name: workspace.tabs.first().map(|tab| tab.name.clone()),
+                tabs: workspace
+                    .tabs
+                    .iter()
+                    .map(|tab| {
+                        let mut panes = Vec::new();
+                        let layout =
+                            startup_layout_tree(&tab.layout, &mut next_pane_id, &mut panes);
+                        TabRestore {
+                            name: tab.name.clone(),
+                            active_pane: layout
+                                .first_pane()
+                                .expect("validated startup layout contains a pane"),
+                            layout,
+                            panes,
+                        }
+                    })
+                    .collect(),
+            }],
+        })
+        .collect();
+    Some(RestoreSnapshot { workspaces })
+}
+
+fn startup_layout_tree(
+    layout: &MuxLayoutConfig,
+    next_pane_id: &mut u64,
+    panes: &mut Vec<PaneRestore>,
+) -> SplitTree {
+    match layout {
+        MuxLayoutConfig::Pane {
+            profile,
+            transport,
+            working_directory,
+        } => {
+            let pane_id = PaneId(*next_pane_id);
+            *next_pane_id = next_pane_id.saturating_add(1);
+            panes.push(PaneRestore {
+                pane_id,
+                session_profile: profile.clone(),
+                transport: match transport {
+                    MuxTransportConfig::Local => {
+                        if cfg!(windows) {
+                            SessionTransportKind::WindowsPseudoconsole
+                        } else {
+                            SessionTransportKind::LocalPty
+                        }
+                    }
+                    MuxTransportConfig::Ssh => SessionTransportKind::Ssh,
+                },
+                working_directory: working_directory.clone(),
+            });
+            SplitTree::Pane(pane_id)
+        }
+        MuxLayoutConfig::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => SplitTree::Split {
+            axis: match axis {
+                MuxSplitAxisConfig::Horizontal => SplitAxis::Horizontal,
+                MuxSplitAxisConfig::Vertical => SplitAxis::Vertical,
+            },
+            children: vec![
+                startup_layout_tree(first, next_pane_id, panes),
+                startup_layout_tree(second, next_pane_id, panes),
+            ],
+            ratios: vec![*ratio, 1.0 - *ratio],
+        },
+    }
+}
+
+fn pane_session_specs(model: &MuxModel) -> Vec<(PaneId, SessionSpec)> {
+    let mut specs = Vec::new();
+    for workspace in model.workspaces.values() {
+        for window in &workspace.windows {
+            for tab in &window.tabs {
+                for pane in tab.panes.values() {
+                    if let Some(session) = tab.sessions.get(&pane.session_id) {
+                        specs.push((pane.id, session.spec.clone()));
+                    }
+                }
+            }
+        }
+    }
+    specs
+}
+
 struct MuxRuntime {
     model: MuxModel,
     panes: HashMap<PaneId, PaneRuntime>,
     surface_cols: u16,
     surface_rows: u16,
     performance: RuntimePerformanceCounters,
+    restore_sessions: bool,
+    state_path: PathBuf,
 }
 
 impl MuxRuntime {
     fn new(config: &AppConfig, metrics: CellMetrics, width: u32, height: u32) -> Self {
-        let mut model = MuxModel::new(session_spec_for_config(config));
-        model.active_workspace_mut().name = config.mux.default_workspace.clone();
+        let state_path = mux_state_path();
+        let mut model = initial_mux_model(config, &state_path);
 
         let surface_cols = cols_for_width(
             content_extent(width, horizontal_content_inset(config)),
@@ -2261,17 +2702,25 @@ impl MuxRuntime {
             metrics,
         )
         .max(1);
-        let pane_id = model.active_tab().active_pane;
-        let pane_size = TerminalGridSize::new(
+        let initial_size = TerminalGridSize::new(
             surface_cols,
             surface_rows
                 .saturating_sub(tab_bar_rows(&model, config))
                 .max(1),
         );
-        let pane = PaneRuntime::new(config, pane_size, metrics);
         let mut panes = HashMap::new();
-        panes.insert(pane_id, pane);
-        mark_session_status(&mut model, pane_id, SessionStatus::Running);
+        for (pane_id, spec) in pane_session_specs(&model) {
+            let pane = PaneRuntime::new(config, &spec, initial_size, metrics);
+            let status = if pane.transport.is_some() {
+                SessionStatus::Running
+            } else {
+                SessionStatus::Failed {
+                    message: "transport failed to start".to_owned(),
+                }
+            };
+            panes.insert(pane_id, pane);
+            mark_session_status(&mut model, pane_id, status);
+        }
 
         let mut runtime = Self {
             model,
@@ -2279,6 +2728,8 @@ impl MuxRuntime {
             surface_cols,
             surface_rows,
             performance: RuntimePerformanceCounters::new(),
+            restore_sessions: config.mux.restore_sessions,
+            state_path,
         };
         runtime.resize_all(width, height, metrics, config);
         runtime
@@ -2325,9 +2776,30 @@ impl MuxRuntime {
 
         let result = match action {
             MuxAction::NewTab => {
-                self.new_tab(config, metrics, width, height);
+                self.new_tab_with_spec(
+                    config,
+                    session_spec_for_config(config),
+                    metrics,
+                    width,
+                    height,
+                );
                 Ok(())
             }
+            MuxAction::NewWorkspace => {
+                let number = self.model.workspaces.len() + 1;
+                let workspace_id = self.model.new_workspace(
+                    format!("workspace {number}"),
+                    session_spec_for_config(config),
+                );
+                let pane_id = self.model.active_tab().active_pane;
+                self.insert_runtime_for_pane(pane_id, config, metrics);
+                self.resize_all(width, height, metrics, config);
+                debug_assert_eq!(self.model.active_workspace, workspace_id);
+                Ok(())
+            }
+            MuxAction::CloseWorkspace => self.close_active_workspace(metrics, config),
+            MuxAction::NextWorkspace => self.switch_relative_workspace(1, metrics, config),
+            MuxAction::PreviousWorkspace => self.switch_relative_workspace(-1, metrics, config),
             MuxAction::CloseTab => self.close_active_tab(metrics, config),
             MuxAction::NextTab => self.switch_relative_tab(1, metrics, config),
             MuxAction::PreviousTab => self.switch_relative_tab(-1, metrics, config),
@@ -2352,10 +2824,12 @@ impl MuxRuntime {
                 Ok(())
             }
             MuxAction::ClosePane => self.close_active_pane(metrics, config),
-            MuxAction::FocusDirection(direction) => self
-                .model
-                .focus_direction(direction)
-                .map(|_| self.resize_active_tab(metrics, config)),
+            MuxAction::FocusDirection(direction) => {
+                self.model.focus_direction(direction).map(|_| {
+                    self.sync_active_tab_title();
+                    self.resize_active_tab(metrics, config);
+                })
+            }
             MuxAction::ResizePane(direction) => self
                 .model
                 .resize_active_pane(direction, config.mux.pane_resize_step as f32)
@@ -2365,10 +2839,10 @@ impl MuxRuntime {
                 self.resize_active_tab(metrics, config);
                 Ok(())
             }
-            MuxAction::MovePane => {
-                eprintln!("mux move_pane is reserved for layout persistence after pane drag UI");
-                Ok(())
-            }
+            MuxAction::MovePane(direction) | MuxAction::SwapPaneDirection(direction) => self
+                .model
+                .move_active_pane(direction)
+                .map(|_| self.resize_active_tab(metrics, config)),
             MuxAction::SwapPane { other } => self
                 .model
                 .swap_panes(self.model.active_tab().active_pane, other)
@@ -2382,12 +2856,16 @@ impl MuxRuntime {
         true
     }
 
-    fn new_tab(&mut self, config: &AppConfig, metrics: CellMetrics, width: u32, height: u32) {
+    fn new_tab_with_spec(
+        &mut self,
+        config: &AppConfig,
+        spec: SessionSpec,
+        metrics: CellMetrics,
+        width: u32,
+        height: u32,
+    ) {
         let tab_number = self.model.active_workspace().active_window().tabs.len() + 1;
-        match self
-            .model
-            .new_tab(tab_number.to_string(), session_spec_for_config(config))
-        {
+        match self.model.new_tab(tab_number.to_string(), spec) {
             Ok(_) => {
                 let pane_id = self.model.active_tab().active_pane;
                 self.insert_runtime_for_pane(pane_id, config, metrics);
@@ -2405,10 +2883,26 @@ impl MuxRuntime {
         width: u32,
         height: u32,
     ) {
-        match self
-            .model
-            .split_active_pane(axis, session_spec_for_config(config))
-        {
+        self.split_active_with_spec(
+            axis,
+            session_spec_for_config(config),
+            config,
+            metrics,
+            width,
+            height,
+        );
+    }
+
+    fn split_active_with_spec(
+        &mut self,
+        axis: SplitAxis,
+        spec: SessionSpec,
+        config: &AppConfig,
+        metrics: CellMetrics,
+        width: u32,
+        height: u32,
+    ) {
+        match self.model.split_active_pane(axis, spec) {
             Ok(pane_id) => {
                 self.insert_runtime_for_pane(pane_id, config, metrics);
                 self.resize_all(width, height, metrics, config);
@@ -2429,7 +2923,14 @@ impl MuxRuntime {
             .find(|layout| layout.pane_id == pane_id)
             .map(|layout| layout.terminal_size)
             .unwrap_or_else(|| TerminalGridSize::new(self.surface_cols, self.surface_rows));
-        let pane = PaneRuntime::new(config, size, metrics);
+        let spec = match self.model.session_for_pane(pane_id) {
+            Ok(session) => session.spec.clone(),
+            Err(error) => {
+                eprintln!("mux pane runtime could not find session: {error}");
+                return;
+            }
+        };
+        let pane = PaneRuntime::new(config, &spec, size, metrics);
         mark_session_status(&mut self.model, pane_id, SessionStatus::Running);
         self.panes.insert(pane_id, pane);
     }
@@ -2470,6 +2971,137 @@ impl MuxRuntime {
         self.model.switch_tab(next_tab)?;
         self.resize_active_tab(metrics, config);
         Ok(())
+    }
+
+    fn switch_relative_workspace(
+        &mut self,
+        delta: isize,
+        metrics: CellMetrics,
+        config: &AppConfig,
+    ) -> mux::MuxResult<()> {
+        let workspace_ids = self.model.workspaces.keys().copied().collect::<Vec<_>>();
+        let active_index = workspace_ids
+            .iter()
+            .position(|id| *id == self.model.active_workspace)
+            .ok_or(mux::MuxError::WorkspaceNotFound(
+                self.model.active_workspace,
+            ))?;
+        let next_index =
+            (active_index as isize + delta).rem_euclid(workspace_ids.len() as isize) as usize;
+        self.model.switch_workspace(workspace_ids[next_index])?;
+        self.resize_active_tab(metrics, config);
+        Ok(())
+    }
+
+    fn close_active_workspace(
+        &mut self,
+        metrics: CellMetrics,
+        config: &AppConfig,
+    ) -> mux::MuxResult<()> {
+        let workspace_id = self.model.active_workspace;
+        let pane_ids = self
+            .model
+            .active_workspace()
+            .windows
+            .iter()
+            .flat_map(|window| &window.tabs)
+            .flat_map(|tab| tab.panes.keys().copied())
+            .collect::<Vec<_>>();
+        self.model.close_workspace(workspace_id)?;
+        for pane_id in pane_ids {
+            if let Some(mut pane) = self.panes.remove(&pane_id) {
+                pane.shutdown();
+            }
+        }
+        self.resize_active_tab(metrics, config);
+        Ok(())
+    }
+
+    fn handle_profile_mux_action(
+        &mut self,
+        action: &str,
+        config: &AppConfig,
+        metrics: CellMetrics,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        let Some((command, profile)) = action.split_once(':') else {
+            return false;
+        };
+        if profile.trim().is_empty() {
+            eprintln!("mux profile action requires a non-empty profile name");
+            return true;
+        }
+        match command {
+            "new_workspace" => {
+                let pane_id = {
+                    self.model
+                        .new_workspace(profile, session_spec_for_config(config));
+                    self.model.active_tab().active_pane
+                };
+                self.insert_runtime_for_pane(pane_id, config, metrics);
+                self.resize_all(width, height, metrics, config);
+                return true;
+            }
+            "rename_workspace" => {
+                let _ = self
+                    .model
+                    .rename_workspace(self.model.active_workspace, profile);
+                return true;
+            }
+            "switch_workspace" => {
+                if let Some(workspace_id) = self
+                    .model
+                    .workspaces
+                    .values()
+                    .find(|workspace| workspace.name == profile)
+                    .map(|workspace| workspace.id)
+                {
+                    let _ = self.model.switch_workspace(workspace_id);
+                    self.resize_active_tab(metrics, config);
+                } else {
+                    eprintln!("mux workspace '{profile}' does not exist");
+                }
+                return true;
+            }
+            "rename_tab" => {
+                let _ = self.model.rename_tab(self.model.active_tab().id, profile);
+                return true;
+            }
+            _ => {}
+        }
+        let spec = match command {
+            "new_local_tab" | "split_local_horizontal" | "split_local_vertical" => {
+                local_session_spec(profile)
+            }
+            "new_ssh_tab" | "split_ssh_horizontal" | "split_ssh_vertical" => {
+                SessionSpec::ssh(profile)
+            }
+            _ => return false,
+        };
+        match command {
+            "new_local_tab" | "new_ssh_tab" => {
+                self.new_tab_with_spec(config, spec, metrics, width, height)
+            }
+            "split_local_horizontal" | "split_ssh_horizontal" => self.split_active_with_spec(
+                SplitAxis::Horizontal,
+                spec,
+                config,
+                metrics,
+                width,
+                height,
+            ),
+            "split_local_vertical" | "split_ssh_vertical" => self.split_active_with_spec(
+                SplitAxis::Vertical,
+                spec,
+                config,
+                metrics,
+                width,
+                height,
+            ),
+            _ => unreachable!("profile mux command was validated above"),
+        }
+        true
     }
 
     fn close_active_pane(
@@ -2513,6 +3145,13 @@ impl MuxRuntime {
         if let Some(pane) = self.active_pane_mut() {
             pane.start_keyboard_selection(kind);
         }
+    }
+
+    fn run_semantic_action(&mut self, action: SemanticAction) -> SemanticActionResult {
+        self.active_pane_mut()
+            .map_or(SemanticActionResult::Noop, |pane| {
+                pane.run_semantic_action(action)
+            })
     }
 
     fn handle_modal_key(&mut self, event: &KeyEvent) -> Option<bool> {
@@ -2578,11 +3217,48 @@ impl MuxRuntime {
         paste_config: &PasteConfig,
         clipboard: &mut ClipboardBridge,
     ) -> MouseHandling {
+        if let Some(tab_id) = self.tab_at_mouse(mouse, metrics, config) {
+            if matches!(mouse.kind, MouseEventKind::Pressed(MouseButton::Left)) {
+                if self.model.switch_tab(tab_id).is_ok() {
+                    self.resize_active_tab(metrics, config);
+                    return MouseHandling {
+                        changed: true,
+                        open_url: None,
+                    };
+                }
+            } else if matches!(mouse.kind, MouseEventKind::Pressed(MouseButton::Middle))
+                && self.model.active_workspace().active_window().tabs.len() > 1
+            {
+                let pane_ids = self
+                    .model
+                    .active_workspace()
+                    .active_window()
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == tab_id)
+                    .map(|tab| tab.panes.keys().copied().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                if self.model.close_tab(tab_id).is_ok() {
+                    for pane_id in pane_ids {
+                        if let Some(mut pane) = self.panes.remove(&pane_id) {
+                            pane.shutdown();
+                        }
+                    }
+                    self.resize_active_tab(metrics, config);
+                    return MouseHandling {
+                        changed: true,
+                        open_url: None,
+                    };
+                }
+            }
+            return MouseHandling::default();
+        }
         let Some((pane_id, local_mouse)) = self.local_mouse_event(mouse, metrics, config) else {
             return MouseHandling::default();
         };
         if matches!(mouse.kind, MouseEventKind::Pressed(_)) {
             let _ = self.model.focus_pane(pane_id);
+            self.sync_active_tab_title();
         }
         let Some(pane) = self.panes.get_mut(&pane_id) else {
             return MouseHandling::default();
@@ -2704,6 +3380,46 @@ impl MuxRuntime {
             })
     }
 
+    fn tab_at_mouse(
+        &self,
+        mouse: MouseEvent,
+        metrics: CellMetrics,
+        config: &AppConfig,
+    ) -> Option<TabId> {
+        if tab_bar_rows(&self.model, config) == 0 {
+            return None;
+        }
+        let inset_x = f64::from(horizontal_content_inset(config));
+        let inset_y = f64::from(vertical_content_inset(config));
+        if mouse.x < inset_x
+            || mouse.y < inset_y
+            || mouse.y >= inset_y + f64::from(metrics.cell_height)
+        {
+            return None;
+        }
+        let mouse_col = ((mouse.x - inset_x) / f64::from(metrics.cell_width)).floor() as usize;
+        let workspace = self.model.active_workspace();
+        let window = workspace.active_window();
+        let mut start = 0usize;
+        for (index, tab) in window.tabs.iter().enumerate() {
+            let width = config
+                .mux
+                .tab_title_format
+                .replace("{index}", &(index + 1).to_string())
+                .replace("{title}", &tab.name)
+                .replace("{workspace}", &workspace.name)
+                .chars()
+                .count()
+                .saturating_add(2);
+            let end = start.saturating_add(width);
+            if (start..end).contains(&mouse_col) {
+                return Some(tab.id);
+            }
+            start = end;
+        }
+        None
+    }
+
     fn poll_outputs(
         &mut self,
         clipboard: &mut ClipboardBridge,
@@ -2711,12 +3427,51 @@ impl MuxRuntime {
         clipboard_config: &ClipboardConfig,
     ) -> bool {
         let mut content_changed = false;
-        for pane in self.panes.values_mut() {
+        let mut status_updates = Vec::new();
+        let mut metadata_updates = Vec::new();
+        for (pane_id, pane) in &mut self.panes {
             let poll = pane.poll_output(clipboard, policy, clipboard_config);
             self.performance.record_pty_bytes(poll.pty_bytes);
             self.performance.record_parser_bytes(poll.parser_bytes);
             if poll.content_changed {
                 content_changed = true;
+            }
+            if poll.error {
+                status_updates.push((
+                    *pane_id,
+                    SessionStatus::Failed {
+                        message: "transport error; see pane output and diagnostics".to_owned(),
+                    },
+                ));
+            } else if poll.closed {
+                status_updates.push((*pane_id, SessionStatus::Exited { exit_code: None }));
+            }
+            metadata_updates.push((
+                *pane_id,
+                pane.terminal.state().title().map(ToOwned::to_owned),
+                pane.semantic_timeline
+                    .metadata()
+                    .remote
+                    .as_ref()
+                    .and_then(|remote| remote.remote_current_working_directory.clone())
+                    .or_else(|| {
+                        pane.semantic_timeline
+                            .metadata()
+                            .shell
+                            .current_working_directory
+                            .clone()
+                    }),
+            ));
+        }
+        for (pane_id, status) in status_updates {
+            mark_session_status(&mut self.model, pane_id, status);
+        }
+        for (pane_id, title, directory) in metadata_updates {
+            if let Some(title) = title {
+                let _ = self.model.update_pane_title(pane_id, title);
+            }
+            if let Ok(session) = self.model.session_for_pane_mut(pane_id) {
+                session.current_working_directory = directory;
             }
         }
         content_changed
@@ -2760,6 +3515,18 @@ impl MuxRuntime {
         self.panes.get_mut(&pane_id)
     }
 
+    fn sync_active_tab_title(&mut self) {
+        let pane_id = self.model.active_tab().active_pane;
+        if let Some(title) = self
+            .panes
+            .get(&pane_id)
+            .and_then(|pane| pane.terminal.state().title())
+            .map(ToOwned::to_owned)
+        {
+            let _ = self.model.update_pane_title(pane_id, title);
+        }
+    }
+
     fn active_layouts(&self, config: &AppConfig) -> Vec<PaneLayout> {
         let tab_bar_rows = tab_bar_rows(&self.model, config);
         self.model.active_tab().layout(LogicalRect::new(
@@ -2771,9 +3538,55 @@ impl MuxRuntime {
     }
 
     fn shutdown_all(&mut self) {
+        self.sync_session_metadata();
+        if self.restore_sessions {
+            if let Some(parent) = self.state_path.parent()
+                && let Err(error) = fs::create_dir_all(parent)
+            {
+                eprintln!("mux state directory could not be created: {error}");
+            }
+            match serde_json::to_string_pretty(&self.model.restore_snapshot()) {
+                Ok(snapshot) => {
+                    if let Err(error) = fs::write(&self.state_path, snapshot) {
+                        eprintln!(
+                            "mux state could not be saved to {}: {error}",
+                            self.state_path.display()
+                        );
+                    }
+                }
+                Err(error) => eprintln!("mux state could not be serialized: {error}"),
+            }
+        }
         for pane in self.panes.values_mut() {
             pane.shutdown();
         }
+    }
+
+    fn sync_session_metadata(&mut self) {
+        for (pane_id, pane) in &self.panes {
+            if let Ok(session) = self.model.session_for_pane_mut(*pane_id) {
+                let metadata = pane.semantic_timeline.metadata();
+                session.current_working_directory = metadata
+                    .remote
+                    .as_ref()
+                    .and_then(|remote| remote.remote_current_working_directory.clone())
+                    .or_else(|| metadata.shell.current_working_directory.clone());
+            }
+        }
+    }
+}
+
+struct PaneTextProvider<'a> {
+    terminal: &'a TerminalEmulator,
+}
+
+impl TerminalTextProvider for PaneTextProvider<'_> {
+    fn text_for_span(&self, span: SemanticSpan) -> Option<String> {
+        Some(self.terminal.state().text_for_selection(Selection {
+            start: GridPosition::new(span.start.row, span.start.col),
+            end: GridPosition::new(span.end.row, span.end.col),
+            kind: SelectionKind::Normal,
+        }))
     }
 }
 
@@ -2782,7 +3595,8 @@ struct PaneRuntime {
     semantic_parser: SemanticEscapeParser,
     semantic_timeline: SemanticTimelineStore,
     parse_semantic_events: bool,
-    transport: Option<LocalPtyTransport>,
+    remote_session: bool,
+    transport: Option<PaneTransport>,
     mouse_protocol: MouseProtocolState,
     selection_anchor: Option<GridPosition>,
     selection_kind: SelectionKind,
@@ -2835,6 +3649,8 @@ struct PanePollStats {
     content_changed: bool,
     pty_bytes: u64,
     parser_bytes: u64,
+    closed: bool,
+    error: bool,
 }
 
 #[derive(Debug)]
@@ -2898,14 +3714,27 @@ fn bytes_per_second(bytes: u64, elapsed: Duration) -> Option<u64> {
 }
 
 impl PaneRuntime {
-    fn new(config: &AppConfig, size: TerminalGridSize, metrics: CellMetrics) -> Self {
+    fn new(
+        config: &AppConfig,
+        spec: &SessionSpec,
+        size: TerminalGridSize,
+        metrics: CellMetrics,
+    ) -> Self {
         let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(size.cols, size.rows));
         let transport_size = terminal_transport_size(size, metrics);
         let mut semantic_timeline = SemanticTimelineStore::new();
         let (transport, parse_semantic_events) =
-            match spawn_initial_transport(config, transport_size) {
+            match spawn_session_transport(config, spec, transport_size) {
                 Ok(initial) => {
                     semantic_timeline.set_integration_mode(initial.semantic_mode);
+                    if let Some(metadata) = initial.remote_metadata {
+                        semantic_timeline.apply_event(
+                            semantics::SemanticEvent::RemoteMetadataChanged {
+                                position: BufferPosition::new(0, 0),
+                                metadata,
+                            },
+                        );
+                    }
                     for diagnostic in initial.activation_diagnostics {
                         eprintln!("shell integration: {diagnostic}");
                     }
@@ -2913,7 +3742,7 @@ impl PaneRuntime {
                 }
                 Err(error) => {
                     let _ = terminal.apply_bytes(
-                        format!("failed to spawn local shell: {error}\r\n").as_bytes(),
+                        format!("failed to start session transport: {error}\r\n").as_bytes(),
                     );
                     semantic_timeline.set_integration_mode(IntegrationMode::Disabled);
                     (None, false)
@@ -2925,6 +3754,7 @@ impl PaneRuntime {
             semantic_parser: SemanticEscapeParser::new(),
             semantic_timeline,
             parse_semantic_events,
+            remote_session: matches!(spec.transport, SessionTransportKind::Ssh),
             transport,
             mouse_protocol: MouseProtocolState::default(),
             selection_anchor: None,
@@ -2946,6 +3776,36 @@ impl PaneRuntime {
             end: position,
             kind,
         });
+    }
+
+    fn run_semantic_action(&mut self, action: SemanticAction) -> SemanticActionResult {
+        let cursor = self.terminal.state().cursor_buffer_position();
+        let position = BufferPosition::new(cursor.row, cursor.col);
+        let provider = PaneTextProvider {
+            terminal: &self.terminal,
+        };
+        let result = self
+            .semantic_timeline
+            .run_action(action, position, &provider);
+        match result {
+            SemanticActionResult::Position(position) => {
+                self.terminal
+                    .state_mut()
+                    .reveal_position(GridPosition::new(position.row, position.col));
+            }
+            SemanticActionResult::Selection(span) => {
+                self.terminal.state_mut().set_selection(Selection {
+                    start: GridPosition::new(span.start.row, span.start.col),
+                    end: GridPosition::new(span.end.row, span.end.col),
+                    kind: SelectionKind::Normal,
+                });
+                self.terminal
+                    .state_mut()
+                    .reveal_position(GridPosition::new(span.start.row, span.start.col));
+            }
+            SemanticActionResult::Text(_) | SemanticActionResult::Noop => {}
+        }
+        result
     }
 
     fn handle_modal_key(&mut self, event: &KeyEvent) -> Option<bool> {
@@ -3176,6 +4036,11 @@ impl PaneRuntime {
                 Ok(Ok(output)) => output,
                 Ok(Err(error)) => {
                     eprintln!("transport poll error: {error}");
+                    let _ = self
+                        .terminal
+                        .apply_bytes(format!("\r\ntransport error: {error}\r\n").as_bytes());
+                    stats.content_changed = true;
+                    stats.error = true;
                     break;
                 }
                 Err(panic) => {
@@ -3183,25 +4048,43 @@ impl PaneRuntime {
                     break;
                 }
             };
-            if output.bytes.is_empty() && output.lifecycle.is_empty() {
+            if output.bytes.is_empty() && output.lifecycle.is_empty() && !output.closed {
                 break;
             }
 
             if !output.bytes.is_empty() {
                 let byte_count = u64::try_from(output.bytes.len()).unwrap_or(u64::MAX);
                 stats.pty_bytes = stats.pty_bytes.saturating_add(byte_count);
-                let cursor = self.terminal.cursor_state();
-                let semantic_position =
-                    BufferPosition::new(cursor.position.row, cursor.position.col);
                 if self.parse_semantic_events {
-                    for parsed in self.semantic_parser.parse(&output.bytes, semantic_position) {
-                        self.semantic_timeline.apply_event(parsed.event);
+                    let cursor = self.terminal.cursor_state();
+                    let initial_position =
+                        BufferPosition::new(cursor.position.row, cursor.position.col);
+                    let parsed = self.semantic_parser.parse(&output.bytes, initial_position);
+                    let mut applied = 0usize;
+                    for parsed in parsed {
+                        let source_end = parsed.source_end.min(output.bytes.len()).max(applied);
+                        if !apply_terminal_bytes(
+                            &mut self.terminal,
+                            &output.bytes[applied..source_end],
+                        ) {
+                            break;
+                        }
+                        applied = source_end;
+                        let cursor = self.terminal.cursor_state();
+                        let event = parsed.event.at_position(BufferPosition::new(
+                            cursor.position.row,
+                            cursor.position.col,
+                        ));
+                        self.semantic_timeline.apply_event(if self.remote_session {
+                            event.in_remote_session()
+                        } else {
+                            event
+                        });
                     }
-                }
-                if let Err(panic) = catch_unwind(AssertUnwindSafe(|| {
-                    let _ = self.terminal.apply_bytes(&output.bytes);
-                })) {
-                    eprintln!("terminal parser panic boundary: {}", panic_payload(panic));
+                    if !apply_terminal_bytes(&mut self.terminal, &output.bytes[applied..]) {
+                        break;
+                    }
+                } else if !apply_terminal_bytes(&mut self.terminal, &output.bytes) {
                     break;
                 }
                 stats.parser_bytes = stats.parser_bytes.saturating_add(byte_count);
@@ -3210,13 +4093,14 @@ impl PaneRuntime {
                     clipboard,
                     policy,
                     clipboard_config,
-                    false,
+                    self.remote_session,
                 );
                 flush_terminal_responses(&mut self.terminal, transport);
                 stats.content_changed = true;
             }
             if output.closed {
                 stats.content_changed = true;
+                stats.closed = true;
                 break;
             }
         }
@@ -3242,15 +4126,7 @@ impl PaneRuntime {
 }
 
 fn mark_session_status(model: &mut MuxModel, pane_id: PaneId, status: SessionStatus) {
-    let Some(session_id) = model
-        .active_tab()
-        .panes
-        .get(&pane_id)
-        .map(|pane| pane.session_id)
-    else {
-        return;
-    };
-    if let Some(session) = model.active_tab_mut().sessions.get_mut(&session_id) {
+    if let Ok(session) = model.session_for_pane_mut(pane_id) {
         session.status = status;
     }
 }
@@ -3270,6 +4146,10 @@ fn session_spec_for_config(config: &AppConfig) -> SessionSpec {
     spec
 }
 
+fn local_session_spec(profile_name: &str) -> SessionSpec {
+    SessionSpec::local(profile_name)
+}
+
 fn terminal_transport_size(size: TerminalGridSize, metrics: CellMetrics) -> TransportSize {
     TransportSize::new(
         size.cols,
@@ -3279,11 +4159,24 @@ fn terminal_transport_size(size: TerminalGridSize, metrics: CellMetrics) -> Tran
     )
 }
 
-fn resize_transport(transport: &mut LocalPtyTransport, size: TransportSize) {
+fn resize_transport(transport: &mut PaneTransport, size: TransportSize) {
     match catch_unwind(AssertUnwindSafe(|| transport.resize(size))) {
         Ok(Ok(())) => {}
         Ok(Err(error)) => eprintln!("transport resize error: {error}"),
         Err(panic) => eprintln!("transport resize panic boundary: {}", panic_payload(panic)),
+    }
+}
+
+fn apply_terminal_bytes(terminal: &mut TerminalEmulator, bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    match catch_unwind(AssertUnwindSafe(|| terminal.apply_bytes(bytes))) {
+        Ok(_) => true,
+        Err(panic) => {
+            eprintln!("terminal parser panic boundary: {}", panic_payload(panic));
+            false
+        }
     }
 }
 
@@ -3406,13 +4299,15 @@ fn append_pane_scene(
 fn append_tab_bar_cells(scene: &mut RenderScene, runtime: &MuxRuntime, config: &AppConfig) {
     let window = runtime.model.active_workspace().active_window();
     let mut col = 0u16;
-    for tab in &window.tabs {
+    for (index, tab) in window.tabs.iter().enumerate() {
         let active = tab.id == window.active_tab;
-        let label = if active {
-            format!(" [{}] ", tab.name)
-        } else {
-            format!(" {} ", tab.name)
-        };
+        let formatted = config
+            .mux
+            .tab_title_format
+            .replace("{index}", &(index + 1).to_string())
+            .replace("{title}", &tab.name)
+            .replace("{workspace}", &runtime.model.active_workspace().name);
+        let label = format!(" {formatted} ");
         for ch in label.chars() {
             if col >= runtime.surface_cols {
                 return;
@@ -3420,11 +4315,15 @@ fn append_tab_bar_cells(scene: &mut RenderScene, runtime: &MuxRuntime, config: &
             scene.grid.cells.push(RenderCell {
                 position: CellPosition { row: 0, col },
                 text: ch.to_string(),
-                foreground: render_color(config.colors.foreground),
-                background: if active {
-                    render_color(config.colors.selection_background)
+                foreground: render_color(if active {
+                    config.mux.appearance.active_tab_foreground
                 } else {
-                    render_color(config.colors.background)
+                    config.mux.appearance.inactive_tab_foreground
+                }),
+                background: if active {
+                    render_color(config.mux.appearance.active_tab_background)
+                } else {
+                    render_color(config.mux.appearance.inactive_tab_background)
                 },
                 style: RenderCellStyle {
                     bold: active,
@@ -3433,6 +4332,16 @@ fn append_tab_bar_cells(scene: &mut RenderScene, runtime: &MuxRuntime, config: &
             });
             col = col.saturating_add(1);
         }
+    }
+    while col < runtime.surface_cols {
+        scene.grid.cells.push(RenderCell {
+            position: CellPosition { row: 0, col },
+            text: " ".to_owned(),
+            foreground: render_color(config.mux.appearance.inactive_tab_foreground),
+            background: render_color(config.mux.appearance.tab_bar_background),
+            style: RenderCellStyle::default(),
+        });
+        col = col.saturating_add(1);
     }
 }
 
@@ -3449,26 +4358,32 @@ fn append_pane_borders(
     for layout in layouts {
         let rect = rect_from_layout(layout.rect, metrics);
         let border = if layout.pane_id == active {
-            render_color(config.colors.cursor)
+            render_color(config.mux.appearance.active_pane_border)
         } else {
-            RenderColor {
-                red: 120,
-                green: 130,
-                blue: 145,
-                alpha: 120,
-            }
+            render_color(config.mux.appearance.inactive_pane_border)
         };
-        if show_borders {
-            scene.decorations.push(render_core::RenderDecoration {
-                bounds: rect,
-                color: RenderColor {
-                    red: 0,
-                    green: 0,
-                    blue: 0,
-                    alpha: 0,
-                },
-                border_color: Some(border),
-            });
+        if show_borders && config.mux.appearance.pane_border_width > 0 {
+            for inset in 0..u32::from(config.mux.appearance.pane_border_width) {
+                let double = inset.saturating_mul(2);
+                if rect.width <= double || rect.height <= double {
+                    break;
+                }
+                scene.decorations.push(render_core::RenderDecoration {
+                    bounds: RenderRect {
+                        x: rect.x.saturating_add(inset as i32),
+                        y: rect.y.saturating_add(inset as i32),
+                        width: rect.width - double,
+                        height: rect.height - double,
+                    },
+                    color: RenderColor {
+                        red: 0,
+                        green: 0,
+                        blue: 0,
+                        alpha: 0,
+                    },
+                    border_color: Some(border),
+                });
+            }
         }
     }
 }
@@ -4715,6 +5630,7 @@ mod tests {
             semantic_parser: SemanticEscapeParser::new(),
             semantic_timeline: SemanticTimelineStore::new(),
             parse_semantic_events: false,
+            remote_session: false,
             transport: None,
             mouse_protocol: MouseProtocolState::default(),
             selection_anchor: None,
@@ -4984,22 +5900,78 @@ mod tests {
         model
             .new_tab("2", SessionSpec::local("default"))
             .expect("new tab");
+        let active_tab = model.active_tab().id;
         let runtime = MuxRuntime {
             model,
             panes: HashMap::new(),
             surface_cols: 100,
             surface_rows: 30,
             performance: RuntimePerformanceCounters::new(),
+            restore_sessions: false,
+            state_path: std::env::temp_dir().join("panea-test-mux-state.json"),
         };
 
         let layout = runtime.active_layouts(&config);
         assert_eq!(layout[0].rect.y, 1.0);
         assert_eq!(layout[0].terminal_size.rows, 29);
+        let mut mouse = mouse_event(MouseEventKind::Pressed(MouseButton::Left));
+        mouse.x = f64::from(horizontal_content_inset(&config)) + 8.0 * 7.0;
+        mouse.y = f64::from(vertical_content_inset(&config)) + 4.0;
+        assert_eq!(
+            runtime.tab_at_mouse(mouse, test_metrics(), &config),
+            Some(active_tab)
+        );
 
         config.mux.show_tab_bar = false;
         let layout = runtime.active_layouts(&config);
         assert_eq!(layout[0].rect.y, 0.0);
         assert_eq!(layout[0].terminal_size.rows, 30);
+    }
+
+    #[test]
+    fn startup_mux_snapshot_preserves_nested_local_and_ssh_transports() {
+        let mut config = AppConfig::default();
+        config.mux.startup_workspaces = vec![config_core::MuxWorkspaceConfig {
+            name: "work".to_owned(),
+            tabs: vec![config_core::MuxTabConfig {
+                name: "mixed".to_owned(),
+                layout: MuxLayoutConfig::Split {
+                    axis: MuxSplitAxisConfig::Vertical,
+                    ratio: 0.7,
+                    first: Box::new(MuxLayoutConfig::Pane {
+                        profile: "default".to_owned(),
+                        transport: MuxTransportConfig::Local,
+                        working_directory: Some("local".to_owned()),
+                    }),
+                    second: Box::new(MuxLayoutConfig::Pane {
+                        profile: "prod".to_owned(),
+                        transport: MuxTransportConfig::Ssh,
+                        working_directory: Some("remote".to_owned()),
+                    }),
+                },
+            }],
+        }];
+
+        let snapshot = startup_mux_snapshot(&config).expect("startup snapshot");
+        let tab = &snapshot.workspaces[0].windows[0].tabs[0];
+        assert_eq!(tab.panes.len(), 2);
+        assert_eq!(
+            tab.panes[0].transport,
+            if cfg!(windows) {
+                SessionTransportKind::WindowsPseudoconsole
+            } else {
+                SessionTransportKind::LocalPty
+            }
+        );
+        assert_eq!(tab.panes[1].transport, SessionTransportKind::Ssh);
+        assert_eq!(
+            MuxModel::from_restore_snapshot(&snapshot, SessionSpec::local("default"))
+                .expect("restore")
+                .active_tab()
+                .layout(LogicalRect::unit())
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -5016,7 +5988,7 @@ mod tests {
         };
         config.shell_integration.activation = ShellIntegrationActivationConfig::Full;
 
-        let (profile, activation) = initial_local_shell_profile(&config);
+        let (profile, activation) = initial_local_shell_profile(&config, None);
 
         assert_eq!(
             activation.action,
@@ -5057,7 +6029,7 @@ mod tests {
         };
         config.shell_integration.activation = ShellIntegrationActivationConfig::Disabled;
 
-        let (profile, activation) = initial_local_shell_profile(&config);
+        let (profile, activation) = initial_local_shell_profile(&config, None);
 
         assert_eq!(
             semantic_mode_for_activation(&activation),
@@ -5089,7 +6061,7 @@ mod tests {
         };
         config.shell_integration.activation = ShellIntegrationActivationConfig::Full;
 
-        let (profile, activation) = initial_local_shell_profile(&config);
+        let (profile, activation) = initial_local_shell_profile(&config, None);
 
         assert_eq!(
             activation.action,
@@ -5129,6 +6101,38 @@ mod tests {
             Duration::from_millis(42),
         );
         timeline
+    }
+
+    #[test]
+    fn semantic_navigation_selection_and_copy_use_raw_pane_text() {
+        let mut pane = test_pane(40, 4);
+        pane.terminal
+            .apply_bytes(b"echo panea\r\npanea-output")
+            .expect("terminal output");
+        pane.semantic_timeline
+            .input_started(BufferPosition::new(0, 0));
+        pane.semantic_timeline
+            .input_ended(BufferPosition::new(0, 10));
+        pane.semantic_timeline
+            .output_started(BufferPosition::new(1, 0));
+        pane.semantic_timeline.command_finished(
+            BufferPosition::new(1, 12),
+            CommandStatus::Code(0),
+            Duration::from_millis(5),
+        );
+
+        assert_eq!(
+            pane.run_semantic_action(SemanticAction::CopyCurrentCommandOutput),
+            SemanticActionResult::Text("panea-output".to_owned())
+        );
+        assert!(matches!(
+            pane.run_semantic_action(SemanticAction::SelectCurrentCommandOutput),
+            SemanticActionResult::Selection(_)
+        ));
+        assert_eq!(
+            pane.terminal.state().selected_text().as_deref(),
+            Some("panea-output")
+        );
     }
 
     #[test]
@@ -5342,6 +6346,85 @@ mod tests {
                 )
                 .expect("PowerShell verification sequence"),
             ]),
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns an interactive PowerShell process with runtime integration"]
+    fn real_powershell_runtime_activation_emits_complete_command_cycle() {
+        let mut config = AppConfig {
+            default_shell_profile: Some("powershell".to_owned()),
+            shell_profiles: vec![ShellProfile {
+                name: "powershell".to_owned(),
+                kind: ShellProfileKind::PowerShell,
+                program: "powershell.exe".to_owned(),
+                ..ShellProfile::default()
+            }],
+            ..AppConfig::default()
+        };
+        config.shell_integration.activation = ShellIntegrationActivationConfig::Full;
+        let (profile, activation) = initial_local_shell_profile(&config, None);
+        assert_eq!(
+            activation.action,
+            ShellIntegrationActivationAction::InjectRuntimeScript
+        );
+        run_interactive_shell_activation_smoke(profile);
+    }
+
+    fn run_interactive_shell_activation_smoke(profile: LocalShellProfile) {
+        let marker = b"panea-runtime-integration-smoke";
+        let mut transport = LocalPtyTransport::spawn(profile, smoke_size()).expect("spawn shell");
+        let mut parser = SemanticEscapeParser::new();
+        let mut events = Vec::new();
+        let mut bytes = Vec::new();
+        let mut command_sent = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        while Instant::now() < deadline {
+            let output = transport.poll_output().expect("poll shell output");
+            if !output.bytes.is_empty() {
+                answer_real_shell_terminal_queries(&mut transport, &output.bytes);
+                for event in parser.parse(&output.bytes, BufferPosition::new(0, 0)) {
+                    events.push(event.event.kind());
+                }
+                bytes.extend_from_slice(&output.bytes);
+            }
+            if !command_sent && events.contains(&SemanticEventKind::InputStarted) {
+                transport
+                    .write_input(b"Write-Output panea-runtime-integration-smoke\r\n")
+                    .expect("write command");
+                command_sent = true;
+            }
+            let observed_marker = bytes.windows(marker.len()).any(|window| window == marker);
+            if observed_marker
+                && [
+                    SemanticEventKind::PromptStarted,
+                    SemanticEventKind::PromptEnded,
+                    SemanticEventKind::InputStarted,
+                    SemanticEventKind::InputEnded,
+                    SemanticEventKind::OutputStarted,
+                    SemanticEventKind::OutputEnded,
+                    SemanticEventKind::CommandFinished,
+                    SemanticEventKind::CurrentWorkingDirectoryChanged,
+                    SemanticEventKind::ShellMetadataChanged,
+                ]
+                .iter()
+                .all(|kind| events.contains(kind))
+            {
+                let _ = transport.shutdown();
+                return;
+            }
+            if output.closed {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let diagnostics = transport.diagnostics();
+        let _ = transport.shutdown();
+        panic!(
+            "interactive shell integration did not complete; command_sent={command_sent}, bytes={}, events={events:?}, diagnostics={diagnostics:?}",
+            bytes.len()
         );
     }
 

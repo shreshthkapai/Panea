@@ -3,7 +3,11 @@
 
 pub const LAYER: &str = "multiplexer structure";
 
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -93,6 +97,130 @@ impl MuxModel {
         self.active_workspace_mut()
             .active_window_mut()
             .active_tab_mut()
+    }
+
+    pub fn session_for_pane(&self, pane_id: PaneId) -> MuxResult<&Session> {
+        for workspace in self.workspaces.values() {
+            for window in &workspace.windows {
+                for tab in &window.tabs {
+                    if let Some(pane) = tab.panes.get(&pane_id) {
+                        return tab
+                            .sessions
+                            .get(&pane.session_id)
+                            .ok_or(MuxError::SessionNotFound(pane.session_id));
+                    }
+                }
+            }
+        }
+        Err(MuxError::PaneNotFound(pane_id))
+    }
+
+    pub fn session_for_pane_mut(&mut self, pane_id: PaneId) -> MuxResult<&mut Session> {
+        for workspace in self.workspaces.values_mut() {
+            for window in &mut workspace.windows {
+                for tab in &mut window.tabs {
+                    if let Some(pane) = tab.panes.get(&pane_id) {
+                        return tab
+                            .sessions
+                            .get_mut(&pane.session_id)
+                            .ok_or(MuxError::SessionNotFound(pane.session_id));
+                    }
+                }
+            }
+        }
+        Err(MuxError::PaneNotFound(pane_id))
+    }
+
+    pub fn update_pane_title(
+        &mut self,
+        pane_id: PaneId,
+        title: impl Into<String>,
+    ) -> MuxResult<()> {
+        let title = title.into();
+        for workspace in self.workspaces.values_mut() {
+            for window in &mut workspace.windows {
+                for tab in &mut window.tabs {
+                    if let Some(pane) = tab.panes.get_mut(&pane_id) {
+                        pane.title = Some(title.clone());
+                        if let Some(session) = tab.sessions.get_mut(&pane.session_id) {
+                            session.title = Some(title.clone());
+                        }
+                        if tab.active_pane == pane_id
+                            && !matches!(tab.title_source, TabTitleSource::User)
+                        {
+                            tab.name = title;
+                            tab.title_source = TabTitleSource::Session;
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Err(MuxError::PaneNotFound(pane_id))
+    }
+
+    pub fn new_workspace(&mut self, name: impl Into<String>, session: SessionSpec) -> WorkspaceId {
+        let workspace_id = self.counters.next_workspace();
+        let window_id = self.counters.next_window();
+        let tab_id = self.counters.next_tab();
+        let pane_id = self.counters.next_pane();
+        let session_id = self.counters.next_session();
+        let workspace = Workspace {
+            id: workspace_id,
+            name: name.into(),
+            windows: vec![WindowModel {
+                id: window_id,
+                tabs: vec![Tab::single_pane(
+                    tab_id,
+                    "1",
+                    Pane::new(pane_id, session_id),
+                    Session::new(session_id, session),
+                )],
+                active_tab: tab_id,
+            }],
+            active_window: window_id,
+        };
+        self.workspaces.insert(workspace_id, workspace);
+        self.active_workspace = workspace_id;
+        workspace_id
+    }
+
+    pub fn switch_workspace(&mut self, workspace_id: WorkspaceId) -> MuxResult<()> {
+        if !self.workspaces.contains_key(&workspace_id) {
+            return Err(MuxError::WorkspaceNotFound(workspace_id));
+        }
+        self.active_workspace = workspace_id;
+        Ok(())
+    }
+
+    pub fn rename_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+        name: impl Into<String>,
+    ) -> MuxResult<()> {
+        let workspace = self
+            .workspaces
+            .get_mut(&workspace_id)
+            .ok_or(MuxError::WorkspaceNotFound(workspace_id))?;
+        workspace.name = name.into();
+        Ok(())
+    }
+
+    pub fn close_workspace(&mut self, workspace_id: WorkspaceId) -> MuxResult<()> {
+        if self.workspaces.len() == 1 {
+            return Err(MuxError::CannotCloseLastWorkspace);
+        }
+        self.workspaces
+            .remove(&workspace_id)
+            .ok_or(MuxError::WorkspaceNotFound(workspace_id))?;
+        if self.active_workspace == workspace_id {
+            self.active_workspace = *self
+                .workspaces
+                .keys()
+                .next()
+                .expect("closing one of multiple workspaces leaves a workspace");
+        }
+        Ok(())
     }
 
     pub fn new_tab(&mut self, name: impl Into<String>, session: SessionSpec) -> MuxResult<TabId> {
@@ -215,6 +343,77 @@ impl MuxModel {
 
     pub fn swap_panes(&mut self, first: PaneId, second: PaneId) -> MuxResult<()> {
         self.active_tab_mut().root.swap_panes(first, second)
+    }
+
+    pub fn move_active_pane(&mut self, direction: FocusDirection) -> MuxResult<PaneId> {
+        let tab = self.active_tab_mut();
+        let active = tab.active_pane;
+        let target = tab.pane_in_direction(direction)?;
+        tab.root.swap_panes(active, target)?;
+        Ok(target)
+    }
+
+    pub fn from_restore_snapshot(
+        snapshot: &RestoreSnapshot,
+        fallback_session: SessionSpec,
+    ) -> MuxResult<Self> {
+        let mut counters = IdCounters::default();
+        let mut workspaces = BTreeMap::new();
+
+        for workspace_restore in &snapshot.workspaces {
+            if workspace_restore.windows.is_empty() {
+                return Err(MuxError::InvalidSnapshot(
+                    "workspace contains no windows".to_owned(),
+                ));
+            }
+            let workspace_id = counters.next_workspace();
+            let mut windows = Vec::new();
+            for window_restore in &workspace_restore.windows {
+                if window_restore.tabs.is_empty() {
+                    return Err(MuxError::InvalidSnapshot(
+                        "window contains no tabs".to_owned(),
+                    ));
+                }
+                let window_id = counters.next_window();
+                let mut tabs = Vec::new();
+                for tab_restore in &window_restore.tabs {
+                    tabs.push(restore_tab(tab_restore, &mut counters, &fallback_session)?);
+                }
+                let active_tab = window_restore
+                    .active_tab_name
+                    .as_ref()
+                    .and_then(|name| tabs.iter().find(|tab| &tab.name == name))
+                    .map_or(tabs[0].id, |tab| tab.id);
+                windows.push(WindowModel {
+                    id: window_id,
+                    tabs,
+                    active_tab,
+                });
+            }
+            let active_window = windows[0].id;
+            workspaces.insert(
+                workspace_id,
+                Workspace {
+                    id: workspace_id,
+                    name: workspace_restore.name.clone(),
+                    windows,
+                    active_window,
+                },
+            );
+        }
+
+        if workspaces.is_empty() {
+            return Ok(Self::new(fallback_session));
+        }
+        let active_workspace = *workspaces
+            .keys()
+            .next()
+            .expect("non-empty restored workspace map");
+        Ok(Self {
+            workspaces,
+            active_workspace,
+            counters,
+        })
     }
 
     #[must_use]
@@ -344,6 +543,12 @@ impl Tab {
     }
 
     pub fn focus_direction(&mut self, direction: FocusDirection) -> MuxResult<PaneId> {
+        let pane_id = self.pane_in_direction(direction)?;
+        self.active_pane = pane_id;
+        Ok(pane_id)
+    }
+
+    fn pane_in_direction(&self, direction: FocusDirection) -> MuxResult<PaneId> {
         let assignments = self.layout(LogicalRect::unit());
         let active = assignments
             .iter()
@@ -389,7 +594,6 @@ impl Tab {
             .first()
             .map(|candidate| candidate.0)
             .ok_or(MuxError::NoPaneInDirection(direction))?;
-        self.active_pane = pane_id;
         Ok(pane_id)
     }
 
@@ -682,6 +886,17 @@ impl SplitTree {
         }
     }
 
+    fn collect_panes(&self, output: &mut Vec<PaneId>) {
+        match self {
+            Self::Pane(pane_id) => output.push(*pane_id),
+            Self::Split { children, .. } => {
+                for child in children {
+                    child.collect_panes(output);
+                }
+            }
+        }
+    }
+
     fn resize_pane(&mut self, target: PaneId, axis: SplitAxis, delta: f32) -> MuxResult<()> {
         match self {
             Self::Pane(_) => Err(MuxError::PaneNotFound(target)),
@@ -968,6 +1183,10 @@ pub struct PaneLayout {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MuxAction {
+    NewWorkspace,
+    CloseWorkspace,
+    NextWorkspace,
+    PreviousWorkspace,
     NewTab,
     CloseTab,
     NextTab,
@@ -980,7 +1199,8 @@ pub enum MuxAction {
     FocusDirection(FocusDirection),
     ResizePane(ResizeDirection),
     ZoomPane,
-    MovePane,
+    MovePane(FocusDirection),
+    SwapPaneDirection(FocusDirection),
     SwapPane { other: PaneId },
 }
 
@@ -988,6 +1208,10 @@ impl MuxAction {
     #[must_use]
     pub fn named(name: &str) -> Option<Self> {
         match name {
+            "new_workspace" => Some(Self::NewWorkspace),
+            "close_workspace" => Some(Self::CloseWorkspace),
+            "next_workspace" => Some(Self::NextWorkspace),
+            "previous_workspace" => Some(Self::PreviousWorkspace),
             "new_tab" => Some(Self::NewTab),
             "close_tab" => Some(Self::CloseTab),
             "next_tab" => Some(Self::NextTab),
@@ -1007,8 +1231,116 @@ impl MuxAction {
             "rename_tab" => Some(Self::RenameTab {
                 name: String::new(),
             }),
-            "move_pane" => Some(Self::MovePane),
+            "move_pane_left" => Some(Self::MovePane(FocusDirection::Left)),
+            "move_pane_right" => Some(Self::MovePane(FocusDirection::Right)),
+            "move_pane_up" => Some(Self::MovePane(FocusDirection::Up)),
+            "move_pane_down" => Some(Self::MovePane(FocusDirection::Down)),
+            "move_pane" => Some(Self::MovePane(FocusDirection::Right)),
+            "swap_pane_left" => Some(Self::SwapPaneDirection(FocusDirection::Left)),
+            "swap_pane_right" => Some(Self::SwapPaneDirection(FocusDirection::Right)),
+            "swap_pane_up" => Some(Self::SwapPaneDirection(FocusDirection::Up)),
+            "swap_pane_down" => Some(Self::SwapPaneDirection(FocusDirection::Down)),
             _ => None,
+        }
+    }
+}
+
+fn restore_tab(
+    restore: &TabRestore,
+    counters: &mut IdCounters,
+    fallback_session: &SessionSpec,
+) -> MuxResult<Tab> {
+    if restore.panes.is_empty() {
+        return Err(MuxError::InvalidSnapshot(
+            "tab contains no panes".to_owned(),
+        ));
+    }
+    let tab_id = counters.next_tab();
+    let mut pane_ids = BTreeMap::new();
+    let mut panes = BTreeMap::new();
+    let mut sessions = BTreeMap::new();
+    for pane_restore in &restore.panes {
+        if pane_restore.session_profile.trim().is_empty() {
+            return Err(MuxError::InvalidSnapshot(
+                "pane session profile is empty".to_owned(),
+            ));
+        }
+        let pane_id = counters.next_pane();
+        let session_id = counters.next_session();
+        if pane_ids.insert(pane_restore.pane_id, pane_id).is_some() {
+            return Err(MuxError::InvalidSnapshot(
+                "tab contains duplicate pane identifiers".to_owned(),
+            ));
+        }
+        let mut spec = fallback_session.clone();
+        spec.profile_name = pane_restore.session_profile.clone();
+        spec.transport = pane_restore.transport;
+        spec.working_directory = pane_restore.working_directory.clone();
+        panes.insert(pane_id, Pane::new(pane_id, session_id));
+        sessions.insert(session_id, Session::new(session_id, spec));
+    }
+    let root = remap_split_tree(&restore.layout, &pane_ids)?;
+    let mut leaves = Vec::new();
+    root.collect_panes(&mut leaves);
+    let unique_leaves = leaves.iter().copied().collect::<BTreeSet<_>>();
+    let restored_panes = panes.keys().copied().collect::<BTreeSet<_>>();
+    if unique_leaves.len() != leaves.len() || unique_leaves != restored_panes {
+        return Err(MuxError::InvalidSnapshot(
+            "layout must reference every pane exactly once".to_owned(),
+        ));
+    }
+    let active_pane = pane_ids
+        .get(&restore.active_pane)
+        .copied()
+        .or_else(|| root.first_pane())
+        .ok_or_else(|| MuxError::InvalidSnapshot("tab layout has no panes".to_owned()))?;
+    Ok(Tab {
+        id: tab_id,
+        name: restore.name.clone(),
+        title_source: TabTitleSource::Default,
+        panes,
+        sessions,
+        root,
+        active_pane,
+        zoomed_pane: None,
+    })
+}
+
+fn remap_split_tree(tree: &SplitTree, pane_ids: &BTreeMap<PaneId, PaneId>) -> MuxResult<SplitTree> {
+    match tree {
+        SplitTree::Pane(old) => pane_ids
+            .get(old)
+            .copied()
+            .map(SplitTree::Pane)
+            .ok_or_else(|| {
+                MuxError::InvalidSnapshot(format!("layout references missing pane {old:?}"))
+            }),
+        SplitTree::Split {
+            axis,
+            children,
+            ratios,
+        } => {
+            if children.len() < 2
+                || children.len() != ratios.len()
+                || ratios
+                    .iter()
+                    .any(|ratio| !ratio.is_finite() || *ratio <= 0.0)
+            {
+                return Err(MuxError::InvalidSnapshot(
+                    "split children and ratios are inconsistent".to_owned(),
+                ));
+            }
+            let children = children
+                .iter()
+                .map(|child| remap_split_tree(child, pane_ids))
+                .collect::<MuxResult<Vec<_>>>()?;
+            let mut restored = SplitTree::Split {
+                axis: *axis,
+                children,
+                ratios: ratios.clone(),
+            };
+            restored.normalize();
+            Ok(restored)
         }
     }
 }
@@ -1162,9 +1494,11 @@ pub enum MuxError {
     PaneNotFound(PaneId),
     SessionNotFound(SessionId),
     CannotCloseLastTab,
+    CannotCloseLastWorkspace,
     CannotCloseLastPane,
     CannotRemoveRootPane,
     NoPaneInDirection(FocusDirection),
+    InvalidSnapshot(String),
 }
 
 impl fmt::Display for MuxError {
@@ -1176,9 +1510,11 @@ impl fmt::Display for MuxError {
             Self::PaneNotFound(id) => write!(f, "pane not found: {id:?}"),
             Self::SessionNotFound(id) => write!(f, "session not found: {id:?}"),
             Self::CannotCloseLastTab => f.write_str("cannot close the last tab"),
+            Self::CannotCloseLastWorkspace => f.write_str("cannot close the last workspace"),
             Self::CannotCloseLastPane => f.write_str("cannot close the last pane"),
             Self::CannotRemoveRootPane => f.write_str("cannot remove the root pane directly"),
             Self::NoPaneInDirection(direction) => write!(f, "no pane in direction {direction:?}"),
+            Self::InvalidSnapshot(message) => write!(f, "invalid mux snapshot: {message}"),
         }
     }
 }
@@ -1233,6 +1569,19 @@ mod tests {
     }
 
     #[test]
+    fn active_pane_title_updates_tab_without_overriding_user_title() {
+        let mut model = model();
+        let pane = model.active_tab().active_pane;
+        model.update_pane_title(pane, "vim").expect("title");
+        assert_eq!(model.active_tab().name, "vim");
+        model
+            .rename_tab(model.active_tab().id, "editor")
+            .expect("user title");
+        model.update_pane_title(pane, "nvim").expect("title");
+        assert_eq!(model.active_tab().name, "editor");
+    }
+
+    #[test]
     fn panes_split_focus_resize_zoom_swap_and_close() {
         let mut model = model();
         let first = model.active_tab().active_pane;
@@ -1273,6 +1622,38 @@ mod tests {
     }
 
     #[test]
+    fn active_pane_can_move_directionally_without_changing_identity() {
+        let mut model = model();
+        let first = model.active_tab().active_pane;
+        let second = model
+            .split_active_pane(SplitAxis::Horizontal, SessionSpec::local("default"))
+            .expect("split");
+
+        assert_eq!(model.move_active_pane(FocusDirection::Left), Ok(first));
+        assert_eq!(model.active_tab().active_pane, second);
+        assert_eq!(model.active_tab().root.first_pane(), Some(second));
+    }
+
+    #[test]
+    fn workspaces_can_be_created_switched_renamed_and_closed() {
+        let mut model = model();
+        let first = model.active_workspace;
+        let second = model.new_workspace("remote", SessionSpec::ssh("prod"));
+
+        assert_eq!(model.active_workspace, second);
+        assert_eq!(model.active_tab().active_pane().session_id, SessionId(2));
+        model.rename_workspace(second, "ops").expect("rename");
+        assert_eq!(model.active_workspace().name, "ops");
+        model.switch_workspace(first).expect("switch");
+        model.close_workspace(second).expect("close");
+        assert_eq!(model.workspaces.len(), 1);
+        assert_eq!(
+            model.close_workspace(first),
+            Err(MuxError::CannotCloseLastWorkspace)
+        );
+    }
+
+    #[test]
     fn nested_layouts_are_proportional_and_dpi_independent() {
         let mut model = model();
         let _right = model
@@ -1306,6 +1687,62 @@ mod tests {
             snapshot.workspaces[0].windows[0].tabs[0].panes[0].session_profile,
             "default"
         );
+
+        let restored = MuxModel::from_restore_snapshot(&snapshot, SessionSpec::local("fallback"))
+            .expect("restore");
+        assert_eq!(restored.active_tab().panes.len(), 2);
+        assert_eq!(restored.active_tab().layout(LogicalRect::unit()).len(), 2);
+        assert!(
+            restored
+                .active_tab()
+                .sessions
+                .values()
+                .all(|session| session.spec.profile_name == "default")
+        );
+    }
+
+    #[test]
+    fn invalid_restore_snapshot_is_rejected_without_panicking() {
+        let snapshot = RestoreSnapshot {
+            workspaces: vec![WorkspaceRestore {
+                name: "broken".to_owned(),
+                windows: Vec::new(),
+            }],
+        };
+
+        assert!(matches!(
+            MuxModel::from_restore_snapshot(&snapshot, SessionSpec::local("default")),
+            Err(MuxError::InvalidSnapshot(_))
+        ));
+
+        let pane_id = PaneId(7);
+        let duplicate = RestoreSnapshot {
+            workspaces: vec![WorkspaceRestore {
+                name: "broken".to_owned(),
+                windows: vec![WindowRestore {
+                    active_tab_name: Some("tab".to_owned()),
+                    tabs: vec![TabRestore {
+                        name: "tab".to_owned(),
+                        layout: SplitTree::Split {
+                            axis: SplitAxis::Horizontal,
+                            children: vec![SplitTree::Pane(pane_id), SplitTree::Pane(pane_id)],
+                            ratios: vec![0.5, 0.5],
+                        },
+                        active_pane: pane_id,
+                        panes: vec![PaneRestore {
+                            pane_id,
+                            session_profile: "default".to_owned(),
+                            transport: SessionTransportKind::LocalPty,
+                            working_directory: None,
+                        }],
+                    }],
+                }],
+            }],
+        };
+        assert!(matches!(
+            MuxModel::from_restore_snapshot(&duplicate, SessionSpec::local("default")),
+            Err(MuxError::InvalidSnapshot(_))
+        ));
     }
 
     #[test]
@@ -1336,7 +1773,10 @@ mod tests {
             "resize_pane_down",
             "zoom_pane",
             "rename_tab",
-            "move_pane",
+            "move_pane_left",
+            "move_pane_right",
+            "move_pane_up",
+            "move_pane_down",
         ] {
             assert!(MuxAction::named(action).is_some(), "{action}");
         }

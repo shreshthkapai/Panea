@@ -74,6 +74,32 @@ backend-specific startup mechanics behind the local transport profile:
 - PowerShell / pwsh uses `-NoExit -Command`.
 - cmd and unsupported shells run without hooks and produce diagnostics.
 
+Markers are applied incrementally at their byte offset in each transport
+batch. This keeps prompt, input, and output regions attached to the actual
+scrollback positions even when a shell emits visible output and several OSC
+markers in one read. Command duration is measured by the semantic timeline
+when the shell does not provide an explicit duration.
+
+Runtime actions are wired to the active pane:
+
+- `jump_to_previous_command`
+- `jump_to_next_command`
+- `select_current_command_output`
+- `copy_current_command_output`
+- `copy_command_and_output`
+
+Selection and copy use raw terminal text. Semantic metadata never rewrites the
+terminal buffer.
+
+Windows PowerShell 5 does not reliably preserve trailing OSC markers returned
+from `prompt`. Panea therefore emits its prompt-end/input-start marker directly
+before the visible prompt on that backend and reports
+`prompt_marker=fallback_prefix` in shell metadata. Command output boundaries,
+exit status, duration, cwd, navigation, and output selection remain reliable;
+PowerShell 7 can use the same portable protocol. Panea only wraps the default
+PSReadLine `AcceptLine` Enter binding; a custom Enter handler is preserved and
+reported as prompt-only semantic integration.
+
 The terminal must continue working when shell integration is disabled,
 unsupported, or not installed on a remote host.
 
@@ -130,10 +156,12 @@ mode, and remote status.
 Performance cost when disabled: no shell hook injection and no semantic escape
 parsing for `off`.
 
-Performance cost when enabled: startup-only profile shaping plus incremental
-OSC parsing per PTY output batch.
+Performance cost when enabled: startup-only profile shaping plus incremental,
+bounded OSC parsing per PTY output batch. Disabled sessions do not run the
+semantic parser.
 
-Tests: unit tests cover activation plans, shell detection, verification
-sequence generation, desktop profile shaping, disabled/off behavior, and
-explicit-args fallback. Ignored real-shell tests exist for PowerShell, bash,
-zsh, and fish; PowerShell has been run on the current Windows host.
+Tests: unit tests cover activation plans, complete marker sets, streaming
+marker offsets, shell detection, desktop profile shaping, semantic navigation,
+raw output selection/copy, disabled/off behavior, and explicit-args fallback.
+Bounded real-shell tests exist for PowerShell, bash, zsh, and fish; only shells
+actually available on a host can be verified there.

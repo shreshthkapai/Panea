@@ -320,16 +320,62 @@ Supported portable profile names:
 
 The deprecated spelling `battery_conscious` is still accepted as an alias.
 
+## Multiplexer Layouts
+
+Startup workspaces use transport-neutral recursive layouts. The same config is
+valid on every desktop OS:
+
+```toml
+[mux]
+restore_sessions = true
+show_tab_bar = true
+tab_title_format = "{index}: {title}"
+
+[mux.appearance]
+active_tab_background = { red = 54, green = 62, blue = 75, alpha = 255 }
+active_pane_border = { red = 80, green = 150, blue = 255, alpha = 255 }
+pane_border_width = 1
+
+[[mux.startup_workspaces]]
+name = "work"
+
+[[mux.startup_workspaces.tabs]]
+name = "mixed"
+
+[mux.startup_workspaces.tabs.layout]
+kind = "split"
+axis = "horizontal"
+ratio = 0.6
+
+[mux.startup_workspaces.tabs.layout.first]
+kind = "pane"
+transport = "local"
+profile = "dev"
+
+[mux.startup_workspaces.tabs.layout.second]
+kind = "pane"
+transport = "ssh"
+profile = "prod"
+```
+
+Named keybinding actions can open a specific profile, for example
+`new_ssh_tab:prod`, `split_ssh_vertical:prod`, `new_local_tab:dev`, or
+`split_local_horizontal:dev`. Workspace actions support
+`new_workspace:name`, `switch_workspace:name`, and `rename_workspace:name`.
+Restoration recreates layouts and starts fresh transports; it does not claim
+process resurrection.
+
 ## Reload Contract
 
 `config-core` can classify config changes into:
 
 - live-reloadable changes: colors, fonts, cursor, padding, keybindings, input,
-  diagnostics, performance budgets, window title, mux settings, and semantic
+  diagnostics, performance budgets, window title, mux appearance/settings, and semantic
   visual settings
 - restart-required changes: GPU backend, renderer scheduling/damage policy,
   major window settings/backend changes, shell profile startup settings, SSH
-  profiles, scrollback storage policy, and platform override changes
+  profiles, mux startup/restoration layouts, scrollback storage policy, and
+  platform override changes
 
 The desktop runtime watches the active TOML or programmable config path with a
 debounced portable polling watcher. Valid live-reloadable changes are applied without

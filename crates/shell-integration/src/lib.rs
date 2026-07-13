@@ -388,6 +388,9 @@ pub enum SemanticParseError {
 pub struct ParsedSemanticEvent {
     pub raw_osc: String,
     pub event: SemanticEvent,
+    /// Byte offset immediately after the marker in the current input batch.
+    /// Zero is used by direct payload parsing where no source batch exists.
+    pub source_end: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,7 +415,7 @@ impl SemanticEscapeParser {
     pub fn parse(&mut self, bytes: &[u8], position: BufferPosition) -> Vec<ParsedSemanticEvent> {
         let mut events = Vec::new();
 
-        for byte in bytes {
+        for (index, byte) in bytes.iter().enumerate() {
             match &mut self.state {
                 ParserState::Ground => {
                     if *byte == ESC {
@@ -434,7 +437,9 @@ impl SemanticEscapeParser {
                     content,
                 } => match (*byte, *escape_seen) {
                     (BEL, _) => {
-                        if let Some(event) = parse_osc_payload(content, position).ok().flatten() {
+                        if let Some(mut event) = parse_osc_payload(content, position).ok().flatten()
+                        {
+                            event.source_end = index.saturating_add(1);
                             events.push(event);
                         }
                         self.state = ParserState::Ground;
@@ -443,7 +448,9 @@ impl SemanticEscapeParser {
                         if content.last() == Some(&ESC) {
                             content.pop();
                         }
-                        if let Some(event) = parse_osc_payload(content, position).ok().flatten() {
+                        if let Some(mut event) = parse_osc_payload(content, position).ok().flatten()
+                        {
+                            event.source_end = index.saturating_add(1);
                             events.push(event);
                         }
                         self.state = ParserState::Ground;
@@ -507,6 +514,7 @@ pub fn parse_osc_payload(
     Ok(Some(ParsedSemanticEvent {
         raw_osc: raw,
         event,
+        source_end: 0,
     }))
 }
 
@@ -703,34 +711,63 @@ fn percent_decode(value: &str) -> String {
 
 pub const BASH_SCRIPT: &str = r#"# Panea shell integration for bash.
 __panea_osc() { printf '\033]777;%s\007' "$1"; }
-__panea_prompt_start() { __panea_osc "prompt_start;shell=bash;cwd=$PWD"; }
-__panea_prompt_end() { __panea_osc "prompt_end"; }
-__panea_preexec() { __panea_osc "input_start"; }
+__panea_active=0
+__panea_ready=0
+__panea_original_prompt_command=${PROMPT_COMMAND:-}
 __panea_precmd() {
   local status=$?
-  __panea_osc "command_finished;status=$status"
+  if [ "$__panea_active" = 1 ]; then
+    __panea_osc "output_end"
+    __panea_osc "command_finished;status=$status"
+    __panea_active=0
+  fi
   __panea_osc "cwd;path=$PWD"
+  __panea_osc "shell;shell=bash;cwd=$PWD"
+  __panea_osc "prompt_start;shell=bash;cwd=$PWD"
 }
-PROMPT_COMMAND="__panea_precmd;__panea_prompt_start;${PROMPT_COMMAND:-};__panea_prompt_end"
+__panea_prompt_cycle() {
+  __panea_ready=0
+  __panea_precmd
+  if [ -n "$__panea_original_prompt_command" ]; then
+    eval "$__panea_original_prompt_command"
+  fi
+  __panea_ready=1
+}
+__panea_preexec() {
+  if [ "$__panea_ready" = 1 ]; then
+    __panea_ready=0
+    __panea_active=1
+    __panea_osc "input_end"
+    __panea_osc "output_start"
+  fi
+}
+PROMPT_COMMAND=__panea_prompt_cycle
+PS1="${PS1}"$'\[\e]777;prompt_end\a\]\[\e]777;input_start\a\]'
 trap '__panea_preexec' DEBUG
 "#;
 
 pub const ZSH_SCRIPT: &str = r#"# Panea shell integration for zsh.
 __panea_osc() { printf '\033]777;%s\007' "$1"; }
+typeset -g __panea_active=0
 precmd_functions+=(__panea_precmd)
 preexec_functions+=(__panea_preexec)
 __panea_precmd() {
   local status=$?
-  __panea_osc "command_finished;status=$status"
+  if (( __panea_active )); then
+    __panea_osc "output_end"
+    __panea_osc "command_finished;status=$status"
+    __panea_active=0
+  fi
   __panea_osc "cwd;path=$PWD"
+  __panea_osc "shell;shell=zsh;cwd=$PWD"
   __panea_osc "prompt_start;shell=zsh;cwd=$PWD"
 }
 __panea_preexec() {
-  __panea_osc "prompt_end"
-  __panea_osc "input_start"
   __panea_osc "input_end"
   __panea_osc "output_start"
+  __panea_active=1
 }
+PROMPT="${PROMPT}"$'%{\e]777;prompt_end\a%}%{\e]777;input_start\a%}'
 "#;
 
 pub const FISH_SCRIPT: &str = r#"# Panea shell integration for fish.
@@ -738,6 +775,13 @@ function __panea_osc
     printf '\e]777;%s\a' $argv[1]
 end
 function __panea_prompt --on-event fish_prompt
+    if set -q __panea_active
+        __panea_osc "output_end"
+        __panea_osc "command_finished;status=$__panea_status"
+        set -e __panea_active
+    end
+    __panea_osc "cwd;path=$PWD"
+    __panea_osc "shell;shell=fish;cwd=$PWD"
     __panea_osc "prompt_start;shell=fish;cwd=$PWD"
 end
 function __panea_preexec --on-event fish_preexec
@@ -745,10 +789,10 @@ function __panea_preexec --on-event fish_preexec
     __panea_osc "input_start"
     __panea_osc "input_end"
     __panea_osc "output_start"
+    set -g __panea_active 1
 end
 function __panea_postexec --on-event fish_postexec
-    __panea_osc "command_finished;status=$status"
-    __panea_osc "cwd;path=$PWD"
+    set -g __panea_status $status
 end
 "#;
 
@@ -759,11 +803,34 @@ function global:__PaneaOsc([string] $Payload) {
 if (Test-Path function:\prompt) {
     Copy-Item function:\prompt function:\__PaneaOriginalPrompt -Force
 }
+$global:__PaneaCommandActive = $false
+if (Get-Module PSReadLine) {
+    $paneaEnterHandler = Get-PSReadLineKeyHandler -Bound |
+      Where-Object { ($_.Key -eq 'Enter') -or ($_.Key -contains 'Enter') } |
+      Select-Object -First 1
+    if (($null -eq $paneaEnterHandler) -or ($paneaEnterHandler.Function -eq 'AcceptLine')) {
+      Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
+        __PaneaOsc "input_end"
+        __PaneaOsc "output_start"
+        $global:__PaneaCommandActive = $true
+        [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+      }
+    } else {
+      __PaneaOsc "shell;shell=powershell;integration=prompt_only;reason=custom_enter_handler"
+    }
+}
 function global:prompt {
     $lastStatus = if ($?) { 0 } else { 1 }
-    __PaneaOsc "command_finished;status=$lastStatus"
+    if ($global:__PaneaCommandActive) {
+        __PaneaOsc "output_end"
+        __PaneaOsc "command_finished;status=$lastStatus"
+        $global:__PaneaCommandActive = $false
+    }
     __PaneaOsc "cwd;path=$PWD"
+    __PaneaOsc "shell;shell=powershell;cwd=$PWD;prompt_marker=fallback_prefix"
     __PaneaOsc "prompt_start;shell=powershell;cwd=$PWD"
+    __PaneaOsc "prompt_end"
+    __PaneaOsc "input_start"
     if (Test-Path function:\__PaneaOriginalPrompt) {
         & function:\__PaneaOriginalPrompt
     } else {
@@ -973,7 +1040,34 @@ mod tests {
         ] {
             let script = script_for_shell(shell).expect("script");
             assert!(script.contents.contains("777"));
+            for marker in [
+                "prompt_start",
+                "prompt_end",
+                "input_start",
+                "input_end",
+                "output_start",
+                "output_end",
+                "command_finished",
+                "cwd",
+                "shell",
+            ] {
+                assert!(
+                    script.contents.contains(marker),
+                    "{shell:?} script is missing {marker}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn parsed_events_report_their_end_offset_in_the_current_batch() {
+        let input = b"visible\x1b]777;output_start\x07more";
+        let mut parser = SemanticEscapeParser::new();
+        let events = parser.parse(input, BufferPosition::new(0, 0));
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_end, input.len() - 4);
+        assert_eq!(events[0].event.kind(), SemanticEventKind::OutputStarted);
     }
 
     #[test]
