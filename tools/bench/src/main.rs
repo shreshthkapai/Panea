@@ -405,9 +405,11 @@ fn render_command_blocks() -> Result<(), Box<dyn Error>> {
                 blue: 160,
                 alpha: 80,
             }),
+            border_width_px: 1,
             corner_radius_px: 2,
             z_index: 10,
             label: None,
+            label_color: None,
         })
         .collect();
     batch_scene_bench("render-command-blocks", scene, 10)
@@ -487,9 +489,11 @@ fn generated_scene(cols: u16, rows: u16, feature_mode: OptionalFeatureCostMode) 
                     alpha: 48,
                 },
                 border_color: None,
+                border_width_px: 0,
                 corner_radius_px: 2,
                 z_index: 10,
                 label: Some("synthetic expensive overlay".to_owned()),
+                label_color: None,
             }]
         } else {
             Vec::new()

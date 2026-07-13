@@ -175,12 +175,13 @@ compile into renderer-independent primitives before a backend draws them.
 Baseline visual sections:
 
 - `visual_theme`: names the active theme/profile set, grouping style, spacing,
-  borders, badges, and success/error accent colors
+  borders, badges, prompt/command/input/output/badge colors, and success/error
+  accent colors
 - `cursor`: shape, thickness, corner radius, inactive style, bounded animation
   flags, and opt-in image cursor asset settings
 - `prompt_decorations`: minimal separator, rounded box, and pill/header styles
 - `command_blocks`: command grouping style, status/duration badges, copy/jump
-  action flags, output grouping, and alternate-screen overlay policy
+  action flags, output grouping/collapse, and alternate-screen overlay policy
 - `performance`: animation FPS, cursor asset size, active animation, and
   animated-region budgets
 
@@ -234,6 +235,11 @@ warn_if_expensive = true
 [prompt_decorations]
 enabled = true
 style = "minimal_separator"
+show_shell_badge = false
+show_current_directory = false
+show_remote_host = false
+show_admin_badge = false
+show_previous_status_accent = false
 allow_in_alternate_screen = false
 
 [command_blocks]
@@ -244,8 +250,23 @@ show_duration = true
 show_exit_status = true
 show_current_directory = true
 show_shell_host = true
+copy_actions_enabled = true
+jump_actions_enabled = true
+collapse_long_output = false
+collapse_after_lines = 200
+collapsed_preview_lines = 1
 allow_in_alternate_screen = false
+
+[visual_theme.spacing]
+block_margin_px = 3
+block_padding_px = 6
+badge_gap_px = 4
 ```
+
+Command block styles are `traditional`, `subtle`, `card`, `split`,
+`minimal_header`, and `custom_theme`. `Ctrl+Shift+G` toggles collapse for the
+current or most recent command. Collapse changes only renderer presentation;
+raw terminal text remains available to selection, search, and copy.
 
 The alternate-screen defaults protect full-screen TUIs. Setting either
 `allow_in_alternate_screen` key to `true` is portable, but validation emits a

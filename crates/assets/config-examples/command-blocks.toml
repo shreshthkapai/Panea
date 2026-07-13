@@ -5,6 +5,17 @@ name = "command-blocks"
 grouping_style = "command_cards"
 prompt_decoration_profile = "pill"
 command_block_profile = "card"
+prompt_background = { red = 34, green = 92, blue = 120, alpha = 48 }
+command_background = { red = 30, green = 35, blue = 43, alpha = 112 }
+input_background = { red = 55, green = 120, blue = 190, alpha = 34 }
+output_background = { red = 125, green = 140, blue = 160, alpha = 22 }
+badge_background = { red = 25, green = 30, blue = 38, alpha = 230 }
+badge_foreground = { red = 245, green = 248, blue = 252, alpha = 255 }
+
+[visual_theme.spacing]
+block_margin_px = 3
+block_padding_px = 6
+badge_gap_px = 4
 
 [visual_theme.borders]
 width_px = 1
@@ -22,6 +33,7 @@ style = "pill_header"
 show_shell_badge = true
 show_current_directory = true
 show_remote_host = true
+show_admin_badge = true
 show_previous_status_accent = true
 allow_in_alternate_screen = false
 
@@ -36,6 +48,9 @@ show_shell_host = true
 allow_in_alternate_screen = false
 copy_actions_enabled = true
 jump_actions_enabled = true
+collapse_long_output = true
+collapse_after_lines = 200
+collapsed_preview_lines = 1
 
 [performance]
 profile = "visual"

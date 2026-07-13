@@ -716,6 +716,8 @@ __panea_ready=0
 __panea_original_prompt_command=${PROMPT_COMMAND:-}
 __panea_precmd() {
   local status=$?
+  local elevated=false
+  if [ "${EUID:-$(id -u)}" -eq 0 ]; then elevated=true; fi
   if [ "$__panea_active" = 1 ]; then
     __panea_osc "output_end"
     __panea_osc "command_finished;status=$status"
@@ -723,7 +725,7 @@ __panea_precmd() {
   fi
   __panea_osc "cwd;path=$PWD"
   __panea_osc "shell;shell=bash;cwd=$PWD"
-  __panea_osc "prompt_start;shell=bash;cwd=$PWD"
+  __panea_osc "prompt_start;shell=bash;cwd=$PWD;elevated=$elevated"
 }
 __panea_prompt_cycle() {
   __panea_ready=0
@@ -753,6 +755,8 @@ precmd_functions+=(__panea_precmd)
 preexec_functions+=(__panea_preexec)
 __panea_precmd() {
   local status=$?
+  local elevated=false
+  if (( EUID == 0 )); then elevated=true; fi
   if (( __panea_active )); then
     __panea_osc "output_end"
     __panea_osc "command_finished;status=$status"
@@ -760,7 +764,7 @@ __panea_precmd() {
   fi
   __panea_osc "cwd;path=$PWD"
   __panea_osc "shell;shell=zsh;cwd=$PWD"
-  __panea_osc "prompt_start;shell=zsh;cwd=$PWD"
+  __panea_osc "prompt_start;shell=zsh;cwd=$PWD;elevated=$elevated"
 }
 __panea_preexec() {
   __panea_osc "input_end"
@@ -775,6 +779,8 @@ function __panea_osc
     printf '\e]777;%s\a' $argv[1]
 end
 function __panea_prompt --on-event fish_prompt
+    set -l elevated false
+    fish_is_root_user; and set elevated true
     if set -q __panea_active
         __panea_osc "output_end"
         __panea_osc "command_finished;status=$__panea_status"
@@ -782,7 +788,7 @@ function __panea_prompt --on-event fish_prompt
     end
     __panea_osc "cwd;path=$PWD"
     __panea_osc "shell;shell=fish;cwd=$PWD"
-    __panea_osc "prompt_start;shell=fish;cwd=$PWD"
+    __panea_osc "prompt_start;shell=fish;cwd=$PWD;elevated=$elevated"
 end
 function __panea_preexec --on-event fish_preexec
     __panea_osc "prompt_end"
@@ -804,6 +810,15 @@ if (Test-Path function:\prompt) {
     Copy-Item function:\prompt function:\__PaneaOriginalPrompt -Force
 }
 $global:__PaneaCommandActive = $false
+$global:__PaneaElevated = try {
+    if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+        $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } else {
+        ((& id -u) -as [int]) -eq 0
+    }
+} catch { $false }
 if (Get-Module PSReadLine) {
     $paneaEnterHandler = Get-PSReadLineKeyHandler -Bound |
       Where-Object { ($_.Key -eq 'Enter') -or ($_.Key -contains 'Enter') } |
@@ -828,7 +843,7 @@ function global:prompt {
     }
     __PaneaOsc "cwd;path=$PWD"
     __PaneaOsc "shell;shell=powershell;cwd=$PWD;prompt_marker=fallback_prefix"
-    __PaneaOsc "prompt_start;shell=powershell;cwd=$PWD"
+    __PaneaOsc "prompt_start;shell=powershell;cwd=$PWD;elevated=$($global:__PaneaElevated.ToString().ToLowerInvariant())"
     __PaneaOsc "prompt_end"
     __PaneaOsc "input_start"
     if (Test-Path function:\__PaneaOriginalPrompt) {

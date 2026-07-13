@@ -1234,9 +1234,20 @@ impl RenderBatchPlanner {
                 } else {
                     &mut decorations
                 };
-                push_solid_quad(batch, bounds, overlay.color);
+                push_rounded_quads(
+                    batch,
+                    bounds,
+                    u32::from(overlay.corner_radius_px),
+                    overlay.color,
+                );
                 if let Some(border_color) = overlay.border_color {
-                    push_stroke_quads(batch, bounds, border_color);
+                    push_rounded_stroke_quads(
+                        batch,
+                        bounds,
+                        u32::from(overlay.border_width_px.max(1)),
+                        u32::from(overlay.corner_radius_px),
+                        border_color,
+                    );
                 }
                 let mut glyph_context = GlyphBatchContext {
                     atlas_uploads: &mut atlas_uploads,
@@ -1254,7 +1265,7 @@ impl RenderBatchPlanner {
             if intersects_any(bounds, &damage_regions) {
                 push_solid_quad(&mut decorations, bounds, decoration.color);
                 if let Some(border_color) = decoration.border_color {
-                    push_stroke_quads(&mut decorations, bounds, border_color);
+                    push_stroke_quads(&mut decorations, bounds, 1, border_color);
                 }
             }
         }
@@ -1455,7 +1466,9 @@ impl RenderBatchPlanner {
         let cell = RenderCell {
             position: CellPosition { row: 0, col: 0 },
             text: label.clone(),
-            foreground: overlay_label_color(overlay.kind),
+            foreground: overlay
+                .label_color
+                .unwrap_or_else(|| overlay_label_color(overlay.kind)),
             background: RenderColor {
                 red: 0,
                 green: 0,
@@ -1541,7 +1554,7 @@ fn overlay_label_rect(overlay: &OverlayPrimitive, metrics: CellMetrics) -> Rende
 
 fn overlay_label_color(kind: OverlayKind) -> RenderColor {
     match kind {
-        OverlayKind::Badge => RenderColor::rgb(245, 248, 252),
+        OverlayKind::Badge | OverlayKind::ContentMask => RenderColor::rgb(245, 248, 252),
         OverlayKind::PerformanceOverlay => RenderColor::rgb(225, 232, 240),
         OverlayKind::PromptDecoration
         | OverlayKind::CommandBlock
@@ -1660,27 +1673,35 @@ fn color_to_f32(color: RenderColor) -> [f32; 4] {
     ]
 }
 
-fn push_stroke_quads(batch: &mut QuadBatch, rect: RenderRect, color: RenderColor) {
+fn push_stroke_quads(batch: &mut QuadBatch, rect: RenderRect, width: u32, color: RenderColor) {
     if rect.width == 0 || rect.height == 0 {
         return;
     }
 
-    push_solid_quad(batch, RenderRect { height: 1, ..rect }, color);
+    let width = width.max(1).min(rect.width).min(rect.height);
     push_solid_quad(
         batch,
         RenderRect {
-            y: rect.y + rect.height.saturating_sub(1) as i32,
-            height: 1,
+            height: width,
             ..rect
         },
         color,
     );
-    push_solid_quad(batch, RenderRect { width: 1, ..rect }, color);
     push_solid_quad(
         batch,
         RenderRect {
-            x: rect.x + rect.width.saturating_sub(1) as i32,
-            width: 1,
+            y: rect.y + rect.height.saturating_sub(width) as i32,
+            height: width,
+            ..rect
+        },
+        color,
+    );
+    push_solid_quad(batch, RenderRect { width, ..rect }, color);
+    push_solid_quad(
+        batch,
+        RenderRect {
+            x: rect.x + rect.width.saturating_sub(width) as i32,
+            width,
             ..rect
         },
         color,
@@ -2565,9 +2586,11 @@ fn prompt_decoration_scene() -> RenderScene {
             alpha: 72,
         },
         border_color: Some(RenderColor::rgb(92, 170, 180)),
+        border_width_px: 1,
         corner_radius_px: 4,
         z_index: 5,
         label: Some("prompt".to_owned()),
+        label_color: None,
     }];
     scene
 }
@@ -2641,9 +2664,11 @@ fn transparency_scene() -> RenderScene {
                 blue: 180,
                 alpha: 180,
             }),
+            border_width_px: 1,
             corner_radius_px: 3,
             z_index: 2,
             label: Some("opacity".to_owned()),
+            label_color: None,
         },
         OverlayPrimitive {
             kind: OverlayKind::Badge,
@@ -2660,9 +2685,11 @@ fn transparency_scene() -> RenderScene {
                 alpha: 88,
             },
             border_color: None,
+            border_width_px: 0,
             corner_radius_px: 2,
             z_index: 3,
             label: Some("badge".to_owned()),
+            label_color: None,
         },
     ];
     scene
@@ -2845,9 +2872,11 @@ fn command_block_overlay(
             alpha: 150,
             ..color
         }),
+        border_width_px: 1,
         corner_radius_px: 4,
         z_index: 8,
         label: Some("command".to_owned()),
+        label_color: None,
     }
 }
 
@@ -2954,10 +2983,21 @@ impl TerminalRasterizer {
                 continue;
             }
             let bounds = offset_region(overlay.bounds, scene.content_offset);
-            blend_rect(&mut frame, bounds, overlay.color);
+            blend_rounded_rect(
+                &mut frame,
+                bounds,
+                u32::from(overlay.corner_radius_px),
+                overlay.color,
+            );
             instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
             if let Some(border_color) = overlay.border_color {
-                stroke_rect(&mut frame, bounds, border_color);
+                stroke_rounded_rect(
+                    &mut frame,
+                    bounds,
+                    u32::from(overlay.border_width_px.max(1)),
+                    u32::from(overlay.corner_radius_px),
+                    border_color,
+                );
                 instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
             }
         }
@@ -2993,10 +3033,21 @@ impl TerminalRasterizer {
                 continue;
             }
             let bounds = offset_region(overlay.bounds, scene.content_offset);
-            blend_rect(&mut frame, bounds, overlay.color);
+            blend_rounded_rect(
+                &mut frame,
+                bounds,
+                u32::from(overlay.corner_radius_px),
+                overlay.color,
+            );
             instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
             if let Some(border_color) = overlay.border_color {
-                stroke_rect(&mut frame, bounds, border_color);
+                stroke_rounded_rect(
+                    &mut frame,
+                    bounds,
+                    u32::from(overlay.border_width_px.max(1)),
+                    u32::from(overlay.corner_radius_px),
+                    border_color,
+                );
                 instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
             }
             self.draw_overlay_label(
@@ -3098,7 +3149,9 @@ impl TerminalRasterizer {
         let cell = RenderCell {
             position: CellPosition { row: 0, col: 0 },
             text: label.clone(),
-            foreground: overlay_label_color(overlay.kind),
+            foreground: overlay
+                .label_color
+                .unwrap_or_else(|| overlay_label_color(overlay.kind)),
             background: RenderColor {
                 red: 0,
                 green: 0,
@@ -3300,27 +3353,115 @@ fn blend_rect(frame: &mut CpuFrame, rect: RenderRect, color: RenderColor) {
     }
 }
 
-fn stroke_rect(frame: &mut CpuFrame, rect: RenderRect, color: RenderColor) {
+fn blend_rounded_rect(frame: &mut CpuFrame, rect: RenderRect, radius: u32, color: RenderColor) {
+    let radius = radius.min(rect.width / 2).min(rect.height / 2);
+    if radius == 0 {
+        blend_rect(frame, rect, color);
+        return;
+    }
+    for y in 0..rect.height {
+        let inset = rounded_inset(radius, y, rect.height);
+        blend_rect(
+            frame,
+            RenderRect {
+                x: rect.x.saturating_add(inset as i32),
+                y: rect.y.saturating_add(y as i32),
+                width: rect.width.saturating_sub(inset.saturating_mul(2)),
+                height: 1,
+            },
+            color,
+        );
+    }
+}
+
+fn stroke_rounded_rect(
+    frame: &mut CpuFrame,
+    rect: RenderRect,
+    width: u32,
+    radius: u32,
+    color: RenderColor,
+) {
+    let radius = radius.min(rect.width / 2).min(rect.height / 2);
+    if radius == 0 {
+        stroke_rect(frame, rect, width, color);
+        return;
+    }
+    let width = width.max(1).min(rect.width / 2).min(rect.height / 2);
+    for y in 0..rect.height {
+        let outer = rounded_inset(radius, y, rect.height);
+        if y < width || y >= rect.height.saturating_sub(width) {
+            fill_rect(
+                frame,
+                RenderRect {
+                    x: rect.x.saturating_add(outer as i32),
+                    y: rect.y.saturating_add(y as i32),
+                    width: rect.width.saturating_sub(outer.saturating_mul(2)),
+                    height: 1,
+                },
+                color,
+            );
+            continue;
+        }
+        let inner = width.saturating_add(rounded_inset(
+            radius.saturating_sub(width),
+            y.saturating_sub(width),
+            rect.height.saturating_sub(width.saturating_mul(2)),
+        ));
+        let side = inner.saturating_sub(outer);
+        fill_rect(
+            frame,
+            RenderRect {
+                x: rect.x.saturating_add(outer as i32),
+                y: rect.y.saturating_add(y as i32),
+                width: side,
+                height: 1,
+            },
+            color,
+        );
+        fill_rect(
+            frame,
+            RenderRect {
+                x: rect
+                    .x
+                    .saturating_add(rect.width.saturating_sub(inner) as i32),
+                y: rect.y.saturating_add(y as i32),
+                width: side,
+                height: 1,
+            },
+            color,
+        );
+    }
+}
+
+fn stroke_rect(frame: &mut CpuFrame, rect: RenderRect, width: u32, color: RenderColor) {
     if rect.width == 0 || rect.height == 0 {
         return;
     }
 
-    fill_rect(frame, RenderRect { height: 1, ..rect }, color);
+    let width = width.max(1).min(rect.width).min(rect.height);
     fill_rect(
         frame,
         RenderRect {
-            y: rect.y + rect.height.saturating_sub(1) as i32,
-            height: 1,
+            height: width,
             ..rect
         },
         color,
     );
-    fill_rect(frame, RenderRect { width: 1, ..rect }, color);
     fill_rect(
         frame,
         RenderRect {
-            x: rect.x + rect.width.saturating_sub(1) as i32,
-            width: 1,
+            y: rect.y + rect.height.saturating_sub(width) as i32,
+            height: width,
+            ..rect
+        },
+        color,
+    );
+    fill_rect(frame, RenderRect { width, ..rect }, color);
+    fill_rect(
+        frame,
+        RenderRect {
+            x: rect.x + rect.width.saturating_sub(width) as i32,
+            width,
             ..rect
         },
         color,
@@ -4641,9 +4782,11 @@ mod tests {
             },
             color: RenderColor::rgb(20, 20, 20),
             border_color: None,
+            border_width_px: 0,
             corner_radius_px: 0,
             z_index: 0,
             label: None,
+            label_color: None,
         });
         let _ = tracker.update(&first, metrics());
 
@@ -4722,9 +4865,11 @@ mod tests {
                     alpha: 96,
                 },
                 border_color: Some(RenderColor::rgb(43, 185, 115)),
+                border_width_px: 1,
                 corner_radius_px: 4,
                 z_index: 10,
                 label: None,
+                label_color: None,
             },
             OverlayPrimitive {
                 kind: OverlayKind::Badge,
@@ -4741,9 +4886,11 @@ mod tests {
                     alpha: 148,
                 },
                 border_color: None,
+                border_width_px: 0,
                 corner_radius_px: 3,
                 z_index: 30,
                 label: Some("ok".to_owned()),
+                label_color: None,
             },
         ];
 
@@ -4760,6 +4907,28 @@ mod tests {
             "badge rectangle should be an overlay decoration"
         );
         assert_eq!(batches.overlay_glyphs.glyph_count, 2);
+    }
+
+    #[test]
+    fn collapsed_content_masks_render_above_terminal_glyphs() {
+        assert!(!overlay_draws_behind_terminal_text(
+            OverlayKind::ContentMask
+        ));
+
+        let mut batch = QuadBatch::new(QuadBatchKind::Decoration);
+        push_rounded_stroke_quads(
+            &mut batch,
+            RenderRect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 32,
+            },
+            3,
+            6,
+            RenderColor::rgb(255, 255, 255),
+        );
+        assert!(batch.quad_count() > 4);
     }
 
     #[test]

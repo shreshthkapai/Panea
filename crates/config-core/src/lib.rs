@@ -535,6 +535,7 @@ impl AppConfig {
             report.error("visual_theme.name", "visual theme name cannot be empty");
         }
         if self.visual_theme.spacing.cell_gap_px > 24
+            || self.visual_theme.spacing.block_margin_px > 64
             || self.visual_theme.spacing.block_padding_px > 64
         {
             report.error(
@@ -552,6 +553,18 @@ impl AppConfig {
             report.warning(
                 "command_blocks.allow_in_alternate_screen",
                 "command block overlays in alternate screen applications can obscure TUIs",
+            );
+        }
+        if self.command_blocks.collapse_after_lines == 0 {
+            report.error(
+                "command_blocks.collapse_after_lines",
+                "collapse threshold must be at least one line",
+            );
+        }
+        if self.command_blocks.collapsed_preview_lines >= self.command_blocks.collapse_after_lines {
+            report.error(
+                "command_blocks.collapsed_preview_lines",
+                "collapsed preview must be smaller than the collapse threshold",
             );
         }
         if self.prompt_decorations.allow_in_alternate_screen {
@@ -1093,6 +1106,12 @@ pub struct VisualThemeConfig {
     pub spacing: VisualSpacingConfig,
     pub borders: VisualBorderConfig,
     pub badges: VisualBadgeConfig,
+    pub prompt_background: RgbaColor,
+    pub command_background: RgbaColor,
+    pub input_background: RgbaColor,
+    pub output_background: RgbaColor,
+    pub badge_background: RgbaColor,
+    pub badge_foreground: RgbaColor,
     pub success_color: RgbaColor,
     pub error_color: RgbaColor,
 }
@@ -1109,6 +1128,37 @@ impl Default for VisualThemeConfig {
             spacing: VisualSpacingConfig::default(),
             borders: VisualBorderConfig::default(),
             badges: VisualBadgeConfig::default(),
+            prompt_background: RgbaColor {
+                red: 80,
+                green: 150,
+                blue: 255,
+                alpha: 28,
+            },
+            command_background: RgbaColor {
+                red: 38,
+                green: 44,
+                blue: 52,
+                alpha: 82,
+            },
+            input_background: RgbaColor {
+                red: 80,
+                green: 150,
+                blue: 255,
+                alpha: 28,
+            },
+            output_background: RgbaColor {
+                red: 180,
+                green: 190,
+                blue: 205,
+                alpha: 24,
+            },
+            badge_background: RgbaColor {
+                red: 32,
+                green: 38,
+                blue: 46,
+                alpha: 220,
+            },
+            badge_foreground: RgbaColor::rgb(245, 248, 252),
             success_color: RgbaColor::rgb(43, 185, 115),
             error_color: RgbaColor::rgb(230, 72, 86),
         }
@@ -1131,6 +1181,7 @@ pub enum InputOutputGroupingStyle {
 #[serde(default)]
 pub struct VisualSpacingConfig {
     pub cell_gap_px: u8,
+    pub block_margin_px: u8,
     pub block_padding_px: u8,
     pub badge_gap_px: u8,
 }
@@ -1139,6 +1190,7 @@ impl Default for VisualSpacingConfig {
     fn default() -> Self {
         Self {
             cell_gap_px: 0,
+            block_margin_px: 3,
             block_padding_px: 6,
             badge_gap_px: 4,
         }
@@ -1168,7 +1220,7 @@ impl Default for VisualBorderConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct VisualBadgeConfig {
     pub shell: bool,
@@ -1176,18 +1228,6 @@ pub struct VisualBadgeConfig {
     pub remote: bool,
     pub admin: bool,
     pub status: bool,
-}
-
-impl Default for VisualBadgeConfig {
-    fn default() -> Self {
-        Self {
-            shell: false,
-            current_directory: true,
-            remote: true,
-            admin: true,
-            status: true,
-        }
-    }
 }
 
 #[must_use]
@@ -1320,6 +1360,8 @@ pub struct CommandBlocksConfig {
     pub copy_actions_enabled: bool,
     pub jump_actions_enabled: bool,
     pub collapse_long_output: bool,
+    pub collapse_after_lines: u16,
+    pub collapsed_preview_lines: u16,
 }
 
 impl Default for CommandBlocksConfig {
@@ -1336,6 +1378,8 @@ impl Default for CommandBlocksConfig {
             copy_actions_enabled: true,
             jump_actions_enabled: true,
             collapse_long_output: false,
+            collapse_after_lines: 200,
+            collapsed_preview_lines: 1,
         }
     }
 }
@@ -1343,6 +1387,7 @@ impl Default for CommandBlocksConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandBlockStyle {
+    Traditional,
     #[default]
     Subtle,
     Card,
@@ -1465,6 +1510,7 @@ impl Default for KeyboardConfig {
                 KeyBinding::new("Ctrl+Shift+Y", "select_current_command_output"),
                 KeyBinding::new("Ctrl+Shift+U", "copy_current_command_output"),
                 KeyBinding::new("Ctrl+Shift+A", "copy_command_and_output"),
+                KeyBinding::new("Ctrl+Shift+G", "toggle_current_command_output"),
                 KeyBinding::new("Shift+PageUp", "scroll_page_up"),
                 KeyBinding::new("Shift+PageDown", "scroll_page_down"),
                 KeyBinding::new("Ctrl+Shift+Home", "scroll_to_top"),
@@ -2217,6 +2263,12 @@ pub struct VisualThemeConfigPatch {
     pub spacing: Option<VisualSpacingConfig>,
     pub borders: Option<VisualBorderConfig>,
     pub badges: Option<VisualBadgeConfig>,
+    pub prompt_background: Option<RgbaColor>,
+    pub command_background: Option<RgbaColor>,
+    pub input_background: Option<RgbaColor>,
+    pub output_background: Option<RgbaColor>,
+    pub badge_background: Option<RgbaColor>,
+    pub badge_foreground: Option<RgbaColor>,
     pub success_color: Option<RgbaColor>,
     pub error_color: Option<RgbaColor>,
 }
@@ -2238,6 +2290,12 @@ impl VisualThemeConfigPatch {
         apply_opt(&mut config.spacing, &self.spacing);
         apply_opt(&mut config.borders, &self.borders);
         apply_opt(&mut config.badges, &self.badges);
+        apply_opt(&mut config.prompt_background, &self.prompt_background);
+        apply_opt(&mut config.command_background, &self.command_background);
+        apply_opt(&mut config.input_background, &self.input_background);
+        apply_opt(&mut config.output_background, &self.output_background);
+        apply_opt(&mut config.badge_background, &self.badge_background);
+        apply_opt(&mut config.badge_foreground, &self.badge_foreground);
         apply_opt(&mut config.success_color, &self.success_color);
         apply_opt(&mut config.error_color, &self.error_color);
     }
@@ -2325,6 +2383,8 @@ pub struct CommandBlocksConfigPatch {
     pub copy_actions_enabled: Option<bool>,
     pub jump_actions_enabled: Option<bool>,
     pub collapse_long_output: Option<bool>,
+    pub collapse_after_lines: Option<u16>,
+    pub collapsed_preview_lines: Option<u16>,
 }
 
 impl CommandBlocksConfigPatch {
@@ -2349,6 +2409,11 @@ impl CommandBlocksConfigPatch {
         apply_opt(&mut config.copy_actions_enabled, &self.copy_actions_enabled);
         apply_opt(&mut config.jump_actions_enabled, &self.jump_actions_enabled);
         apply_opt(&mut config.collapse_long_output, &self.collapse_long_output);
+        apply_opt(&mut config.collapse_after_lines, &self.collapse_after_lines);
+        apply_opt(
+            &mut config.collapsed_preview_lines,
+            &self.collapsed_preview_lines,
+        );
     }
 }
 
@@ -3016,6 +3081,27 @@ pub fn export_schema() -> ConfigSchema {
                         false,
                     ),
                     field(
+                        "command_blocks.collapse_long_output",
+                        "boolean",
+                        default.command_blocks.collapse_long_output,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "command_blocks.collapse_after_lines",
+                        "integer",
+                        default.command_blocks.collapse_after_lines,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "command_blocks.collapsed_preview_lines",
+                        "integer",
+                        default.command_blocks.collapsed_preview_lines,
+                        true,
+                        false,
+                    ),
+                    field(
                         "prompt_decorations.allow_in_alternate_screen",
                         "boolean",
                         default.prompt_decorations.allow_in_alternate_screen,
@@ -3585,6 +3671,23 @@ mod tests {
             diagnostic.path == "prompt_decorations.allow_in_alternate_screen"
                 && diagnostic.severity == ConfigDiagnosticSeverity::Warning
         }));
+    }
+
+    #[test]
+    fn command_block_collapse_ranges_are_validated() {
+        let mut config = AppConfig::default();
+        config.command_blocks.collapse_after_lines = 4;
+        config.command_blocks.collapsed_preview_lines = 4;
+
+        let report = config.validate();
+
+        assert!(report.has_errors());
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.path == "command_blocks.collapsed_preview_lines" })
+        );
     }
 
     #[test]

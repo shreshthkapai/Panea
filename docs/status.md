@@ -87,7 +87,7 @@ These areas are real foundations but must not be called complete:
 | Input, clipboard, selection, and scrollback UX | tested | Shared key/application-mode encoding, mouse/focus protocols, absolute normal/rectangular mouse and keyboard selection, selection overlays, anchored wheel/page scrollback, interactive search, portable HTTP(S) URL activation, keyboard copy/paste, Linux primary-selection provider behavior, paste protection, bracketed paste, middle-click paste, and OSC 52 policy exist. Real macOS/Linux runtime verification, remote OSC 52 confirmation UI, and full app compatibility coverage remain. |
 | Baseline compatibility | tested | The xterm-256color protocol implementation and Windows required compatibility smoke are tested; full interactive evidence for editors, pagers, TUIs, tmux, screen, zellij, SSH, WSL, and all target OSes remains tracked by app/cross-OS verification. |
 | Shell integration | partial | Local runtime activation planning and desktop injection exist for supported shells, with Windows PowerShell semantic smoke verified. Remote install flows, heuristic command detection, WSL-specific coverage, and real bash/zsh/fish/macOS/Linux session verification remain. |
-| Visual overlays | partial | Semantic command-block overlay projection, badge glyph batching, cursor animation quads, and image cursor metadata caching exist; collapse/expand behavior, polished interactive UI, full image cursor frame upload/draw, real shell-driven verification, and cross-OS visual verification remain. |
+| Visual overlays | tested | Prompt separators/boxes/pills, real metadata badges and status accents, distinct command/grouping styles, viewport-correct command cards, presentation-only output collapse/expand, configured spacing/borders/colors, alternate-screen suppression, damage tracking, and batched overlay glyphs pass Windows-host automated tests. Full image cursor frame upload/draw, real non-Windows shell-driven verification, and cross-OS visual verification remain separate work. |
 | Native mux runtime | tested | Runtime workspaces, tabs, nested local/SSH panes, startup/restored layouts and configurable appearance are implemented. Drag UI, reconnect UI, cross-OS GUI runs and automated nested external-mux runs remain unverified/deferred. |
 | SSH UX and security | partial | Provider contracts and real-server smoke harness exist, but desktop host-key approval UI, changed-host-key resolution UI, password/passphrase prompt UI, native OS keychain backend wiring, reconnect UI, proxy jump, and collected real-server reports remain. |
 | Performance reporting | partial | GPU timestamp query wiring and a developer in-window overlay exist, but real timestamp samples across hardware/backends, polished installed overlay UX, CI regression gates, and reproducible cross-machine benchmark reporting remain. |
@@ -127,8 +127,8 @@ The following major accepted features have no complete product behavior yet:
   changes, and backend failure simulation across desktop OSes.
 - Remote OSC 52 confirmation UI and real Linux primary-selection compositor verification.
 - Native OS watcher backends and real macOS/Linux runtime reload validation.
-- Product-complete desktop tabs/panes/sessions/workspaces runtime, including
-  startup layouts, SSH panes, polished chrome, and cross-OS smoke tests.
+- Cross-OS GUI smoke and interaction polish for the implemented desktop
+  tabs/panes/sessions/workspaces runtime.
 - Remote shell integration install flows and real bash/zsh/fish/macOS/Linux
   shell verification.
 - Full animated image cursor pixel-frame decode/upload/draw path and cross-OS
@@ -152,7 +152,7 @@ The following major accepted features have no complete product behavior yet:
 | render performance | partial | Persistent WGPU batches, retained-frame damage, shaping/glyph/emoji caches, low-idle scheduling, benchmarks, renderer recovery, screenshots, GPU timing, and a developer overlay exist; real device-loss/GPU timing and cross-OS runtime validation remain. |
 | config portability | partial | Schema-v2 defaults/migrations, TOML discovery/validation, portable overrides, schema export, safe TOML/programmable live reload, and controlled programmable compilation exist; cross-OS runtime reload validation remains. |
 | semantic meaning | tested | Semantic events, byte-positioned timeline updates, complete local hook marker sets, desktop activation, remote metadata context, command navigation and output copy are implemented; real remote and non-Windows shell verification remain. |
-| visual overlay | partial | Prompt and command block overlay projection, input/output grouping, metadata badges, alternate-screen suppression, renderer overlay glyph batching, and cursor animation quads exist; collapse/expand UI, full cursor image drawing, and cross-OS visual smoke remain. |
+| visual overlay | tested | Prompt and command-block styles, real metadata/status badges, input/output grouping, renderer-only collapse masks, alternate-screen suppression, scrollback projection, configured rounded borders, damage tracking, and overlay glyph batching pass automated Windows-host tests; full cursor image drawing and cross-OS visual smoke remain. |
 | session transport | partial | Local and SSH transport foundations plus the SSH real-server smoke harness exist; non-Windows local smoke, collected SSH server reports, and app UX remain. |
 | multiplexer structure | partial | Model and local desktop runtime wiring exist; startup layouts, SSH panes, polished chrome, and cross-OS smoke remain. |
 | diagnostics | partial | Installed and xtask doctor diagnostics plus packaged doctor smoke exist; richer live platform reports and cross-OS doctor/package output verification remain. |

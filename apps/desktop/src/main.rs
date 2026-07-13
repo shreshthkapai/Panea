@@ -970,28 +970,35 @@ fn run() -> Result<(), Box<dyn Error>> {
                                             window.request_redraw();
                                         }
                                         "jump_to_previous_command" => {
-                                            let _ = mux_runtime.run_semantic_action(
-                                                SemanticAction::JumpToPreviousCommand,
-                                            );
-                                            scheduler.terminal_content_changed();
-                                            window.request_redraw();
+                                            if config.command_blocks.jump_actions_enabled {
+                                                let _ = mux_runtime.run_semantic_action(
+                                                    SemanticAction::JumpToPreviousCommand,
+                                                );
+                                                scheduler.terminal_content_changed();
+                                                window.request_redraw();
+                                            }
                                         }
                                         "jump_to_next_command" => {
-                                            let _ = mux_runtime.run_semantic_action(
-                                                SemanticAction::JumpToNextCommand,
-                                            );
-                                            scheduler.terminal_content_changed();
-                                            window.request_redraw();
+                                            if config.command_blocks.jump_actions_enabled {
+                                                let _ = mux_runtime.run_semantic_action(
+                                                    SemanticAction::JumpToNextCommand,
+                                                );
+                                                scheduler.terminal_content_changed();
+                                                window.request_redraw();
+                                            }
                                         }
                                         "select_current_command_output" => {
-                                            let _ = mux_runtime.run_semantic_action(
-                                                SemanticAction::SelectCurrentCommandOutput,
-                                            );
-                                            scheduler.terminal_content_changed();
-                                            window.request_redraw();
+                                            if config.command_blocks.copy_actions_enabled {
+                                                let _ = mux_runtime.run_semantic_action(
+                                                    SemanticAction::SelectCurrentCommandOutput,
+                                                );
+                                                scheduler.terminal_content_changed();
+                                                window.request_redraw();
+                                            }
                                         }
                                         "copy_current_command_output" => {
-                                            if let SemanticActionResult::Text(text) = mux_runtime
+                                            if config.command_blocks.copy_actions_enabled
+                                                && let SemanticActionResult::Text(text) = mux_runtime
                                                 .run_semantic_action(
                                                     SemanticAction::CopyCurrentCommandOutput,
                                                 )
@@ -1005,7 +1012,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                                             }
                                         }
                                         "copy_command_and_output" => {
-                                            if let SemanticActionResult::Text(text) = mux_runtime
+                                            if config.command_blocks.copy_actions_enabled
+                                                && let SemanticActionResult::Text(text) = mux_runtime
                                                 .run_semantic_action(
                                                     SemanticAction::CopyCommandAndOutput,
                                                 )
@@ -1016,6 +1024,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                                                     &clipboard_config,
                                                     "semantic command and output copy",
                                                 );
+                                            }
+                                        }
+                                        "toggle_current_command_output" => {
+                                            if mux_runtime.toggle_current_command_output(&config) {
+                                                scheduler.terminal_content_changed();
+                                                window.request_redraw();
                                             }
                                         }
                                         "toggle_fullscreen" => {
@@ -3154,6 +3168,11 @@ impl MuxRuntime {
             })
     }
 
+    fn toggle_current_command_output(&mut self, config: &AppConfig) -> bool {
+        self.active_pane_mut()
+            .is_some_and(|pane| pane.toggle_current_command_output(config))
+    }
+
     fn handle_modal_key(&mut self, event: &KeyEvent) -> Option<bool> {
         self.active_pane_mut()?.handle_modal_key(event)
     }
@@ -3602,6 +3621,9 @@ struct PaneRuntime {
     selection_kind: SelectionKind,
     keyboard_selection: Option<KeyboardSelection>,
     search: PaneSearch,
+    /// Per-command presentation override. `true` is collapsed, `false` keeps
+    /// an otherwise auto-collapsed block expanded. Raw terminal data is untouched.
+    command_output_collapsed: HashMap<u64, bool>,
 }
 
 #[derive(Debug, Default)]
@@ -3761,7 +3783,42 @@ impl PaneRuntime {
             selection_kind: SelectionKind::Normal,
             keyboard_selection: None,
             search: PaneSearch::default(),
+            command_output_collapsed: HashMap::new(),
         }
+    }
+
+    fn toggle_current_command_output(&mut self, config: &AppConfig) -> bool {
+        if !config.command_blocks.enabled {
+            return false;
+        }
+        let cursor = self.terminal.state().cursor_buffer_position();
+        let Some(block) = self
+            .semantic_timeline
+            .current_command(BufferPosition::new(cursor.row, cursor.col))
+            .or_else(|| {
+                self.semantic_timeline
+                    .previous_command(BufferPosition::new(cursor.row, cursor.col))
+            })
+        else {
+            return false;
+        };
+        let output_rows = self
+            .semantic_timeline
+            .output_span_for_command(block)
+            .map_or(0, semantic_span_rows);
+        if output_rows <= u32::from(config.command_blocks.collapsed_preview_lines) {
+            return false;
+        }
+        let auto_collapsed = config.command_blocks.collapse_long_output
+            && output_rows > u32::from(config.command_blocks.collapse_after_lines);
+        let currently_collapsed = self
+            .command_output_collapsed
+            .get(&block.region_id)
+            .copied()
+            .unwrap_or(auto_collapsed);
+        self.command_output_collapsed
+            .insert(block.region_id, !currently_collapsed);
+        true
     }
 
     fn start_keyboard_selection(&mut self, kind: SelectionKind) {
@@ -4258,6 +4315,7 @@ fn append_pane_scene(
         &pane.terminal,
         &pane.semantic_timeline,
         &pane.search,
+        &pane.command_output_collapsed,
         metrics,
         config,
         cursor,
@@ -4431,9 +4489,11 @@ fn append_performance_overlay(
                 blue: 122,
                 alpha: 180,
             }),
+            border_width_px: 1,
             corner_radius_px: 4,
             z_index: 1000,
             label: Some(label),
+            label_color: None,
         });
         y = y.saturating_add(line_height as i32 + 5);
     }
@@ -4475,6 +4535,7 @@ fn scene_from_terminal(
     terminal: &TerminalEmulator,
     semantic_timeline: &SemanticTimelineStore,
     search: &PaneSearch,
+    command_output_collapsed: &HashMap<u64, bool>,
     metrics: Option<CellMetrics>,
     config: &AppConfig,
     presentation: CursorPresentation,
@@ -4534,10 +4595,14 @@ fn scene_from_terminal(
         let mut overlays = url_hint_overlays(terminal, visible.viewport.size.rows, metrics);
         overlays.extend(semantic_visual_overlays(
             semantic_timeline,
+            command_output_collapsed,
             terminal.modes().contains(&TerminalMode::AlternateScreen),
-            visible.viewport.size.rows,
-            visible.viewport.size.cols,
-            metrics,
+            SemanticOverlayViewport {
+                origin_row: visible.viewport.origin_row,
+                rows: visible.viewport.size.rows,
+                cols: visible.viewport.size.cols,
+                metrics,
+            },
             config,
         ));
         overlays
@@ -4646,6 +4711,7 @@ fn search_overlays(
     config: &AppConfig,
 ) -> Vec<OverlayPrimitive> {
     let mut overlays = Vec::new();
+
     for (index, selection) in search.matches.iter().enumerate() {
         let (start, end) = if selection.start <= selection.end {
             (selection.start, selection.end)
@@ -4684,9 +4750,11 @@ fn search_overlays(
                     }
                 },
                 border_color: None,
+                border_width_px: 0,
                 corner_radius_px: 1,
                 z_index: 12,
                 label: None,
+                label_color: None,
             });
         }
     }
@@ -4717,9 +4785,11 @@ fn search_overlays(
                 alpha: 235,
             },
             border_color: Some(render_color(config.colors.selection_background)),
+            border_width_px: 1,
             corner_radius_px: 4,
             z_index: 100,
             label: Some(label),
+            label_color: None,
         });
     }
     overlays
@@ -4807,9 +4877,11 @@ fn url_hint_overlays(
                 alpha: 64,
             },
             border_color: None,
+            border_width_px: 0,
             corner_radius_px: 2,
             z_index: 10,
             label: Some(hint.text),
+            label_color: None,
         })
         .collect()
 }
@@ -4847,12 +4919,19 @@ fn line_column_for_char_offset(line: &term_core::Line, offset: usize) -> u16 {
     col
 }
 
-fn semantic_visual_overlays(
-    semantic_timeline: &SemanticTimelineStore,
-    alternate_screen_active: bool,
+#[derive(Debug, Clone, Copy)]
+struct SemanticOverlayViewport {
+    origin_row: i64,
     rows: u16,
     cols: u16,
     metrics: CellMetrics,
+}
+
+fn semantic_visual_overlays(
+    semantic_timeline: &SemanticTimelineStore,
+    command_output_collapsed: &HashMap<u64, bool>,
+    alternate_screen_active: bool,
+    viewport: SemanticOverlayViewport,
     config: &AppConfig,
 ) -> Vec<OverlayPrimitive> {
     let mut overlays = Vec::new();
@@ -4862,9 +4941,7 @@ fn semantic_visual_overlays(
     {
         overlays.extend(prompt_decoration_overlays(
             semantic_timeline,
-            rows,
-            cols,
-            metrics,
+            viewport,
             config,
         ));
     }
@@ -4873,9 +4950,8 @@ fn semantic_visual_overlays(
     {
         overlays.extend(command_block_overlays(
             semantic_timeline,
-            rows,
-            cols,
-            metrics,
+            command_output_collapsed,
+            viewport,
             config,
         ));
     }
@@ -4885,72 +4961,119 @@ fn semantic_visual_overlays(
 
 fn prompt_decoration_overlays(
     semantic_timeline: &SemanticTimelineStore,
-    rows: u16,
-    cols: u16,
-    metrics: CellMetrics,
+    viewport: SemanticOverlayViewport,
     config: &AppConfig,
 ) -> Vec<OverlayPrimitive> {
     semantic_timeline
         .regions()
         .iter()
         .filter(|region| region.kind == SemanticRegionKind::Prompt)
-        .filter_map(|region| region.span())
-        .filter_map(|span| row_overlay_bounds(span.start.row, span.end.row, rows, cols, metrics))
-        .map(|bounds| inset_overlay_bounds(bounds, prompt_overlay_padding(config)))
-        .map(|bounds| OverlayPrimitive {
-            kind: OverlayKind::PromptDecoration,
-            bounds,
-            color: prompt_decoration_color(config),
-            border_color: match config.prompt_decorations.style {
-                PromptDecorationStyle::MinimalSeparator => None,
-                PromptDecorationStyle::RoundedBox | PromptDecorationStyle::PillHeader => {
-                    Some(render_color(config.visual_theme.borders.color))
-                }
-            },
-            corner_radius_px: match config.prompt_decorations.style {
-                PromptDecorationStyle::MinimalSeparator => 0,
-                PromptDecorationStyle::RoundedBox | PromptDecorationStyle::PillHeader => {
-                    config.visual_theme.borders.radius_px
-                }
-            },
-            z_index: 20,
-            label: prompt_badge_label(config),
+        .filter_map(|region| {
+            let span = region.span()?;
+            let raw_bounds = row_overlay_bounds(span.start.row, span.end.row, viewport)?;
+            let previous_status = semantic_timeline
+                .previous_command(span.start)
+                .map(|block| &block.status);
+            let status_color = previous_status
+                .map(|status| command_status_color(status, config))
+                .unwrap_or_else(|| render_color(config.visual_theme.borders.color));
+            let bounds = prompt_decoration_bounds(raw_bounds, viewport.metrics, config);
+            let color = if config.prompt_decorations.style
+                == PromptDecorationStyle::MinimalSeparator
+                && config.prompt_decorations.show_previous_status_accent
+                && previous_status.is_some()
+            {
+                status_color
+            } else {
+                prompt_decoration_color(config)
+            };
+            Some(OverlayPrimitive {
+                kind: OverlayKind::PromptDecoration,
+                bounds,
+                color,
+                border_color: match config.prompt_decorations.style {
+                    PromptDecorationStyle::MinimalSeparator => None,
+                    PromptDecorationStyle::RoundedBox | PromptDecorationStyle::PillHeader => {
+                        Some(if config.prompt_decorations.show_previous_status_accent {
+                            status_color
+                        } else {
+                            render_color(config.visual_theme.borders.color)
+                        })
+                    }
+                },
+                border_width_px: config.visual_theme.borders.width_px,
+                corner_radius_px: match config.prompt_decorations.style {
+                    PromptDecorationStyle::MinimalSeparator => 0,
+                    PromptDecorationStyle::RoundedBox | PromptDecorationStyle::PillHeader => {
+                        config.visual_theme.borders.radius_px
+                    }
+                },
+                z_index: 20,
+                label: prompt_badge_label(&region.metadata, previous_status, config),
+                label_color: Some(render_color(config.visual_theme.badge_foreground)),
+            })
         })
         .collect()
 }
 
+fn prompt_decoration_bounds(
+    bounds: RenderRect,
+    metrics: CellMetrics,
+    config: &AppConfig,
+) -> RenderRect {
+    let mut bounds = inset_overlay_bounds(bounds, prompt_overlay_padding(config));
+    match config.prompt_decorations.style {
+        PromptDecorationStyle::MinimalSeparator => {
+            let height = u32::from(config.visual_theme.borders.width_px.max(1));
+            bounds.y = bounds
+                .y
+                .saturating_add(bounds.height.saturating_sub(height) as i32);
+            bounds.height = height;
+        }
+        PromptDecorationStyle::RoundedBox => {}
+        PromptDecorationStyle::PillHeader => {
+            bounds.height = (metrics.cell_height * 0.86).ceil().max(12.0) as u32;
+        }
+    }
+    bounds
+}
+
 fn command_block_overlays(
     semantic_timeline: &SemanticTimelineStore,
-    rows: u16,
-    cols: u16,
-    metrics: CellMetrics,
+    command_output_collapsed: &HashMap<u64, bool>,
+    viewport: SemanticOverlayViewport,
     config: &AppConfig,
 ) -> Vec<OverlayPrimitive> {
     let mut overlays = Vec::new();
+
+    if config.command_blocks.style == CommandBlockStyle::Traditional {
+        return overlays;
+    }
 
     for block in semantic_timeline.command_blocks() {
         let Some(span) = semantic_timeline.command_span(block) else {
             continue;
         };
-        let Some(raw_bounds) =
-            row_overlay_bounds(span.start.row, span.end.row, rows, cols, metrics)
-        else {
+        let Some(raw_bounds) = row_overlay_bounds(span.start.row, span.end.row, viewport) else {
             continue;
         };
 
-        let bounds = inset_overlay_bounds(raw_bounds, command_block_padding(config));
+        let bounds = margin_overlay_bounds(raw_bounds, config.visual_theme.spacing.block_margin_px);
+        let decoration_bounds = command_block_bounds(bounds, viewport.metrics, config);
         let metadata = semantic_timeline
             .command_metadata(block)
             .unwrap_or_else(|| semantic_timeline.metadata());
         let status_color = command_status_color(&block.status, config);
         overlays.push(OverlayPrimitive {
             kind: OverlayKind::CommandBlock,
-            bounds,
+            bounds: decoration_bounds,
             color: command_block_fill(config),
             border_color: Some(status_color),
+            border_width_px: config.visual_theme.borders.width_px,
             corner_radius_px: command_block_corner_radius(config),
             z_index: 15,
             label: None,
+            label_color: None,
         });
 
         if config.command_blocks.separate_prompt_input_output {
@@ -4961,9 +5084,7 @@ fn command_block_overlays(
                     (block.input_region_id, "input"),
                     (block.output_region_id, "output"),
                 ],
-                rows,
-                cols,
-                metrics,
+                viewport,
                 config,
             );
         }
@@ -4974,7 +5095,16 @@ fn command_block_overlays(
             block,
             metadata,
             status_color,
-            metrics,
+            viewport.metrics,
+            config,
+        );
+
+        append_collapsed_output_overlay(
+            &mut overlays,
+            semantic_timeline,
+            block,
+            command_output_collapsed,
+            viewport,
             config,
         );
     }
@@ -4982,15 +5112,67 @@ fn command_block_overlays(
     overlays
 }
 
+fn append_collapsed_output_overlay(
+    overlays: &mut Vec<OverlayPrimitive>,
+    timeline: &SemanticTimelineStore,
+    block: &semantics::CommandBlock,
+    collapsed_overrides: &HashMap<u64, bool>,
+    viewport: SemanticOverlayViewport,
+    config: &AppConfig,
+) {
+    let Some(span) = timeline.output_span_for_command(block) else {
+        return;
+    };
+    let output_rows = semantic_span_rows(span);
+    let auto_collapsed = config.command_blocks.collapse_long_output
+        && output_rows > u32::from(config.command_blocks.collapse_after_lines);
+    if !collapsed_overrides
+        .get(&block.region_id)
+        .copied()
+        .unwrap_or(auto_collapsed)
+    {
+        return;
+    }
+
+    let preview_rows = i64::from(config.command_blocks.collapsed_preview_lines);
+    let hidden_start = span.start.row.saturating_add(preview_rows);
+    if hidden_start >= span.end.row {
+        return;
+    }
+    let Some(bounds) = row_overlay_bounds(hidden_start, span.end.row, viewport) else {
+        return;
+    };
+    let hidden_rows = span.end.row.saturating_sub(hidden_start);
+    overlays.push(OverlayPrimitive {
+        kind: OverlayKind::ContentMask,
+        bounds: inset_overlay_bounds(bounds, command_block_padding(config)),
+        color: RenderColor {
+            alpha: u8::MAX,
+            ..render_color(config.colors.background)
+        },
+        border_color: Some(render_color(config.visual_theme.borders.color)),
+        border_width_px: config.visual_theme.borders.width_px,
+        corner_radius_px: command_block_corner_radius(config),
+        z_index: 40,
+        label: Some(format!("{hidden_rows} output lines collapsed")),
+        label_color: Some(render_color(config.visual_theme.badge_foreground)),
+    });
+}
+
+fn semantic_span_rows(span: SemanticSpan) -> u32 {
+    u32::try_from(span.end.row.saturating_sub(span.start.row).max(0)).unwrap_or(u32::MAX)
+}
+
 fn append_input_output_group_overlays(
     overlays: &mut Vec<OverlayPrimitive>,
     semantic_timeline: &SemanticTimelineStore,
     regions: [(Option<u64>, &'static str); 2],
-    rows: u16,
-    cols: u16,
-    metrics: CellMetrics,
+    viewport: SemanticOverlayViewport,
     config: &AppConfig,
 ) {
+    if config.visual_theme.grouping_style == InputOutputGroupingStyle::Traditional {
+        return;
+    }
     for (region_id, label) in regions {
         let Some(region_id) = region_id else {
             continue;
@@ -5003,18 +5185,28 @@ fn append_input_output_group_overlays(
         else {
             continue;
         };
-        let Some(bounds) = row_overlay_bounds(span.start.row, span.end.row, rows, cols, metrics)
-        else {
+        let Some(bounds) = row_overlay_bounds(span.start.row, span.end.row, viewport) else {
             continue;
         };
+        let bounds = input_output_group_bounds(
+            inset_overlay_bounds(bounds, input_output_group_padding(config)),
+            viewport.metrics,
+            config,
+        );
         overlays.push(OverlayPrimitive {
             kind: OverlayKind::InputOutputGroup,
-            bounds: inset_overlay_bounds(bounds, input_output_group_padding(config)),
+            bounds,
             color: input_output_group_color(label, config),
             border_color: None,
+            border_width_px: 0,
             corner_radius_px: input_output_group_radius(config),
             z_index: 16,
-            label: None,
+            label: matches!(
+                config.visual_theme.grouping_style,
+                InputOutputGroupingStyle::MinimalHeaders
+            )
+            .then(|| label.to_owned()),
+            label_color: None,
         });
     }
 }
@@ -5053,11 +5245,13 @@ fn append_command_badges(
                 width,
                 height: badge_height,
             },
-            color: badge_color(&label, status_color),
+            color: badge_color(&label, status_color, config),
             border_color: None,
+            border_width_px: 0,
             corner_radius_px: config.visual_theme.borders.radius_px.min(8),
             z_index: 35,
             label: Some(label),
+            label_color: Some(render_color(config.visual_theme.badge_foreground)),
         });
         right -= gap;
     }
@@ -5066,21 +5260,21 @@ fn append_command_badges(
 fn row_overlay_bounds(
     start_row: i64,
     end_row: i64,
-    rows: u16,
-    cols: u16,
-    metrics: CellMetrics,
+    viewport: SemanticOverlayViewport,
 ) -> Option<RenderRect> {
-    if end_row < 0 || start_row >= i64::from(rows) {
+    let start_row = start_row.saturating_sub(viewport.origin_row);
+    let end_row = end_row.saturating_sub(viewport.origin_row);
+    if end_row < 0 || start_row >= i64::from(viewport.rows) {
         return None;
     }
 
     let start = start_row.max(0);
-    let end = end_row.max(start + 1).min(i64::from(rows));
+    let end = end_row.max(start + 1).min(i64::from(viewport.rows));
     Some(RenderRect {
         x: 0,
-        y: (start as f32 * metrics.cell_height).floor() as i32,
-        width: (f32::from(cols) * metrics.cell_width).ceil() as u32,
-        height: ((end - start) as f32 * metrics.cell_height).ceil() as u32,
+        y: (start as f32 * viewport.metrics.cell_height).floor() as i32,
+        width: (f32::from(viewport.cols) * viewport.metrics.cell_width).ceil() as u32,
+        height: ((end - start) as f32 * viewport.metrics.cell_height).ceil() as u32,
     })
 }
 
@@ -5098,6 +5292,67 @@ fn inset_overlay_bounds(bounds: RenderRect, padding_px: u8) -> RenderRect {
     }
 }
 
+fn margin_overlay_bounds(bounds: RenderRect, margin_px: u8) -> RenderRect {
+    let margin = u32::from(margin_px);
+    if margin == 0 {
+        return bounds;
+    }
+    let horizontal = margin.saturating_mul(2).min(bounds.width);
+    let vertical = margin.saturating_mul(2).min(bounds.height);
+    RenderRect {
+        x: bounds.x.saturating_add(margin as i32),
+        y: bounds.y.saturating_add(margin as i32),
+        width: bounds.width.saturating_sub(horizontal),
+        height: bounds.height.saturating_sub(vertical),
+    }
+}
+
+fn command_block_bounds(
+    mut bounds: RenderRect,
+    metrics: CellMetrics,
+    config: &AppConfig,
+) -> RenderRect {
+    match config.command_blocks.style {
+        CommandBlockStyle::Traditional
+        | CommandBlockStyle::Card
+        | CommandBlockStyle::Split
+        | CommandBlockStyle::CustomTheme => bounds,
+        CommandBlockStyle::Subtle => {
+            let height = u32::from(config.visual_theme.borders.width_px.max(1));
+            bounds.y = bounds
+                .y
+                .saturating_add(bounds.height.saturating_sub(height) as i32);
+            bounds.height = height;
+            bounds
+        }
+        CommandBlockStyle::MinimalHeader => {
+            bounds.height = metrics.cell_height.ceil().max(1.0) as u32;
+            bounds
+        }
+    }
+}
+
+fn input_output_group_bounds(
+    mut bounds: RenderRect,
+    metrics: CellMetrics,
+    config: &AppConfig,
+) -> RenderRect {
+    match config.visual_theme.grouping_style {
+        InputOutputGroupingStyle::Traditional
+        | InputOutputGroupingStyle::CommandCards
+        | InputOutputGroupingStyle::InputOutputSplit
+        | InputOutputGroupingStyle::CustomTheme => bounds,
+        InputOutputGroupingStyle::SubtleSeparators => {
+            bounds.height = u32::from(config.visual_theme.borders.width_px.max(1));
+            bounds
+        }
+        InputOutputGroupingStyle::MinimalHeaders => {
+            bounds.height = metrics.cell_height.ceil().max(1.0) as u32;
+            bounds
+        }
+    }
+}
+
 fn prompt_overlay_padding(config: &AppConfig) -> u8 {
     match config.prompt_decorations.style {
         PromptDecorationStyle::MinimalSeparator => 0,
@@ -5109,6 +5364,7 @@ fn prompt_overlay_padding(config: &AppConfig) -> u8 {
 
 fn command_block_padding(config: &AppConfig) -> u8 {
     match config.command_blocks.style {
+        CommandBlockStyle::Traditional => 0,
         CommandBlockStyle::Subtle => config.visual_theme.spacing.block_padding_px / 2,
         CommandBlockStyle::Card
         | CommandBlockStyle::Split
@@ -5131,6 +5387,7 @@ fn input_output_group_padding(config: &AppConfig) -> u8 {
 
 fn command_block_corner_radius(config: &AppConfig) -> u8 {
     match config.command_blocks.style {
+        CommandBlockStyle::Traditional => 0,
         CommandBlockStyle::Subtle | CommandBlockStyle::MinimalHeader => 2,
         CommandBlockStyle::Card | CommandBlockStyle::Split | CommandBlockStyle::CustomTheme => {
             config.visual_theme.borders.radius_px
@@ -5152,37 +5409,29 @@ fn input_output_group_radius(config: &AppConfig) -> u8 {
 fn prompt_decoration_color(config: &AppConfig) -> RenderColor {
     match config.prompt_decorations.style {
         PromptDecorationStyle::MinimalSeparator => RenderColor {
-            red: 180,
-            green: 190,
-            blue: 205,
-            alpha: 36,
+            alpha: config.visual_theme.borders.color.alpha.max(96),
+            ..render_color(config.visual_theme.borders.color)
         },
-        PromptDecorationStyle::RoundedBox | PromptDecorationStyle::PillHeader => RenderColor {
-            red: 80,
-            green: 150,
-            blue: 255,
-            alpha: 28,
-        },
+        PromptDecorationStyle::RoundedBox | PromptDecorationStyle::PillHeader => {
+            render_color(config.visual_theme.prompt_background)
+        }
     }
 }
 
 fn command_block_fill(config: &AppConfig) -> RenderColor {
     match config.command_blocks.style {
+        CommandBlockStyle::Traditional => RenderColor {
+            alpha: 0,
+            ..render_color(config.colors.background)
+        },
         CommandBlockStyle::Subtle => RenderColor {
-            red: 220,
-            green: 225,
-            blue: 235,
             alpha: 20,
+            ..render_color(config.visual_theme.command_background)
         },
         CommandBlockStyle::Card
         | CommandBlockStyle::Split
         | CommandBlockStyle::MinimalHeader
-        | CommandBlockStyle::CustomTheme => RenderColor {
-            red: 38,
-            green: 44,
-            blue: 52,
-            alpha: 82,
-        },
+        | CommandBlockStyle::CustomTheme => render_color(config.visual_theme.command_background),
     }
 }
 
@@ -5197,34 +5446,67 @@ fn input_output_group_color(label: &str, config: &AppConfig) -> RenderColor {
     };
     match label {
         "input" => RenderColor {
-            red: 80,
-            green: 150,
-            blue: 255,
             alpha,
+            ..render_color(config.visual_theme.input_background)
         },
         _ => RenderColor {
-            red: 180,
-            green: 190,
-            blue: 205,
             alpha,
+            ..render_color(config.visual_theme.output_background)
         },
     }
 }
 
-fn prompt_badge_label(config: &AppConfig) -> Option<String> {
+fn prompt_badge_label(
+    metadata: &SemanticMetadata,
+    previous_status: Option<&CommandStatus>,
+    config: &AppConfig,
+) -> Option<String> {
+    if config.prompt_decorations.style == PromptDecorationStyle::MinimalSeparator {
+        return None;
+    }
     let mut badges = Vec::new();
-    if config.prompt_decorations.show_shell_badge || config.visual_theme.badges.shell {
-        badges.push("shell");
-    }
-    if config.prompt_decorations.show_current_directory
-        || config.visual_theme.badges.current_directory
+    if (config.prompt_decorations.show_shell_badge || config.visual_theme.badges.shell)
+        && let Some(shell) = metadata.shell.shell.as_deref()
     {
-        badges.push("cwd");
+        badges.push(truncate_badge_text(shell, 20));
     }
-    if config.prompt_decorations.show_remote_host || config.visual_theme.badges.remote {
-        badges.push("remote");
+    if (config.prompt_decorations.show_current_directory
+        || config.visual_theme.badges.current_directory)
+        && let Some(cwd) = metadata
+            .remote
+            .as_ref()
+            .and_then(|remote| remote.remote_current_working_directory.as_deref())
+            .or(metadata.shell.current_working_directory.as_deref())
+    {
+        badges.push(compact_path_label(cwd));
     }
-    (!badges.is_empty()).then(|| badges.join(" "))
+    if (config.prompt_decorations.show_remote_host || config.visual_theme.badges.remote)
+        && let Some(remote) = metadata.remote.as_ref()
+        && let Some(host) = remote.remote_host.as_deref()
+    {
+        badges.push(remote.remote_user.as_ref().map_or_else(
+            || truncate_badge_text(host, 28),
+            |user| truncate_badge_text(&format!("{user}@{host}"), 28),
+        ));
+    }
+    if (config.prompt_decorations.show_admin_badge || config.visual_theme.badges.admin)
+        && semantic_attribute_is_true(metadata, "elevated")
+    {
+        badges.push("admin".to_owned());
+    }
+    if config.prompt_decorations.show_previous_status_accent
+        && let Some(status) = previous_status.and_then(command_status_label)
+    {
+        badges.push(status);
+    }
+    (!badges.is_empty()).then(|| truncate_badge_text(&badges.join(" "), 72))
+}
+
+fn semantic_attribute_is_true(metadata: &SemanticMetadata, key: &str) -> bool {
+    metadata.attributes.iter().any(|(candidate, value)| {
+        candidate.eq_ignore_ascii_case(key)
+            && matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+    })
 }
 
 fn command_status_color(status: &CommandStatus, config: &AppConfig) -> RenderColor {
@@ -5245,7 +5527,7 @@ fn command_badge_labels(
     config: &AppConfig,
 ) -> Vec<String> {
     let mut labels = Vec::new();
-    if config.command_blocks.show_exit_status
+    if (config.command_blocks.show_exit_status || config.visual_theme.badges.status)
         && let Some(label) = command_status_label(&block.status)
     {
         labels.push(label);
@@ -5255,7 +5537,8 @@ fn command_badge_labels(
     {
         labels.push(format_duration_badge(duration));
     }
-    if config.command_blocks.show_current_directory
+    if (config.command_blocks.show_current_directory
+        || config.visual_theme.badges.current_directory)
         && let Some(cwd) = metadata
             .shell
             .current_working_directory
@@ -5269,10 +5552,15 @@ fn command_badge_labels(
     {
         labels.push(format!("cwd {}", compact_path_label(cwd)));
     }
-    if config.command_blocks.show_shell_host
+    if (config.command_blocks.show_shell_host
+        || config.visual_theme.badges.shell
+        || config.visual_theme.badges.remote)
         && let Some(label) = shell_host_badge_label(metadata)
     {
         labels.push(label);
+    }
+    if config.visual_theme.badges.admin && semantic_attribute_is_true(metadata, "elevated") {
+        labels.push("admin".to_owned());
     }
     labels
 }
@@ -5333,19 +5621,14 @@ fn badge_width(label: &str, metrics: CellMetrics, config: &AppConfig) -> u32 {
     (text_width + padding).ceil().max(16.0) as u32
 }
 
-fn badge_color(label: &str, status_color: RenderColor) -> RenderColor {
+fn badge_color(label: &str, status_color: RenderColor, config: &AppConfig) -> RenderColor {
     if label == "ok" || label.starts_with("exit ") || label.starts_with("signal ") {
         return RenderColor {
             alpha: 148,
             ..status_color
         };
     }
-    RenderColor {
-        red: 32,
-        green: 38,
-        blue: 46,
-        alpha: 156,
-    }
+    render_color(config.visual_theme.badge_background)
 }
 
 fn style_for_attributes(attributes: CellAttributes) -> RenderCellStyle {
@@ -5637,6 +5920,7 @@ mod tests {
             selection_kind: SelectionKind::Normal,
             keyboard_selection: None,
             search: PaneSearch::default(),
+            command_output_collapsed: HashMap::new(),
         }
     }
 
@@ -6082,6 +6366,15 @@ mod tests {
         }
     }
 
+    fn test_semantic_viewport(origin_row: i64) -> SemanticOverlayViewport {
+        SemanticOverlayViewport {
+            origin_row,
+            rows: 10,
+            cols: 80,
+            metrics: test_metrics(),
+        }
+    }
+
     fn command_timeline() -> SemanticTimelineStore {
         let mut timeline = SemanticTimelineStore::new();
         timeline.apply_event(semantics::SemanticEvent::ShellMetadataChanged {
@@ -6143,7 +6436,13 @@ mod tests {
         config.command_blocks.style = CommandBlockStyle::Card;
         config.visual_theme.grouping_style = InputOutputGroupingStyle::InputOutputSplit;
 
-        let overlays = semantic_visual_overlays(&timeline, false, 10, 80, test_metrics(), &config);
+        let overlays = semantic_visual_overlays(
+            &timeline,
+            &HashMap::new(),
+            false,
+            test_semantic_viewport(0),
+            &config,
+        );
 
         assert!(
             overlays
@@ -6178,11 +6477,23 @@ mod tests {
         config.command_blocks.enabled = true;
         config.prompt_decorations.enabled = true;
 
-        let overlays = semantic_visual_overlays(&timeline, true, 10, 80, test_metrics(), &config);
+        let overlays = semantic_visual_overlays(
+            &timeline,
+            &HashMap::new(),
+            true,
+            test_semantic_viewport(0),
+            &config,
+        );
         assert!(overlays.is_empty());
 
         config.command_blocks.allow_in_alternate_screen = true;
-        let overlays = semantic_visual_overlays(&timeline, true, 10, 80, test_metrics(), &config);
+        let overlays = semantic_visual_overlays(
+            &timeline,
+            &HashMap::new(),
+            true,
+            test_semantic_viewport(0),
+            &config,
+        );
         assert!(
             overlays
                 .iter()
@@ -6200,7 +6511,157 @@ mod tests {
         let timeline = command_timeline();
         let config = AppConfig::default();
 
-        let overlays = semantic_visual_overlays(&timeline, false, 10, 80, test_metrics(), &config);
+        let overlays = semantic_visual_overlays(
+            &timeline,
+            &HashMap::new(),
+            false,
+            test_semantic_viewport(0),
+            &config,
+        );
+
+        assert!(overlays.is_empty());
+    }
+
+    #[test]
+    fn prompt_overlay_uses_real_metadata_elevation_and_previous_status() {
+        let mut timeline = command_timeline();
+        timeline.prompt_started(
+            BufferPosition::new(5, 0),
+            SemanticMetadata {
+                shell: semantics::ShellMetadata {
+                    shell: Some("pwsh".to_owned()),
+                    current_working_directory: Some("C:\\work\\panea".to_owned()),
+                    ..semantics::ShellMetadata::default()
+                },
+                attributes: vec![("elevated".to_owned(), "true".to_owned())],
+                ..SemanticMetadata::default()
+            },
+        );
+        timeline.prompt_ended(BufferPosition::new(5, 8));
+        let mut config = AppConfig::default();
+        config.prompt_decorations.enabled = true;
+        config.prompt_decorations.style = PromptDecorationStyle::RoundedBox;
+        config.prompt_decorations.show_shell_badge = true;
+        config.prompt_decorations.show_current_directory = true;
+        config.prompt_decorations.show_admin_badge = true;
+        config.prompt_decorations.show_previous_status_accent = true;
+
+        let overlays = semantic_visual_overlays(
+            &timeline,
+            &HashMap::new(),
+            false,
+            test_semantic_viewport(0),
+            &config,
+        );
+        let prompt = overlays
+            .iter()
+            .find(|overlay| overlay.kind == OverlayKind::PromptDecoration)
+            .expect("prompt overlay");
+
+        let label = prompt.label.as_deref().expect("prompt metadata label");
+        assert!(label.contains("pwsh"));
+        assert!(label.contains("panea"));
+        assert!(label.contains("admin"));
+        assert!(label.contains("ok"));
+        assert_eq!(
+            prompt.border_color,
+            Some(render_color(config.visual_theme.success_color))
+        );
+    }
+
+    #[test]
+    fn semantic_overlays_follow_absolute_scrollback_positions() {
+        let mut timeline = SemanticTimelineStore::new();
+        timeline.input_started(BufferPosition::new(101, 0));
+        timeline.input_ended(BufferPosition::new(101, 4));
+        timeline.output_started(BufferPosition::new(102, 0));
+        timeline.command_finished(
+            BufferPosition::new(104, 0),
+            CommandStatus::Code(0),
+            Duration::from_millis(1),
+        );
+        let mut config = AppConfig::default();
+        config.command_blocks.enabled = true;
+        config.command_blocks.style = CommandBlockStyle::Card;
+
+        let overlays = semantic_visual_overlays(
+            &timeline,
+            &HashMap::new(),
+            false,
+            test_semantic_viewport(100),
+            &config,
+        );
+        let block = overlays
+            .iter()
+            .find(|overlay| overlay.kind == OverlayKind::CommandBlock)
+            .expect("visible command block");
+        assert!(block.bounds.y < (test_metrics().cell_height * 5.0) as i32);
+    }
+
+    #[test]
+    fn collapsed_output_is_foreground_mask_and_preserves_raw_copy_text() {
+        let mut pane = test_pane(40, 8);
+        pane.terminal
+            .apply_bytes(b"echo panea\r\none\r\ntwo\r\nthree\r\nfour")
+            .expect("terminal output");
+        pane.semantic_timeline
+            .input_started(BufferPosition::new(0, 0));
+        pane.semantic_timeline
+            .input_ended(BufferPosition::new(0, 10));
+        pane.semantic_timeline
+            .output_started(BufferPosition::new(1, 0));
+        pane.semantic_timeline.command_finished(
+            BufferPosition::new(5, 0),
+            CommandStatus::Code(0),
+            Duration::from_millis(5),
+        );
+        let block_id = pane.semantic_timeline.command_blocks()[0].region_id;
+        pane.command_output_collapsed.insert(block_id, true);
+        let mut config = AppConfig::default();
+        config.command_blocks.enabled = true;
+        config.command_blocks.style = CommandBlockStyle::Card;
+        config.command_blocks.collapsed_preview_lines = 1;
+
+        let raw_before = pane.run_semantic_action(SemanticAction::CopyCurrentCommandOutput);
+        let scene = scene_from_terminal(
+            &pane.terminal,
+            &pane.semantic_timeline,
+            &pane.search,
+            &pane.command_output_collapsed,
+            Some(test_metrics()),
+            &config,
+            CursorPresentation {
+                window_focused: true,
+                blink_visible: true,
+            },
+        );
+        let raw_after = pane.run_semantic_action(SemanticAction::CopyCurrentCommandOutput);
+
+        assert_eq!(raw_before, raw_after);
+        assert!(matches!(raw_after, SemanticActionResult::Text(text) if text.contains("four")));
+        assert!(
+            scene
+                .semantic_overlays
+                .iter()
+                .any(|overlay| overlay.kind == OverlayKind::ContentMask
+                    && overlay.color.alpha == u8::MAX)
+        );
+    }
+
+    #[test]
+    fn traditional_command_style_projects_no_command_visuals() {
+        let timeline = command_timeline();
+        let mut config = AppConfig::default();
+        config.command_blocks.enabled = true;
+        config.command_blocks.style = CommandBlockStyle::Traditional;
+
+        let overlays = semantic_visual_overlays(
+            &timeline,
+            &HashMap::new(),
+            false,
+            test_semantic_viewport(0),
+            &config,
+        );
 
         assert!(overlays.is_empty());
     }

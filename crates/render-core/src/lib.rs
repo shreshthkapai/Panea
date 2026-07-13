@@ -102,6 +102,9 @@ pub enum OverlayKind {
     PromptDecoration,
     CommandBlock,
     InputOutputGroup,
+    /// Opaque presentation-only cover used to hide collapsed semantic output.
+    /// The terminal grid and selection model remain unchanged.
+    ContentMask,
     Badge,
     PerformanceOverlay,
 }
@@ -112,9 +115,11 @@ pub struct OverlayPrimitive {
     pub bounds: RenderRect,
     pub color: RenderColor,
     pub border_color: Option<RenderColor>,
+    pub border_width_px: u8,
     pub corner_radius_px: u8,
     pub z_index: i16,
     pub label: Option<String>,
+    pub label_color: Option<RenderColor>,
 }
 
 impl OverlayPrimitive {
@@ -125,9 +130,11 @@ impl OverlayPrimitive {
             bounds,
             color,
             border_color: None,
+            border_width_px: 0,
             corner_radius_px: 0,
             z_index: 0,
             label: None,
+            label_color: None,
         }
     }
 }

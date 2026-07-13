@@ -386,11 +386,13 @@ to more visible features before the dependencies they rely on are hardened.
   verification exists. Real bash/zsh/fish, WSL, remote, macOS, Linux X11, and
   Linux Wayland verification, plus heuristic command detection and remote
   install helpers, remain follow-up work.
-- Next-pass Phase 12 establishes command-block visual overlay projection and
-  badge glyph batching, but collapse/expand long output UI, command-block copy
-  mode UI, real shell-driven command-block verification beyond the Windows
-  PowerShell semantic smoke, and cross-OS visual smoke coverage remain deferred
-  until the app compatibility and cross-OS runner phases.
+- Steps 11 and 12 implement prompt and command-block customization as semantic
+  overlays: separators/rounded boxes/pill headers, real shell/cwd/remote/admin
+  badges, prior-status accents, traditional/subtle/card/split/minimal/custom
+  grouping, configurable colors/spacing/borders, raw-text copy/navigation, and
+  renderer-only long-output collapse/expand. Projection is scrollback-aware,
+  alternate-screen safe by default, damage-tracked, and batched. Real
+  non-Windows shell-driven and cross-OS visual reports remain verification work.
 - Next-pass Phase 13 establishes opt-in cursor animation runtime wiring,
   cursor-neighborhood damage regions, batched renderer animation quads,
   `[cursor.image]` config, nonblocking GIF/PNG image metadata decode/cache, and

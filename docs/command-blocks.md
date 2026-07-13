@@ -23,6 +23,10 @@ Phase 12 establishes:
   terminal text and badge labels as a bounded overlay glyph batch
 - copy/jump action flags in config, backed by Phase 10 semantic actions
 - visual performance budgets for animations and animated regions
+- viewport-correct projection over absolute scrollback coordinates
+- real shell, cwd, remote, elevated, status, and duration labels
+- presentation-only long-output collapse with explicit per-pane expansion state
+- configured overlay colors, margins, padding, border width/radius, and badge colors
 
 The raw terminal grid remains authoritative. If shell integration is inactive,
 command block overlays should degrade to absent or clearly diagnostic behavior,
@@ -34,6 +38,11 @@ not heuristic rewriting of visible output.
 [prompt_decorations]
 enabled = true
 style = "pill_header"
+show_shell_badge = true
+show_current_directory = true
+show_remote_host = true
+show_admin_badge = true
+show_previous_status_accent = true
 allow_in_alternate_screen = false
 
 [command_blocks]
@@ -44,12 +53,35 @@ show_duration = true
 show_exit_status = true
 show_current_directory = true
 show_shell_host = true
+collapse_long_output = true
+collapse_after_lines = 200
+collapsed_preview_lines = 1
 allow_in_alternate_screen = false
+
+[visual_theme.spacing]
+block_margin_px = 3
+block_padding_px = 6
+badge_gap_px = 4
+
+[visual_theme.borders]
+width_px = 1
+radius_px = 4
+color = { red = 180, green = 190, blue = 205, alpha = 80 }
 ```
 
 `allow_in_alternate_screen` defaults to `false` for both prompt decorations and
 command blocks. Enabling it is valid, but config validation warns because visual
 overlays can obscure full-screen TUIs.
+
+`command_blocks.style = "traditional"` retains semantic actions while projecting
+no command-block visuals. `Ctrl+Shift+G` toggles the current or most recent
+command output between collapsed and expanded presentation. Collapse uses an
+opaque foreground overlay; raw text, selection, search, and copy remain unchanged.
+
+Command styles are `traditional`, `subtle`, `card`, `split`, `minimal_header`,
+and `custom_theme`. Input/output grouping styles are `traditional`,
+`subtle_separators`, `command_cards`, `input_output_split`, `minimal_headers`,
+and `custom_theme`.
 
 ## Phase 12 Design Note
 
@@ -90,10 +122,13 @@ semantic command regions are trusted, heuristic, disabled, or absent.
 Performance cost when disabled: near-zero in scene generation; no semantic
 visual overlays are projected.
 
-Performance cost when enabled: proportional to visible semantic regions and a
-bounded set of badges per command block. Overlay glyphs are batched separately
-instead of drawn through per-badge calls.
+Performance cost when enabled: proportional only to visible semantic regions
+and a bounded set of badges per command block. Overlay glyphs are batched
+separately instead of drawn through per-badge calls. Collapse state is a small
+per-pane map and does not rewrite or duplicate terminal text.
 
-Tests: desktop scene-builder tests cover badges, input/output grouping,
-alternate-screen suppression, and disabled projection. Renderer tests cover
-command-block draw ordering and overlay glyph batching.
+Tests: desktop scene-builder tests cover real metadata labels, status accents,
+input/output grouping, scrollback projection, collapse/raw-copy preservation,
+traditional/disabled projection, and alternate-screen suppression. Renderer
+tests cover command-block draw ordering, foreground masks, rounded borders,
+configured border width, and overlay glyph batching.

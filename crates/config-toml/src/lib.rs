@@ -739,6 +739,7 @@ fn known_paths() -> BTreeSet<&'static str> {
         "visual_theme.grouping_style",
         "visual_theme.spacing",
         "visual_theme.spacing.cell_gap_px",
+        "visual_theme.spacing.block_margin_px",
         "visual_theme.spacing.block_padding_px",
         "visual_theme.spacing.badge_gap_px",
         "visual_theme.borders",
@@ -751,6 +752,12 @@ fn known_paths() -> BTreeSet<&'static str> {
         "visual_theme.badges.remote",
         "visual_theme.badges.admin",
         "visual_theme.badges.status",
+        "visual_theme.prompt_background",
+        "visual_theme.command_background",
+        "visual_theme.input_background",
+        "visual_theme.output_background",
+        "visual_theme.badge_background",
+        "visual_theme.badge_foreground",
         "visual_theme.success_color",
         "visual_theme.error_color",
         "scrollback",
@@ -790,6 +797,8 @@ fn known_paths() -> BTreeSet<&'static str> {
         "command_blocks.copy_actions_enabled",
         "command_blocks.jump_actions_enabled",
         "command_blocks.collapse_long_output",
+        "command_blocks.collapse_after_lines",
+        "command_blocks.collapsed_preview_lines",
         "prompt_decorations",
         "prompt_decorations.enabled",
         "prompt_decorations.style",
@@ -1143,6 +1152,40 @@ mod tests {
         assert_eq!(
             linux_paths[0],
             PathBuf::from("/home/me/.config/panea/config.toml")
+        );
+    }
+
+    #[test]
+    fn semantic_visual_theme_and_collapse_settings_parse_portably() {
+        let loaded = parse_str(
+            r#"
+            [visual_theme]
+            badge_foreground = { red = 1, green = 2, blue = 3, alpha = 255 }
+
+            [visual_theme.spacing]
+            block_margin_px = 5
+
+            [command_blocks]
+            enabled = true
+            style = "custom_theme"
+            collapse_long_output = true
+            collapse_after_lines = 80
+            collapsed_preview_lines = 2
+            "#,
+            None,
+            ConfigPlatform::Windows,
+        )
+        .expect("semantic visual config");
+
+        assert_eq!(loaded.config.visual_theme.spacing.block_margin_px, 5);
+        assert_eq!(loaded.config.visual_theme.badge_foreground.red, 1);
+        assert_eq!(loaded.config.command_blocks.collapse_after_lines, 80);
+        assert_eq!(loaded.config.command_blocks.collapsed_preview_lines, 2);
+        assert!(
+            !loaded
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("unknown setting"))
         );
     }
 
