@@ -1,0 +1,13 @@
+schema_version = 2
+
+[visual_theme]
+name = "panea-dark"
+grouping_style = "traditional"
+
+[colors]
+foreground = { red = 224, green = 229, blue = 235, alpha = 255 }
+background = { red = 18, green = 21, blue = 24, alpha = 255 }
+cursor = { red = 83, green = 190, blue = 176, alpha = 255 }
+cursor_text = { red = 18, green = 21, blue = 24, alpha = 255 }
+selection_foreground = { red = 255, green = 255, blue = 255, alpha = 255 }
+selection_background = { red = 83, green = 190, blue = 176, alpha = 96 }

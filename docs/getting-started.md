@@ -1,6 +1,8 @@
 # Getting Started
 
-Panea is currently a development workspace, not a packaged daily-driver release.
+Panea is currently an alpha candidate, not a cross-OS verified daily-driver
+release. Native distribution builders exist, but only the Windows development
+installer path has been exercised on the current host.
 
 ## Build
 
@@ -13,6 +15,26 @@ cargo build --workspace
 ```powershell
 cargo run -p panea-desktop
 ```
+
+## Build An Installer Or Portable Package
+
+On the target OS, build release artifacts with:
+
+```powershell
+cargo xtask package build --profile release
+```
+
+Windows emits a portable ZIP and per-user installer EXE. macOS emits an app
+ZIP and DMG. Linux emits a portable tarball and deb. Validate staged binaries
+and, on Windows, the full install/uninstall path with:
+
+```powershell
+cargo xtask package smoke --profile release
+```
+
+Artifacts are written under `target/packages/`. macOS signing/notarization and
+Windows signing require release-owner credentials. The repository is currently
+unlicensed, so the owner must select an OSS license before public distribution.
 
 The app loads the default portable config when no user config exists. Generate a
 sample config with:

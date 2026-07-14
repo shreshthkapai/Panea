@@ -58,7 +58,7 @@ stated scope:
 | Windows local transport | tested | Portable PTY/ConPTY lifecycle is bounded; Windows smoke tests were made non-hanging and observed output. |
 | Diagnostics foundations | tested | Installed `panea doctor ...`, `cargo xtask doctor ...`, JSON doctor output, bug-report snapshots, release/security/hardening/package readiness reports, and iOS readiness reports exist through shared diagnostics models. |
 | Performance harness foundation | tested | `cargo xtask bench ...` and `tools/bench` fixtures exist for repeatable local measurements. |
-| Performance instrumentation overlay | tested | Shared instrumentation now reports frame/CPU/GPU timing status, glyph cache and atlas occupancy, damage/draw counts, active animations, idle wakeups, PTY/parser throughput, and memory estimates; the desktop app can draw a developer overlay through renderer overlay primitives. |
+| Performance instrumentation and power policy | tested | Shared instrumentation reports frame/CPU/GPU timing status, glyph cache and atlas occupancy, damage/draw counts, active animations, idle wakeups, PTY/parser throughput, memory estimates, effective profile, and power source. The desktop overlay is renderer-only, and a cross-platform power provider applies reversible battery caps outside hot paths. |
 | Mux model | tested | Workspace, window, tab, pane, session, split tree, restore snapshot, and mux action models exist with unit coverage. |
 | Desktop mux runtime | tested | Independent local/SSH pane runtimes, workspaces, tabs, nested splits, focus/resize/zoom/move/swap/close, clickable configurable tab chrome, pane borders, startup layouts, fresh-process session restoration, PTY resize, and active-pane input routing are wired. Cross-OS GUI smoke remains separate. |
 | Semantic model and runtime actions | tested | Incrementally positioned OSC regions, command blocks, navigation, raw output selection/copy, exit status, measured duration, cwd, shell and remote metadata are wired per pane without buffer mutation. |
@@ -70,7 +70,7 @@ stated scope:
 | SSH product integration | tested | SSH tabs/panes use nonblocking connection workers, explicit unknown/changed-host overlays, masked credential entry, opt-in native Windows/macOS/Linux keychain persistence, remote semantic overlays, disconnect status, preserved scrollback, and explicit reconnect. Real-server/cross-OS reports remain separate. |
 | SSH real-server smoke harness | tested | `cargo xtask ssh-smoke` uses the real `transport-ssh` backend, explicit trust providers, smoke-owned known-hosts storage, remote PTY output polling, resize, reconnect, changed-host detection, and remote OSC 52 policy checks. Real server reports still need to be collected per OS. |
 | Cross-OS verification runner | tested | `cargo xtask verify-os` composes architecture, unit, parser, Unicode, fuzz-smoke, renderer, config, clipboard, shell, PTY, screenshot, compatibility, doctor, Linux compositor, SSH, and package-smoke checks into platform-stamped markdown/JSON reports. GitHub Actions defines Windows, macOS, Linux X11, and Linux Wayland jobs. |
-| Packaging artifact runner | tested | `cargo xtask package` plans, builds, and smokes portable/staged desktop packages. The Windows dev portable package was staged on the current host; packaged `panea.exe doctor --json` and packaged `panea shell-smoke --json` both passed. macOS/Linux package reports remain uncollected. |
+| Packaging and distribution runner | tested | `cargo xtask package` builds staged packages plus Windows portable ZIP/installer EXE, macOS app/ZIP/DMG, and Linux tarball/deb. Windows portable and installer development artifacts passed doctor, real-PTY shell launch, install, installed-binary, uninstall, and cleanup smoke on the current host. macOS/Linux reports remain uncollected. |
 | iOS shared-engine foundation | tested | `apps/ios` reuses shared parser/core/config/transport/semantic/render contracts and models lifecycle, input, safe-area sizing, mobile SSH session specs, native bridge contracts, SSH profile forms, trust prompt models, Keychain capability handoff, renderer surface specs, and device checklist cases. |
 
 ## What Is Partial
@@ -79,7 +79,7 @@ These areas are real foundations but must not be called complete:
 
 | Area | Status | Missing before completion |
 | --- | --- | --- |
-| Desktop app runtime | partial | Full app lifecycle, polished UI chrome, complete mux integration, installer-grade packaging, and cross-OS manual validation. |
+| Desktop app runtime | partial | Full app lifecycle, polished UI chrome, GUI package smoke, and cross-OS manual validation remain; mux runtime and installer-grade Windows delivery are wired. |
 | Platform windowing | partial | Native winit paths, explicit X11/Wayland builders, exclusive/borderless/frameless modes, decoration fallback reporting, DPI resize propagation, IME preedit overlays, and clipboard providers exist. Real macOS/Linux compositor/IME/DPI validation and native notifications remain. |
 | GPU renderer | tested | WGPU setup, persistent growable GPU batches, retained-frame damage rendering with full-draw fallback, incremental desktop damage projection, shaped-run/glyph/RGBA emoji atlas caching, row-scoped uploads, low-idle scheduling, benchmarks, device-loss backend recreation, screenshot infrastructure, and GPU timing plumbing exist; real sleep/wake/monitor-loss validation, macOS/Linux baselines, and cross-OS render validation remain. |
 | Font and text rendering | tested | OpenType shaping, per-grapheme configured/system fallback, real regular/bold/italic/bold-italic face resolution, CJK/combining/ligature/emoji shaping, COLR/bitmap color glyph rasterization, RGBA atlas batching, run caching, and portable font diagnostics pass automated tests on Windows. |
@@ -91,7 +91,7 @@ These areas are real foundations but must not be called complete:
 | Native mux runtime | tested | Runtime workspaces, tabs, nested local/SSH panes, startup/restored layouts, configurable appearance and SSH reconnect are implemented. Drag UI, cross-OS GUI runs and automated nested external-mux runs remain unverified/deferred. |
 | SSH UX and security | tested | Desktop trust/auth overlays, native desktop keychains, disconnect/reconnect presentation and secure defaults are implemented and unit-tested. Proxy jump, remote integration installation, remote OSC 52 confirmation, and collected real-server/cross-OS reports remain. |
 | Performance reporting | partial | GPU timestamp query wiring and a developer in-window overlay exist, but real timestamp samples across hardware/backends, polished installed overlay UX, CI regression gates, and reproducible cross-machine benchmark reporting remain. |
-| Hardening/release readiness | partial | GPU recovery, crash-safe config reload, and portable/staged packaging foundations exist, but real device-loss platform validation, installer/AppImage/DMG artifacts, validation suite automation, and platform lab coverage remain. |
+| Hardening/release readiness | partial | GPU recovery, local/SSH session restart, crash-safe config reload, battery adaptation, release workflows, and native distribution builders exist. Real device-loss/platform validation, signing/notarization, AppImage/rpm, GUI package smoke, and platform lab coverage remain. |
 | iOS companion | partial | Shared-engine contracts, native bridge boundaries, mobile connection planning, renderer surface specs, and device checklist exist. Native UIKit/SwiftUI shell, iOS GPU surface implementation, Keychain provider backend, host-key approval UI, key import UX, simulator/device validation, and packaging remain. |
 
 ## What Is Stubbed
@@ -101,7 +101,7 @@ These areas exist mostly as placeholders, contracts, or documentation:
 | Area | Status | Current shape |
 | --- | --- | --- |
 | `tools/conformance` | stubbed | Directory and README exist; full terminal conformance fixture suite is not built out. |
-| Packaging installers | stubbed | Portable/staged package directories exist; Windows installer, macOS DMG/zip/signing/notarization, Linux AppImage/deb/rpm, and terminfo installation remain unimplemented. |
+| Additional signed/distro formats | stubbed | Windows Authenticode, macOS signing/notarization, Linux AppImage/rpm, and any custom terminfo installation remain release-owner/toolchain work; Windows installer, macOS ZIP/DMG, and Linux deb builders exist. |
 | Native notifications | stubbed | Tracked in the platform matrix as not implemented. |
 | iOS app shell | stubbed | Rust shared-engine crate and native bridge traits exist; no UIKit/SwiftUI mobile app host exists yet. |
 | Advanced config import/helpers | stubbed | Accepted by rollout rules, but no product implementation exists. |
@@ -139,8 +139,9 @@ The following major accepted features have no complete product behavior yet:
   remote shell-integration installation UX.
 - Cross-OS verification of the installed doctor command output and packaged
   doctor smoke output.
-- Release installers and compressed distribution artifacts beyond the current
-  portable/staged package directories.
+- Signed/notarized release artifacts, Linux AppImage/rpm, and collected package
+  reports outside Windows. The current repository license also must be changed
+  from unlicensed before Panea can be distributed as a true OSS project.
 - Native iOS SSH companion app runtime and device-verified release path.
 
 ## Layer Status Matrix
@@ -149,7 +150,7 @@ The following major accepted features have no complete product behavior yet:
 | --- | --- | --- |
 | core correctness | partial | Strong baseline, Unicode cell hardening, fuzz harness, and app compatibility runner exist, but interactive app compatibility and conformance hardening remain. |
 | platform parity | partial | Capability-driven windows, explicit Linux backends, DPI/IME/clipboard/fullscreen/frameless paths, compositor matrix, cross-OS runners, and portable packages exist; real macOS/Linux verification reports and compositor lab evidence remain open. |
-| render performance | partial | Persistent WGPU batches, retained-frame damage, shaping/glyph/emoji caches, low-idle scheduling, benchmarks, renderer recovery, screenshots, GPU timing, and a developer overlay exist; real device-loss/GPU timing and cross-OS runtime validation remain. |
+| render performance | partial | Persistent WGPU batches, retained-frame damage, shaping/glyph/emoji caches, low-idle scheduling, benchmarks, renderer recovery, GPU timing, an in-window overlay, and reversible battery budgets exist; fair competitor measurements and real cross-OS device/GPU validation remain. |
 | config portability | partial | Schema-v2 defaults/migrations, TOML discovery/validation, portable overrides, schema export, safe TOML/programmable live reload, and controlled programmable compilation exist; cross-OS runtime reload validation remains. |
 | semantic meaning | tested | Semantic events, byte-positioned timeline updates, complete local hook marker sets, desktop activation, remote metadata context, command navigation and output copy are implemented; real remote and non-Windows shell verification remain. |
 | visual overlay | tested | Prompt and command-block styles, real metadata/status badges, input/output grouping, renderer-only collapse masks, alternate-screen suppression, scrollback projection, configured rounded borders, damage tracking, and overlay glyph batching pass automated Windows-host tests; full cursor image drawing and cross-OS visual smoke remain. |

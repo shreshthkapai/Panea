@@ -11,5 +11,6 @@ workspace = true
 [dependencies]
 arboard.workspace = true
 platform-core = { path = "../platform-core" }
+starship-battery.workspace = true
 webbrowser.workspace = true
 winit.workspace = true

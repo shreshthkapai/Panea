@@ -17,9 +17,9 @@ use config_core::{
     AppConfig, ClipboardConfig, CommandBlockStyle, ConfigDiagnostic, ConfigDiagnosticSeverity,
     ConfigPlatform, DecorationStrategyConfig, InputOutputGroupingStyle, LinuxBackendConfig,
     LogLevel, MuxLayoutConfig, MuxSplitAxisConfig, MuxTransportConfig, PasteConfig,
-    PresentModePreference, PromptDecorationStyle, ReloadPlan, ReloadableSection,
-    ShellIntegrationActivationConfig, ShellProfile, ShellProfileKind, SshAuthMethod,
-    SshKnownHostsPolicy, SshProfile, WindowModeConfig,
+    PerformanceConfig, PerformanceProfile, PresentModePreference, PromptDecorationStyle,
+    ReloadPlan, ReloadableSection, ShellIntegrationActivationConfig, ShellProfile,
+    ShellProfileKind, SshAuthMethod, SshKnownHostsPolicy, SshProfile, WindowModeConfig,
 };
 use diagnostics::{PerformanceBudget, PerformanceOverlay};
 use font_system::{CellMetrics, FontConfig as RuntimeFontConfig, FontSource, FontSystem};
@@ -30,11 +30,12 @@ use mux::{
 };
 use platform_core::{
     DecorationMode, InputEvent, KeyEvent, KeyModifiers, KeyState, LinuxWindowBackend, MouseButton,
-    MouseEvent, MouseEventKind, UrlOpener, WindowAction, WindowMode,
+    MouseEvent, MouseEventKind, PowerSource, PowerState, PowerStateProvider, UrlOpener,
+    WindowAction, WindowMode,
 };
 use platform_winit::{
-    ClipboardBridge, DesktopUrlOpener, DesktopWindow, InputTranslator, WindowSettings,
-    apply_window_mode_with_decoration, create_event_loop, platform_capabilities,
+    ClipboardBridge, DesktopPowerMonitor, DesktopUrlOpener, DesktopWindow, InputTranslator,
+    WindowSettings, apply_window_mode_with_decoration, create_event_loop, platform_capabilities,
 };
 use render_core::{
     CellPosition, CursorVisual, OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle,
@@ -765,6 +766,16 @@ fn run() -> Result<(), Box<dyn Error>> {
     let loaded_config = load_desktop_config()?;
     log_config_diagnostics(&loaded_config.diagnostics);
     let mut config = loaded_config.config;
+    let mut configured_performance = config.performance.clone();
+    let mut power_monitor =
+        DesktopPowerMonitor::with_enabled(config.performance.disable_expensive_effects_on_battery);
+    let startup_power_state = power_monitor.power_state();
+    apply_power_policy(
+        &mut config.performance,
+        &configured_performance,
+        startup_power_state.state,
+    );
+    log_power_policy(&config.performance, &startup_power_state);
     let cursor_asset_base_dir = loaded_config.asset_base_dir;
     let mut config_watcher = loaded_config.watcher;
     let _ssh_session_profiles: Vec<SshConnectionProfile> = config
@@ -826,7 +837,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut damage_tracker = DamageTracker::new();
     let mut performance_overlay =
         PerformanceOverlay::new(config.diagnostics.performance_overlay, "wgpu");
-    let mut performance_budget = performance_budget(&config);
+    update_performance_overlay_context(
+        &mut performance_overlay,
+        &config,
+        startup_power_state.state,
+    );
+    let mut performance_budget = performance_budget_from_config(&config);
     let mut cursor_animator = CursorAnimationRuntime::new();
     let mut cursor_blink = CursorBlinkRuntime::new();
     let mut window_focused = true;
@@ -896,7 +912,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                             if performance_overlay.is_enabled() {
                                 mux_runtime.populate_performance_sample(&mut instrumentation);
                             }
+                            let had_performance_sample = performance_overlay.latest().is_some();
                             performance_overlay.record(instrumentation);
+                            if performance_overlay.is_enabled() && !had_performance_sample {
+                                scheduler.terminal_content_changed();
+                                window.request_redraw();
+                            }
                             if matches!(config.diagnostics.log_level, LogLevel::Trace)
                                 && let Some(text) =
                                     performance_overlay.render_text(performance_budget)
@@ -1137,6 +1158,21 @@ fn run() -> Result<(), Box<dyn Error>> {
                                                 window.request_redraw();
                                             }
                                         }
+                                        "toggle_performance_overlay" => {
+                                            config.diagnostics.performance_overlay =
+                                                !config.diagnostics.performance_overlay;
+                                            performance_overlay.set_enabled(
+                                                config.diagnostics.performance_overlay,
+                                            );
+                                            let power_state = power_monitor.power_state();
+                                            update_performance_overlay_context(
+                                                &mut performance_overlay,
+                                                &config,
+                                                power_state.state,
+                                            );
+                                            scheduler.terminal_content_changed();
+                                            window.request_redraw();
+                                        }
                                         "toggle_fullscreen" => {
                                             current_window_mode = if matches!(
                                                 current_window_mode,
@@ -1353,6 +1389,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                             diagnostics,
                         } => {
                             let loaded = *loaded;
+                            let next_configured_performance = loaded.performance.clone();
                             log_config_diagnostics(&diagnostics);
                             let plan = config.reload_plan_from(&loaded);
                             log_reload_plan(&plan);
@@ -1370,6 +1407,26 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 &window,
                             ) {
                                 Ok(reloaded) => {
+                                    configured_performance = next_configured_performance;
+                                    power_monitor.set_enabled(
+                                        configured_performance
+                                            .disable_expensive_effects_on_battery,
+                                    );
+                                    let power_state = power_monitor.power_state();
+                                    apply_power_policy(
+                                        &mut config.performance,
+                                        &configured_performance,
+                                        power_state.state,
+                                    );
+                                    renderer.set_glyph_cache_capacity(
+                                        config.performance.glyph_cache_entries,
+                                    );
+                                    performance_budget = performance_budget_from_config(&config);
+                                    update_performance_overlay_context(
+                                        &mut performance_overlay,
+                                        &config,
+                                        power_state.state,
+                                    );
                                     request_cursor_image_if_enabled(
                                         &mut cursor_image_cache,
                                         &config,
@@ -1405,6 +1462,31 @@ fn run() -> Result<(), Box<dyn Error>> {
                             );
                         }
                     }
+                }
+
+                if power_monitor.refresh_if_due() {
+                    let power_state = power_monitor.power_state();
+                    apply_power_policy(
+                        &mut config.performance,
+                        &configured_performance,
+                        power_state.state,
+                    );
+                    renderer.set_glyph_cache_capacity(config.performance.glyph_cache_entries);
+                    performance_budget = performance_budget_from_config(&config);
+                    request_cursor_image_if_enabled(
+                        &mut cursor_image_cache,
+                        &config,
+                        cursor_asset_base_dir.as_deref(),
+                    );
+                    cursor_image_status_reported = None;
+                    update_performance_overlay_context(
+                        &mut performance_overlay,
+                        &config,
+                        power_state.state,
+                    );
+                    log_power_policy(&config.performance, &power_state);
+                    scheduler.animation_changed();
+                    window.request_redraw();
                 }
 
                 if mux_runtime.poll_outputs(&mut clipboard, &osc52_policy, &clipboard_config) {
@@ -1458,7 +1540,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let animation_delay = cursor_animator.next_frame_after(cursor_settings);
                 let cursor_image_delay = cursor_image_runtime.next_frame_after();
                 let blink_delay = cursor_blink.next_frame_after();
-                let next_delay = [animation_delay, cursor_image_delay, blink_delay]
+                let power_delay = power_monitor.next_refresh_after();
+                let next_delay = [animation_delay, cursor_image_delay, blink_delay, power_delay]
                     .into_iter()
                     .flatten()
                     .min();
@@ -1553,7 +1636,7 @@ fn apply_live_config_reload(
             ReloadableSection::Performance => {
                 renderer.set_glyph_cache_capacity(next.performance.glyph_cache_entries);
                 current.performance = next.performance.clone();
-                *runtime_performance_budget = performance_budget(current);
+                *runtime_performance_budget = performance_budget_from_config(current);
             }
             ReloadableSection::VisualSemantics => {
                 current.visual_theme = next.visual_theme.clone();
@@ -1586,6 +1669,82 @@ fn font_config(config: &config_core::FontConfig) -> RuntimeFontConfig {
         size: config.size as f32,
         line_height: config.line_height as f32,
         ligatures: config.ligatures,
+    }
+}
+
+fn apply_power_policy(
+    effective: &mut PerformanceConfig,
+    configured: &PerformanceConfig,
+    power: PowerState,
+) {
+    *effective = configured.clone();
+    if !power.is_on_battery() || !configured.disable_expensive_effects_on_battery {
+        return;
+    }
+
+    let mut battery = PerformanceConfig::default();
+    battery.apply_profile(PerformanceProfile::BatterySaver);
+    effective.frame_rate_limit = Some(
+        effective
+            .frame_rate_limit
+            .unwrap_or(u16::MAX)
+            .min(battery.frame_rate_limit.unwrap_or(30)),
+    );
+    effective.glyph_cache_entries = effective
+        .glyph_cache_entries
+        .min(battery.glyph_cache_entries);
+    effective.max_animation_fps = effective.max_animation_fps.min(battery.max_animation_fps);
+    effective.max_active_animations = effective
+        .max_active_animations
+        .min(battery.max_active_animations);
+    effective.max_animated_region_pixels = effective
+        .max_animated_region_pixels
+        .min(battery.max_animated_region_pixels);
+}
+
+fn update_performance_overlay_context(
+    overlay: &mut PerformanceOverlay,
+    config: &AppConfig,
+    power: PowerState,
+) {
+    if !overlay.is_enabled() {
+        return;
+    }
+    overlay.set_runtime_context(
+        performance_profile_label(config.performance.profile),
+        power_source_label(power.source),
+    );
+}
+
+const fn performance_profile_label(profile: PerformanceProfile) -> &'static str {
+    match profile {
+        PerformanceProfile::MaximumPerformance => "maximum_performance",
+        PerformanceProfile::Balanced => "balanced",
+        PerformanceProfile::Visual => "visual",
+        PerformanceProfile::BatterySaver => "battery_saver",
+    }
+}
+
+fn log_power_policy(config: &PerformanceConfig, diagnostic: &platform_core::PowerStateDiagnostic) {
+    if let Some(message) = diagnostic.message.as_deref() {
+        eprintln!("power diagnostics: {message}");
+    }
+    if diagnostic.state.is_on_battery() && config.disable_expensive_effects_on_battery {
+        eprintln!(
+            "performance power policy: battery caps active (charge={:?}%, fps={:?}, animations={}, pixels={})",
+            diagnostic.state.charge_percent,
+            config.frame_rate_limit,
+            config.max_active_animations,
+            config.max_animated_region_pixels
+        );
+    }
+}
+
+const fn power_source_label(source: PowerSource) -> &'static str {
+    match source {
+        PowerSource::Ac => "ac",
+        PowerSource::Battery => "battery",
+        PowerSource::Unknown => "unknown",
     }
 }
 
@@ -1631,7 +1790,7 @@ fn request_cursor_image_if_enabled(
     config: &AppConfig,
     config_base_dir: Option<&Path>,
 ) {
-    if !config.cursor.image.enabled {
+    if !config.cursor.image.enabled || config.performance.max_active_animations == 0 {
         cache.disable();
         return;
     }
@@ -1672,7 +1831,7 @@ fn expand_home_path(path: &Path) -> PathBuf {
         )
 }
 
-fn performance_budget(config: &AppConfig) -> PerformanceBudget {
+fn performance_budget_from_config(config: &AppConfig) -> PerformanceBudget {
     PerformanceBudget {
         max_frame_time: Duration::from_millis(u64::from(config.performance.max_frame_time_ms)),
         ..PerformanceBudget::default()
@@ -4667,11 +4826,9 @@ impl PaneRuntime {
     }
 
     fn reconnect(&mut self, config: &AppConfig, metrics: CellMetrics) -> bool {
-        if !self.remote_session {
-            return false;
-        }
         self.shutdown();
         self.ssh_prompt = None;
+        self.semantic_parser = SemanticEscapeParser::new();
         let transport_size = terminal_transport_size(self.last_size, metrics);
         match spawn_session_transport(config, &self.session_spec, transport_size) {
             Ok(initial) => {
@@ -4687,17 +4844,32 @@ impl PaneRuntime {
                         },
                     );
                 }
-                self.connection_state = PaneConnectionState::Connecting;
-                let _ = self
-                    .terminal
-                    .apply_bytes(b"\r\n[Panea reconnecting SSH session...]\r\n");
+                for diagnostic in initial.activation_diagnostics {
+                    eprintln!("shell integration: {diagnostic}");
+                }
+                self.connection_state = if self.remote_session {
+                    PaneConnectionState::Connecting
+                } else {
+                    PaneConnectionState::Connected
+                };
+                let message = if self.remote_session {
+                    b"\r\n[Panea reconnecting SSH session...]\r\n".as_slice()
+                } else {
+                    b"\r\n[Panea restarting local session...]\r\n".as_slice()
+                };
+                let _ = self.terminal.apply_bytes(message);
                 true
             }
             Err(error) => {
                 self.connection_state = PaneConnectionState::Disconnected(error.to_string());
+                let operation = if self.remote_session {
+                    "SSH reconnect"
+                } else {
+                    "local session restart"
+                };
                 let _ = self
                     .terminal
-                    .apply_bytes(format!("\r\nSSH reconnect failed: {error}\r\n").as_bytes());
+                    .apply_bytes(format!("\r\n{operation} failed: {error}\r\n").as_bytes());
                 false
             }
         }
@@ -6632,6 +6804,56 @@ fn ansi_color(index: u8, config: &AppConfig) -> RenderColor {
 mod tests {
     use super::*;
     use semantics::{SemanticEventKind, SemanticTimeline};
+
+    #[test]
+    fn battery_policy_is_bounded_and_reversible() {
+        let mut configured = PerformanceConfig::default();
+        configured.apply_profile(PerformanceProfile::Visual);
+        let mut effective = configured.clone();
+        apply_power_policy(
+            &mut effective,
+            &configured,
+            PowerState {
+                source: PowerSource::Battery,
+                battery_count: 1,
+                charge_percent: Some(50),
+            },
+        );
+
+        assert!(effective.max_animation_fps <= 30);
+        assert!(effective.max_active_animations <= 2);
+        assert!(effective.glyph_cache_entries <= 4096);
+
+        apply_power_policy(
+            &mut effective,
+            &configured,
+            PowerState {
+                source: PowerSource::Ac,
+                battery_count: 1,
+                charge_percent: Some(51),
+            },
+        );
+        assert_eq!(effective, configured);
+    }
+
+    #[test]
+    fn disabled_battery_adaptation_preserves_configured_profile() {
+        let configured = PerformanceConfig {
+            disable_expensive_effects_on_battery: false,
+            ..PerformanceConfig::default()
+        };
+        let mut effective = configured.clone();
+        apply_power_policy(
+            &mut effective,
+            &configured,
+            PowerState {
+                source: PowerSource::Battery,
+                battery_count: 1,
+                charge_percent: None,
+            },
+        );
+        assert_eq!(effective, configured);
+    }
 
     fn mouse_event(kind: MouseEventKind) -> MouseEvent {
         MouseEvent {

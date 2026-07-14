@@ -1,0 +1,14 @@
+schema_version = 2
+
+[cursor]
+animations_enabled = true
+
+[cursor.image]
+enabled = false
+path = "path/to/cursor.gif"
+fps = 24
+warn_if_expensive = true
+
+[performance]
+max_cursor_asset_size_kb = 256
+max_animation_fps = 30

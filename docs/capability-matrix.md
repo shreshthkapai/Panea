@@ -59,7 +59,8 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Advanced programmable config | tested | implemented | implemented | implemented | Controlled `config-lua` frontend compiles deterministic `panea.*` programs into `AppConfig`, with platform conditionals/overrides, generated themes, bindings, profiles, formatting, validation, and automatic safe reload. Non-Windows host reports remain open. |
 | Benchmark CLI | tested | implemented | implemented | implemented | Repeatable local command exists; CI/platform runners remain open. |
 | Renderer instrumentation | tested | implemented | implemented | implemented | CPU, submission, glyph/cache, atlas, PTY/parser throughput, memory estimate, and GPU timestamp status metrics exist; real timestamp samples need cross-OS backend validation. |
-| In-window performance overlay | tested | partial | partial | partial | Developer overlay projection exists through renderer overlay primitives; polished installed toggle/UX and cross-OS visual verification remain. |
+| In-window performance overlay | tested | partial | partial | partial | Overlay projection reports CPU/GPU/frame/cache/damage/throughput/memory/profile/power data through renderer primitives; config live-toggle works, while cross-OS visual verification remains. |
+| Battery-aware performance policy | tested | implemented | implemented | implemented | Shared provider contract and native battery backends apply reversible optional-work caps outside hot paths; current-host Windows unit/runtime detection is verified, native macOS/Linux reports remain. |
 | Native mux model | tested | implemented | implemented | implemented | Workspace/tab/pane/session/layout model exists. |
 | Native tabs/workspaces runtime | tested | partial | partial | partial | Windows-host tests cover workspace/tab lifecycle, clickable configurable tab chrome, startup layouts and fresh-process restore; real GUI and non-Windows smoke remain. |
 | Native panes/splits runtime | tested | partial | partial | partial | Windows-host tests cover nested layouts, per-pane local/SSH ownership, focus, resize, zoom, move, swap, close, transport resize and pane-aware rendering; real GUI/non-Windows smoke remains. |
@@ -82,7 +83,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Doctor diagnostics | tested | implemented | implemented | implemented | Installed `panea doctor` and `cargo xtask doctor` share one diagnostics model with human-readable and JSON output; macOS/Linux runtime output still needs host verification. |
 | Bug-report snapshot | tested | implemented | implemented | implemented | Privacy-aware model exists; product export UX remains. |
 | Native notifications | planned | planned | planned | planned | Not implemented. |
-| Packaging artifacts | tested | implemented | implemented | implemented | `cargo xtask package` builds portable/staged packages with binary, config template/schema/examples, shell integration scripts, docs, license, manifest, packaged doctor smoke, and packaged headless shell-session smoke. Windows dev portable smoke passed on the current host; macOS app bundle and Linux portable package reports still need to be collected on those OSes. MSI/DMG/AppImage/deb/rpm remain later. |
+| Packaging artifacts | tested | implemented | implemented | implemented | Windows portable ZIP and per-user installer, macOS app/ZIP/DMG, and Linux tarball/deb builders include binary, themes, cursor profiles, config/schema/examples, shell scripts, docs, icons, and smoke commands. Windows install/uninstall smoke passed; non-Windows reports, signing/notarization, AppImage, and rpm remain. |
 | Release validation suite | partial | partial | partial | partial | Reports/gates exist; full cross-OS suite is unimplemented. |
 
 ## Mobile Matrix
@@ -104,7 +105,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 
 | Platform | Overall status | Why |
 | --- | --- | --- |
-| Windows | partial | Current host build/test/lint, local PTY smoke, required compatibility runner smoke, SSH smoke harness compilation, installed doctor smoke, cross-OS runner implementation, and Windows portable package doctor smoke have been verified, but renderer GUI, optional app matrix, a real SSH server report, installer packaging, and full daily-driver workflows are incomplete. |
+| Windows | partial | Current-host build/test/lint, local PTY, compatibility, installed doctor, portable package, and installer install/doctor/real-PTY/uninstall smokes are verified. Renderer GUI workflows, optional app matrix, real SSH server report, signing, and alpha usage remain. |
 | macOS | partial | Platform-neutral code and a macOS CI runner definition exist, but runtime behavior and verification reports are not yet collected. |
 | Linux X11 | partial | Platform-neutral code, X11 strategy, and a Linux X11 runner definition exist, but real X11 window manager/compositor behavior and reports are unverified. |
 | Linux Wayland | partial | Platform-neutral code, Wayland strategy, and a Linux Wayland runner definition exist, but real compositor behavior and reports are unverified. |

@@ -43,6 +43,32 @@ pub const PROGRAMMABLE_CONFIG_EXAMPLES: &[ConfigExample] = &[ConfigExample {
     contents: include_str!("../config-examples/advanced.panea"),
 }];
 
+pub const THEMES: &[ConfigExample] = &[
+    ConfigExample {
+        name: "panea-dark.toml",
+        contents: include_str!("../themes/panea-dark.toml"),
+    },
+    ConfigExample {
+        name: "panea-light.toml",
+        contents: include_str!("../themes/panea-light.toml"),
+    },
+];
+
+pub const CURSOR_PROFILES: &[ConfigExample] = &[
+    ConfigExample {
+        name: "static.toml",
+        contents: include_str!("../cursor-profiles/static.toml"),
+    },
+    ConfigExample {
+        name: "motion.toml",
+        contents: include_str!("../cursor-profiles/motion.toml"),
+    },
+    ConfigExample {
+        name: "image-template.toml",
+        contents: include_str!("../cursor-profiles/image-template.toml"),
+    },
+];
+
 #[must_use]
 pub fn config_example(name: &str) -> Option<&'static str> {
     CONFIG_EXAMPLES
@@ -61,6 +87,8 @@ mod tests {
         assert!(config_example("balanced.toml").is_some());
         assert!(config_example("foundational-customization.toml").is_some());
         assert_eq!(PROGRAMMABLE_CONFIG_EXAMPLES.len(), 1);
+        assert_eq!(THEMES.len(), 2);
+        assert_eq!(CURSOR_PROFILES.len(), 3);
     }
 
     #[test]

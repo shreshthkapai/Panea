@@ -213,6 +213,20 @@ performance_overlay = false
 `renderer.gpu_timestamps` is portable and defaults off. If a backend does not
 support timestamp queries, Panea reports the timing status as unsupported and
 continues rendering.
+The default `Ctrl+Shift+F12` binding toggles the in-window performance overlay.
+
+Battery adaptation is portable and enabled by default:
+
+```toml
+[performance]
+profile = "balanced"
+disable_expensive_effects_on_battery = true
+```
+
+Panea samples power state outside render/input/PTY paths. While discharging it
+temporarily caps optional animation/cache budgets; returning to AC restores the
+configured values. Set the key to `false` to disable both adaptation and power
+provider polling.
 
 ```toml
 [cursor]

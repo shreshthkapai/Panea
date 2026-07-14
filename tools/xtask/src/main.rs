@@ -12,6 +12,7 @@ use image::{
     DynamicImage, ImageFormat, RgbaImage,
     imageops::{FilterType, crop_imm, overlay, resize},
 };
+use sha2::{Digest, Sha256};
 
 use security::{
     AuthMethod, HostKey, HostKeyTrustAction, HostKeyTrustRequest, HostTrustProvider, KnownHosts,
@@ -3112,9 +3113,9 @@ fn print_package_plan() {
     println!("{}", diagnostics::packaging_plan().render_text());
     println!();
     println!("Implemented package artifacts:");
-    println!("- windows: portable directory with panea.exe at the package root");
-    println!("- macos: Panea.app bundle directory with resources under Contents/Resources");
-    println!("- linux: portable directory with bin/, share/panea/, desktop file, and icon");
+    println!("- windows: staged directory, portable ZIP, and per-user installer EXE");
+    println!("- macos: Panea.app bundle, distribution ZIP, and DMG");
+    println!("- linux: staged directory, portable tar.gz, and deb package");
     println!();
     println!("Build on each target OS:");
     println!("  cargo xtask package build --profile release");
@@ -3124,7 +3125,7 @@ fn print_package_plan() {
     println!("  panea shell-smoke --json");
     println!();
     println!(
-        "Installer, DMG, signing/notarization, AppImage, deb, and rpm builders remain later release-hardening work."
+        "Signing/notarization and Linux AppImage/rpm remain credential/toolchain release steps."
     );
 }
 
@@ -3256,7 +3257,18 @@ fn build_package(options: &PackageOptions) -> ExitCode {
             println!("wrote package artifact {}", layout.package_dir.display());
             println!("binary {}", layout.binary_path.display());
             println!("manifest {}", layout.manifest_path.display());
-            ExitCode::SUCCESS
+            match emit_distribution_artifacts(options, &layout) {
+                Ok(artifacts) => {
+                    for artifact in artifacts {
+                        println!("distribution {} {}", artifact.kind, artifact.path.display());
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("distribution artifact build failed: {error}");
+                    ExitCode::from(1)
+                }
+            }
         }
         Err(error) => {
             eprintln!("package build failed: {error}");
@@ -3274,6 +3286,10 @@ fn smoke_package(options: &PackageOptions) -> ExitCode {
     }
 
     let layout = package_layout(options);
+    if let Err(error) = verify_distribution_checksums(options) {
+        eprintln!("package checksum smoke failed: {error}");
+        return ExitCode::from(1);
+    }
     match verify_package_contents(&layout, options.target_platform) {
         Ok(()) => {}
         Err(error) => {
@@ -3297,6 +3313,14 @@ fn smoke_package(options: &PackageOptions) -> ExitCode {
     }
 
     println!("{}", shell_smoke.render_line());
+    if options.target_platform == CompatPlatform::Windows {
+        let installer_smoke = run_windows_installer_smoke(options);
+        if installer_smoke.status != PackageSmokeStatus::Passed {
+            eprintln!("{}", installer_smoke.render_line());
+            return ExitCode::from(1);
+        }
+        println!("{}", installer_smoke.render_line());
+    }
     ExitCode::SUCCESS
 }
 
@@ -3310,6 +3334,24 @@ fn build_desktop_binary(profile: PackageProfile) -> ExitCode {
 
 fn stage_package(options: &PackageOptions) -> Result<PackageLayout, String> {
     let layout = package_layout(options);
+    if layout.package_dir.exists() {
+        let package_dir = layout
+            .package_dir
+            .canonicalize()
+            .map_err(|error| format!("failed to resolve existing package directory: {error}"))?;
+        let out_dir = options
+            .out_dir
+            .canonicalize()
+            .map_err(|error| format!("failed to resolve package output directory: {error}"))?;
+        if !package_dir.starts_with(&out_dir) || package_dir == out_dir {
+            return Err(format!(
+                "refusing to clear package path outside output directory: {}",
+                package_dir.display()
+            ));
+        }
+        fs::remove_dir_all(&package_dir)
+            .map_err(|error| format!("failed to clear {}: {error}", package_dir.display()))?;
+    }
     fs::create_dir_all(&layout.resource_dir).map_err(|error| {
         format!(
             "failed to create {}: {error}",
@@ -3332,6 +3374,339 @@ fn stage_package(options: &PackageOptions) -> Result<PackageLayout, String> {
 
     write_package_resources(options, &layout)?;
     Ok(layout)
+}
+
+#[derive(Debug, Clone)]
+struct DistributionArtifact {
+    kind: &'static str,
+    path: PathBuf,
+}
+
+fn emit_distribution_artifacts(
+    options: &PackageOptions,
+    layout: &PackageLayout,
+) -> Result<Vec<DistributionArtifact>, String> {
+    fs::create_dir_all(&options.out_dir).map_err(|error| {
+        format!(
+            "failed to create artifact directory {}: {error}",
+            options.out_dir.display()
+        )
+    })?;
+    let mut artifacts = match options.target_platform {
+        CompatPlatform::Windows => emit_windows_artifacts(options, layout),
+        CompatPlatform::Macos => emit_macos_artifacts(options, layout),
+        CompatPlatform::LinuxX11 | CompatPlatform::LinuxWayland => {
+            emit_linux_artifacts(options, layout)
+        }
+        CompatPlatform::Any | CompatPlatform::Unix => {
+            Err("distribution artifacts require a concrete target platform".to_owned())
+        }
+    }?;
+    let checksums = write_artifact_checksums(options, &artifacts)?;
+    artifacts.push(DistributionArtifact {
+        kind: "sha256-checksums",
+        path: checksums,
+    });
+    Ok(artifacts)
+}
+
+fn write_artifact_checksums(
+    options: &PackageOptions,
+    artifacts: &[DistributionArtifact],
+) -> Result<PathBuf, String> {
+    let path = checksum_manifest_path(options);
+    let mut contents = String::new();
+    for artifact in artifacts {
+        let bytes = fs::read(&artifact.path)
+            .map_err(|error| format!("failed to hash {}: {error}", artifact.path.display()))?;
+        let digest = Sha256::digest(bytes);
+        let name = artifact
+            .path
+            .file_name()
+            .ok_or_else(|| format!("artifact has no file name: {}", artifact.path.display()))?;
+        contents.push_str(&format!("{digest:x}  {}\n", name.to_string_lossy()));
+    }
+    write_file(&path, &contents)?;
+    Ok(path)
+}
+
+fn checksum_manifest_path(options: &PackageOptions) -> PathBuf {
+    let platform = match options.target_platform {
+        CompatPlatform::Windows => "windows",
+        CompatPlatform::Macos => "macos",
+        CompatPlatform::LinuxX11 | CompatPlatform::LinuxWayland => "linux",
+        CompatPlatform::Any | CompatPlatform::Unix => "unknown",
+    };
+    options.out_dir.join(format!(
+        "{}-SHA256SUMS.txt",
+        artifact_stem(options, platform)
+    ))
+}
+
+fn verify_distribution_checksums(options: &PackageOptions) -> Result<(), String> {
+    let manifest_path = checksum_manifest_path(options);
+    let manifest = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("failed to read {}: {error}", manifest_path.display()))?;
+    let mut checked = 0usize;
+    for line in manifest.lines().filter(|line| !line.trim().is_empty()) {
+        let (expected, file_name) = line
+            .split_once("  ")
+            .ok_or_else(|| format!("invalid checksum line: {line}"))?;
+        if file_name.contains('/') || file_name.contains('\\') || file_name.contains("..") {
+            return Err(format!("unsafe checksum artifact name: {file_name}"));
+        }
+        let artifact = options.out_dir.join(file_name);
+        let bytes = fs::read(&artifact)
+            .map_err(|error| format!("failed to read {}: {error}", artifact.display()))?;
+        let actual = format!("{:x}", Sha256::digest(bytes));
+        if actual != expected {
+            return Err(format!("checksum mismatch for {}", artifact.display()));
+        }
+        checked += 1;
+    }
+    if checked < 2 {
+        return Err("checksum manifest did not cover all distribution artifacts".to_owned());
+    }
+    Ok(())
+}
+
+fn artifact_stem(options: &PackageOptions, platform: &str) -> String {
+    format!(
+        "panea-{}-{platform}-{}-{}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::ARCH,
+        options.profile.label()
+    )
+}
+
+fn emit_windows_artifacts(
+    options: &PackageOptions,
+    layout: &PackageLayout,
+) -> Result<Vec<DistributionArtifact>, String> {
+    let archive = options.out_dir.join(format!(
+        "{}.zip",
+        artifact_stem(options, "windows-portable")
+    ));
+    remove_file_if_exists(&archive)?;
+    let package_name = layout
+        .package_dir
+        .file_name()
+        .ok_or_else(|| "Windows package directory has no file name".to_owned())?;
+    run_checked(
+        Command::new("tar.exe")
+            .arg("-a")
+            .arg("-c")
+            .arg("-f")
+            .arg(&archive)
+            .arg("-C")
+            .arg(
+                layout
+                    .package_dir
+                    .parent()
+                    .ok_or_else(|| "Windows package directory has no parent".to_owned())?,
+            )
+            .arg(package_name),
+        "Windows portable ZIP",
+    )?;
+
+    let installer = options.out_dir.join(format!(
+        "{}.exe",
+        artifact_stem(options, "windows-installer")
+    ));
+    let package_root = layout
+        .package_dir
+        .canonicalize()
+        .map_err(|error| format!("failed to resolve installer payload: {error}"))?;
+    let mut command = Command::new("cargo");
+    command.args(["build", "-p", "panea-windows-installer"]);
+    if options.profile == PackageProfile::Release {
+        command.arg("--release");
+    }
+    command.env("PANEA_PACKAGE_ROOT", package_root);
+    run_checked(&mut command, "Windows installer build")?;
+    fs::copy(
+        PathBuf::from("target")
+            .join(options.profile.target_dir())
+            .join("panea-installer.exe"),
+        &installer,
+    )
+    .map_err(|error| format!("failed to copy Windows installer: {error}"))?;
+
+    Ok(vec![
+        DistributionArtifact {
+            kind: "windows-portable-zip",
+            path: archive,
+        },
+        DistributionArtifact {
+            kind: "windows-per-user-installer",
+            path: installer,
+        },
+    ])
+}
+
+fn emit_macos_artifacts(
+    options: &PackageOptions,
+    layout: &PackageLayout,
+) -> Result<Vec<DistributionArtifact>, String> {
+    let app = layout.package_dir.join("Panea.app");
+    let zip = options
+        .out_dir
+        .join(format!("{}.zip", artifact_stem(options, "macos")));
+    remove_file_if_exists(&zip)?;
+    run_checked(
+        Command::new("ditto")
+            .args(["-c", "-k", "--sequesterRsrc", "--keepParent"])
+            .arg(&app)
+            .arg(&zip),
+        "macOS application ZIP",
+    )?;
+
+    let dmg = options
+        .out_dir
+        .join(format!("{}.dmg", artifact_stem(options, "macos")));
+    remove_file_if_exists(&dmg)?;
+    run_checked(
+        Command::new("hdiutil")
+            .args(["create", "-volname", "Panea", "-srcfolder"])
+            .arg(&app)
+            .args(["-ov", "-format", "UDZO"])
+            .arg(&dmg),
+        "macOS DMG",
+    )?;
+    Ok(vec![
+        DistributionArtifact {
+            kind: "macos-app-zip",
+            path: zip,
+        },
+        DistributionArtifact {
+            kind: "macos-dmg",
+            path: dmg,
+        },
+    ])
+}
+
+fn emit_linux_artifacts(
+    options: &PackageOptions,
+    layout: &PackageLayout,
+) -> Result<Vec<DistributionArtifact>, String> {
+    let tarball = options.out_dir.join(format!(
+        "{}.tar.gz",
+        artifact_stem(options, "linux-portable")
+    ));
+    remove_file_if_exists(&tarball)?;
+    let package_name = layout
+        .package_dir
+        .file_name()
+        .ok_or_else(|| "Linux package directory has no file name".to_owned())?;
+    run_checked(
+        Command::new("tar")
+            .arg("-czf")
+            .arg(&tarball)
+            .arg("-C")
+            .arg(
+                layout
+                    .package_dir
+                    .parent()
+                    .ok_or_else(|| "Linux package directory has no parent".to_owned())?,
+            )
+            .arg(package_name),
+        "Linux portable tarball",
+    )?;
+
+    let deb_root = options
+        .out_dir
+        .join(format!(".{}-deb", artifact_stem(options, "linux")));
+    if deb_root.exists() {
+        fs::remove_dir_all(&deb_root)
+            .map_err(|error| format!("failed to clear deb staging: {error}"))?;
+    }
+    let usr = deb_root.join("usr");
+    copy_dir_recursive(&layout.package_dir.join("bin"), &usr.join("bin"))?;
+    copy_dir_recursive(&layout.package_dir.join("share"), &usr.join("share"))?;
+    write_file(
+        &deb_root.join("DEBIAN").join("control"),
+        &format!(
+            "Package: panea\nVersion: {}\nSection: utils\nPriority: optional\nArchitecture: {}\nMaintainer: Panea contributors\nDescription: GPU-first cross-platform terminal emulator\n",
+            env!("CARGO_PKG_VERSION"),
+            deb_architecture()
+        ),
+    )?;
+    let deb = options
+        .out_dir
+        .join(format!("{}.deb", artifact_stem(options, "linux")));
+    remove_file_if_exists(&deb)?;
+    run_checked(
+        Command::new("dpkg-deb")
+            .args(["--build", "--root-owner-group"])
+            .arg(&deb_root)
+            .arg(&deb),
+        "Debian package",
+    )?;
+    fs::remove_dir_all(&deb_root)
+        .map_err(|error| format!("failed to clear deb staging: {error}"))?;
+
+    Ok(vec![
+        DistributionArtifact {
+            kind: "linux-portable-tarball",
+            path: tarball,
+        },
+        DistributionArtifact {
+            kind: "linux-deb",
+            path: deb,
+        },
+    ])
+}
+
+fn deb_architecture() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "x86" => "i386",
+        other => other,
+    }
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination)
+        .map_err(|error| format!("failed to create {}: {error}", destination.display()))?;
+    for entry in fs::read_dir(source)
+        .map_err(|error| format!("failed to read {}: {error}", source.display()))?
+    {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        let output = destination.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir_recursive(&path, &output)?;
+        } else {
+            fs::copy(&path, &output).map_err(|error| {
+                format!(
+                    "failed to copy {} to {}: {error}",
+                    path.display(),
+                    output.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        fs::remove_file(path)
+            .map_err(|error| format!("failed to replace {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn run_checked(command: &mut Command, label: &str) -> Result<(), String> {
+    let status = command
+        .status()
+        .map_err(|error| format!("failed to start {label}: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{label} exited with {status}"))
+    }
 }
 
 fn package_layout(options: &PackageOptions) -> PackageLayout {
@@ -3405,6 +3780,21 @@ fn write_package_resources(options: &PackageOptions, layout: &PackageLayout) -> 
             example.contents,
         )?;
     }
+    for theme in assets::THEMES {
+        write_file(
+            &layout.resource_dir.join("themes").join(theme.name),
+            theme.contents,
+        )?;
+    }
+    for profile in assets::CURSOR_PROFILES {
+        write_file(
+            &layout
+                .resource_dir
+                .join("cursor-profiles")
+                .join(profile.name),
+            profile.contents,
+        )?;
+    }
 
     for shell in [
         ShellKind::Bash,
@@ -3469,7 +3859,8 @@ fn write_macos_bundle_files(layout: &PackageLayout) -> Result<(), String> {
         .ok_or_else(|| "invalid macOS bundle layout".to_owned())?;
     write_file(
         &contents_dir.join("Info.plist"),
-        r#"<?xml version="1.0" encoding="UTF-8"?>
+        &format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -3478,11 +3869,15 @@ fn write_macos_bundle_files(layout: &PackageLayout) -> Result<(), String> {
   <key>CFBundleName</key><string>Panea</string>
   <key>CFBundleIconFile</key><string>Panea.icns</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleShortVersionString</key><string>{}</string>
+  <key>CFBundleVersion</key><string>{}</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
 </dict>
 </plist>
 "#,
+            env!("CARGO_PKG_VERSION"),
+            env!("CARGO_PKG_VERSION"),
+        ),
     )?;
     write_bytes(
         &layout.resource_dir.join("Panea.icns"),
@@ -3513,7 +3908,7 @@ fn write_linux_package_files(layout: &PackageLayout) -> Result<(), String> {
 fn write_windows_package_files(layout: &PackageLayout) -> Result<(), String> {
     write_file(
         &layout.resource_dir.join("WINDOWS.txt"),
-        "Panea Windows portable package.\n\nRun panea.exe from the package root or add the package root to PATH.\nInstaller, Start menu shortcuts, and PATH mutation are deferred to the installer phase.\n",
+        "Panea Windows portable package.\n\nRun panea.exe from the package root. The release pipeline also emits a per-user installer that adds Start menu entries and the install directory to the user PATH.\n",
     )?;
     write_bytes(
         &layout.resource_dir.join("icons").join("panea.ico"),
@@ -3553,6 +3948,16 @@ fn verify_package_contents(
             .join("config")
             .join("examples")
             .join("advanced.panea"),
+        &layout.resource_dir.join("themes").join("panea-dark.toml"),
+        &layout.resource_dir.join("themes").join("panea-light.toml"),
+        &layout
+            .resource_dir
+            .join("cursor-profiles")
+            .join("static.toml"),
+        &layout
+            .resource_dir
+            .join("cursor-profiles")
+            .join("motion.toml"),
     ] {
         if !path.exists() {
             return Err(format!("missing packaged file {}", path.display()));
@@ -3808,6 +4213,104 @@ fn run_packaged_shell_smoke(binary_path: &Path, timeout: Duration) -> PackageSmo
     }
 }
 
+fn run_windows_installer_smoke(options: &PackageOptions) -> PackageSmokeResult {
+    let started = Instant::now();
+    let installer = options.out_dir.join(format!(
+        "{}.exe",
+        artifact_stem(options, "windows-installer")
+    ));
+    let install_dir = options
+        .out_dir
+        .join(format!(".panea-installer-smoke-{}", std::process::id()));
+    if install_dir.exists()
+        && let Err(error) = fs::remove_dir_all(&install_dir)
+    {
+        return PackageSmokeResult {
+            name: "windows-installer",
+            status: PackageSmokeStatus::Failed,
+            duration: started.elapsed(),
+            detail: format!("failed to clear installer smoke directory: {error}"),
+        };
+    }
+
+    let install = run_bounded_command(
+        Command::new(&installer)
+            .args(["install", "--install-dir"])
+            .arg(&install_dir)
+            .args(["--no-shortcuts", "--no-path", "--no-register"]),
+        options.timeout,
+    );
+    if let Err(error) = install {
+        return PackageSmokeResult {
+            name: "windows-installer",
+            status: PackageSmokeStatus::Failed,
+            duration: started.elapsed(),
+            detail: format!("installer launch failed: {error}"),
+        };
+    }
+
+    let installed_binary = install_dir.join("panea.exe");
+    let doctor = run_packaged_doctor(&installed_binary, options.timeout);
+    let shell = run_packaged_shell_smoke(&installed_binary, options.timeout);
+    let uninstall = run_bounded_command(
+        Command::new(&installer)
+            .args(["uninstall", "--install-dir"])
+            .arg(&install_dir)
+            .args(["--no-shortcuts", "--no-path", "--no-register"]),
+        options.timeout,
+    );
+
+    let passed = doctor.status == PackageSmokeStatus::Passed
+        && shell.status == PackageSmokeStatus::Passed
+        && uninstall.is_ok()
+        && !install_dir.exists();
+    PackageSmokeResult {
+        name: "windows-installer",
+        status: if passed {
+            PackageSmokeStatus::Passed
+        } else {
+            PackageSmokeStatus::Failed
+        },
+        duration: started.elapsed(),
+        detail: format!(
+            "install={} doctor={} shell={} uninstall={} cleaned={}",
+            installer.display(),
+            doctor.status.label(),
+            shell.status.label(),
+            uninstall.as_ref().map_or("failed", |_| "passed"),
+            !install_dir.exists()
+        ),
+    }
+}
+
+fn run_bounded_command(command: &mut Command, timeout: Duration) -> Result<(), String> {
+    let started = Instant::now();
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(format!("command exited with {status}"));
+            }
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("command exceeded {} ms", timeout.as_millis()));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.to_string());
+            }
+        }
+    }
+}
+
 fn built_desktop_binary(profile: PackageProfile) -> PathBuf {
     PathBuf::from("target")
         .join(profile.target_dir())
@@ -3852,7 +4355,7 @@ fn render_package_manifest(options: &PackageOptions, layout: &PackageLayout) -> 
             "  \"resources\": \"{}\",\n",
             "  \"doctor_smoke\": \"panea doctor --json\",\n",
             "  \"shell_launch_smoke\": \"panea shell-smoke --json\",\n",
-            "  \"contains\": [\"binary\", \"application_icon\", \"default_config\", \"config_schema\", \"config_examples\", \"programmable_config_examples\", \"shell_integration_scripts\", \"doctor_command\", \"shell_smoke_command\", \"license\", \"readme\"]\n",
+            "  \"contains\": [\"binary\", \"application_icon\", \"default_config\", \"config_schema\", \"config_examples\", \"programmable_config_examples\", \"themes\", \"cursor_profiles\", \"shell_integration_scripts\", \"doctor_command\", \"shell_smoke_command\", \"license\", \"readme\"]\n",
             "}}\n"
         ),
         env!("CARGO_PKG_VERSION"),
@@ -3876,13 +4379,13 @@ fn package_install_notes(options: &PackageOptions) -> String {
     let common = "Panea package artifact\n\nRun `panea doctor --json` first to verify diagnostics. Run `panea shell-smoke --json` to verify that the packaged binary can start a bounded local shell session through Panea's PTY transport.\n\n";
     match options.target_platform {
         CompatPlatform::Windows => format!(
-            "{common}Windows portable behavior:\n- Run `panea.exe` from this directory.\n- Add this directory to PATH manually if desired.\n- Installer, Start menu integration, and automatic PATH changes are deferred.\n"
+            "{common}Windows delivery:\n- Run `panea.exe` directly from the portable ZIP.\n- Or run the Panea installer EXE for a per-user install, Start menu shortcuts, and user PATH registration.\n- Uninstall from the Start menu shortcut or `panea-uninstall.exe uninstall`.\n"
         ),
         CompatPlatform::Macos => format!(
-            "{common}macOS app behavior:\n- Open `Panea.app` or run `Panea.app/Contents/MacOS/panea doctor --json`.\n- Signing, notarization, DMG, and zip distribution are deferred.\n"
+            "{common}macOS delivery:\n- Open `Panea.app` or run `Panea.app/Contents/MacOS/panea doctor --json`.\n- Release builds emit ZIP and DMG artifacts. Signing and notarization require distribution credentials.\n"
         ),
         CompatPlatform::LinuxX11 | CompatPlatform::LinuxWayland => format!(
-            "{common}Linux portable behavior:\n- Run `bin/panea` from this package.\n- A desktop file and SVG icon are staged under `share/`.\n- AppImage, deb, rpm, and terminfo installation strategy are deferred.\n"
+            "{common}Linux delivery:\n- Extract the portable tarball and run `bin/panea`.\n- Install the generated deb package on Debian-compatible distributions.\n- Desktop metadata and the application icon are included under `share/`.\n"
         ),
         CompatPlatform::Any | CompatPlatform::Unix => common.to_owned(),
     }
@@ -4385,6 +4888,7 @@ const WORKSPACE_PACKAGES: &[&str] = &[
     "panea-desktop",
     "panea-fuzz",
     "panea-ios",
+    "panea-windows-installer",
     "platform-core",
     "platform-winit",
     "render-core",
@@ -4654,6 +5158,7 @@ fn dependency_rules() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
                 "transport-ssh",
             ]),
         ),
+        ("panea-windows-installer", allowed([])),
         ("platform-core", allowed([])),
         ("platform-winit", allowed(["platform-core"])),
         ("render-core", allowed([])),
@@ -4670,6 +5175,7 @@ fn dependency_rules() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
             "xtask",
             allowed([
                 "assets",
+                "config-core",
                 "config-toml",
                 "diagnostics",
                 "render-wgpu",
@@ -5128,6 +5634,8 @@ mod tests {
         assert!(manifest.contains("\"doctor_command\""));
         assert!(manifest.contains("\"shell_smoke_command\""));
         assert!(manifest.contains("\"programmable_config_examples\""));
+        assert!(manifest.contains("\"themes\""));
+        assert!(manifest.contains("\"cursor_profiles\""));
         assert!(manifest.contains("\"license\""));
         assert!(manifest.contains("\"application_icon\""));
     }
@@ -5148,5 +5656,24 @@ mod tests {
             package_icon_paths(&linux, CompatPlatform::LinuxWayland)[0]
                 .ends_with(Path::new("512x512").join("apps").join("panea.png"))
         );
+    }
+
+    #[test]
+    fn distribution_artifact_names_are_versioned_and_arch_specific() {
+        let mut options = PackageOptions::default_for(CompatPlatform::Windows);
+        options.profile = PackageProfile::Release;
+        let name = artifact_stem(&options, "windows-installer");
+
+        assert!(name.contains(env!("CARGO_PKG_VERSION")));
+        assert!(name.contains(std::env::consts::ARCH));
+        assert!(name.ends_with("-release"));
+    }
+
+    #[test]
+    fn packaged_theme_and_cursor_profiles_parse_as_portable_config() {
+        for asset in assets::THEMES.iter().chain(assets::CURSOR_PROFILES) {
+            config_toml::parse_str(asset.contents, None, config_core::ConfigPlatform::Unknown)
+                .unwrap_or_else(|error| panic!("{} must parse: {error}", asset.name));
+        }
     }
 }

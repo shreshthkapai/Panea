@@ -1530,45 +1530,47 @@ pub fn packaging_plan() -> PackagingPlan {
     PackagingPlan {
         targets: vec![
             PackageTarget {
-                target: "macOS app bundle",
-                status: ReadinessStatus::NotVerified,
+                target: "macOS app bundle, ZIP, and DMG",
+                status: ReadinessStatus::Warning,
                 requirements: vec![
-                    "bundle apps/desktop binary with assets and shell integration scripts",
-                    "preserve macOS config discovery path",
-                    "add signing and notarization plan before public release",
+                    "artifact builders include binary, assets, config, and shell scripts",
+                    "run package smoke on a macOS release host",
+                    "sign and notarize with release-owner credentials before public release",
                 ],
             },
             PackageTarget {
                 target: "Windows installer",
-                status: ReadinessStatus::NotVerified,
+                status: ReadinessStatus::Pass,
                 requirements: vec![
-                    "install desktop binary, assets, themes, and shell scripts",
-                    "preserve Windows config discovery path",
-                    "include portable build or clearly document install location",
+                    "per-user install, atomic upgrade, Start menu, PATH, and uninstall are implemented",
+                    "current-host install/doctor/shell/uninstall smoke passed",
+                    "Authenticode signing requires a release certificate",
                 ],
             },
             PackageTarget {
                 target: "Windows portable build",
-                status: ReadinessStatus::NotVerified,
+                status: ReadinessStatus::Pass,
                 requirements: vec![
-                    "ship single extracted directory with binary and assets",
-                    "avoid writing secrets or config inside the install directory by default",
+                    "portable ZIP includes binary, assets, themes, cursor profiles, and scripts",
+                    "current-host packaged doctor and shell smoke passed",
                 ],
             },
             PackageTarget {
-                target: "Linux AppImage or equivalent",
-                status: ReadinessStatus::NotVerified,
+                target: "Linux portable tarball",
+                status: ReadinessStatus::Warning,
                 requirements: vec![
-                    "include assets, themes, and shell integration scripts",
-                    "validate both X11 and Wayland startup behavior",
-                    "document compositor-specific fallback behavior",
+                    "portable tarball builder includes binary, assets, themes, and scripts",
+                    "run package smoke on Linux X11 and Wayland hosts",
+                    "AppImage remains an additional optional distribution format",
                 ],
             },
             PackageTarget {
-                target: "Linux distro packages",
-                status: ReadinessStatus::NotVerified,
+                target: "Linux distro packages (deb; rpm later)",
+                status: ReadinessStatus::Warning,
                 requirements: vec![
-                    "defer until file layout, desktop entry, icons, and dependency policy are stable",
+                    "deb builder includes /usr binary, desktop entry, icon, and resources",
+                    "validate package dependencies and installation on supported distributions",
+                    "rpm remains a future distribution format",
                 ],
             },
         ],
@@ -1638,9 +1640,9 @@ pub fn release_validation_report(input: &DoctorInput) -> ReadinessReport {
             },
             ReadinessItem {
                 area: "packaging",
-                status: ReadinessStatus::Blocked,
+                status: ReadinessStatus::Warning,
                 message:
-                    "macOS, Windows, and Linux package artifacts are not produced by automation yet"
+                    "release automation builds Windows ZIP/installer, macOS app/ZIP/DMG, and Linux tarball/deb; non-Windows validation and release signing remain"
                         .to_owned(),
             },
             ReadinessItem {
@@ -2072,6 +2074,8 @@ pub struct PerformanceOverlay {
     samples: VecDeque<RenderInstrumentation>,
     capacity: usize,
     backend: String,
+    runtime_profile: &'static str,
+    power_source: &'static str,
 }
 
 impl PerformanceOverlay {
@@ -2082,6 +2086,8 @@ impl PerformanceOverlay {
             samples: VecDeque::new(),
             capacity: 120,
             backend: backend.into(),
+            runtime_profile: "balanced",
+            power_source: "unknown",
         }
     }
 
@@ -2103,6 +2109,14 @@ impl PerformanceOverlay {
 
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+    }
+
+    pub fn set_runtime_context(&mut self, profile: &'static str, power_source: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        self.runtime_profile = profile;
+        self.power_source = power_source;
     }
 
     #[must_use]
@@ -2140,8 +2154,10 @@ impl PerformanceOverlay {
                 format_duration_ms(latest.cpu_prepare_time),
             ),
             format!(
-                "backend {} timestamps {} draws {} damage {} anim {} idle {}",
+                "backend {} profile {} power {} timestamps {} draws {} damage {} anim {} idle {}",
                 self.backend,
+                self.runtime_profile,
+                self.power_source,
                 gpu_timing_label(latest.gpu_timing_status),
                 latest.draw_call_count,
                 latest.damage_region_count,
@@ -2600,7 +2616,8 @@ mod tests {
 
         assert!(text.contains("macOS app bundle"));
         assert!(text.contains("Windows installer"));
-        assert!(text.contains("Linux AppImage"));
+        assert!(text.contains("Linux portable tarball"));
+        assert!(text.contains("Linux distro packages"));
     }
 
     #[test]

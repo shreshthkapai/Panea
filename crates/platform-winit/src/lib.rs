@@ -2,7 +2,10 @@
 
 pub const LAYER: &str = "platform parity";
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use arboard::Clipboard;
 use platform_core::{
@@ -10,9 +13,12 @@ use platform_core::{
     CompositorInfo, DecorationMode, DecorationModeDiagnostic, DesktopPlatform, DpiBehavior,
     DpiInfo, ImeEvent, ImeSupport, InputEvent, KeyEvent, KeyModifiers, KeyState,
     LinuxWindowBackend, LinuxWindowBackendDiagnostic, MonitorInfo, MouseButton, MouseEvent,
-    MouseEventKind, PlatformCapabilities, PlatformFallback, ShellEnvironmentInfo,
-    UrlOpenDiagnostic, UrlOpener, WindowAction, WindowMode, WindowModeDiagnostic,
+    MouseEventKind, PlatformCapabilities, PlatformFallback, PowerSource, PowerState,
+    PowerStateDiagnostic, PowerStateProvider, ShellEnvironmentInfo, UrlOpenDiagnostic, UrlOpener,
+    WindowAction, WindowMode, WindowModeDiagnostic,
 };
+use starship_battery::units::ratio::percent;
+use starship_battery::{Manager as BatteryManager, State as BatteryState};
 use winit::{
     dpi::LogicalSize,
     event::{ElementState, Ime, MouseScrollDelta, WindowEvent},
@@ -20,6 +26,156 @@ use winit::{
     keyboard::{Key, ModifiersState, NamedKey},
     window::{Fullscreen, Window, WindowBuilder},
 };
+
+const POWER_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+pub struct DesktopPowerMonitor {
+    enabled: bool,
+    manager: Option<BatteryManager>,
+    last: PowerStateDiagnostic,
+    next_refresh: Instant,
+}
+
+impl DesktopPowerMonitor {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_enabled(true)
+    }
+
+    #[must_use]
+    pub fn with_enabled(enabled: bool) -> Self {
+        if !enabled {
+            return Self {
+                enabled: false,
+                manager: None,
+                last: PowerStateDiagnostic {
+                    state: PowerState::UNKNOWN,
+                    message: None,
+                },
+                next_refresh: Instant::now() + POWER_REFRESH_INTERVAL,
+            };
+        }
+        let (manager, last) = match BatteryManager::new() {
+            Ok(manager) => (
+                Some(manager),
+                PowerStateDiagnostic {
+                    state: PowerState::UNKNOWN,
+                    message: None,
+                },
+            ),
+            Err(error) => (
+                None,
+                PowerStateDiagnostic {
+                    state: PowerState::UNKNOWN,
+                    message: Some(format!("power-state provider unavailable: {error}")),
+                },
+            ),
+        };
+        let mut monitor = Self {
+            enabled: true,
+            manager,
+            last,
+            next_refresh: Instant::now(),
+        };
+        monitor.refresh_if_due();
+        monitor
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if self.enabled == enabled {
+            return;
+        }
+        *self = Self::with_enabled(enabled);
+    }
+
+    pub fn refresh_if_due(&mut self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if Instant::now() < self.next_refresh {
+            return false;
+        }
+        self.next_refresh = Instant::now() + POWER_REFRESH_INTERVAL;
+        let next = self.read_power_state();
+        let changed = next != self.last;
+        self.last = next;
+        changed
+    }
+
+    #[must_use]
+    pub fn next_refresh_after(&self) -> Option<Duration> {
+        self.enabled
+            .then(|| self.next_refresh.saturating_duration_since(Instant::now()))
+    }
+
+    fn read_power_state(&self) -> PowerStateDiagnostic {
+        let Some(manager) = self.manager.as_ref() else {
+            return self.last.clone();
+        };
+        let batteries = match manager.batteries() {
+            Ok(batteries) => batteries,
+            Err(error) => {
+                return PowerStateDiagnostic {
+                    state: PowerState::UNKNOWN,
+                    message: Some(format!("failed to enumerate batteries: {error}")),
+                };
+            }
+        };
+
+        let mut battery_count = 0usize;
+        let mut on_battery = false;
+        let mut charge_percent: Option<u8> = None;
+        let mut provider_error = None;
+        for battery in batteries {
+            match battery {
+                Ok(battery) => {
+                    battery_count += 1;
+                    on_battery |= matches!(
+                        battery.state(),
+                        BatteryState::Discharging | BatteryState::Empty
+                    );
+                    let charge = battery
+                        .state_of_charge()
+                        .get::<percent>()
+                        .clamp(0.0, 100.0)
+                        .round() as u8;
+                    charge_percent = Some(charge_percent.map_or(charge, |value| value.min(charge)));
+                }
+                Err(error) => provider_error = Some(error.to_string()),
+            }
+        }
+
+        let source = if on_battery {
+            PowerSource::Battery
+        } else if battery_count > 0 {
+            PowerSource::Ac
+        } else {
+            PowerSource::Unknown
+        };
+        PowerStateDiagnostic {
+            state: PowerState {
+                source,
+                battery_count,
+                charge_percent,
+            },
+            message: provider_error.map(|error| format!("battery read failed: {error}")),
+        }
+    }
+}
+
+impl Default for DesktopPowerMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PowerStateProvider for DesktopPowerMonitor {
+    fn power_state(&mut self) -> PowerStateDiagnostic {
+        self.refresh_if_due();
+        self.last.clone()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowSettings {
@@ -809,6 +965,15 @@ fn clipboard_diagnostic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_power_monitor_does_not_schedule_provider_work() {
+        let mut monitor = DesktopPowerMonitor::with_enabled(false);
+
+        assert!(!monitor.refresh_if_due());
+        assert_eq!(monitor.next_refresh_after(), None);
+        assert_eq!(monitor.power_state().state, PowerState::UNKNOWN);
+    }
 
     #[test]
     fn recovery_shortcuts_translate_to_window_actions() {

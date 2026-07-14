@@ -67,6 +67,44 @@ pub enum GpuBackend {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerSource {
+    Ac,
+    Battery,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PowerState {
+    pub source: PowerSource,
+    pub battery_count: usize,
+    pub charge_percent: Option<u8>,
+}
+
+impl PowerState {
+    pub const UNKNOWN: Self = Self {
+        source: PowerSource::Unknown,
+        battery_count: 0,
+        charge_percent: None,
+    };
+
+    #[must_use]
+    pub const fn is_on_battery(self) -> bool {
+        matches!(self.source, PowerSource::Battery)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PowerStateDiagnostic {
+    pub state: PowerState,
+    pub message: Option<String>,
+}
+
+/// Power-state contract. Providers are sampled outside render, input, and PTY hot paths.
+pub trait PowerStateProvider {
+    fn power_state(&mut self) -> PowerStateDiagnostic;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImeSupport {
     Unsupported,
     Basic,
@@ -394,6 +432,19 @@ mod tests {
                 .expect_err("fake provider has no primary selection")
                 .availability,
             ClipboardAvailability::Unavailable
+        );
+    }
+
+    #[test]
+    fn power_state_contract_distinguishes_unknown_from_battery() {
+        assert!(!PowerState::UNKNOWN.is_on_battery());
+        assert!(
+            PowerState {
+                source: PowerSource::Battery,
+                battery_count: 1,
+                charge_percent: Some(42),
+            }
+            .is_on_battery()
         );
     }
 }

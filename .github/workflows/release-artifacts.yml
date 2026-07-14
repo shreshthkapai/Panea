@@ -1,0 +1,61 @@
+name: release-artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  package:
+    name: package (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows
+            os: windows-latest
+          - target: macos
+            os: macos-latest
+          - target: linux-x11
+            os: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Build release distributions
+        run: >
+          cargo run -p xtask -- package build
+          --target-platform ${{ matrix.target }}
+          --profile release
+      - name: Smoke staged release
+        run: >
+          cargo run -p xtask -- package smoke
+          --target-platform ${{ matrix.target }}
+          --profile release
+          --timeout-ms 15000
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: panea-${{ matrix.target }}
+          path: target/packages/
+          if-no-files-found: error
+
+  performance-contract:
+    name: performance contract (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and measure representative renderer path
+        run: cargo run --release -p panea-bench -- render-grid
+      - name: Verify disabled/default/heavy cursor budgets
+        run: cargo run --release -p panea-bench -- cursor-animation

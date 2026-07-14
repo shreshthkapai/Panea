@@ -164,15 +164,23 @@ fn render_grid() -> Result<(), Box<dyn Error>> {
     );
     let mut fonts = FontSystem::new(FontConfig::default());
     let mut rasterizer = TerminalRasterizer::default();
+    let cold = rasterizer
+        .prepare_batches(&scene, &mut fonts)?
+        .instrumentation;
     let started = Instant::now();
     let iterations = 5;
     let mut last = RenderInstrumentation::default();
 
     for _ in 0..iterations {
         last = rasterizer
-            .rasterize_instrumented(&scene, &mut fonts)?
+            .prepare_batches(&scene, &mut fonts)?
             .instrumentation;
     }
+
+    println!(
+        "bench=render-grid-cold cpu_prepare={:?} glyph_misses={} atlas_uploads={}",
+        cold.cpu_prepare_time, cold.glyphs.cache_misses, cold.glyphs.atlas_uploads
+    );
 
     print_result(BenchmarkResult {
         name: "render-grid",
@@ -191,6 +199,9 @@ fn batch_scene_bench(
 ) -> Result<(), Box<dyn Error>> {
     let mut fonts = FontSystem::new(FontConfig::default());
     let mut rasterizer = TerminalRasterizer::default();
+    let cold = rasterizer
+        .prepare_batches(&scene, &mut fonts)?
+        .instrumentation;
     let started = Instant::now();
     let mut last = RenderInstrumentation::default();
 
@@ -199,6 +210,11 @@ fn batch_scene_bench(
             .prepare_batches(&scene, &mut fonts)?
             .instrumentation;
     }
+
+    println!(
+        "bench={name}-cold cpu_prepare={:?} glyph_misses={} atlas_uploads={}",
+        cold.cpu_prepare_time, cold.glyphs.cache_misses, cold.glyphs.atlas_uploads
+    );
 
     print_result(BenchmarkResult {
         name,
@@ -319,6 +335,9 @@ fn cursor_animation_cost() -> Result<(), Box<dyn Error>> {
         disabled_report.passed,
         disabled_report.warnings.len()
     );
+    if !disabled_report.passed {
+        return Err("disabled cursor animation recorded render work".into());
+    }
 
     for mode in [
         OptionalFeatureCostMode::EnabledDefault,

@@ -12,21 +12,24 @@ User-facing behavior: users receive a packaged `panea` binary plus resources,
 default config, shell integration scripts, documentation, and `panea doctor`
 Config keys: no package-only config keys; packaged config templates use the
 same portable `AppConfig`
-macOS behavior: `Panea.app` bundle layout with binary under
-`Contents/MacOS` and resources under `Contents/Resources`
-Windows behavior: portable directory with `panea.exe` at the package root
-Linux X11 behavior: portable directory with `bin/panea`, `share/panea`,
-desktop file, and icon
+macOS behavior: `Panea.app` bundle plus ZIP and DMG distribution artifacts
+Windows behavior: portable directory/ZIP plus a self-contained per-user
+installer with atomic upgrade, Start menu shortcuts, user PATH registration,
+and uninstall
+Linux X11 behavior: portable directory/tarball plus a Debian package, desktop
+file, and icon
 Linux Wayland behavior: same Linux package layout as X11; backend behavior is
 selected and diagnosed at runtime
-Fallback behavior: MSI/DMG/AppImage/deb/rpm/signing/notarization are deferred;
-the portable/staged artifact remains inspectable
+Fallback behavior: portable archives remain available when signing credentials
+or optional distro tooling are unavailable; signing/notarization, AppImage,
+and rpm are explicit release-toolchain steps
 Diagnostics: packaged `panea doctor --json` and `panea shell-smoke --json`
 are smoke-tested
 Performance cost when disabled: none; packaging is offline build tooling
 Performance cost when enabled: one desktop binary build plus filesystem staging
-Tests: xtask unit tests, package content verification, packaged doctor smoke,
-packaged headless shell-session smoke, and cross-OS runner integration
+Tests: xtask unit tests, package content verification, packaged doctor and
+headless shell-session smoke, Windows install/installed-binary/uninstall smoke,
+and cross-OS release runners
 
 ## Commands
 
@@ -56,6 +59,9 @@ panea doctor --json
 panea shell-smoke --json
 ```
 
+On Windows it also installs into a temporary per-user-style directory, runs
+both commands from the installed binary, uninstalls, and verifies cleanup.
+
 `shell-smoke` starts a bounded local PTY session, runs a one-shot marker command
 through the selected/default shell profile, observes output, and shuts the
 transport down. Full GUI launch remains a manual release smoke on each target
@@ -81,6 +87,13 @@ panea-<version>-windows-portable-<profile>/
     package-manifest.json
 ```
 
+The Windows build also emits:
+
+```text
+panea-<version>-windows-portable-<arch>-<profile>.zip
+panea-<version>-windows-installer-<arch>-<profile>.exe
+```
+
 macOS app bundle:
 
 ```text
@@ -99,6 +112,10 @@ panea-<version>-macos-app-<profile>/
       INSTALL.md
       package-manifest.json
 ```
+
+The macOS host also emits a ZIP and compressed DMG containing `Panea.app`.
+Signing and notarization are intentionally separate because they require the
+release owner's Apple credentials.
 
 Linux portable:
 
@@ -119,11 +136,28 @@ panea-<version>-linux-portable-<profile>/
     package-manifest.json
 ```
 
-## Deferred
+The Linux host also emits:
 
-- Windows MSI/installer, Start menu integration, and PATH mutation.
-- macOS zip/DMG, signing, and notarization.
-- Linux AppImage, deb, rpm, dependency policy, and terminfo installation.
-- Cross-OS collected package reports for macOS, Linux X11, and Linux Wayland.
-- Full GUI packaged launch smoke remains manual until an installed GUI runner
-  exists.
+```text
+panea-<version>-linux-portable-<arch>-<profile>.tar.gz
+panea-<version>-linux-<arch>-<profile>.deb
+```
+
+All package layouts include `themes/`, `cursor-profiles/`, static and
+programmable config examples, and shell integration scripts.
+Each platform build emits a `SHA256SUMS.txt` manifest, and package smoke
+recomputes every listed digest before launching packaged binaries.
+
+## Release Boundaries
+
+- Windows installer and portable artifacts are implemented and passed the
+  current-host development package smoke. Authenticode signing requires a
+  release certificate.
+- macOS ZIP/DMG generation is implemented but must run and be validated on a
+  macOS host. Code signing/notarization requires Apple credentials.
+- Linux portable tarball and deb generation are implemented but must run and
+  be validated on Linux. AppImage/rpm remain additional distribution formats.
+- Full GUI launch and interaction remain manual release checks on every target
+  OS; headless doctor and real-PTY shell startup are automated.
+- The repository is currently marked unlicensed. Public OSS distribution
+  requires the owner to select and apply an open-source license first.

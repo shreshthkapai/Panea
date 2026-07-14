@@ -1,0 +1,13 @@
+schema_version = 2
+
+[cursor]
+shape = "block"
+blink = true
+blink_interval_ms = 600
+thickness = 0.15
+corner_radius = 0.0
+inactive_shape = "hollow_block"
+animations_enabled = false
+
+[cursor.image]
+enabled = false

@@ -475,3 +475,18 @@ to more visible features before the dependencies they rely on are hardened.
   implementation, iOS Keychain-backed `SecretProvider`, host-key approval UI,
   key import UX, remote shell-integration activation, simulator/device
   validation, and App Store/TestFlight packaging remain follow-up work.
+- Product Step 17 completes the current performance/reliability slice with a
+  platform-neutral power contract, native cross-platform battery provider,
+  reversible battery-saver caps, power/profile overlay diagnostics, disabled
+  provider/overlay fast paths, and explicit restart for disconnected local or
+  SSH panes. Existing renderer device recreation and last-valid-config reload
+  retention remain part of the same recovery contract. Fair Alacritty/WezTerm
+  comparisons still require controlled public benchmark runs.
+- Product Step 18 extends packaging from staged directories to distribution
+  artifacts: Windows portable ZIP and atomic per-user installer EXE with Start
+  menu/PATH/uninstall support, macOS app ZIP and DMG, and Linux portable tarball
+  plus deb. Packages now include default themes, cursor profiles, config
+  examples, shell scripts, icons, docs, doctor, and real-PTY shell smoke. The
+  Windows development installer passed install/doctor/shell/uninstall cleanup;
+  non-Windows artifact runs, signing/notarization, AppImage/rpm, and a selected
+  OSS license remain release gates.

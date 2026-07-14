@@ -37,6 +37,9 @@ The harness reports elapsed time, byte throughput where applicable, frame
 timing, CPU render preparation time, glyph cache hits/misses, atlas uploads,
 damage region count, draw-call count, animated region count, idle wakeups, and
 performance-gate warnings.
+Renderer commands report cold cache population separately from timed warm
+iterations, so glyph discovery/rasterization cost is not confused with steady
+state batch preparation.
 
 Renderer batching details and the Phase 4 design note live in
 [renderer-batching.md](renderer-batching.md).
@@ -57,6 +60,9 @@ The portable performance profiles are:
 - `battery_saver`
 
 Profiles describe budget posture. They are not public performance claims.
+When `disable_expensive_effects_on_battery = true`, Panea samples the platform
+power provider outside hot paths and temporarily applies battery-saver caps to
+optional animation work. Returning to AC restores the configured profile.
 
 ## Gates
 
@@ -75,3 +81,9 @@ Internal gates:
 
 Do not claim the terminal is faster than another terminal until benchmarks are
 reproducible, fair, and documented.
+
+For comparisons with Alacritty or WezTerm, record the exact commit/version,
+release build, GPU/backend, window grid, font/fallback chain, shell/PTY fixture,
+warm-up count, and optional-feature state. Report latency/throughput
+distributions and include cases Panea loses; a single FPS number is not a
+terminal-performance result.

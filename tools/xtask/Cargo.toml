@@ -14,11 +14,13 @@ workspace = true
 
 [dependencies]
 assets = { path = "../../crates/assets" }
+config-core = { path = "../../crates/config-core" }
 config-toml = { path = "../../crates/config-toml" }
 diagnostics = { path = "../../crates/diagnostics" }
 image.workspace = true
 render-wgpu = { path = "../../crates/render-wgpu" }
 security = { path = "../../crates/security" }
+sha2.workspace = true
 shell-integration = { path = "../../crates/shell-integration" }
 transport-core = { path = "../../crates/transport-core" }
 transport-pty = { path = "../../crates/transport-pty" }

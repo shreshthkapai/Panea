@@ -1,0 +1,16 @@
+schema_version = 2
+
+[cursor]
+shape = "beam"
+blink = true
+smooth_movement = true
+typing_pulse = true
+typing_stretch = false
+trail = false
+short_lived_glow = false
+animations_enabled = true
+
+[performance]
+max_animation_fps = 60
+max_active_animations = 4
+max_animated_region_pixels = 100000
