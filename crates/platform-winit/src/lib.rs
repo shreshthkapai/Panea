@@ -1001,6 +1001,47 @@ pub fn apply_window_mode_with_decoration(
     }
 }
 
+/// Reveals the operating system caption for an auto-hidden fullscreen window.
+///
+/// Preparing the native frame is only necessary after another window-mode
+/// action changed the decoration style. Keeping it prepared avoids rebuilding
+/// the non-client area on every subsequent hover.
+pub fn reveal_native_fullscreen_titlebar(window: &Window, prepare_native_frame: bool) {
+    if prepare_native_frame {
+        window.set_decorations(true);
+        window.set_fullscreen(None);
+        window.set_maximized(true);
+    } else {
+        // The maximized restore state remains active beneath borderless
+        // fullscreen, so later reveals need only one native state change.
+        window.set_fullscreen(None);
+    }
+}
+
+/// Returns a temporarily decorated window to borderless fullscreen while
+/// retaining its prepared native frame for the next reveal.
+///
+/// Native compositors suppress the frame while fullscreen. Deliberately not
+/// clearing the decoration style removes a redundant frame reconstruction from
+/// each later hide/reveal cycle.
+pub fn hide_native_fullscreen_titlebar(
+    window: &Window,
+    requested: WindowMode,
+) -> WindowModeDiagnostic {
+    debug_assert!(matches!(
+        requested,
+        WindowMode::BorderlessFullscreen | WindowMode::FramelessFullscreen
+    ));
+    // Preserve maximized as the restore state beneath fullscreen. This makes
+    // the next reveal a single fullscreen exit instead of a second maximize.
+    window.set_fullscreen(Some(Fullscreen::Borderless(window.current_monitor())));
+    WindowModeDiagnostic {
+        requested,
+        effective: requested,
+        fallback: None,
+    }
+}
+
 fn preferred_video_mode(window: &Window) -> Option<winit::monitor::VideoMode> {
     let size = window.inner_size();
     window.current_monitor()?.video_modes().max_by_key(|mode| {

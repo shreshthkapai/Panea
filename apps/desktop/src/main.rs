@@ -38,7 +38,8 @@ use platform_core::{
 use platform_winit::{
     ClipboardBridge, DesktopNotificationProvider, DesktopPowerMonitor, DesktopUrlOpener,
     DesktopWindow, InputTranslator, WindowSettings, apply_window_mode_with_decoration,
-    create_event_loop, platform_capabilities,
+    create_event_loop, hide_native_fullscreen_titlebar, platform_capabilities,
+    reveal_native_fullscreen_titlebar,
 };
 use render_core::{
     CellPosition, CursorVisual, OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle,
@@ -1130,6 +1131,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
     let mut window_focused = true;
     let mut pointer_visible = true;
     let mut fullscreen_titlebar = NativeFullscreenTitlebarState::default();
+    let mut transient_titlebar_resize_until = None;
     let mut pending_terminal_resize = PendingTerminalResize::default();
     let mut cursor_image_cache = AnimatedCursorImageCache::new();
     let mut cursor_image_runtime = AnimatedCursorImageRuntime::new();
@@ -1334,7 +1336,11 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                         panic_payload(panic)
                                     );
                                 }
-                                pending_terminal_resize.queue(resized);
+                                if transient_titlebar_resize_until
+                                    .is_none_or(|deadline| Instant::now() >= deadline)
+                                {
+                                    pending_terminal_resize.queue(resized);
+                                }
                                 scheduler.window_resized();
                                 window.request_redraw();
                             }
@@ -1548,6 +1554,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                                 decoration_mode,
                                             );
                                             fullscreen_titlebar.reset();
+                                            transient_titlebar_resize_until = None;
                                             scheduler.window_resized();
                                             window.request_redraw();
                                         }
@@ -1559,6 +1566,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                                 decoration_mode,
                                             );
                                             fullscreen_titlebar.reset();
+                                            transient_titlebar_resize_until = None;
                                             scheduler.window_resized();
                                             window.request_redraw();
                                         }
@@ -1577,6 +1585,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                                 decoration_mode,
                                             );
                                             fullscreen_titlebar.reset();
+                                            transient_titlebar_resize_until = None;
                                             scheduler.window_resized();
                                             window.request_redraw();
                                         }
@@ -1633,22 +1642,33 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                     current_window_mode,
                                     dpi_scale_factor,
                                     &config,
+                                    Instant::now(),
                                 ) {
+                                    transient_titlebar_resize_until = Some(
+                                        Instant::now() + NATIVE_TITLEBAR_GEOMETRY_GUARD,
+                                    );
                                     current_window_mode = match transition {
-                                        NativeTitlebarTransition::Reveal => apply_window_mode_logged(
-                                            &window,
-                                            WindowMode::Maximized,
-                                            DecorationMode::Native,
-                                        ),
+                                        NativeTitlebarTransition::Reveal {
+                                            prepare_native_frame,
+                                        } => {
+                                            reveal_native_fullscreen_titlebar(
+                                                &window,
+                                                prepare_native_frame,
+                                            );
+                                            WindowMode::Maximized
+                                        }
                                         NativeTitlebarTransition::Hide { fullscreen_mode } => {
-                                            apply_window_mode_logged(
+                                            let diagnostic = hide_native_fullscreen_titlebar(
                                                 &window,
                                                 fullscreen_mode,
-                                                decoration_mode,
-                                            )
+                                            );
+                                            log_window_mode_diagnostic(&diagnostic);
+                                            diagnostic.effective
                                         }
                                     };
-                                    pending_terminal_resize.queue(window.inner_size());
+                                    // Caption visibility is transient app chrome. Resizing the
+                                    // terminal and PTY here causes needless reflow before the
+                                    // original fullscreen geometry is immediately restored.
                                     scheduler.window_resized();
                                     window.request_redraw();
                                     continue;
@@ -1729,6 +1749,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                             InputEvent::WindowAction(action) => match action {
                                 WindowAction::ToggleFullscreen => {
                                     fullscreen_titlebar.reset();
+                                    transient_titlebar_resize_until = None;
                                     current_window_mode =
                                         if matches!(current_window_mode, WindowMode::Windowed) {
                                             WindowMode::BorderlessFullscreen
@@ -1745,6 +1766,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                 }
                                 WindowAction::RestoreWindowDecorations => {
                                     fullscreen_titlebar.reset();
+                                    transient_titlebar_resize_until = None;
                                     current_window_mode = WindowMode::Windowed;
                                     current_window_mode = apply_window_mode_logged(
                                         &window,
@@ -1756,6 +1778,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                 }
                                 WindowAction::ToggleFrameless => {
                                     fullscreen_titlebar.reset();
+                                    transient_titlebar_resize_until = None;
                                     current_window_mode = if matches!(
                                         current_window_mode,
                                         WindowMode::FramelessWindowed
@@ -3727,13 +3750,17 @@ fn apply_window_mode_logged(
     decoration: DecorationMode,
 ) -> WindowMode {
     let diagnostic = apply_window_mode_with_decoration(window, requested, decoration);
+    log_window_mode_diagnostic(&diagnostic);
+    diagnostic.effective
+}
+
+fn log_window_mode_diagnostic(diagnostic: &platform_core::WindowModeDiagnostic) {
     if let Some(fallback) = diagnostic.fallback.as_ref() {
         eprintln!(
             "platform fallback [{}]: requested={} effective={} reason={}",
             fallback.feature, fallback.requested, fallback.effective, fallback.reason
         );
     }
-    diagnostic.effective
 }
 
 fn map_window_mode(mode: WindowModeConfig) -> WindowMode {
@@ -6260,18 +6287,25 @@ fn surface_size_is_renderable(size: winit::dpi::PhysicalSize<u32>) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeTitlebarTransition {
-    Reveal,
+    Reveal { prepare_native_frame: bool },
     Hide { fullscreen_mode: WindowMode },
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+const NATIVE_TITLEBAR_REVEAL_GUARD: Duration = Duration::from_millis(50);
+const NATIVE_TITLEBAR_GEOMETRY_GUARD: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy, Default)]
 struct NativeFullscreenTitlebarState {
     return_mode: Option<WindowMode>,
+    native_frame_ready: bool,
+    hide_not_before: Option<Instant>,
 }
 
 impl NativeFullscreenTitlebarState {
     fn reset(&mut self) {
         self.return_mode = None;
+        self.native_frame_ready = false;
+        self.hide_not_before = None;
     }
 
     fn handle_mouse(
@@ -6280,12 +6314,18 @@ impl NativeFullscreenTitlebarState {
         mode: WindowMode,
         scale_factor: f64,
         config: &AppConfig,
+        now: Instant,
     ) -> Option<NativeTitlebarTransition> {
         if !matches!(mouse.kind, MouseEventKind::Moved) {
             return None;
         }
 
-        if let Some(fullscreen_mode) = self.return_mode.take() {
+        if let Some(fullscreen_mode) = self.return_mode {
+            if self.hide_not_before.is_some_and(|deadline| now < deadline) {
+                return None;
+            }
+            self.return_mode = None;
+            self.hide_not_before = None;
             return Some(NativeTitlebarTransition::Hide { fullscreen_mode });
         }
 
@@ -6304,7 +6344,12 @@ impl NativeFullscreenTitlebarState {
         );
         if mouse.y >= 0.0 && mouse.y < f64::from(reveal_height) {
             self.return_mode = Some(mode);
-            Some(NativeTitlebarTransition::Reveal)
+            self.hide_not_before = Some(now + NATIVE_TITLEBAR_REVEAL_GUARD);
+            let prepare_native_frame = !self.native_frame_ready;
+            self.native_frame_ready = true;
+            Some(NativeTitlebarTransition::Reveal {
+                prepare_native_frame,
+            })
         } else {
             None
         }
@@ -10367,17 +10412,52 @@ mod tests {
         let mut moved = mouse_event(MouseEventKind::Moved);
         moved.x = 200.0;
         moved.y = 1.0;
+        let now = Instant::now();
 
         assert_eq!(
-            state.handle_mouse(moved, WindowMode::BorderlessFullscreen, 1.0, &config),
-            Some(NativeTitlebarTransition::Reveal)
+            state.handle_mouse(moved, WindowMode::BorderlessFullscreen, 1.0, &config, now,),
+            Some(NativeTitlebarTransition::Reveal {
+                prepare_native_frame: true,
+            })
         );
         moved.y = 20.0;
         assert_eq!(
-            state.handle_mouse(moved, WindowMode::Maximized, 1.0, &config),
+            state.handle_mouse(
+                moved,
+                WindowMode::Maximized,
+                1.0,
+                &config,
+                now + Duration::from_millis(10),
+            ),
+            None,
+            "queued pointer motion must not immediately reverse the reveal"
+        );
+        assert_eq!(
+            state.handle_mouse(
+                moved,
+                WindowMode::Maximized,
+                1.0,
+                &config,
+                now + NATIVE_TITLEBAR_REVEAL_GUARD,
+            ),
             Some(NativeTitlebarTransition::Hide {
                 fullscreen_mode: WindowMode::BorderlessFullscreen,
             })
+        );
+
+        moved.y = 1.0;
+        assert_eq!(
+            state.handle_mouse(
+                moved,
+                WindowMode::BorderlessFullscreen,
+                1.0,
+                &config,
+                now + Duration::from_millis(100),
+            ),
+            Some(NativeTitlebarTransition::Reveal {
+                prepare_native_frame: false,
+            }),
+            "later reveals reuse the prepared native frame"
         );
     }
 }

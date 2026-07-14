@@ -19,9 +19,10 @@ borderless fullscreen. Native visual verification remains required.
 
 Windows behavior: Uses the real Windows non-client titlebar and caption buttons
 while revealed. The installed release has been visually verified for startup,
-reveal, and return to borderless fullscreen. Resize events are coalesced before
-terminal and PTY resize so intermediate Windows transition geometry cannot
-reflow terminal content repeatedly.
+reveal, and return to borderless fullscreen. The native frame is retained after
+its first reveal so later hover cycles do not rebuild the non-client style.
+Transient caption geometry is excluded from terminal and PTY resizing, so a
+hover cannot reflow terminal content.
 
 Linux X11 behavior: Requests the WM's native decorated/maximized window, then
 returns to fullscreen. The active WM remains authoritative and compositor-matrix
@@ -44,8 +45,9 @@ Performance cost when disabled: A single predictable branch for pointer events;
 no render work, allocation, timer, wakeup, or redraw.
 
 Performance cost when enabled: No per-frame work or animation. Only entering or
-leaving the top-edge state requests a native window-mode transition. Terminal
-and PTY resize is applied once after the geometry settles.
+leaving the top-edge state requests a native window-mode transition. A short
+input guard rejects queued pointer motion while the OS applies the caption.
+Terminal and PTY geometry remains unchanged during the transient reveal.
 
 Tests: Config defaults, validation, TOML, programmable config, platform
 overrides, live reload classification, and native reveal/hide state transitions.
