@@ -1889,6 +1889,10 @@ impl ScreenBuffer {
     fn resize_reflow(&mut self, size: TerminalSize) {
         let old_wrap_pending = self.wrap_pending;
         let size = size.normalized();
+        if size.cols == self.size.cols {
+            self.resize_rows(size);
+            return;
+        }
         let logical = logical_lines(&self.scrollback, &self.lines);
         let target_physical = self.scrollback.len().saturating_add(self.cursor_row);
         let (target_logical, target_offset) = logical_cursor_position(
@@ -1897,10 +1901,13 @@ impl ScreenBuffer {
             target_physical,
             self.cursor_col,
         );
+        let (viewport_logical, viewport_offset) =
+            logical_cursor_position(&self.scrollback, &self.lines, self.scrollback.len(), 0);
         let mut reflowed = Vec::new();
         let mut cursor_physical = 0usize;
         let mut cursor_col = 0usize;
         let mut cursor_wrap_pending = false;
+        let mut viewport_physical = 0usize;
         for (logical_index, mut cells) in logical.into_iter().enumerate() {
             if logical_index == target_logical {
                 // Non-wrapped lines omit trailing blank cells from the logical
@@ -1916,17 +1923,23 @@ impl ScreenBuffer {
                 cursor_col = mapped.1;
                 cursor_wrap_pending = old_wrap_pending || mapped.2;
             }
+            if logical_index == viewport_logical {
+                let mapped = reflow_cursor_position(&cells, viewport_offset, size.cols);
+                viewport_physical = reflowed.len().saturating_add(mapped.0);
+            }
             reflowed.extend(reflow_logical_lines(vec![cells], size.cols));
         }
         let rows = usize::from(size.rows);
-
-        while reflowed.len() < rows {
-            reflowed.push(Line::blank(size.cols));
-        }
-
-        let split = reflowed.len().saturating_sub(rows);
+        // Preserve the old viewport origin through horizontal reflow, then
+        // move it only as far as required to keep the cursor visible.
+        // Bottom-anchoring the entire buffer would turn transient startup
+        // shrink/grow events into blank scrollback and displace the first
+        // shell output.
+        let split = viewport_physical.max(cursor_physical.saturating_sub(rows.saturating_sub(1)));
+        let viewport_end = split.saturating_add(rows).min(reflowed.len());
         self.scrollback = reflowed[..split].to_vec();
-        self.lines = reflowed[split..].to_vec();
+        self.lines = reflowed[split..viewport_end].to_vec();
+        self.lines.resize_with(rows, || Line::blank(size.cols));
         self.size = size;
         self.reset_scroll_region();
         self.cursor_row = cursor_physical
@@ -1934,6 +1947,21 @@ impl ScreenBuffer {
             .min(rows.saturating_sub(1));
         self.cursor_col = cursor_col.min(usize::from(size.cols) - 1);
         self.wrap_pending = cursor_wrap_pending;
+    }
+
+    fn resize_rows(&mut self, size: TerminalSize) {
+        let rows = usize::from(size.rows);
+        let shift = self.cursor_row.saturating_sub(rows.saturating_sub(1));
+        if shift > 0 {
+            self.scrollback.extend(self.lines.drain(..shift));
+            self.cursor_row = self.cursor_row.saturating_sub(shift);
+        }
+
+        self.lines.truncate(rows);
+        self.lines.resize_with(rows, || Line::blank(size.cols));
+        self.size = size;
+        self.reset_scroll_region();
+        self.clamp_cursor();
     }
 
     fn clamp_cursor(&mut self) {
@@ -2733,6 +2761,57 @@ mod tests {
             .unwrap();
         assert_eq!(line_text(&terminal, 0), "PS C:\\Users\\shres> Wr");
         assert_eq!(terminal.cursor_state().position, GridPosition::new(0, 21));
+    }
+
+    #[test]
+    fn startup_shrink_and_grow_keeps_first_shell_output_at_top() {
+        let mut terminal = TerminalState::new(TerminalSize::new(171, 54));
+
+        // Borderless fullscreen negotiation may briefly report the window's
+        // configured size before the monitor-sized surface arrives.
+        terminal.resize(TerminalSize::new(100, 28)).unwrap();
+        terminal
+            .apply_actions(
+                "Windows PowerShell 5.1\r\nCopyright (C) Microsoft Corporation.\r\n\r\nPS C:\\Users\\shres> "
+                    .chars()
+                    .map(|ch| match ch {
+                        '\r' => TerminalAction::CarriageReturn,
+                        '\n' => TerminalAction::LineFeed,
+                        _ => TerminalAction::Print(ch),
+                    }),
+            )
+            .unwrap();
+        terminal.resize(TerminalSize::new(171, 54)).unwrap();
+
+        assert_eq!(line_text(&terminal, 0), "Windows PowerShell 5.1");
+        assert_eq!(
+            line_text(&terminal, 1),
+            "Copyright (C) Microsoft Corporation."
+        );
+        assert_eq!(line_text(&terminal, 2), "");
+        assert_eq!(line_text(&terminal, 3), "PS C:\\Users\\shres>");
+        assert_eq!(terminal.cursor_state().position, GridPosition::new(3, 19));
+        assert!(terminal.scrollback().lines.is_empty());
+    }
+
+    #[test]
+    fn shrinking_moves_only_rows_above_cursor_into_scrollback() {
+        let mut terminal = TerminalState::new(TerminalSize::new(8, 5));
+        terminal
+            .apply_actions("one\r\ntwo\r\nthree\r\nfour".chars().map(|ch| match ch {
+                '\r' => TerminalAction::CarriageReturn,
+                '\n' => TerminalAction::LineFeed,
+                _ => TerminalAction::Print(ch),
+            }))
+            .unwrap();
+
+        terminal.resize(TerminalSize::new(8, 3)).unwrap();
+
+        assert_eq!(terminal.scrollback().lines.len(), 1);
+        assert_eq!(line_text(&terminal, 0), "two");
+        assert_eq!(line_text(&terminal, 1), "three");
+        assert_eq!(line_text(&terminal, 2), "four");
+        assert_eq!(terminal.cursor_state().position, GridPosition::new(2, 4));
     }
 
     #[test]

@@ -953,13 +953,13 @@ pub fn apply_window_mode_with_decoration(
 
     match requested {
         WindowMode::Windowed => {
-            window.set_decorations(decorated);
             window.set_fullscreen(None);
             window.set_maximized(false);
+            window.set_decorations(decorated);
         }
         WindowMode::Maximized => {
-            window.set_decorations(decorated);
             window.set_fullscreen(None);
+            window.set_decorations(decorated);
             window.set_maximized(true);
         }
         WindowMode::Fullscreen => {
@@ -978,14 +978,17 @@ pub fn apply_window_mode_with_decoration(
             }
         }
         WindowMode::BorderlessFullscreen => {
+            window.set_maximized(false);
             window.set_decorations(false);
             window.set_fullscreen(Some(Fullscreen::Borderless(window.current_monitor())));
         }
         WindowMode::FramelessWindowed => {
             window.set_fullscreen(None);
+            window.set_maximized(false);
             window.set_decorations(false);
         }
         WindowMode::FramelessFullscreen => {
+            window.set_maximized(false);
             window.set_decorations(false);
             window.set_fullscreen(Some(Fullscreen::Borderless(window.current_monitor())));
         }

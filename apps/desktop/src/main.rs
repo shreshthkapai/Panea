@@ -1129,7 +1129,8 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
     let mut cursor_blink = CursorBlinkRuntime::new();
     let mut window_focused = true;
     let mut pointer_visible = true;
-    let mut fullscreen_titlebar = FullscreenTitlebarState::default();
+    let mut fullscreen_titlebar = NativeFullscreenTitlebarState::default();
+    let mut pending_terminal_resize = PendingTerminalResize::default();
     let mut cursor_image_cache = AnimatedCursorImageCache::new();
     let mut cursor_image_runtime = AnimatedCursorImageRuntime::new();
     let mut cursor_image_status_reported: Option<String> = None;
@@ -1172,6 +1173,13 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
             Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
                 WindowEvent::RedrawRequested => {
                     let metrics = fonts.cell_metrics().ok();
+                    let observed_size = window.inner_size();
+                    if surface_size_is_renderable(observed_size) && observed_size != surface_size {
+                        surface_size = observed_size;
+                        renderer.resize(surface_size.width, surface_size.height);
+                        pending_terminal_resize.queue(surface_size);
+                        damage_tracker.request_full_redraw();
+                    }
                     let mut scene = scene_from_mux(
                         &mux_runtime,
                         metrics,
@@ -1190,15 +1198,6 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                             &performance_overlay,
                             &performance_overlay_ui,
                             performance_budget,
-                            metrics,
-                        );
-                        append_fullscreen_titlebar(
-                            &mut scene,
-                            &fullscreen_titlebar,
-                            current_window_mode,
-                            surface_size,
-                            dpi_scale_factor,
-                            &config,
                             metrics,
                         );
                         if let Some(cursor) = scene.cursor {
@@ -1322,7 +1321,11 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                 target.exit();
                             }
                             InputEvent::Resized { width, height } => {
-                                surface_size = winit::dpi::PhysicalSize::new(width, height);
+                                let resized = winit::dpi::PhysicalSize::new(width, height);
+                                if !surface_size_is_renderable(resized) {
+                                    continue;
+                                }
+                                surface_size = resized;
                                 if let Err(panic) = catch_unwind(AssertUnwindSafe(|| {
                                     renderer.resize(width, height)
                                 })) {
@@ -1331,27 +1334,21 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                         panic_payload(panic)
                                     );
                                 }
-                                if let Ok(metrics) = fonts.cell_metrics() {
-                                    mux_runtime.resize_all(width, height, metrics, &config);
-                                }
+                                pending_terminal_resize.queue(resized);
                                 scheduler.window_resized();
                                 window.request_redraw();
                             }
                             InputEvent::ScaleFactorChanged { scale_factor } => {
-                                surface_size = window.inner_size();
+                                let observed_size = window.inner_size();
+                                if surface_size_is_renderable(observed_size) {
+                                    surface_size = observed_size;
+                                }
                                 renderer.resize(surface_size.width, surface_size.height);
                                 dpi_scale_factor = scale_factor;
                                 if fonts.set_scale_factor(scale_factor) {
                                     renderer.request_full_redraw();
                                 }
-                                if let Ok(metrics) = fonts.cell_metrics() {
-                                    mux_runtime.resize_all(
-                                        surface_size.width,
-                                        surface_size.height,
-                                        metrics,
-                                        &config,
-                                    );
-                                }
+                                pending_terminal_resize.queue(surface_size);
                                 if matches!(config.diagnostics.log_level, LogLevel::Debug | LogLevel::Trace) {
                                     eprintln!("DPI scale changed to {scale_factor:.3}");
                                 }
@@ -1550,7 +1547,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                                 current_window_mode,
                                                 decoration_mode,
                                             );
-                                            fullscreen_titlebar.hide();
+                                            fullscreen_titlebar.reset();
                                             scheduler.window_resized();
                                             window.request_redraw();
                                         }
@@ -1561,7 +1558,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                                 current_window_mode,
                                                 decoration_mode,
                                             );
-                                            fullscreen_titlebar.hide();
+                                            fullscreen_titlebar.reset();
                                             scheduler.window_resized();
                                             window.request_redraw();
                                         }
@@ -1579,7 +1576,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                                 current_window_mode,
                                                 decoration_mode,
                                             );
-                                            fullscreen_titlebar.hide();
+                                            fullscreen_titlebar.reset();
                                             scheduler.window_resized();
                                             window.request_redraw();
                                         }
@@ -1631,39 +1628,29 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                     window.set_cursor_visible(true);
                                     pointer_visible = true;
                                 }
-                                let chrome = fullscreen_titlebar.handle_mouse(
+                                if let Some(transition) = fullscreen_titlebar.handle_mouse(
                                     mouse,
                                     current_window_mode,
-                                    surface_size,
                                     dpi_scale_factor,
                                     &config,
-                                );
-                                if chrome.changed {
-                                    scheduler.terminal_content_changed();
-                                    window.request_redraw();
-                                }
-                                if let Some(action) = chrome.action {
-                                    match action {
-                                        FullscreenTitlebarAction::Minimize => {
-                                            window.set_minimized(true);
-                                        }
-                                        FullscreenTitlebarAction::LeaveFullscreen => {
-                                            current_window_mode = apply_window_mode_logged(
+                                ) {
+                                    current_window_mode = match transition {
+                                        NativeTitlebarTransition::Reveal => apply_window_mode_logged(
+                                            &window,
+                                            WindowMode::Maximized,
+                                            DecorationMode::Native,
+                                        ),
+                                        NativeTitlebarTransition::Hide { fullscreen_mode } => {
+                                            apply_window_mode_logged(
                                                 &window,
-                                                WindowMode::Windowed,
+                                                fullscreen_mode,
                                                 decoration_mode,
-                                            );
-                                            fullscreen_titlebar.hide();
-                                            scheduler.window_resized();
-                                            window.request_redraw();
+                                            )
                                         }
-                                        FullscreenTitlebarAction::Close => {
-                                            mux_runtime.shutdown_all();
-                                            target.exit();
-                                        }
-                                    }
-                                }
-                                if chrome.consumed {
+                                    };
+                                    pending_terminal_resize.queue(window.inner_size());
+                                    scheduler.window_resized();
+                                    window.request_redraw();
                                     continue;
                                 }
                                 if let Ok(metrics) = fonts.cell_metrics() {
@@ -1741,6 +1728,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                             }
                             InputEvent::WindowAction(action) => match action {
                                 WindowAction::ToggleFullscreen => {
+                                    fullscreen_titlebar.reset();
                                     current_window_mode =
                                         if matches!(current_window_mode, WindowMode::Windowed) {
                                             WindowMode::BorderlessFullscreen
@@ -1752,22 +1740,22 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                         current_window_mode,
                                         decoration_mode,
                                     );
-                                    fullscreen_titlebar.hide();
                                     scheduler.window_resized();
                                     window.request_redraw();
                                 }
                                 WindowAction::RestoreWindowDecorations => {
+                                    fullscreen_titlebar.reset();
                                     current_window_mode = WindowMode::Windowed;
                                     current_window_mode = apply_window_mode_logged(
                                         &window,
                                         current_window_mode,
                                         decoration_mode,
                                     );
-                                    fullscreen_titlebar.hide();
                                     scheduler.window_resized();
                                     window.request_redraw();
                                 }
                                 WindowAction::ToggleFrameless => {
+                                    fullscreen_titlebar.reset();
                                     current_window_mode = if matches!(
                                         current_window_mode,
                                         WindowMode::FramelessWindowed
@@ -1781,7 +1769,6 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                         current_window_mode,
                                         decoration_mode,
                                     );
-                                    fullscreen_titlebar.hide();
                                     scheduler.window_resized();
                                     window.request_redraw();
                                 }
@@ -1817,6 +1804,15 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                 }
             }
             Event::AboutToWait => {
+                let now = Instant::now();
+                if let Some(size) = pending_terminal_resize.take_due(now) {
+                    if let Ok(metrics) = fonts.cell_metrics() {
+                        mux_runtime.resize_all(size.width, size.height, metrics, &config);
+                        damage_tracker.request_full_redraw();
+                        scheduler.window_resized();
+                        window.request_redraw();
+                    }
+                }
                 if gui_smoke_hold_until.is_some_and(|deadline| Instant::now() >= deadline) {
                     if let Some(completed) = &gui_smoke_completed {
                         completed.store(true, Ordering::Release);
@@ -2144,6 +2140,9 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                     retain_earliest_deadline(&mut next_wake, deadline);
                 }
                 if let Some(deadline) = gui_smoke_hold_until {
+                    retain_earliest_deadline(&mut next_wake, deadline);
+                }
+                if let Some(deadline) = pending_terminal_resize.deadline() {
                     retain_earliest_deadline(&mut next_wake, deadline);
                 }
                 if let Some(deadline) = next_wake {
@@ -3673,20 +3672,15 @@ fn window_settings(config: &AppConfig) -> WindowSettings {
 }
 
 fn panea_window_icon() -> Option<platform_winit::WindowIcon> {
-    const PANEA_ICON_PNG: &[u8] =
-        include_bytes!("../../../crates/assets/branding/generated/panea-icon-128.png");
     static ICON: std::sync::OnceLock<Option<platform_winit::WindowIcon>> =
         std::sync::OnceLock::new();
     ICON.get_or_init(|| {
-        let decoded = match image::load_from_memory(PANEA_ICON_PNG) {
-            Ok(decoded) => decoded.into_rgba8(),
-            Err(error) => {
-                eprintln!("window icon fallback: failed to decode Panea icon: {error}");
-                return None;
-            }
-        };
-        let (width, height) = decoded.dimensions();
-        match platform_winit::WindowIcon::from_rgba(decoded.into_raw(), width, height) {
+        let bitmap = panea_brand_bitmap()?;
+        match platform_winit::WindowIcon::from_rgba(
+            bitmap.pixels.as_ref().to_vec(),
+            bitmap.width,
+            bitmap.height,
+        ) {
             Ok(icon) => Some(icon),
             Err(error) => {
                 eprintln!("window icon fallback: invalid Panea icon: {error}");
@@ -3695,6 +3689,36 @@ fn panea_window_icon() -> Option<platform_winit::WindowIcon> {
         }
     })
     .clone()
+}
+
+#[derive(Debug)]
+struct PaneaBrandBitmap {
+    pixels: Arc<[u8]>,
+    width: u32,
+    height: u32,
+}
+
+fn panea_brand_bitmap() -> Option<&'static PaneaBrandBitmap> {
+    const PANEA_ICON_PNG: &[u8] =
+        include_bytes!("../../../crates/assets/branding/generated/panea-icon-128.png");
+    static BITMAP: std::sync::OnceLock<Option<PaneaBrandBitmap>> = std::sync::OnceLock::new();
+    BITMAP
+        .get_or_init(|| match image::load_from_memory(PANEA_ICON_PNG) {
+            Ok(decoded) => {
+                let decoded = decoded.into_rgba8();
+                let (width, height) = decoded.dimensions();
+                Some(PaneaBrandBitmap {
+                    pixels: Arc::from(decoded.into_raw()),
+                    width,
+                    height,
+                })
+            }
+            Err(error) => {
+                eprintln!("window icon fallback: failed to decode Panea icon: {error}");
+                None
+            }
+        })
+        .as_ref()
 }
 
 fn apply_window_mode_logged(
@@ -6224,298 +6248,96 @@ struct CursorPresentation {
     window_focused: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FullscreenTitlebarControl {
-    Minimize,
-    LeaveFullscreen,
-    Close,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FullscreenTitlebarAction {
-    Minimize,
-    LeaveFullscreen,
-    Close,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct FullscreenTitlebarState {
-    visible: bool,
-    hovered: Option<FullscreenTitlebarControl>,
-    consume_left_release: bool,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct FullscreenTitlebarMouseResult {
-    consumed: bool,
-    changed: bool,
-    action: Option<FullscreenTitlebarAction>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FullscreenTitlebarLayout {
-    bar: RenderRect,
-    minimize: Option<RenderRect>,
-    leave_fullscreen: Option<RenderRect>,
-    close: Option<RenderRect>,
-}
-
-impl FullscreenTitlebarState {
-    fn hide(&mut self) -> bool {
-        let changed = self.visible || self.hovered.is_some();
-        self.visible = false;
-        self.hovered = None;
-        changed
-    }
-
-    fn handle_mouse(
-        &mut self,
-        mouse: MouseEvent,
-        mode: WindowMode,
-        surface_size: winit::dpi::PhysicalSize<u32>,
-        scale_factor: f64,
-        config: &AppConfig,
-    ) -> FullscreenTitlebarMouseResult {
-        if self.consume_left_release
-            && matches!(mouse.kind, MouseEventKind::Released(MouseButton::Left))
-        {
-            self.consume_left_release = false;
-            return FullscreenTitlebarMouseResult {
-                consumed: true,
-                ..FullscreenTitlebarMouseResult::default()
-            };
-        }
-        if !fullscreen_titlebar_active(mode, config) {
-            return FullscreenTitlebarMouseResult {
-                changed: self.hide(),
-                ..FullscreenTitlebarMouseResult::default()
-            };
-        }
-
-        let layout = fullscreen_titlebar_layout(
-            surface_size.width,
-            scale_factor,
-            &config.window.fullscreen_titlebar,
-        );
-        let reveal_height = logical_pixels(
-            config.window.fullscreen_titlebar.reveal_height,
-            scale_factor,
-        );
-        let was_visible = self.visible;
-        let previous_hover = self.hovered;
-
-        if matches!(mouse.kind, MouseEventKind::Moved) {
-            if !self.visible && mouse.y >= 0.0 && mouse.y < f64::from(reveal_height) {
-                self.visible = true;
-            } else if self.visible && (mouse.y < 0.0 || mouse.y >= f64::from(layout.bar.height)) {
-                self.visible = false;
-                self.hovered = None;
-            }
-        }
-
-        if self.visible && point_in_rect(mouse.x, mouse.y, layout.bar) {
-            self.hovered = titlebar_control_at(mouse.x, mouse.y, layout);
-        } else if self.visible {
-            self.hovered = None;
-        }
-
-        let consumed = self.visible && point_in_rect(mouse.x, mouse.y, layout.bar);
-        let action = if consumed && matches!(mouse.kind, MouseEventKind::Pressed(MouseButton::Left))
-        {
-            self.consume_left_release = true;
-            self.hovered.map(|control| match control {
-                FullscreenTitlebarControl::Minimize => FullscreenTitlebarAction::Minimize,
-                FullscreenTitlebarControl::LeaveFullscreen => {
-                    FullscreenTitlebarAction::LeaveFullscreen
-                }
-                FullscreenTitlebarControl::Close => FullscreenTitlebarAction::Close,
-            })
-        } else {
-            None
-        };
-
-        FullscreenTitlebarMouseResult {
-            consumed,
-            changed: was_visible != self.visible || previous_hover != self.hovered,
-            action,
-        }
-    }
-}
-
-fn fullscreen_titlebar_active(mode: WindowMode, config: &AppConfig) -> bool {
-    config.window.fullscreen_titlebar.enabled
-        && matches!(
-            mode,
-            WindowMode::BorderlessFullscreen | WindowMode::FramelessFullscreen
-        )
-}
-
 fn logical_pixels(value: u16, scale_factor: f64) -> u32 {
     (f64::from(value) * scale_factor.max(0.25))
         .round()
         .clamp(1.0, f64::from(u32::MAX)) as u32
 }
 
-fn fullscreen_titlebar_layout(
-    surface_width: u32,
-    scale_factor: f64,
-    config: &config_core::FullscreenTitlebarConfig,
-) -> FullscreenTitlebarLayout {
-    let height = logical_pixels(config.height, scale_factor);
-    let bar = RenderRect {
-        x: 0,
-        y: 0,
-        width: surface_width,
-        height,
-    };
-    if !config.show_window_controls {
-        return FullscreenTitlebarLayout {
-            bar,
-            minimize: None,
-            leave_fullscreen: None,
-            close: None,
-        };
-    }
-
-    let button_width = logical_pixels(46, scale_factor).min(surface_width.max(1));
-    let close_x = surface_width.saturating_sub(button_width);
-    let restore_x = close_x.saturating_sub(button_width);
-    let minimize_x = restore_x.saturating_sub(button_width);
-    let control = |x: u32| RenderRect {
-        x: x.min(i32::MAX as u32) as i32,
-        y: 0,
-        width: button_width,
-        height,
-    };
-    FullscreenTitlebarLayout {
-        bar,
-        minimize: Some(control(minimize_x)),
-        leave_fullscreen: Some(control(restore_x)),
-        close: Some(control(close_x)),
-    }
+fn surface_size_is_renderable(size: winit::dpi::PhysicalSize<u32>) -> bool {
+    size.width > 0 && size.height > 0
 }
 
-fn titlebar_control_at(
-    x: f64,
-    y: f64,
-    layout: FullscreenTitlebarLayout,
-) -> Option<FullscreenTitlebarControl> {
-    [
-        (layout.close, FullscreenTitlebarControl::Close),
-        (
-            layout.leave_fullscreen,
-            FullscreenTitlebarControl::LeaveFullscreen,
-        ),
-        (layout.minimize, FullscreenTitlebarControl::Minimize),
-    ]
-    .into_iter()
-    .find_map(|(bounds, control)| {
-        bounds
-            .filter(|bounds| point_in_rect(x, y, *bounds))
-            .map(|_| control)
-    })
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeTitlebarTransition {
+    Reveal,
+    Hide { fullscreen_mode: WindowMode },
 }
 
-#[allow(clippy::too_many_arguments)]
-fn append_fullscreen_titlebar(
-    scene: &mut RenderScene,
-    state: &FullscreenTitlebarState,
-    mode: WindowMode,
-    surface_size: winit::dpi::PhysicalSize<u32>,
-    scale_factor: f64,
-    config: &AppConfig,
-    metrics: CellMetrics,
-) {
-    if !state.visible || !fullscreen_titlebar_active(mode, config) {
-        return;
-    }
-    let layout = fullscreen_titlebar_layout(
-        surface_size.width,
-        scale_factor,
-        &config.window.fullscreen_titlebar,
-    );
-    let background = render_color(config.colors.background);
-    let foreground = render_color(config.colors.foreground);
-    let mut border = foreground;
-    border.alpha = 64;
-    scene.surface_overlays.push(OverlayPrimitive {
-        kind: OverlayKind::WindowChrome,
-        bounds: layout.bar,
-        color: background,
-        border_color: Some(border),
-        border_width_px: 1,
-        corner_radius_px: 0,
-        z_index: 3000,
-        label: Some(config.window.title.clone()),
-        label_color: Some(foreground),
-    });
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct NativeFullscreenTitlebarState {
+    return_mode: Option<WindowMode>,
+}
 
-    for (bounds, control, label) in [
-        (layout.minimize, FullscreenTitlebarControl::Minimize, "-"),
-        (
-            layout.leave_fullscreen,
-            FullscreenTitlebarControl::LeaveFullscreen,
-            "[]",
-        ),
-        (layout.close, FullscreenTitlebarControl::Close, "X"),
-    ] {
-        let Some(bounds) = bounds else {
-            continue;
-        };
-        let hovered = state.hovered == Some(control);
-        let color = if hovered && control == FullscreenTitlebarControl::Close {
-            RenderColor::rgb(196, 43, 28)
-        } else if hovered {
-            let mut color = render_color(config.colors.selection_background);
-            color.alpha = color.alpha.max(160);
-            color
+impl NativeFullscreenTitlebarState {
+    fn reset(&mut self) {
+        self.return_mode = None;
+    }
+
+    fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        mode: WindowMode,
+        scale_factor: f64,
+        config: &AppConfig,
+    ) -> Option<NativeTitlebarTransition> {
+        if !matches!(mouse.kind, MouseEventKind::Moved) {
+            return None;
+        }
+
+        if let Some(fullscreen_mode) = self.return_mode.take() {
+            return Some(NativeTitlebarTransition::Hide { fullscreen_mode });
+        }
+
+        if !config.window.fullscreen_titlebar.enabled
+            || !matches!(
+                mode,
+                WindowMode::BorderlessFullscreen | WindowMode::FramelessFullscreen
+            )
+        {
+            return None;
+        }
+
+        let reveal_height = logical_pixels(
+            config.window.fullscreen_titlebar.reveal_height,
+            scale_factor,
+        );
+        if mouse.y >= 0.0 && mouse.y < f64::from(reveal_height) {
+            self.return_mode = Some(mode);
+            Some(NativeTitlebarTransition::Reveal)
         } else {
-            RenderColor {
-                red: 0,
-                green: 0,
-                blue: 0,
-                alpha: 0,
-            }
-        };
-        scene.surface_overlays.push(OverlayPrimitive {
-            kind: OverlayKind::WindowChrome,
-            bounds,
-            color,
-            border_color: None,
-            border_width_px: 0,
-            corner_radius_px: 0,
-            z_index: 3001,
-            label: None,
-            label_color: None,
-        });
+            None
+        }
+    }
+}
 
-        let label_width = ((label.chars().count() as f32 * metrics.cell_width).ceil() as u32)
-            .saturating_add(8)
-            .min(bounds.width);
-        let label_x = bounds
-            .x
-            .saturating_add((bounds.width.saturating_sub(label_width) / 2) as i32);
-        scene.surface_overlays.push(OverlayPrimitive {
-            kind: OverlayKind::WindowChrome,
-            bounds: RenderRect {
-                x: label_x,
-                y: bounds.y,
-                width: label_width,
-                height: bounds.height,
-            },
-            color: RenderColor {
-                red: 0,
-                green: 0,
-                blue: 0,
-                alpha: 0,
-            },
-            border_color: None,
-            border_width_px: 0,
-            corner_radius_px: 0,
-            z_index: 3002,
-            label: Some(label.to_owned()),
-            label_color: Some(foreground),
-        });
+const TERMINAL_RESIZE_SETTLE: Duration = Duration::from_millis(40);
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PendingTerminalResize {
+    size: Option<winit::dpi::PhysicalSize<u32>>,
+    apply_at: Option<Instant>,
+}
+
+impl PendingTerminalResize {
+    fn queue(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+        if !surface_size_is_renderable(size) {
+            return;
+        }
+        self.size = Some(size);
+        self.apply_at = Some(Instant::now() + TERMINAL_RESIZE_SETTLE);
+    }
+
+    fn deadline(self) -> Option<Instant> {
+        self.apply_at
+    }
+
+    fn take_due(&mut self, now: Instant) -> Option<winit::dpi::PhysicalSize<u32>> {
+        if self.apply_at.is_none_or(|deadline| now < deadline) {
+            return None;
+        }
+        self.apply_at = None;
+        self.size.take()
     }
 }
 
@@ -10538,79 +10360,24 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_titlebar_reveals_consumes_controls_and_hides() {
+    fn fullscreen_titlebar_transitions_between_borderless_and_native_chrome() {
         let mut config = AppConfig::default();
         config.window.fullscreen_titlebar.enabled = true;
-        let size = winit::dpi::PhysicalSize::new(1920, 1080);
-        let mut state = FullscreenTitlebarState::default();
+        let mut state = NativeFullscreenTitlebarState::default();
         let mut moved = mouse_event(MouseEventKind::Moved);
         moved.x = 200.0;
         moved.y = 1.0;
 
-        let revealed =
-            state.handle_mouse(moved, WindowMode::BorderlessFullscreen, size, 1.0, &config);
-        assert!(revealed.changed);
-        assert!(revealed.consumed);
-        assert!(state.visible);
-
-        let mut close = mouse_event(MouseEventKind::Pressed(MouseButton::Left));
-        close.x = 1910.0;
-        close.y = 12.0;
-        let clicked =
-            state.handle_mouse(close, WindowMode::BorderlessFullscreen, size, 1.0, &config);
-        assert_eq!(clicked.action, Some(FullscreenTitlebarAction::Close));
-        assert!(clicked.consumed);
-
-        moved.y = 80.0;
-        let hidden =
-            state.handle_mouse(moved, WindowMode::BorderlessFullscreen, size, 1.0, &config);
-        assert!(hidden.changed);
-        assert!(!hidden.consumed);
-        assert!(!state.visible);
-
-        let mut released = mouse_event(MouseEventKind::Released(MouseButton::Left));
-        released.x = 1910.0;
-        released.y = 12.0;
-        let quarantined = state.handle_mouse(released, WindowMode::Windowed, size, 1.0, &config);
-        assert!(quarantined.consumed);
-    }
-
-    #[test]
-    fn fullscreen_titlebar_is_surface_overlay_and_opt_in() {
-        let mut config = AppConfig::default();
-        let mut scene = RenderScene::default();
-        let state = FullscreenTitlebarState {
-            visible: true,
-            hovered: None,
-            consume_left_release: false,
-        };
-        append_fullscreen_titlebar(
-            &mut scene,
-            &state,
-            WindowMode::BorderlessFullscreen,
-            winit::dpi::PhysicalSize::new(1280, 720),
-            1.0,
-            &config,
-            test_metrics(),
+        assert_eq!(
+            state.handle_mouse(moved, WindowMode::BorderlessFullscreen, 1.0, &config),
+            Some(NativeTitlebarTransition::Reveal)
         );
-        assert!(scene.surface_overlays.is_empty());
-
-        config.window.fullscreen_titlebar.enabled = true;
-        append_fullscreen_titlebar(
-            &mut scene,
-            &state,
-            WindowMode::BorderlessFullscreen,
-            winit::dpi::PhysicalSize::new(1280, 720),
-            1.0,
-            &config,
-            test_metrics(),
+        moved.y = 20.0;
+        assert_eq!(
+            state.handle_mouse(moved, WindowMode::Maximized, 1.0, &config),
+            Some(NativeTitlebarTransition::Hide {
+                fullscreen_mode: WindowMode::BorderlessFullscreen,
+            })
         );
-        assert!(
-            scene
-                .surface_overlays
-                .iter()
-                .all(|overlay| overlay.kind == OverlayKind::WindowChrome)
-        );
-        assert_eq!(scene.surface_overlays[0].bounds.width, 1280);
     }
 }

@@ -176,6 +176,15 @@ space at the end of a PowerShell prompt. A character-by-character real
 PowerShell regression covers immediate post-resize PSReadLine redraws and emits
 the PTY/query/response trace on failure.
 
+Primary-screen resize now preserves the reflowed viewport origin and shifts it
+only far enough to keep the cursor visible. Transient fullscreen shrink/grow
+events therefore cannot turn unused rows into leading blank scrollback or move
+the first shell banner into the middle of the window. Height-only changes use a
+direct row resize instead of logical-line reflow. The desktop reconciles the
+live physical surface size before scene construction, ignores zero-sized
+minimize events, and coalesces transition geometry for 40 ms before resizing
+terminal state or the PTY.
+
 ## Immediate Next Slice
 
 The dependency-ordered implementation pass through Phase 22 is now complete at
