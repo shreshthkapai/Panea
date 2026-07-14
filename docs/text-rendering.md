@@ -42,7 +42,17 @@ Can diagnostics show its cost? Glyph cache hits/misses and atlas uploads/occupan
 
 - `font-system` queries real regular/bold/italic/bold-italic faces through
   `fontdb`; it does not synthesize style metadata.
+- `font.size` is measured in typographic points. The desktop runtime converts
+  points to physical pixels using the active window scale factor, and rebuilds
+  cell metrics when a window moves between displays.
+- The generic `monospace` family resolves through Panea's portable modern
+  fallback order before the host's legacy generic alias.
 - Rustybuzz shapes OpenType runs and preserves cluster offsets.
+- Rustybuzz positions are converted with the same `ab_glyph::PxScale`
+  factor used by cell metrics and rasterization (`font.size_px /
+  font.height_unscaled()`). Units-per-em must not be used as a substitute:
+  mixing those scales makes text advances diverge from cell and cursor
+  coordinates.
 - Fallback selection occurs per Unicode grapheme, including combining marks,
   variation selectors, emoji modifiers, and ZWJ sequences.
 - Swash rasterizes monochrome outlines, COLR/CPAL color outlines, and embedded
@@ -52,6 +62,11 @@ Can diagnostics show its cost? Glyph cache hits/misses and atlas uploads/occupan
   font ligatures while terminal selection and cursor positions remain cell-based.
 - CJK and emoji cells remain independently owned terminal graphemes; wide-cell
   occupancy remains a `term-core` responsibility.
+- Shaped glyph advances remain floating point until final pixel placement so
+  fractional advances cannot accumulate one rounding error per glyph.
+- Tests require a primary monospace run's shaped advance to match its terminal
+  cell span and require prepared glyph geometry to remain aligned with the
+  following cursor cell.
 
 ## Verification Boundary
 

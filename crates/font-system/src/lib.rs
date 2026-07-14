@@ -193,6 +193,7 @@ impl Error for FontError {}
 pub struct FontSystem {
     database: fontdb::Database,
     config: FontConfig,
+    scale_factor: f32,
     primary: Option<LoadedFont>,
     loaded: HashMap<u64, LoadedFont>,
     attempted_faces: HashSet<(String, bool, bool)>,
@@ -201,12 +202,18 @@ pub struct FontSystem {
 impl FontSystem {
     #[must_use]
     pub fn new(config: FontConfig) -> Self {
+        Self::new_with_scale_factor(config, 1.0)
+    }
+
+    #[must_use]
+    pub fn new_with_scale_factor(config: FontConfig, scale_factor: f64) -> Self {
         let mut database = fontdb::Database::new();
         database.load_system_fonts();
 
         Self {
             database,
             config,
+            scale_factor: normalized_scale_factor(scale_factor),
             primary: None,
             loaded: HashMap::new(),
             attempted_faces: HashSet::new(),
@@ -242,7 +249,27 @@ impl FontSystem {
         self.config.size.to_bits().hash(&mut hasher);
         self.config.line_height.to_bits().hash(&mut hasher);
         self.config.ligatures.hash(&mut hasher);
+        self.scale_factor.to_bits().hash(&mut hasher);
         hasher.finish()
+    }
+
+    pub fn set_scale_factor(&mut self, scale_factor: f64) -> bool {
+        let scale_factor = normalized_scale_factor(scale_factor);
+        if self.scale_factor.to_bits() == scale_factor.to_bits() {
+            return false;
+        }
+        self.scale_factor = scale_factor;
+        true
+    }
+
+    #[must_use]
+    pub fn scale_factor(&self) -> f32 {
+        self.scale_factor
+    }
+
+    #[must_use]
+    pub fn physical_font_size(&self) -> f32 {
+        points_to_physical_pixels(self.config.size, self.scale_factor)
     }
 
     pub fn primary_font(&mut self) -> Result<&LoadedFont, FontError> {
@@ -256,7 +283,7 @@ impl FontSystem {
     }
 
     pub fn cell_metrics(&mut self) -> Result<CellMetrics, FontError> {
-        let size = self.config.size;
+        let size = self.physical_font_size();
         let line_height = self.config.line_height;
         self.primary_font()
             .map(|font| font.metrics(size, line_height))
@@ -302,7 +329,7 @@ impl FontSystem {
             }
         }
 
-        let size = self.config.size;
+        let size = self.physical_font_size();
         let mut glyphs = Vec::new();
         let mut advance_width = 0.0;
         let mut families_used = Vec::new();
@@ -392,7 +419,9 @@ impl FontSystem {
 
     fn requested_families(&self) -> Vec<String> {
         let mut requested = Vec::new();
-        requested.push(self.config.family.clone());
+        if !self.config.family.eq_ignore_ascii_case("monospace") {
+            requested.push(self.config.family.clone());
+        }
         requested.extend(self.config.fallback_families.clone());
         requested.extend([
             "Cascadia Mono".to_owned(),
@@ -539,6 +568,20 @@ impl FontSystem {
     }
 }
 
+fn normalized_scale_factor(scale_factor: f64) -> f32 {
+    if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor.clamp(0.25, 8.0) as f32
+    } else {
+        1.0
+    }
+}
+
+fn points_to_physical_pixels(points: f32, scale_factor: f32) -> f32 {
+    const CSS_PIXELS_PER_INCH: f32 = 96.0;
+    const POINTS_PER_INCH: f32 = 72.0;
+    (points * CSS_PIXELS_PER_INCH / POINTS_PER_INCH * scale_factor).max(1.0)
+}
+
 fn family_query(family: &str) -> Vec<fontdb::Family<'_>> {
     if family.eq_ignore_ascii_case("monospace") {
         vec![fontdb::Family::Monospace]
@@ -642,8 +685,12 @@ impl LoadedFont {
                 reason: "OpenType shaping face could not be created".to_owned(),
             });
         };
-        let units_per_em = face.units_per_em().max(1) as f32;
-        let scale = size / units_per_em;
+        // `ab_glyph::PxScale` defines `size` against the font's unscaled
+        // vertical height, not units-per-em. Cell metrics and rasterization use
+        // that contract, so shaping must use the same scale or glyph advances
+        // visibly drift away from terminal cells and the cursor.
+        let unscaled_height = self.font.height_unscaled().max(1.0);
+        let scale = size / unscaled_height;
         let mut buffer = rustybuzz::UnicodeBuffer::new();
         buffer.push_str(text);
         buffer.guess_segment_properties();
@@ -681,7 +728,7 @@ impl LoadedFont {
         let cell_height = ((ascent - descent + line_gap) * line_height)
             .ceil()
             .max(1.0);
-        let zero_width = scaled.h_advance(self.font.glyph_id('0')).ceil().max(1.0);
+        let zero_width = scaled.h_advance(self.font.glyph_id('0')).max(1.0);
 
         CellMetrics {
             font_size: size,
@@ -951,6 +998,44 @@ mod tests {
     }
 
     #[test]
+    fn point_sizes_scale_to_physical_pixels() {
+        let config = FontConfig {
+            size: 12.0,
+            ..FontConfig::default()
+        };
+        let fonts = FontSystem::new_with_scale_factor(config, 1.5);
+
+        assert_eq!(fonts.physical_font_size(), 24.0);
+        assert_eq!(fonts.scale_factor(), 1.5);
+    }
+
+    #[test]
+    fn scale_factor_changes_font_generation() {
+        let mut fonts = FontSystem::new(FontConfig::default());
+        let initial = fonts.generation_id();
+
+        assert!(fonts.set_scale_factor(2.0));
+        assert_ne!(fonts.generation_id(), initial);
+        assert!(!fonts.set_scale_factor(2.0));
+    }
+
+    #[test]
+    fn invalid_scale_factor_uses_one() {
+        let fonts = FontSystem::new_with_scale_factor(FontConfig::default(), f64::NAN);
+
+        assert_eq!(fonts.scale_factor(), 1.0);
+    }
+
+    #[test]
+    fn generic_monospace_uses_portable_preferred_families_first() {
+        let fonts = FontSystem::new(FontConfig::default());
+        let requested = fonts.requested_families();
+
+        assert_eq!(requested.first().map(String::as_str), Some("Cascadia Mono"));
+        assert_eq!(requested.last().map(String::as_str), Some("monospace"));
+    }
+
+    #[test]
     fn shaping_preserves_clusters_and_rasterizes_selected_glyphs() {
         let mut fonts = FontSystem::new(FontConfig::default());
         let Ok(run) = fonts.shape_text("ffi e\u{301}", false, false) else {
@@ -969,6 +1054,24 @@ mod tests {
             assert!(bitmap.width > 0);
             assert!(bitmap.height > 0);
         }
+    }
+
+    #[test]
+    fn primary_monospace_shape_advance_matches_cell_metrics() {
+        let mut fonts = FontSystem::new_with_scale_factor(FontConfig::default(), 1.25);
+        let metrics = fonts.cell_metrics().expect("cell metrics");
+        let run = fonts
+            .shape_text("panea-grid-cursor-check", false, false)
+            .expect("shape text");
+        let expected = metrics.cell_width * 23.0;
+
+        assert!(
+            (run.advance_width - expected).abs() <= 0.5,
+            "terminal text advance drifted from the cell grid: shaped={}, expected={}, cell_width={}",
+            run.advance_width,
+            expected,
+            metrics.cell_width
+        );
     }
 
     #[test]

@@ -1045,7 +1045,7 @@ impl Default for RendererConfig {
         Self {
             backend: RendererBackendPreference::Auto,
             vsync: true,
-            damage_tracking: true,
+            damage_tracking: false,
             present_mode: PresentModePreference::Auto,
             gpu_timestamps: false,
         }
@@ -3917,6 +3917,7 @@ mod tests {
         assert_eq!(config.window.rows, WindowConfig::default().rows);
         assert_eq!(config.font.family, FontConfig::default().family);
         assert_eq!(config.font.size, 14.0);
+        assert!(!config.renderer.damage_tracking);
     }
 
     #[test]

@@ -63,6 +63,11 @@ Fonts support family, size, line height, ordered fallback families, real style
 faces, color emoji fallback, and a ligature switch that controls OpenType
 `liga`, `clig`, and `calt` shaping features.
 
+Font size is specified in points, not device pixels. Panea applies the active
+per-monitor scale factor before shaping and rasterization; moving a window
+between displays recomputes metrics, pane geometry, terminal grids, and PTY
+pixel sizes from the same scaled values.
+
 ## Window Insets And Opacity
 
 `padding_x`/`padding_y` and `margin_x`/`margin_y` are pixel values. They reduce

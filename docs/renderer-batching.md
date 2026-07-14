@@ -15,7 +15,7 @@ macOS behavior: same render-core scene and render-wgpu batch planner; runtime GP
 Windows behavior: same render-core scene and render-wgpu batch planner; compile, unit tests, and renderer benchmarks were run on the current Windows host.
 Linux X11 behavior: same render-core scene and render-wgpu batch planner; X11 runtime validation remains unverified until run on Linux X11.
 Linux Wayland behavior: same render-core scene and render-wgpu batch planner; Wayland runtime validation remains unverified until run on Linux Wayland.
-Fallback behavior: CPU snapshot rasterization remains available for renderer tests and future screenshot fixtures; GPU surface errors still report through RendererError.
+Fallback behavior: production uses event-driven full-frame GPU batches while retained damage presentation is correctness-gated; CPU snapshot rasterization remains available for renderer tests and GPU surface errors report through RendererError.
 Diagnostics: RenderInstrumentation reports frame time, CPU preparation time, GPU timing status, glyph cache hits/misses, atlas uploads/occupancy, damage region count, draw-call count, animated regions, idle wakeups, and runtime throughput fields.
 Performance cost when disabled: disabled visual features do not create animation batches or extra overlay batches.
 Performance cost when enabled: enabled overlays and cursor animation add bounded batches for their affected damage regions.
@@ -29,7 +29,7 @@ Does this run every frame? Yes, scene-to-batch preparation runs for frames that 
 Does this run every input event? No, input only requests rendering through normal frame scheduling.
 Does this run every PTY output batch? Only after terminal state changes request a render frame.
 Does this allocate in the hot path? CPU damage batches are bounded per requested frame. GPU vertex/index buffers are persistent, grow geometrically, and are updated with `Queue::write_buffer`; they are not recreated every frame.
-Does this force full redraw? No; explicit damage regions filter generated cell, overlay, selection, and cursor batches.
+Does this force full redraw? Currently yes for each requested frame. Rendering remains event-driven and batched, so an idle terminal does not redraw. Retained damage is disabled until cross-frame GPU pixel verification proves it correct.
 Does this require GPU uploads? Only newly cached glyphs produce RGBA atlas uploads; unchanged monochrome and color glyphs reuse atlas entries.
 Does this run script/user code? No.
 Can it be cached? Glyph bitmaps, atlas entries, and text-to-glyph run keys are cached.
@@ -53,23 +53,40 @@ runs, selects fallback faces per grapheme, caches shaped output, and uploads
 monochrome or color glyphs into one RGBA atlas. Real bold/italic faces and color
 emoji use the same bounded batched draw path.
 
+Terminal palette values and user-authored image assets are sRGB. The WGPU
+pipelines linearize configured solid/glyph colors before writing to an sRGB
+surface, while sRGB atlas textures decode color emoji and cursor images during
+sampling. Explicit non-sRGB fragment variants preserve the encoded output on a
+linear swapchain fallback. This prevents colors such as `#0c0c0c` from being
+double-encoded and displayed as gray.
+
 `GpuTerminalRenderer::render_scene` uses those batches directly:
 
 - prepares batches through `TerminalRasterizer::prepare_batches`
 - uploads only new glyph atlas rows
 - submits indexed WGPU draws for non-empty batches
 - records batch draw counts and glyph atlas/cache stats
-- keeps a renderer-owned retained frame so damage-only draws never rely on
-  undefined swapchain content preservation
-- copies the retained frame to the acquired surface after each requested frame;
-  backends without surface `COPY_DST` support explicitly fall back to full draws
+- submits a complete GPU batch for every scheduler-requested frame
+- clears the presentation target for every full-frame batch, so removed glyphs
+  cannot leak from an older frame
+- does not allocate, load, or copy a retained texture while retained damage is
+  disabled
+- creates the animated-image cursor shader, pipeline, sampler, and bind-group
+  layout only when an image cursor is actually uploaded; disabled image cursors
+  add no GPU pipeline work to normal startup
 - forces a full redraw after startup, resize, or device recovery
 
-The desktop runtime now feeds `DamageTracker` output into every scene. Damage
+The desktop runtime feeds `DamageTracker` output into every scene. Damage
 includes changed and removed cells, old/new cursor positions, selections,
 semantic/search overlays, decorations, and animations. Unchanged text uses the
-glyph-run cache, so a cursor-only frame does not reshape the grid or re-upload
-resident glyphs.
+glyph-run cache and resident glyph atlas. The renderer currently promotes those
+regions to a full-frame batch because the retained-texture implementation failed
+interactive Windows frame-sequence verification. `renderer.damage_tracking`
+therefore defaults to `false`; requesting it emits an explicit fallback
+diagnostic instead of risking stale or displaced terminal text.
+The frame-policy regression tests require every full-frame path to reject
+retained-pixel loading; retained loading is legal only for a verified
+incremental frame.
 
 The CPU rasterizer remains in place for deterministic snapshot-style tests. It
 does not replace the normal WGPU batch submission path.
@@ -105,3 +122,6 @@ repeatable measurements for regression detection and feature-cost review.
   documented in [performance-instrumentation.md](performance-instrumentation.md);
   real GPU timing validation and polished installed UX remain open.
 - Batch vector reuse/pooling remains future renderer hot-path hardening.
+- Retained damage must remain production-disabled until automated GPU
+  frame-sequence tests cover startup, typing, output, cursor movement, erase,
+  scroll, and resize on Windows, macOS, Linux X11, and Linux Wayland.

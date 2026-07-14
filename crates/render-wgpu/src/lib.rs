@@ -32,6 +32,12 @@ use render_core::{
 use serde::Deserialize;
 use winit::window::Window;
 
+// Retained damage is correctness-gated. The current texture-retention path can
+// present stale or displaced glyphs across interactive frames on WGPU/DX12.
+// Keep production rendering full-frame and batched until a GPU frame-sequence
+// test proves retention on every supported backend.
+const RETAINED_DAMAGE_PRESENTATION_ENABLED: bool = false;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresentMode {
     Vsync,
@@ -51,7 +57,7 @@ impl Default for RendererOptions {
     fn default() -> Self {
         Self {
             present_mode: PresentMode::Vsync,
-            damage_tracking: true,
+            damage_tracking: false,
             gpu_timestamps: false,
             transparent: false,
             glyph_cache_entries: 8192,
@@ -482,12 +488,20 @@ fn scene_grid_region(scene: &RenderScene, metrics: CellMetrics) -> DamageRegion 
 }
 
 fn cell_region(position: CellPosition, metrics: CellMetrics) -> DamageRegion {
+    let x = cell_axis_bounds(u32::from(position.col), metrics.cell_width);
+    let y = cell_axis_bounds(position.row.max(0) as u32, metrics.cell_height);
     RenderRect {
-        x: (f32::from(position.col) * metrics.cell_width).floor() as i32,
-        y: (position.row.max(0) as f32 * metrics.cell_height).floor() as i32,
-        width: metrics.cell_width.ceil() as u32,
-        height: metrics.cell_height.ceil() as u32,
+        x: x.0,
+        y: y.0,
+        width: x.1,
+        height: y.1,
     }
+}
+
+fn cell_axis_bounds(index: u32, advance: f32) -> (i32, u32) {
+    let start = (index as f32 * advance).floor() as i32;
+    let end = (index.saturating_add(1) as f32 * advance).floor() as i32;
+    (start, end.saturating_sub(start).max(1) as u32)
 }
 
 fn cell_region_at(
@@ -2096,8 +2110,8 @@ impl RenderBatchPlanner {
             run
         };
 
-        let mut pen_x = context.rect.x;
-        let mut pen_y = context.rect.y;
+        let mut pen_x = context.rect.x as f32;
+        let mut pen_y = context.rect.y as f32;
         for item in run {
             let key = item.key;
             let cache_hit = self.glyph_cache.contains_key(key);
@@ -2138,8 +2152,8 @@ impl RenderBatchPlanner {
                 push_glyph_quad(
                     glyphs,
                     RenderRect {
-                        x: pen_x + item.x_offset.round() as i32 + bitmap.offset_x,
-                        y: pen_y - item.y_offset.round() as i32 + bitmap.offset_y,
+                        x: (pen_x + item.x_offset).round() as i32 + bitmap.offset_x,
+                        y: (pen_y - item.y_offset).round() as i32 + bitmap.offset_y,
                         width: bitmap.width,
                         height: bitmap.height,
                     },
@@ -2149,8 +2163,8 @@ impl RenderBatchPlanner {
                     bitmap.format == GlyphBitmapFormat::Rgba,
                 );
             }
-            pen_x += item.x_advance.round() as i32;
-            pen_y += item.y_advance.round() as i32;
+            pen_x += item.x_advance;
+            pen_y += item.y_advance;
         }
 
         Ok(())
@@ -2237,9 +2251,13 @@ fn damaged_terminal_text_runs(
 
 fn text_run_region(cell: &RenderCell, metrics: CellMetrics) -> RenderRect {
     let mut rect = cell_region(cell.position, metrics);
-    rect.width = (metrics.cell_width * cell.text.chars().count().max(1) as f32)
-        .ceil()
-        .max(1.0) as u32;
+    let cells = cell.text.chars().count().max(1) as u32;
+    let end = cell_axis_bounds(
+        u32::from(cell.position.col).saturating_add(cells),
+        metrics.cell_width,
+    )
+    .0;
+    rect.width = end.saturating_sub(rect.x).max(1) as u32;
     rect
 }
 
@@ -3998,8 +4016,8 @@ impl TerminalRasterizer {
     ) -> Result<(), RendererError> {
         let rect = offset_region(text_run_region(cell, metrics), offset);
 
-        let mut pen_x = rect.x;
-        let mut pen_y = rect.y;
+        let mut pen_x = rect.x as f32;
+        let mut pen_y = rect.y as f32;
         let shaped = fonts.shape_text(&cell.text, cell.style.bold, cell.style.italic)?;
         for glyph in shaped.glyphs {
             let key = glyph.key;
@@ -4010,13 +4028,13 @@ impl TerminalRasterizer {
             });
             draw_glyph(
                 frame,
-                pen_x + glyph.x_offset.round() as i32 + bitmap.offset_x,
-                pen_y - glyph.y_offset.round() as i32 + bitmap.offset_y,
+                (pen_x + glyph.x_offset).round() as i32 + bitmap.offset_x,
+                (pen_y - glyph.y_offset).round() as i32 + bitmap.offset_y,
                 bitmap.as_ref(),
                 cell.foreground,
             );
-            pen_x += glyph.x_advance.round() as i32;
-            pen_y += glyph.y_advance.round() as i32;
+            pen_x += glyph.x_advance;
+            pen_y += glyph.y_advance;
         }
 
         if cell.style.underline {
@@ -4079,8 +4097,8 @@ impl TerminalRasterizer {
             style: RenderCellStyle::default(),
         };
         let rect = offset_region(overlay_label_rect(overlay, metrics), offset);
-        let mut pen_x = rect.x;
-        let mut pen_y = rect.y;
+        let mut pen_x = rect.x as f32;
+        let mut pen_y = rect.y as f32;
         let shaped = fonts.shape_text(&cell.text, false, false)?;
         for glyph in shaped.glyphs {
             let key = glyph.key;
@@ -4091,14 +4109,14 @@ impl TerminalRasterizer {
             });
             draw_glyph(
                 frame,
-                pen_x + glyph.x_offset.round() as i32 + bitmap.offset_x,
-                pen_y - glyph.y_offset.round() as i32 + bitmap.offset_y,
+                (pen_x + glyph.x_offset).round() as i32 + bitmap.offset_x,
+                (pen_y - glyph.y_offset).round() as i32 + bitmap.offset_y,
                 bitmap.as_ref(),
                 cell.foreground,
             );
-            pen_x += glyph.x_advance.round() as i32;
-            pen_y += glyph.y_advance.round() as i32;
-            if pen_x > rect.x + rect.width as i32 {
+            pen_x += glyph.x_advance;
+            pen_y += glyph.y_advance;
+            if pen_x > (rect.x + rect.width as i32) as f32 {
                 break;
             }
         }
@@ -4604,9 +4622,7 @@ struct GpuBackend {
     glyph_atlas_texture: Option<wgpu::Texture>,
     glyph_atlas_size: Option<(u32, u32)>,
     glyph_bind_group: Option<wgpu::BindGroup>,
-    cursor_image_pipeline: wgpu::RenderPipeline,
-    cursor_image_bind_group_layout: wgpu::BindGroupLayout,
-    cursor_image_sampler: wgpu::Sampler,
+    cursor_image_resources: Option<CursorImageGpuResources>,
     cursor_image_texture: Option<wgpu::Texture>,
     cursor_image_asset_id: Option<u64>,
     cursor_image_bind_group: Option<wgpu::BindGroup>,
@@ -4618,6 +4634,12 @@ struct GpuBackend {
     device_loss_signal: Arc<Mutex<Option<DeviceLossSignal>>>,
     gpu_timing: GpuTiming,
     transparent: bool,
+}
+
+struct CursorImageGpuResources {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4836,6 +4858,15 @@ impl GpuTerminalRenderer {
             .is_some_and(|backend| backend.transparent)
     }
 
+    #[must_use]
+    pub fn damage_tracking_active(&self) -> bool {
+        self.options.damage_tracking
+            && self
+                .backend
+                .as_ref()
+                .is_some_and(GpuBackend::supports_retained_damage)
+    }
+
     pub fn render_scene(
         &mut self,
         scene: &RenderScene,
@@ -4857,14 +4888,17 @@ impl GpuTerminalRenderer {
 
         let frame_started = Instant::now();
         backend.poll_gpu_timing();
-        if self.requires_full_redraw {
-            backend.retained_frame_initialized = false;
-        }
-        let mut batches = if should_prepare_full_frame(
+        let retained_damage_enabled =
+            self.options.damage_tracking && backend.supports_retained_damage();
+        let prepare_full_frame = should_prepare_full_frame(
             self.requires_full_redraw,
             self.options.damage_tracking,
             backend.supports_retained_damage(),
-        ) {
+        );
+        if prepare_full_frame {
+            backend.retained_frame_initialized = false;
+        }
+        let mut batches = if prepare_full_frame {
             self.rasterizer.prepare_full_batches(scene, fonts)?
         } else {
             self.rasterizer.prepare_batches(scene, fonts)?
@@ -4876,7 +4910,11 @@ impl GpuTerminalRenderer {
         if let Some(asset) = batches.cursor_image_asset.as_deref() {
             backend.upload_cursor_image(asset);
         }
-        let result = backend.present_batches(&batches);
+        let result = backend.present_batches(
+            &batches,
+            retained_damage_enabled,
+            should_load_retained_frame(retained_damage_enabled, prepare_full_frame),
+        );
         batches.instrumentation.gpu_submit_time = Some(gpu_started.elapsed());
         batches.instrumentation.frame_time = frame_started.elapsed();
         self.last_instrumentation = batches.instrumentation;
@@ -4889,7 +4927,11 @@ impl GpuTerminalRenderer {
             Ok(PresentOutcome::Timeout) => Ok(()),
             Ok(PresentOutcome::SurfaceReconfigured(reason)) => {
                 self.record_surface_recovery(reason);
-                self.retry_present_after_surface_reconfigure(&batches)
+                self.retry_present_after_surface_reconfigure(
+                    &batches,
+                    retained_damage_enabled,
+                    should_load_retained_frame(retained_damage_enabled, prepare_full_frame),
+                )
             }
             Err(error @ RendererError::DeviceLost { .. }) => {
                 self.mark_backend_lost(&error);
@@ -4963,6 +5005,8 @@ impl GpuTerminalRenderer {
     fn retry_present_after_surface_reconfigure(
         &mut self,
         batches: &PreparedRenderBatches,
+        retained_damage_enabled: bool,
+        load_retained_frame: bool,
     ) -> Result<(), RendererError> {
         let Some(backend) = self.backend.as_mut() else {
             return Err(RendererError::DeviceUnavailable(
@@ -4970,7 +5014,7 @@ impl GpuTerminalRenderer {
             ));
         };
 
-        match backend.present_batches(batches) {
+        match backend.present_batches(batches, retained_damage_enabled, load_retained_frame) {
             Ok(PresentOutcome::Submitted | PresentOutcome::Timeout) => Ok(()),
             Ok(PresentOutcome::SurfaceReconfigured(_)) => Ok(()),
             Err(error @ RendererError::DeviceLost { .. }) => {
@@ -5016,6 +5060,10 @@ fn should_prepare_full_frame(
     retained_damage_supported: bool,
 ) -> bool {
     requires_full_redraw || !damage_tracking_enabled || !retained_damage_supported
+}
+
+fn should_load_retained_frame(retained_damage_enabled: bool, prepare_full_frame: bool) -> bool {
+    retained_damage_enabled && !prepare_full_frame
 }
 
 impl GpuBackend {
@@ -5096,7 +5144,8 @@ impl GpuBackend {
         } else {
             caps.alpha_modes[0]
         };
-        let surface_copy_supported = caps.usages.contains(wgpu::TextureUsages::COPY_DST);
+        let surface_copy_supported = RETAINED_DAMAGE_PRESENTATION_ENABLED
+            && caps.usages.contains(wgpu::TextureUsages::COPY_DST);
         let config = wgpu::SurfaceConfiguration {
             usage: if surface_copy_supported {
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST
@@ -5128,7 +5177,11 @@ impl GpuBackend {
             &batch_shader,
             format,
             "panea-quad-pipeline",
-            "fs_color",
+            if format.is_srgb() {
+                "fs_color_srgb_target"
+            } else {
+                "fs_color_unorm_target"
+            },
         );
         let glyph_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -5164,56 +5217,16 @@ impl GpuBackend {
             &batch_shader,
             format,
             "panea-glyph-pipeline",
-            "fs_glyph",
+            if format.is_srgb() {
+                "fs_glyph_srgb_target"
+            } else {
+                "fs_glyph_unorm_target"
+            },
         );
         let glyph_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("panea-glyph-sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            ..wgpu::SamplerDescriptor::default()
-        });
-        let cursor_image_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("panea-cursor-image-bind-group-layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2Array,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
-        let cursor_image_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("panea-cursor-image-pipeline-layout"),
-                bind_group_layouts: &[&cursor_image_bind_group_layout],
-                push_constant_ranges: &[],
-            });
-        let cursor_image_pipeline = create_batch_pipeline(
-            &device,
-            &cursor_image_pipeline_layout,
-            &batch_shader,
-            format,
-            "panea-cursor-image-pipeline",
-            "fs_cursor_image",
-        );
-        let cursor_image_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("panea-cursor-image-sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..wgpu::SamplerDescriptor::default()
         });
         let gpu_timing = if options.gpu_timestamps {
@@ -5238,9 +5251,7 @@ impl GpuBackend {
             glyph_atlas_texture: None,
             glyph_atlas_size: None,
             glyph_bind_group: None,
-            cursor_image_pipeline,
-            cursor_image_bind_group_layout,
-            cursor_image_sampler,
+            cursor_image_resources: None,
             cursor_image_texture: None,
             cursor_image_asset_id: None,
             cursor_image_bind_group: None,
@@ -5406,6 +5417,10 @@ impl GpuBackend {
         if asset.width == 0 || asset.height == 0 || layer_count == 0 {
             return;
         }
+        self.ensure_cursor_image_resources();
+        let Some(resources) = self.cursor_image_resources.as_ref() else {
+            return;
+        };
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("panea-cursor-image-array"),
             size: wgpu::Extent3d {
@@ -5483,7 +5498,7 @@ impl GpuBackend {
         });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("panea-cursor-image-bind-group"),
-            layout: &self.cursor_image_bind_group_layout,
+            layout: &resources.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -5491,7 +5506,7 @@ impl GpuBackend {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&self.cursor_image_sampler),
+                    resource: wgpu::BindingResource::Sampler(&resources.sampler),
                 },
             ],
         });
@@ -5500,11 +5515,87 @@ impl GpuBackend {
         self.cursor_image_bind_group = Some(bind_group);
     }
 
+    fn ensure_cursor_image_resources(&mut self) {
+        if self.cursor_image_resources.is_some() {
+            return;
+        }
+
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("panea-cursor-image-shader"),
+                source: wgpu::ShaderSource::Wgsl(CURSOR_IMAGE_SHADER.into()),
+            });
+        let bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("panea-cursor-image-bind-group-layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2Array,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("panea-cursor-image-pipeline-layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let pipeline = create_batch_pipeline(
+            &self.device,
+            &pipeline_layout,
+            &shader,
+            self.config.format,
+            "panea-cursor-image-pipeline",
+            if self.config.format.is_srgb() {
+                "fs_cursor_image_srgb_target"
+            } else {
+                "fs_cursor_image_unorm_target"
+            },
+        );
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("panea-cursor-image-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..wgpu::SamplerDescriptor::default()
+        });
+        self.cursor_image_resources = Some(CursorImageGpuResources {
+            pipeline,
+            bind_group_layout,
+            sampler,
+        });
+    }
+
     fn present_batches(
         &mut self,
         batches: &PreparedRenderBatches,
+        retained_damage_enabled: bool,
+        load_retained_frame: bool,
     ) -> Result<PresentOutcome, RendererError> {
-        self.ensure_retained_frame();
+        if retained_damage_enabled {
+            self.ensure_retained_frame();
+        } else {
+            self.retained_frame = None;
+            self.retained_frame_size = None;
+            self.retained_frame_initialized = false;
+        }
         let output = match self.surface.get_current_texture() {
             Ok(output) => output,
             Err(wgpu::SurfaceError::Lost) => {
@@ -5584,15 +5675,16 @@ impl GpuBackend {
             .as_ref()
             .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
         let target_view = retained_view.as_ref().unwrap_or(&view);
-        let load = if retained_view.is_some() && self.retained_frame_initialized {
-            wgpu::LoadOp::Load
-        } else {
-            wgpu::LoadOp::Clear(if self.transparent {
-                wgpu::Color::TRANSPARENT
+        let load =
+            if load_retained_frame && retained_view.is_some() && self.retained_frame_initialized {
+                wgpu::LoadOp::Load
             } else {
-                wgpu::Color::BLACK
-            })
-        };
+                wgpu::LoadOp::Clear(if self.transparent {
+                    wgpu::Color::TRANSPARENT
+                } else {
+                    wgpu::Color::BLACK
+                })
+            };
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -5637,9 +5729,10 @@ impl GpuBackend {
             }
             if self.cursor_image_asset_id
                 == batches.cursor_image_asset.as_ref().map(|asset| asset.id)
+                && let Some(cursor_image_resources) = &self.cursor_image_resources
                 && let Some(cursor_image_bind_group) = &self.cursor_image_bind_group
             {
-                pass.set_pipeline(&self.cursor_image_pipeline);
+                pass.set_pipeline(&cursor_image_resources.pipeline);
                 pass.set_bind_group(0, cursor_image_bind_group, &[]);
                 draw_buffers(&mut pass, &self.batches.cursor_image);
             }
@@ -5780,8 +5873,25 @@ fn vs_batch(in: VertexIn) -> VertexOut {
     return out;
 }
 
+fn srgb_to_linear(color: vec3<f32>) -> vec3<f32> {
+    let low = color / 12.92;
+    let high = pow((color + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+    return select(high, low, color <= vec3<f32>(0.04045));
+}
+
+fn linear_to_srgb(color: vec3<f32>) -> vec3<f32> {
+    let low = color * 12.92;
+    let high = 1.055 * pow(color, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
+    return select(high, low, color <= vec3<f32>(0.0031308));
+}
+
 @fragment
-fn fs_color(in: VertexOut) -> @location(0) vec4<f32> {
+fn fs_color_srgb_target(in: VertexOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(srgb_to_linear(in.color.rgb), in.color.a);
+}
+
+@fragment
+fn fs_color_unorm_target(in: VertexOut) -> @location(0) vec4<f32> {
     return in.color;
 }
 
@@ -5789,22 +5899,68 @@ fn fs_color(in: VertexOut) -> @location(0) vec4<f32> {
 @group(0) @binding(1) var glyph_sampler: sampler;
 
 @fragment
-fn fs_glyph(in: VertexOut) -> @location(0) vec4<f32> {
+fn fs_glyph_srgb_target(in: VertexOut) -> @location(0) vec4<f32> {
     let sample = textureSample(glyph_atlas, glyph_sampler, in.uv);
     if in.color.a < 0.0 {
         return vec4<f32>(sample.rgb, sample.a * -in.color.a);
     }
+    return vec4<f32>(srgb_to_linear(in.color.rgb), in.color.a * sample.a);
+}
+
+@fragment
+fn fs_glyph_unorm_target(in: VertexOut) -> @location(0) vec4<f32> {
+    let sample = textureSample(glyph_atlas, glyph_sampler, in.uv);
+    if in.color.a < 0.0 {
+        return vec4<f32>(linear_to_srgb(sample.rgb), sample.a * -in.color.a);
+    }
     return vec4<f32>(in.color.rgb, in.color.a * sample.a);
+}
+
+"#;
+
+const CURSOR_IMAGE_SHADER: &str = r#"
+struct VertexIn {
+    @location(0) position: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+};
+
+struct VertexOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+@vertex
+fn vs_batch(in: VertexIn) -> VertexOut {
+    var out: VertexOut;
+    out.position = vec4<f32>(in.position, 0.0, 1.0);
+    out.uv = in.uv;
+    out.color = in.color;
+    return out;
+}
+
+fn linear_to_srgb(color: vec3<f32>) -> vec3<f32> {
+    let low = color * 12.92;
+    let high = 1.055 * pow(color, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
+    return select(high, low, color <= vec3<f32>(0.0031308));
 }
 
 @group(0) @binding(2) var cursor_images: texture_2d_array<f32>;
 @group(0) @binding(3) var cursor_image_sampler: sampler;
 
 @fragment
-fn fs_cursor_image(in: VertexOut) -> @location(0) vec4<f32> {
+fn fs_cursor_image_srgb_target(in: VertexOut) -> @location(0) vec4<f32> {
     let frame = i32(round(in.color.r));
     let sample = textureSample(cursor_images, cursor_image_sampler, in.uv, frame);
     return vec4<f32>(sample.rgb, sample.a * in.color.g);
+}
+
+@fragment
+fn fs_cursor_image_unorm_target(in: VertexOut) -> @location(0) vec4<f32> {
+    let frame = i32(round(in.color.r));
+    let sample = textureSample(cursor_images, cursor_image_sampler, in.uv, frame);
+    return vec4<f32>(linear_to_srgb(sample.rgb), sample.a * in.color.g);
 }
 "#;
 
@@ -5855,7 +6011,7 @@ mod tests {
         device.push_error_scope(wgpu::ErrorFilter::Validation);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("panea-cursor-image-test-shader"),
-            source: wgpu::ShaderSource::Wgsl(BATCH_SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(CURSOR_IMAGE_SHADER.into()),
         });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("panea-cursor-image-test-layout"),
@@ -5889,7 +6045,7 @@ mod tests {
             &shader,
             wgpu::TextureFormat::Bgra8UnormSrgb,
             "panea-cursor-image-test-pipeline",
-            "fs_cursor_image",
+            "fs_cursor_image_srgb_target",
         );
         device.poll(wgpu::Maintain::Wait);
         let error = pollster::block_on(device.pop_error_scope());
@@ -5911,10 +6067,38 @@ mod tests {
 
     #[test]
     fn full_frame_fallback_honors_config_and_surface_capability() {
+        assert!(!RendererOptions::default().damage_tracking);
         assert!(should_prepare_full_frame(true, true, true));
         assert!(should_prepare_full_frame(false, false, true));
         assert!(should_prepare_full_frame(false, true, false));
         assert!(!should_prepare_full_frame(false, true, true));
+    }
+
+    #[test]
+    fn full_frame_rendering_never_loads_stale_retained_pixels() {
+        for (damage_tracking_enabled, retained_damage_supported) in
+            [(false, false), (false, true), (true, false)]
+        {
+            let full_frame = should_prepare_full_frame(
+                false,
+                damage_tracking_enabled,
+                retained_damage_supported,
+            );
+            let retained_damage_enabled = damage_tracking_enabled && retained_damage_supported;
+            assert!(full_frame);
+            assert!(!should_load_retained_frame(
+                retained_damage_enabled,
+                full_frame
+            ));
+        }
+
+        let retained_damage_enabled = true;
+        let full_frame = should_prepare_full_frame(false, true, true);
+        assert!(!full_frame);
+        assert!(should_load_retained_frame(
+            retained_damage_enabled,
+            full_frame
+        ));
     }
 
     fn scene(cells: Vec<RenderCell>) -> RenderScene {
@@ -6217,6 +6401,53 @@ mod tests {
 
         assert!(second.instrumentation.glyphs.cache_hits > 0);
         assert_eq!(second.instrumentation.glyphs.atlas_uploads, 0);
+    }
+
+    #[test]
+    fn shaped_terminal_run_stays_aligned_with_cursor_cell() {
+        const TEXT: &str = "panea-grid-cursor-check";
+        let mut fonts = FontSystem::new_with_scale_factor(font_system::FontConfig::default(), 1.25);
+        let metrics = fonts.cell_metrics().expect("cell metrics");
+        let cells = TEXT
+            .chars()
+            .enumerate()
+            .map(|(col, ch)| cell(0, col as u16, &ch.to_string()))
+            .collect::<Vec<_>>();
+        let mut test_scene = scene(cells);
+        test_scene.cursor = Some(CursorVisual {
+            position: CellPosition {
+                row: 0,
+                col: TEXT.len() as u16,
+            },
+            shape: RenderCursorShape::Beam,
+            color: RenderColor::rgb(255, 255, 255),
+            visible: true,
+            thickness_percent: 15,
+            corner_radius_px: 0,
+            inactive: false,
+        });
+        let mut planner = RenderBatchPlanner::default();
+        let batches = planner
+            .prepare_full(&test_scene, &mut fonts)
+            .expect("prepare terminal run");
+
+        let text_right = batches
+            .glyphs
+            .vertices
+            .iter()
+            .map(|vertex| vertex.position_px[0])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let cursor_left = batches
+            .cursor
+            .vertices
+            .iter()
+            .map(|vertex| vertex.position_px[0])
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            text_right <= cursor_left + metrics.cell_width,
+            "text geometry escaped its terminal cells: text_right={text_right}, cursor_left={cursor_left}, cell_width={}",
+            metrics.cell_width
+        );
     }
 
     #[test]

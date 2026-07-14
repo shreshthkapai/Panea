@@ -59,6 +59,7 @@ stated scope:
 | Diagnostics foundations | tested | Installed `panea doctor ...`, `cargo xtask doctor ...`, JSON doctor output, bug-report snapshots, release/security/hardening/package readiness reports, and iOS readiness reports exist through shared diagnostics models. |
 | Performance harness foundation | tested | `cargo xtask bench ...` and `tools/bench` fixtures exist for repeatable local measurements. |
 | Performance instrumentation and power policy | tested | Shared instrumentation reports frame/CPU/GPU timing status, glyph cache and atlas occupancy, damage/draw counts, active animations, idle wakeups, PTY/parser throughput, memory estimates, effective profile, and power source. The desktop overlay is renderer-only, and a cross-platform power provider applies reversible battery caps outside hot paths. |
+| GPU frame presentation | partial | Event-driven full-frame WGPU batches, persistent GPU buffers, glyph caching, and idle suppression are the production path. Retained partial-frame presentation reproduced stale/displaced glyph corruption on Windows and is correctness-gated off on every OS; requesting it emits a fallback diagnostic. Cross-frame GPU verification is required before re-enabling it. |
 | Mux model | tested | Workspace, window, tab, pane, session, split tree, restore snapshot, and mux action models exist with unit coverage. |
 | Desktop mux runtime | tested | Independent local/SSH pane runtimes, workspaces, tabs, nested splits, focus/resize/zoom/move/swap/close, drag-to-reorder tabs, modifier-drag pane swaps, renderer-only drag targets, configurable tab chrome, pane borders, startup layouts, fresh-process session restoration, PTY resize, and active-pane input routing are wired. Cross-OS GUI smoke remains separate. |
 | Semantic model and runtime actions | tested | Incrementally positioned OSC regions, command blocks, navigation, raw output selection/copy, exit status, measured duration, cwd, shell and remote metadata are wired per pane without buffer mutation. |
@@ -80,9 +81,9 @@ These areas are real foundations but must not be called complete:
 
 | Area | Status | Missing before completion |
 | --- | --- | --- |
-| Desktop app runtime | partial | Full app lifecycle polish and cross-OS manual validation remain; bounded GUI smokes verify window, GPU renderer, session creation, exactly one settled startup prompt without input, terminal input/output, first frame, and teardown. Orphan key repeats and control-only IME commits are rejected at the platform-neutral input boundary. |
+| Desktop app runtime | partial | Full app lifecycle polish and cross-OS manual validation remain; bounded GUI smokes verify window, GPU renderer, session creation, exactly one settled startup prompt without input, terminal input/output, first frame, and teardown. Initial launcher activation keys, orphan key repeats, and control-only IME commits are rejected at the platform-neutral input boundary. |
 | Platform windowing | partial | Native winit paths, explicit X11/Wayland builders, exclusive/borderless/frameless modes, decoration fallback reporting, DPI resize propagation, IME preedit overlays, clipboard providers, and native notification providers exist. Real macOS/Linux compositor/IME/DPI/notification validation remains. |
-| GPU renderer | tested | WGPU setup, persistent growable GPU batches, retained-frame damage rendering with full-draw fallback, incremental desktop damage projection, shaped-run/glyph/RGBA emoji atlas caching, row-scoped uploads, low-idle scheduling, benchmarks, device-loss backend recreation, screenshot infrastructure, and GPU timing plumbing exist; real sleep/wake/monitor-loss validation, macOS/Linux baselines, and cross-OS render validation remain. |
+| GPU renderer | tested | WGPU setup, persistent growable GPU batches, correctness-gated retained damage with event-driven full-frame presentation, incremental desktop damage projection, shaped-run/glyph/RGBA emoji atlas caching, lazy opt-in image-cursor GPU resources, row-scoped uploads, low-idle scheduling, benchmarks, device-loss backend recreation, screenshot infrastructure, and GPU timing plumbing exist; real sleep/wake/monitor-loss validation, macOS/Linux baselines, cross-OS render validation, and lower cold-start latency remain. |
 | Font and text rendering | tested | OpenType shaping, per-grapheme configured/system fallback, real regular/bold/italic/bold-italic face resolution, CJK/combining/ligature/emoji shaping, COLR/bitmap color glyph rasterization, RGBA atlas batching, run caching, and portable font diagnostics pass automated tests on Windows. |
 | Unicode support | tested | Core/parser grapheme correctness and renderer shaping/fallback/color-glyph paths are covered by automated tests; real installed-font and screenshot/app parity still require macOS/Linux host reports. |
 | Input, clipboard, selection, and scrollback UX | tested | Shared key/application-mode encoding, mouse/focus protocols, absolute normal/rectangular mouse and keyboard selection, selection overlays, anchored wheel/page scrollback, interactive search, portable HTTP(S) URL activation, keyboard copy/paste, Linux primary-selection provider behavior, paste protection, bracketed paste, middle-click paste, OSC 52 policy, and remote one-time confirmation overlay exist. Real macOS/Linux runtime verification and full app compatibility coverage remain. |
@@ -157,6 +158,13 @@ The following major accepted features have no complete product behavior yet:
 | multiplexer structure | partial | Model, startup layouts, local/SSH panes, reconnect, tab reorder drag, pane swap drag, target chrome, and desktop runtime wiring exist; cross-OS GUI smoke remains. |
 | diagnostics | partial | Installed and xtask doctor diagnostics plus packaged doctor smoke exist; richer live platform reports and cross-OS doctor/package output verification remain. |
 | security | partial | Explicit SSH trust UI, masked secrets, native desktop keychains, secure provider flow, bounded OSC 52 policy, and privacy-preserving remote confirmation exist; native iOS Keychain and cross-OS real-server evidence remain. |
+
+Windows desktop startup now quarantines launcher activation input at the native
+event-loop handoff rather than at translator construction time. This prevents
+slow font/GPU initialization from forwarding a Windows Search Enter/Space key
+to the PTY. PTY startup also precedes GPU device creation so shell startup and
+renderer initialization can overlap. Equivalent launcher behavior still needs
+real macOS and Linux desktop verification.
 
 ## Immediate Next Slice
 

@@ -108,7 +108,9 @@ entrypoint is linked with the Windows GUI subsystem, so Start-menu and portable
 desktop launches do not create a console window. The console entrypoint keeps
 stdout/stderr available for `doctor`, shell integration, and smoke commands.
 The installer shortcut targets `panea-gui.exe`; the user `PATH` still exposes
-`panea.exe`.
+`panea.exe`. During the initial window-focus handoff, launcher activation keys
+that can remain held by Start menu or desktop activation are quarantined until
+release; they are never forwarded to the new PTY session as terminal input.
 
 macOS app bundle:
 
@@ -205,6 +207,11 @@ after stable, distinct capabilities and a remote fallback strategy exist.
 
 ## Release Boundaries
 
+- Desktop startup arms its launcher-input quarantine immediately before the
+  native event loop begins consuming events. Slow font discovery or GPU setup
+  therefore cannot expire the guard and forward the Windows Search activation
+  key into the shell. Local PTY startup begins before GPU device creation so
+  initial shell output can be produced concurrently with renderer setup.
 - Windows installer and portable artifacts are implemented and passed the
   current-host development package smoke. Authenticode hooks are implemented;
   a release certificate is still an external release credential.

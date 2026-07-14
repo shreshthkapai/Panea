@@ -995,6 +995,7 @@ fn font_discovery_label(config: &AppConfig) -> String {
 }
 
 fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
+    let startup_probe_started = gui_smoke.as_ref().map(|_| Instant::now());
     if gui_smoke.is_some() {
         eprintln!("gui-smoke milestone=config-load-start");
     }
@@ -1028,7 +1029,10 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
     });
     let desktop_window = DesktopWindow::create(&event_loop, &settings)?;
     if gui_smoke.is_some() {
-        eprintln!("gui-smoke milestone=window-created");
+        eprintln!(
+            "gui-smoke milestone=window-created elapsed_ms={}",
+            startup_probe_started.map_or(0, |started| started.elapsed().as_millis())
+        );
     }
     if let Some(fallback) = desktop_window.diagnostics().window_mode.fallback.as_ref() {
         eprintln!(
@@ -1067,14 +1071,39 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
     let mut paste_config = config.paste.clone();
     let mut osc52_policy = osc52_policy(&clipboard_config);
 
-    let mut fonts = FontSystem::new(font_config(&config.font));
+    let mut dpi_scale_factor = window.scale_factor();
+    let mut fonts = FontSystem::new_with_scale_factor(font_config(&config.font), dpi_scale_factor);
     let metrics = fonts.cell_metrics()?;
+    // Start the transport as soon as cell metrics are available. PTY startup
+    // and initial shell output can then overlap GPU adapter/device creation.
+    let mut surface_size = window.inner_size();
+    let mut mux_runtime = MuxRuntime::new(
+        &config,
+        metrics,
+        surface_size.width,
+        surface_size.height,
+        transport_waker,
+    );
+    if gui_smoke.is_some() {
+        eprintln!(
+            "gui-smoke milestone=session-created elapsed_ms={}",
+            startup_probe_started.map_or(0, |started| started.elapsed().as_millis())
+        );
+    }
     let mut renderer = pollster::block_on(GpuTerminalRenderer::new(
         Arc::clone(&window),
         renderer_options(&config),
     ))?;
+    if config.renderer.damage_tracking && !renderer.damage_tracking_active() {
+        eprintln!(
+            "renderer fallback: retained damage presentation is disabled because cross-frame correctness is not verified; using event-driven full-frame GPU batches"
+        );
+    }
     if gui_smoke.is_some() {
-        eprintln!("gui-smoke milestone=renderer-created");
+        eprintln!(
+            "gui-smoke milestone=renderer-created elapsed_ms={}",
+            startup_probe_started.map_or(0, |started| started.elapsed().as_millis())
+        );
     }
     if config.window.opacity < 1.0 && !renderer.transparency_active() {
         eprintln!(
@@ -1111,18 +1140,8 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
         &config,
         cursor_asset_base_dir.as_deref(),
     );
-    let mut surface_size = window.inner_size();
-    let mut mux_runtime = MuxRuntime::new(
-        &config,
-        metrics,
-        surface_size.width,
-        surface_size.height,
-        transport_waker,
-    );
-    if gui_smoke.is_some() {
-        eprintln!("gui-smoke milestone=session-created");
-    }
 
+    input_translator.arm_initial_focus_handoff();
     scheduler.terminal_content_changed();
     let gui_smoke_deadline = gui_smoke
         .as_ref()
@@ -1290,6 +1309,10 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                             InputEvent::ScaleFactorChanged { scale_factor } => {
                                 surface_size = window.inner_size();
                                 renderer.resize(surface_size.width, surface_size.height);
+                                dpi_scale_factor = scale_factor;
+                                if fonts.set_scale_factor(scale_factor) {
+                                    renderer.request_full_redraw();
+                                }
                                 if let Ok(metrics) = fonts.cell_metrics() {
                                     mux_runtime.resize_all(
                                         surface_size.width,
@@ -1758,6 +1781,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                 &mut performance_budget,
                                 &mut renderer,
                                 &window,
+                                dpi_scale_factor,
                             ) {
                                 Ok(reloaded) => {
                                     configured_performance = next_configured_performance;
@@ -2086,13 +2110,15 @@ fn apply_live_config_reload(
     runtime_performance_budget: &mut PerformanceBudget,
     renderer: &mut GpuTerminalRenderer,
     window: &winit::window::Window,
+    dpi_scale_factor: f64,
 ) -> Result<bool, String> {
     if plan.live.is_empty() {
         return Ok(false);
     }
 
     if plan.live.contains(&ReloadableSection::Font) {
-        let mut reloaded_fonts = FontSystem::new(font_config(&next.font));
+        let mut reloaded_fonts =
+            FontSystem::new_with_scale_factor(font_config(&next.font), dpi_scale_factor);
         reloaded_fonts
             .cell_metrics()
             .map_err(|error| format!("font reload failed: {error}"))?;
@@ -9635,6 +9661,164 @@ mod tests {
             "PowerShell startup events produced {prompt_count} prompts; resized_after_prompt={resized_after_prompt}; focus_reported_after_prompt={focus_reported_after_prompt}; visible={visible:?}; raw={:?}",
             String::from_utf8_lossy(&raw)
         );
+    }
+
+    #[test]
+    #[ignore = "spawns an interactive PowerShell process and verifies grid/cursor coherence"]
+    fn real_powershell_input_echo_keeps_grid_and_cursor_coherent() {
+        let profile = LocalShellProfile::powershell();
+        // Match the normal desktop launch more closely: Panea starts at a
+        // modest window size, then may receive multiple grow/resize events as
+        // the native window is presented or maximized.
+        let size = TransportSize::new(86, 26, 944, 548);
+        let mut transport = LocalPtyTransport::spawn(profile, size).expect("spawn shell");
+        let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(size.cols, size.rows));
+        let startup_deadline = Instant::now() + Duration::from_secs(2);
+
+        while Instant::now() < startup_deadline {
+            let output = transport.poll_output().expect("poll shell output");
+            if !output.bytes.is_empty() {
+                answer_real_shell_terminal_queries(&mut transport, &output.bytes);
+                terminal
+                    .apply_bytes(&output.bytes)
+                    .expect("apply startup output");
+            }
+            if terminal_visible_lines(&terminal)
+                .iter()
+                .any(|line| line.trim_start().starts_with("PS "))
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let resized = TransportSize::new(171, 42, 1868, 868);
+        terminal
+            .resize(CoreTerminalSize::new(resized.cols, resized.rows))
+            .expect("resize terminal grid before input");
+        transport.resize(resized).expect("resize PTY before input");
+        transport
+            .resize(resized)
+            .expect("repeat native resize event before input");
+        let resize_deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < resize_deadline {
+            let output = transport.poll_output().expect("poll resize output");
+            if !output.bytes.is_empty() {
+                answer_real_shell_terminal_queries(&mut transport, &output.bytes);
+                terminal
+                    .apply_bytes(&output.bytes)
+                    .expect("apply resize output");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        const MARKER: &str = "panea-grid-cursor-check";
+        const INPUT: &str = "Write-Output panea-grid-cursor-check";
+        transport
+            .write_input(INPUT.as_bytes())
+            .expect("write input without submitting it");
+        let echo_deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < echo_deadline {
+            let output = transport.poll_output().expect("poll input echo");
+            if !output.bytes.is_empty() {
+                terminal
+                    .apply_bytes(&output.bytes)
+                    .expect("apply input echo");
+            }
+            if terminal_visible_lines(&terminal)
+                .iter()
+                .any(|line| line.contains(INPUT))
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let lines = terminal_visible_lines(&terminal);
+        let prompt_count = lines
+            .iter()
+            .filter(|line| line.trim_start().starts_with("PS "))
+            .count();
+        assert_eq!(
+            prompt_count,
+            1,
+            "startup/resize produced duplicate prompts before submission; cursor={:?}; visible={lines:?}",
+            terminal.cursor_state().position
+        );
+        let input_row = lines
+            .iter()
+            .position(|line| line.contains(INPUT))
+            .expect("typed input must be visible");
+        let input_line = &lines[input_row];
+        assert!(
+            input_line.trim_start().starts_with("PS "),
+            "input echo moved away from its prompt; cursor={:?}; visible={lines:?}",
+            terminal.cursor_state().position
+        );
+        let input_end_col = input_line.find(INPUT).expect("input column") + INPUT.len();
+        assert_eq!(
+            terminal.cursor_state().position,
+            GridPosition::new(input_row as i64, input_end_col as u16),
+            "cursor does not follow the visible input; visible={lines:?}"
+        );
+
+        transport.write_input(b"\r\n").expect("submit input");
+        let command_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < command_deadline {
+            let output = transport.poll_output().expect("poll command output");
+            if !output.bytes.is_empty() {
+                answer_real_shell_terminal_queries(&mut transport, &output.bytes);
+                terminal
+                    .apply_bytes(&output.bytes)
+                    .expect("apply command output");
+            }
+            let lines = terminal_visible_lines(&terminal);
+            if lines
+                .iter()
+                .enumerate()
+                .any(|(row, line)| row > input_row && line.trim() == MARKER)
+                && lines
+                    .iter()
+                    .enumerate()
+                    .any(|(row, line)| row > input_row && line.trim_start().starts_with("PS "))
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let lines = terminal_visible_lines(&terminal);
+        let output_row = lines
+            .iter()
+            .enumerate()
+            .find_map(|(row, line)| (row > input_row && line.trim() == MARKER).then_some(row))
+            .expect("command output must be below submitted input");
+        let next_prompt_row = lines
+            .iter()
+            .enumerate()
+            .find_map(|(row, line)| {
+                (row > output_row && line.trim_start().starts_with("PS ")).then_some(row)
+            })
+            .expect("next prompt must be below command output");
+        assert_eq!(
+            terminal.cursor_state().position.row,
+            next_prompt_row as i64,
+            "cursor row must match the next visible prompt; visible={lines:?}"
+        );
+        let _ = transport.shutdown();
+    }
+
+    fn terminal_visible_lines(terminal: &TerminalEmulator) -> Vec<String> {
+        let visible = terminal.visible_grid();
+        visible
+            .cells
+            .chunks(usize::from(visible.viewport.size.cols.max(1)))
+            .map(|cells| term_core::Line {
+                cells: cells.to_vec(),
+                hard_wrapped: false,
+            })
+            .map(|line| line.raw_text())
+            .collect()
     }
 
     fn run_interactive_shell_activation_smoke(profile: LocalShellProfile) {

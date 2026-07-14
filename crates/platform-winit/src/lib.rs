@@ -31,12 +31,13 @@ use winit::{
     dpi::LogicalSize,
     event::{ElementState, Ime, MouseScrollDelta, WindowEvent},
     event_loop::{EventLoop, EventLoopBuilder, EventLoopWindowTarget},
-    keyboard::{Key, ModifiersState, NamedKey, PhysicalKey},
+    keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey},
     window::{Fullscreen, Window, WindowBuilder},
 };
 
 const POWER_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const NOTIFICATION_QUEUE_CAPACITY: usize = 16;
+const INITIAL_ACTIVATION_KEY_GUARD: Duration = Duration::from_millis(750);
 
 #[derive(Debug)]
 pub struct DesktopNotificationProvider {
@@ -482,6 +483,9 @@ pub struct InputTranslator {
     modifiers: KeyModifiers,
     cursor_position: (f64, f64),
     pressed_keys: HashSet<PhysicalKey>,
+    suppressed_activation_keys: HashSet<PhysicalKey>,
+    activation_guard_started_at: Instant,
+    initial_focus_seen: bool,
 }
 
 impl InputTranslator {
@@ -491,6 +495,9 @@ impl InputTranslator {
             modifiers: KeyModifiers::default(),
             cursor_position: (0.0, 0.0),
             pressed_keys: HashSet::new(),
+            suppressed_activation_keys: HashSet::new(),
+            activation_guard_started_at: Instant::now(),
+            initial_focus_seen: false,
         }
     }
 
@@ -499,12 +506,27 @@ impl InputTranslator {
         self.modifiers
     }
 
+    /// Starts a fresh launcher-to-window input handoff immediately before the
+    /// application begins consuming native events. Expensive startup work may
+    /// happen after this translator is constructed, so constructor time is not
+    /// a reliable boundary for quarantining a held launcher key.
+    pub fn arm_initial_focus_handoff(&mut self) {
+        self.pressed_keys.clear();
+        self.suppressed_activation_keys.clear();
+        self.activation_guard_started_at = Instant::now();
+        self.initial_focus_seen = false;
+    }
+
     pub fn translate_window_event(&mut self, event: &WindowEvent) -> Vec<InputEvent> {
         match event {
             WindowEvent::CloseRequested => vec![InputEvent::CloseRequested],
             WindowEvent::Focused(focused) => {
-                if !focused {
+                if *focused && !self.initial_focus_seen {
+                    self.activation_guard_started_at = Instant::now();
+                    self.initial_focus_seen = true;
+                } else if !focused {
                     self.pressed_keys.clear();
+                    self.suppressed_activation_keys.clear();
                     self.modifiers = KeyModifiers::default();
                 }
                 vec![InputEvent::Focused(*focused)]
@@ -523,6 +545,14 @@ impl InputTranslator {
                 Vec::new()
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if should_suppress_initial_activation_key(
+                    &mut self.suppressed_activation_keys,
+                    &event.physical_key,
+                    event.state,
+                    Instant::now().saturating_duration_since(self.activation_guard_started_at),
+                ) {
+                    return Vec::new();
+                }
                 if !should_forward_key_event(
                     &mut self.pressed_keys,
                     &event.physical_key,
@@ -588,6 +618,37 @@ impl InputTranslator {
             _ => Vec::new(),
         }
     }
+}
+
+fn should_suppress_initial_activation_key(
+    suppressed_keys: &mut HashSet<PhysicalKey>,
+    key: &PhysicalKey,
+    state: ElementState,
+    since_initial_focus: Duration,
+) -> bool {
+    if suppressed_keys.contains(key) {
+        if state == ElementState::Released {
+            suppressed_keys.remove(key);
+        }
+        return true;
+    }
+
+    if state == ElementState::Pressed
+        && since_initial_focus <= INITIAL_ACTIVATION_KEY_GUARD
+        && is_window_activation_key(key)
+    {
+        suppressed_keys.insert(*key);
+        return true;
+    }
+
+    false
+}
+
+fn is_window_activation_key(key: &PhysicalKey) -> bool {
+    matches!(
+        key,
+        PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space)
+    )
 }
 
 fn should_forward_key_event(
@@ -1212,7 +1273,64 @@ fn clipboard_diagnostic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use winit::keyboard::KeyCode;
+
+    #[test]
+    fn initial_window_activation_key_is_quarantined_until_release() {
+        let enter = PhysicalKey::Code(KeyCode::Enter);
+        let letter = PhysicalKey::Code(KeyCode::KeyA);
+        let mut suppressed = HashSet::new();
+
+        assert!(should_suppress_initial_activation_key(
+            &mut suppressed,
+            &enter,
+            ElementState::Pressed,
+            Duration::from_millis(100),
+        ));
+        assert!(should_suppress_initial_activation_key(
+            &mut suppressed,
+            &enter,
+            ElementState::Pressed,
+            Duration::from_secs(2),
+        ));
+        assert!(should_suppress_initial_activation_key(
+            &mut suppressed,
+            &enter,
+            ElementState::Released,
+            Duration::from_secs(2),
+        ));
+        assert!(suppressed.is_empty());
+
+        assert!(!should_suppress_initial_activation_key(
+            &mut suppressed,
+            &letter,
+            ElementState::Pressed,
+            Duration::from_millis(100),
+        ));
+        assert!(!should_suppress_initial_activation_key(
+            &mut suppressed,
+            &enter,
+            ElementState::Pressed,
+            INITIAL_ACTIVATION_KEY_GUARD + Duration::from_millis(1),
+        ));
+    }
+
+    #[test]
+    fn initial_focus_handoff_is_rearmed_after_slow_startup() {
+        let mut translator = InputTranslator::new();
+        translator.activation_guard_started_at =
+            Instant::now() - INITIAL_ACTIVATION_KEY_GUARD - Duration::from_secs(1);
+        translator.initial_focus_seen = true;
+        translator
+            .pressed_keys
+            .insert(PhysicalKey::Code(KeyCode::KeyA));
+
+        translator.arm_initial_focus_handoff();
+
+        assert!(!translator.initial_focus_seen);
+        assert!(translator.pressed_keys.is_empty());
+        assert!(translator.suppressed_activation_keys.is_empty());
+        assert!(translator.activation_guard_started_at.elapsed() <= INITIAL_ACTIVATION_KEY_GUARD);
+    }
 
     #[test]
     fn orphan_key_repeat_is_not_forwarded_as_terminal_input() {
