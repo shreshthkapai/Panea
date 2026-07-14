@@ -322,7 +322,13 @@ impl DamageTracker {
                 .copied(),
         );
         for position in self.removed_positions.drain(..) {
-            regions.push(cell_region_at(position, metrics, scene.content_offset));
+            push_text_damage_context(
+                &mut regions,
+                position,
+                scene.grid.columns,
+                metrics,
+                scene.content_offset,
+            );
             self.previous_cells.remove(&position);
         }
 
@@ -332,7 +338,13 @@ impl DamageTracker {
                 .get(&cell.position)
                 .is_some_and(|fingerprint| fingerprint.matches(cell))
             {
-                regions.push(cell_region_at(cell.position, metrics, scene.content_offset));
+                push_text_damage_context(
+                    &mut regions,
+                    cell.position,
+                    scene.grid.columns,
+                    metrics,
+                    scene.content_offset,
+                );
                 self.previous_cells
                     .insert(cell.position, CellFingerprint::from(cell));
             }
@@ -484,6 +496,35 @@ fn cell_region_at(
     offset: render_core::RenderOffset,
 ) -> DamageRegion {
     offset_region(cell_region(position, metrics), offset)
+}
+
+fn push_text_damage_context(
+    regions: &mut Vec<DamageRegion>,
+    position: CellPosition,
+    columns: u16,
+    metrics: CellMetrics,
+    offset: render_core::RenderOffset,
+) {
+    const LIGATURE_CONTEXT_CELLS: u16 = 2;
+
+    if columns == 0 {
+        return;
+    }
+    let start = position.col.saturating_sub(LIGATURE_CONTEXT_CELLS);
+    let end = position
+        .col
+        .saturating_add(LIGATURE_CONTEXT_CELLS)
+        .min(columns - 1);
+    regions.extend((start..=end).map(|col| {
+        cell_region_at(
+            CellPosition {
+                row: position.row,
+                col,
+            },
+            metrics,
+            offset,
+        )
+    }));
 }
 
 fn offset_region(mut region: RenderRect, offset: render_core::RenderOffset) -> RenderRect {
@@ -1836,11 +1877,13 @@ impl RenderBatchPlanner {
             push_text_decorations(&mut decorations, cell, metrics, rect);
         }
 
-        for cell in terminal_text_runs(&scene.grid.cells) {
+        for cell in damaged_terminal_text_runs(
+            &scene.grid.cells,
+            &damage_regions,
+            metrics,
+            scene.content_offset,
+        ) {
             let rect = cell_region_at(cell.position, metrics, scene.content_offset);
-            if !intersects_any(text_run_region(&cell, metrics), &damage_regions) {
-                continue;
-            }
             let mut glyph_context = GlyphBatchContext {
                 atlas_uploads: &mut atlas_uploads,
                 instrumentation: &mut instrumentation,
@@ -2171,6 +2214,25 @@ fn terminal_text_runs(cells: &[RenderCell]) -> Vec<RenderCell> {
         }
     }
     runs
+}
+
+fn damaged_terminal_text_runs(
+    cells: &[RenderCell],
+    damage_regions: &[DamageRegion],
+    metrics: CellMetrics,
+    offset: render_core::RenderOffset,
+) -> Vec<RenderCell> {
+    let damaged = cells
+        .iter()
+        .filter(|cell| {
+            intersects_any(
+                cell_region_at(cell.position, metrics, offset),
+                damage_regions,
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    terminal_text_runs(&damaged)
 }
 
 fn text_run_region(cell: &RenderCell, metrics: CellMetrics) -> RenderRect {
@@ -5932,6 +5994,33 @@ mod tests {
     }
 
     #[test]
+    fn content_damage_includes_local_ligature_context() {
+        let mut tracker = DamageTracker::new();
+        let first = scene_without_cursor(vec![
+            cell(0, 0, "a"),
+            cell(0, 1, "b"),
+            cell(0, 2, "c"),
+            cell(0, 3, "d"),
+        ]);
+        let _ = tracker.update(&first, metrics());
+        let second = scene_without_cursor(vec![
+            cell(0, 0, "a"),
+            cell(0, 1, "b"),
+            cell(0, 2, "x"),
+            cell(0, 3, "d"),
+        ]);
+
+        let damage = tracker.update(&second, metrics());
+
+        for col in 0..4 {
+            assert!(
+                damage.iter().any(|region| region.x == col * 8),
+                "column {col} should be repainted for shaping context"
+            );
+        }
+    }
+
+    #[test]
     fn damage_tracks_removed_cells_and_removed_overlays() {
         let mut tracker = DamageTracker::new();
         let mut first = scene(vec![cell(0, 0, "a"), cell(0, 1, "b")]);
@@ -6167,8 +6256,32 @@ mod tests {
         };
 
         assert!(batches.background.quad_count() <= 1);
+        assert_eq!(batches.glyphs.glyph_count, 1);
         assert_eq!(batches.cursor.quad_count(), 1);
         assert_eq!(batches.damage_regions.len(), 1);
+    }
+
+    #[test]
+    fn incremental_batch_does_not_repaint_an_entire_intersecting_text_run() {
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let mut planner = RenderBatchPlanner::default();
+        let mut test_scene = scene_without_cursor(vec![
+            cell(0, 0, "a"),
+            cell(0, 1, "b"),
+            cell(0, 2, "c"),
+            cell(0, 3, "d"),
+        ]);
+        let Ok(font_metrics) = fonts.cell_metrics() else {
+            return;
+        };
+        test_scene.damage_regions =
+            vec![cell_region(CellPosition { row: 0, col: 3 }, font_metrics)];
+        let Ok(batches) = planner.prepare(&test_scene, &mut fonts) else {
+            return;
+        };
+
+        assert_eq!(batches.background.quad_count(), 1);
+        assert_eq!(batches.glyphs.glyph_count, 1);
     }
 
     #[test]
@@ -6228,7 +6341,7 @@ mod tests {
     }
 
     #[test]
-    fn content_offset_applies_to_damage_without_expanding_cell_damage() {
+    fn content_offset_applies_to_bounded_text_context_damage() {
         let mut tracker = DamageTracker::new();
         let mut first = scene(vec![cell(0, 0, "a")]);
         first.content_offset = render_core::RenderOffset { x: 12, y: 8 };
@@ -6239,10 +6352,12 @@ mod tests {
         let mut second = first.clone();
         second.grid.cells[0].text = "b".to_owned();
         let damage = tracker.update(&second, metrics());
-        assert_eq!(damage.len(), 1);
-        assert_eq!(damage[0].x, 12);
-        assert_eq!(damage[0].y, 8);
-        assert!(damage[0].width <= metrics().cell_width.ceil() as u32);
+        assert_eq!(damage.len(), 3);
+        for (index, region) in damage.iter().enumerate() {
+            assert_eq!(region.x, 12 + i32::try_from(index).unwrap() * 8);
+            assert_eq!(region.y, 8);
+            assert!(region.width <= metrics().cell_width.ceil() as u32);
+        }
     }
 
     #[test]

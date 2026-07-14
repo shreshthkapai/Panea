@@ -2846,16 +2846,26 @@ fn terminal_key(event: &KeyEvent) -> Option<TerminalKey> {
         logical if logical.len() > 1 && logical.starts_with('F') => {
             TerminalKey::Function(logical[1..].parse().ok()?)
         }
-        _ => TerminalKey::Character(
-            event
-                .text
-                .as_ref()
-                .filter(|text| !text.is_empty())
-                .unwrap_or(&event.logical_key)
-                .clone(),
-        ),
+        _ => TerminalKey::Character(terminal_character_text(event)?),
     };
     Some(key)
+}
+
+fn terminal_character_text(event: &KeyEvent) -> Option<String> {
+    if event.modifiers.ctrl && !event.modifiers.alt_graph {
+        let logical = event.logical_key.as_str();
+        if logical.chars().count() == 1 && logical.chars().next().is_some_and(|ch| !ch.is_control())
+        {
+            return Some(logical.to_owned());
+        }
+        return None;
+    }
+
+    event
+        .text
+        .as_ref()
+        .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
+        .cloned()
 }
 
 fn keypad_key(physical_key: &str) -> Option<KeypadKey> {
@@ -7955,6 +7965,68 @@ mod tests {
             modifiers,
             repeat: false,
         }
+    }
+
+    fn text_key_event(logical_key: &str, text: &str, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            physical_key: None,
+            logical_key: logical_key.to_owned(),
+            text: Some(text.to_owned()),
+            state: KeyState::Pressed,
+            modifiers,
+            repeat: false,
+        }
+    }
+
+    #[test]
+    fn terminal_input_ignores_modifier_and_unknown_named_keys() {
+        for key in [
+            "Alt",
+            "AltGraph",
+            "Control",
+            "Shift",
+            "Super",
+            "CapsLock",
+            "NumLock",
+            "PrintScreen",
+            "Pause",
+            "Unidentified",
+        ] {
+            assert_eq!(terminal_key(&key_event(key, KeyModifiers::default())), None);
+        }
+    }
+
+    #[test]
+    fn terminal_input_uses_text_only_for_printable_character_events() {
+        assert_eq!(
+            terminal_key(&text_key_event("a", "a", KeyModifiers::default())),
+            Some(TerminalKey::Character("a".to_owned()))
+        );
+        assert_eq!(
+            terminal_key(&text_key_event("Dead(Acute)", "", KeyModifiers::default())),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_input_encodes_ctrl_from_logical_key_not_control_text() {
+        let modifiers = KeyModifiers {
+            ctrl: true,
+            ..KeyModifiers::default()
+        };
+        let event = text_key_event("a", "\u{1}", modifiers);
+        assert_eq!(
+            terminal_key(&event),
+            Some(TerminalKey::Character("a".to_owned()))
+        );
+        assert_eq!(
+            encode_terminal_key(
+                &terminal_key(&event).expect("Ctrl+A terminal key"),
+                terminal_modifiers(event.modifiers),
+                &BTreeSet::new(),
+            ),
+            Some(vec![0x01])
+        );
     }
 
     fn test_pane(cols: u16, rows: u16) -> PaneRuntime {
