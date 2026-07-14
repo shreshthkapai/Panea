@@ -21,8 +21,9 @@ use config_core::{
     ConfigProviderError, CursorConfigPatch, CursorShape, DecorationStrategyConfig,
     DiagnosticsConfigPatch, FontConfigPatch, InputOutputGroupingStyle, KeyBinding,
     LinuxBackendConfig, LoadedAppConfig, LogLevel, MouseBinding, NotificationConfigPatch,
-    Osc52ClipboardConfigPatch, PerformanceConfigPatch, PerformanceProfile, PlatformOverride,
-    PlatformOverrides, PresentModePreference, PromptDecorationStyle, PromptDecorationsConfigPatch,
+    Osc52ClipboardConfigPatch, PerformanceConfigPatch, PerformanceOverlayDetail,
+    PerformanceOverlayPosition, PerformanceProfile, PlatformOverride, PlatformOverrides,
+    PresentModePreference, PromptDecorationStyle, PromptDecorationsConfigPatch,
     RendererBackendPreference, RendererConfigPatch, RgbaColor, ShellIntegrationActivationConfig,
     ShellIntegrationConfigPatch, ShellProfile, ShellProfileKind, SshProfile, WindowConfigPatch,
     WindowModeConfig,
@@ -1008,6 +1009,8 @@ fn set_config_value(config: &mut AppConfig, path: &str, value: &ConfigValue) -> 
         "mux.restore_sessions" => config.mux.restore_sessions = value_as_bool(value)?,
         "mux.default_workspace" => config.mux.default_workspace = value_as_string(value)?,
         "mux.show_tab_bar" => config.mux.show_tab_bar = value_as_bool(value)?,
+        "mux.drag_tabs" => config.mux.drag_tabs = value_as_bool(value)?,
+        "mux.drag_panes" => config.mux.drag_panes = value_as_bool(value)?,
         "mux.tab_title_format" => config.mux.tab_title_format = value_as_string(value)?,
         "mux.status_format" => config.mux.status_format = value_as_string(value)?,
         "mux.pane_resize_step" => config.mux.pane_resize_step = value_as_f64(value)?,
@@ -1048,6 +1051,17 @@ fn set_config_value(config: &mut AppConfig, path: &str, value: &ConfigValue) -> 
         "diagnostics.enabled" => config.diagnostics.enabled = value_as_bool(value)?,
         "diagnostics.performance_overlay" => {
             config.diagnostics.performance_overlay = value_as_bool(value)?;
+        }
+        "diagnostics.performance_overlay_position" => {
+            config.diagnostics.performance_overlay_position =
+                parse_performance_overlay_position(value_as_string_ref(value)?)?;
+        }
+        "diagnostics.performance_overlay_detail" => {
+            config.diagnostics.performance_overlay_detail =
+                parse_performance_overlay_detail(value_as_string_ref(value)?)?;
+        }
+        "diagnostics.persist_performance_overlay" => {
+            config.diagnostics.persist_performance_overlay = value_as_bool(value)?;
         }
         "diagnostics.capability_report" => {
             config.diagnostics.capability_report = value_as_bool(value)?;
@@ -1263,6 +1277,28 @@ fn set_platform_override_value(
                 .get_or_insert_with(DiagnosticsConfigPatch::default)
                 .performance_overlay = Some(value_as_bool(value)?);
         }
+        "diagnostics.performance_overlay_position" => {
+            entry
+                .diagnostics
+                .get_or_insert_with(DiagnosticsConfigPatch::default)
+                .performance_overlay_position = Some(parse_performance_overlay_position(
+                value_as_string_ref(value)?,
+            )?);
+        }
+        "diagnostics.performance_overlay_detail" => {
+            entry
+                .diagnostics
+                .get_or_insert_with(DiagnosticsConfigPatch::default)
+                .performance_overlay_detail = Some(parse_performance_overlay_detail(
+                value_as_string_ref(value)?,
+            )?);
+        }
+        "diagnostics.persist_performance_overlay" => {
+            entry
+                .diagnostics
+                .get_or_insert_with(DiagnosticsConfigPatch::default)
+                .persist_performance_overlay = Some(value_as_bool(value)?);
+        }
         other => return Err(format!("unsupported platform override key '{other}'")),
     }
     Ok(())
@@ -1428,6 +1464,24 @@ fn parse_performance_profile(value: &str) -> Result<PerformanceProfile, String> 
         "visual" => Ok(PerformanceProfile::Visual),
         "battery_saver" | "battery_conscious" => Ok(PerformanceProfile::BatterySaver),
         other => Err(format!("unknown performance profile '{other}'")),
+    }
+}
+
+fn parse_performance_overlay_position(value: &str) -> Result<PerformanceOverlayPosition, String> {
+    match normalized(value).as_str() {
+        "top_left" => Ok(PerformanceOverlayPosition::TopLeft),
+        "top_right" => Ok(PerformanceOverlayPosition::TopRight),
+        "bottom_left" => Ok(PerformanceOverlayPosition::BottomLeft),
+        "bottom_right" => Ok(PerformanceOverlayPosition::BottomRight),
+        other => Err(format!("unknown performance overlay position '{other}'")),
+    }
+}
+
+fn parse_performance_overlay_detail(value: &str) -> Result<PerformanceOverlayDetail, String> {
+    match normalized(value).as_str() {
+        "compact" => Ok(PerformanceOverlayDetail::Compact),
+        "detailed" => Ok(PerformanceOverlayDetail::Detailed),
+        other => Err(format!("unknown performance overlay detail '{other}'")),
     }
 }
 
@@ -1678,6 +1732,34 @@ mod tests {
         assert!(loaded.config.notifications.enabled);
         assert!(!loaded.config.notifications.only_when_unfocused);
         assert!(!loaded.config.notifications.transport_errors);
+    }
+
+    #[test]
+    fn programmable_desktop_ux_compiles_into_app_config() {
+        let loaded = parse_str(
+            r#"
+            panea.set("mux.drag_tabs", false)
+            panea.set("mux.drag_panes", true)
+            panea.set("diagnostics.performance_overlay_position", "bottom_right")
+            panea.set("diagnostics.performance_overlay_detail", "detailed")
+            panea.set("diagnostics.persist_performance_overlay", false)
+            "#,
+            None,
+            ConfigPlatform::MacOs,
+        )
+        .expect("desktop UX programmable config should compile");
+
+        assert!(!loaded.config.mux.drag_tabs);
+        assert!(loaded.config.mux.drag_panes);
+        assert_eq!(
+            loaded.config.diagnostics.performance_overlay_position,
+            PerformanceOverlayPosition::BottomRight
+        );
+        assert_eq!(
+            loaded.config.diagnostics.performance_overlay_detail,
+            PerformanceOverlayDetail::Detailed
+        );
+        assert!(!loaded.config.diagnostics.persist_performance_overlay);
     }
 
     #[test]

@@ -12,10 +12,11 @@ Feature name: Desktop multiplexer runtime wiring
 Layer: multiplexer structure, session transport, render performance
 User-facing behavior: keybindings can manage workspaces, tabs, nested splits,
   focus, resize, close, zoom, move, and swap panes. Tabs are mouse-selectable and
-  middle-click closeable. Each pane may start a local or SSH profile.
+  middle-click closeable and drag-reorderable. Ctrl+Shift-drag swaps pane
+  positions. Each pane may start a local or SSH profile.
 Config keys: mux.enabled, mux.restore_sessions, mux.default_workspace,
-  mux.startup_workspaces, mux.show_tab_bar, mux.tab_title_format,
-  mux.pane_resize_step, mux.appearance, keyboard.keybindings
+  mux.startup_workspaces, mux.show_tab_bar, mux.tab_title_format, mux.drag_tabs,
+  mux.drag_panes, mux.pane_resize_step, mux.appearance, keyboard.keybindings
 macOS behavior: same config and runtime model; real GUI smoke unverified.
 Windows behavior: build and unit tests pass on the current host; real multi-pane
   GUI smoke still needs a manual or automated run.
@@ -32,8 +33,8 @@ Performance cost when enabled: proportional to the number of pane transports
   polled and visible panes rendered; each pane is bounded to 64 output batches
   per event-loop tick. SSH connection setup runs off the UI thread.
 Tests: mux model, snapshot validation, startup layout, local/SSH spec, desktop
-  keybinding, tab hit-testing, and layout tests. Real cross-OS GUI smoke remains
-  unverified.
+  keybinding, tab hit-testing/reorder, pane drag target, and layout tests. Real
+  cross-OS GUI smoke remains unverified.
 ```
 
 Native mux responsibilities:
@@ -53,6 +54,8 @@ Current desktop runtime behavior:
 - active-pane keyboard, IME, paste, focus, mouse, selection-copy, and OSC 52
   policy handling
 - configurable top-row tab chrome with mouse switching and middle-click close
+- direct tab drag reorder and Ctrl+Shift pane drag-to-swap with renderer-only
+  target feedback
 - renderer scene composition offsets each pane into its own viewport and draws
   configurable pane borders as renderer decorations
 - declarative startup workspaces with nested local/SSH layouts
@@ -73,7 +76,5 @@ mechanism or external tools.
 
 ## Still Unverified Or Deferred
 
-- drag-to-reorder UI; keyboard move/swap actions are implemented
-- interactive SSH trust/secret prompts and reconnect presentation
 - cross-OS native mux GUI smoke tests
 - automated tmux/screen/zellij compatibility runs inside native panes

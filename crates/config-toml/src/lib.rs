@@ -866,6 +866,8 @@ fn known_paths() -> BTreeSet<&'static str> {
         "mux.restore_sessions",
         "mux.default_workspace",
         "mux.show_tab_bar",
+        "mux.drag_tabs",
+        "mux.drag_panes",
         "mux.tab_title_format",
         "mux.status_format",
         "mux.pane_resize_step",
@@ -913,6 +915,9 @@ fn known_paths() -> BTreeSet<&'static str> {
         "diagnostics",
         "diagnostics.enabled",
         "diagnostics.performance_overlay",
+        "diagnostics.performance_overlay_position",
+        "diagnostics.performance_overlay_detail",
+        "diagnostics.persist_performance_overlay",
         "diagnostics.capability_report",
         "diagnostics.log_level",
     ])
@@ -1471,6 +1476,41 @@ mod tests {
             "unexpected diagnostics: {:?}",
             loaded.diagnostics
         );
+    }
+
+    #[test]
+    fn desktop_drag_and_overlay_preferences_parse_without_unknown_keys() {
+        let loaded = parse_str(
+            r#"
+            schema_version = 2
+
+            [mux]
+            drag_tabs = false
+            drag_panes = true
+
+            [diagnostics]
+            performance_overlay = true
+            performance_overlay_position = "bottom_left"
+            performance_overlay_detail = "detailed"
+            persist_performance_overlay = false
+            "#,
+            None,
+            ConfigPlatform::LinuxWayland,
+        )
+        .expect("portable desktop UX config should parse");
+
+        assert!(!loaded.config.mux.drag_tabs);
+        assert!(loaded.config.mux.drag_panes);
+        assert_eq!(
+            loaded.config.diagnostics.performance_overlay_position,
+            config_core::PerformanceOverlayPosition::BottomLeft
+        );
+        assert_eq!(
+            loaded.config.diagnostics.performance_overlay_detail,
+            config_core::PerformanceOverlayDetail::Detailed
+        );
+        assert!(!loaded.config.diagnostics.persist_performance_overlay);
+        assert!(loaded.diagnostics.is_empty());
     }
 
     fn temp_config_path(name: &str) -> PathBuf {

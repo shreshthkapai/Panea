@@ -229,12 +229,30 @@ gpu_timestamps = false
 
 [diagnostics]
 performance_overlay = false
+performance_overlay_position = "top_right" # top_left, top_right, bottom_left, bottom_right
+performance_overlay_detail = "compact"     # compact or detailed
+persist_performance_overlay = true
 ```
 
 `renderer.gpu_timestamps` is portable and defaults off. If a backend does not
 support timestamp queries, Panea reports the timing status as unsupported and
 continues rendering.
 The default `Ctrl+Shift+F12` binding toggles the in-window performance overlay.
+Clicking its first metrics row opens controls for detail, placement, and hide.
+When persistence is enabled, those runtime choices are stored in Panea's OS
+state directory without rewriting the portable config file.
+
+Mux drag behavior is portable and can be disabled independently:
+
+```toml
+[mux]
+drag_tabs = true
+drag_panes = true
+```
+
+Drag tabs directly across the tab bar. Hold `Ctrl+Shift` while dragging a pane
+onto another pane to swap their split-tree positions; terminal and transport
+ownership move with the pane model rather than being recreated.
 
 Battery adaptation is portable and enabled by default:
 

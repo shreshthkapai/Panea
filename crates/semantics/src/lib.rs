@@ -309,6 +309,23 @@ impl SemanticTimelineStore {
         self.mode = mode;
     }
 
+    #[must_use]
+    pub const fn integration_mode(&self) -> IntegrationMode {
+        self.mode
+    }
+
+    /// Records transport-provided remote context without claiming that remote
+    /// shell integration has emitted a semantic marker.
+    pub fn set_remote_session_metadata(&mut self, metadata: RemoteMetadata) {
+        self.metadata.remote = Some(metadata);
+    }
+
+    /// Marks that a semantic marker was actually observed in a remote byte
+    /// stream. Transport metadata alone must not call this method.
+    pub fn mark_remote_integration_active(&mut self) {
+        self.remote_integration_active = true;
+    }
+
     pub fn apply_event(&mut self, event: SemanticEvent) {
         match event {
             SemanticEvent::PromptStarted { position, metadata } => {
@@ -936,6 +953,28 @@ mod tests {
         assert_eq!(
             diagnostics.command_block_confidence,
             CommandBlockConfidence::None
+        );
+    }
+
+    #[test]
+    fn transport_remote_metadata_does_not_claim_remote_integration() {
+        let mut timeline = SemanticTimelineStore::new();
+        timeline.set_remote_session_metadata(RemoteMetadata {
+            transport: Some("ssh".to_owned()),
+            remote_host: Some("example.test".to_owned()),
+            ..RemoteMetadata::default()
+        });
+
+        let diagnostics = timeline.diagnostics(Instant::now());
+        assert!(!diagnostics.remote_integration_active);
+        assert!(!diagnostics.integration_active);
+        assert_eq!(
+            timeline
+                .metadata()
+                .remote
+                .as_ref()
+                .and_then(|remote| remote.remote_host.as_deref()),
+            Some("example.test")
         );
     }
 }

@@ -75,6 +75,7 @@ cargo xtask fuzz-smoke
 - [Cursor customization](docs/cursor-customization.md)
 - [Command blocks](docs/command-blocks.md)
 - [Shell integration](docs/shell-integration.md)
+- [Desktop UX](docs/desktop-ux.md)
 - [SSH profiles](docs/ssh-profiles.md)
 - [SSH trust and secrets](docs/ssh-trust-and-secrets.md)
 - [SSH server smoke tests](docs/ssh-smoke-tests.md)

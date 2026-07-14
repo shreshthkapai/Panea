@@ -128,6 +128,7 @@ pub enum OverlayKind {
     ContentMask,
     Badge,
     PerformanceOverlay,
+    DragTarget,
     SecurityPrompt,
     SessionStatus,
     ImePreedit,

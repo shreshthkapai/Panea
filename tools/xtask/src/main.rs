@@ -3825,6 +3825,7 @@ fn write_package_resources(options: &PackageOptions, layout: &PackageLayout) -> 
         "docs/programmable-config.md",
         "docs/doctor.md",
         "docs/shell-integration.md",
+        "docs/desktop-ux.md",
         "docs/platform-support.md",
         "docs/troubleshooting.md",
         "docs/packaging.md",

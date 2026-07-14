@@ -59,8 +59,11 @@ Activation modes:
 - `auto_detect` / `auto`: accept semantic escape sequences and inject only
   when `auto_install = true`.
 - `manual`: do not inject; report install instructions.
-- `heuristic`: reserve heuristic semantic mode without claiming shell
-  integration accuracy.
+- `heuristic`: use low-confidence user input boundaries. Panea starts an input
+  region when line-oriented input is sent, starts output on Enter/Ctrl+C, and
+  finalizes the previous command when the next input begins or the session
+  closes. It never invents prompt text, exit status, cwd, shell identity, or
+  remote metadata, and it is suppressed in alternate-screen applications.
 - `disabled` / `off`: do not parse shell semantic events for the session.
 
 Runtime activation is applied at session startup, before PTY spawn. The desktop
@@ -102,6 +105,27 @@ reported as prompt-only semantic integration.
 
 The terminal must continue working when shell integration is disabled,
 unsupported, or not installed on a remote host.
+
+## Remote Installation Helpers
+
+Remote hooks are opt-in code running under the remote account. Panea therefore
+does not mutate a remote dotfile automatically. Generate a reviewable plan and
+export the exact packaged hook locally:
+
+```powershell
+panea shell-integration remote-plan --shell bash --profile production
+panea shell-integration export --shell bash --output panea.bash
+```
+
+The plan identifies the remote destination, activation file, source line, and
+verification command. Transfer the reviewed hook through an authenticated
+`scp`, `sftp`, or normal deployment flow. A configured SSH profile remains
+`awaiting markers` until the session actually emits a semantic escape; knowing
+the remote host name alone no longer claims active integration.
+
+`ssh_profiles.proxy_jump` remains a documented later transport extension. It
+is currently rejected before connection with config/doctor diagnostics rather
+than ignored or emulated through an OS-specific command.
 
 ## Diagnostics
 
@@ -151,7 +175,8 @@ report diagnostics.
 
 Diagnostics: activation plans carry status messages; semantic diagnostics
 report detected shell, last event, active/inactive state, confidence, heuristic
-mode, and remote status.
+mode, and marker-backed remote status. `panea doctor shell` distinguishes
+disabled, heuristic, configured-but-unobserved, and active runtime states.
 
 Performance cost when disabled: no shell hook injection and no semantic escape
 parsing for `off`.
@@ -162,6 +187,8 @@ semantic parser.
 
 Tests: unit tests cover activation plans, complete marker sets, streaming
 marker offsets, shell detection, desktop profile shaping, semantic navigation,
-raw output selection/copy, disabled/off behavior, and explicit-args fallback.
+raw output selection/copy, disabled/off behavior, explicit-args fallback,
+heuristic input boundaries, alternate-screen suppression, remote install plans,
+and the transport-metadata/remote-marker distinction.
 Bounded real-shell tests exist for PowerShell, bash, zsh, and fish; only shells
 actually available on a host can be verified there.

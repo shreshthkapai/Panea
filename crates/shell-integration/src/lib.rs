@@ -2,7 +2,11 @@
 
 pub const LAYER: &str = "semantic meaning";
 
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use semantics::{
     BufferPosition, CommandStatus, RemoteMetadata, SemanticEvent, SemanticMetadata, ShellMetadata,
@@ -353,6 +357,219 @@ pub fn manual_install_instructions(shell: ShellKind) -> Option<&'static str> {
             Some("cmd has limited shell integration and currently runs without hooks")
         }
         ShellKind::Unknown => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteIntegrationState {
+    Disabled,
+    Heuristic,
+    AwaitingMarkers,
+    Active,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteIntegrationDiagnostic {
+    pub profile_name: String,
+    pub state: RemoteIntegrationState,
+    pub message: String,
+}
+
+#[must_use]
+pub fn remote_integration_diagnostic(
+    profile_name: &str,
+    profile_enabled: bool,
+    runtime_mode: ShellIntegrationRuntimeMode,
+    marker_observed: bool,
+) -> RemoteIntegrationDiagnostic {
+    let (state, message) = if !profile_enabled || runtime_mode == ShellIntegrationRuntimeMode::Off {
+        (
+            RemoteIntegrationState::Disabled,
+            "remote semantic features are disabled for this profile".to_owned(),
+        )
+    } else if runtime_mode == ShellIntegrationRuntimeMode::Heuristic {
+        (
+            RemoteIntegrationState::Heuristic,
+            "remote commands use low-confidence input-boundary heuristics; exit status, prompt, and cwd metadata are unavailable"
+                .to_owned(),
+        )
+    } else if marker_observed {
+        (
+            RemoteIntegrationState::Active,
+            "remote semantic markers were observed in this session".to_owned(),
+        )
+    } else {
+        (
+            RemoteIntegrationState::AwaitingMarkers,
+            "remote semantic markers have not been observed; install and source the Panea hook on the remote host"
+                .to_owned(),
+        )
+    };
+
+    RemoteIntegrationDiagnostic {
+        profile_name: profile_name.to_owned(),
+        state,
+        message,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteInstallPlan {
+    pub shell: ShellKind,
+    pub script_file_name: &'static str,
+    pub remote_directory: &'static str,
+    pub remote_script_path: String,
+    pub activation_file: &'static str,
+    pub activation_line: String,
+    pub verification_command: String,
+    pub security_notes: Vec<&'static str>,
+}
+
+impl RemoteInstallPlan {
+    #[must_use]
+    pub fn render(&self, profile_name: &str) -> String {
+        [
+            format!("Panea remote shell-integration plan for profile '{profile_name}'"),
+            format!("shell={}", self.shell.as_str().unwrap_or("unknown")),
+            format!("1. Export the packaged hook: panea shell-integration export --shell {} --output {}", self.shell.as_str().unwrap_or("unknown"), self.script_file_name),
+            format!("2. Create {} on the remote account.", self.remote_directory),
+            format!("3. Transfer the reviewed hook to {} using scp, sftp, or your normal deployment tooling.", self.remote_script_path),
+            format!("4. Add this line to {}: {}", self.activation_file, self.activation_line),
+            format!("5. Start a new remote shell and verify with: {}", self.verification_command),
+            "The helper never connects, changes a remote account, or bypasses SSH host verification by itself."
+                .to_owned(),
+        ]
+        .join("\n")
+    }
+}
+
+#[must_use]
+pub fn remote_install_plan(shell: ShellKind) -> Option<RemoteInstallPlan> {
+    let script = script_for_shell(shell)?;
+    let (remote_directory, remote_script_path, activation_file, activation_line) = match shell {
+        ShellKind::Bash => (
+            "~/.config/panea",
+            format!("~/.config/panea/{}", script.file_name),
+            "~/.bashrc",
+            format!("source ~/.config/panea/{}", script.file_name),
+        ),
+        ShellKind::Zsh => (
+            "~/.config/panea",
+            format!("~/.config/panea/{}", script.file_name),
+            "~/.zshrc",
+            format!("source ~/.config/panea/{}", script.file_name),
+        ),
+        ShellKind::Fish => (
+            "~/.config/fish/conf.d",
+            format!("~/.config/fish/conf.d/{}", script.file_name),
+            "automatic fish conf.d loading",
+            "no activation line required".to_owned(),
+        ),
+        ShellKind::PowerShell | ShellKind::Pwsh => (
+            "~/.config/powershell",
+            format!("~/.config/powershell/{}", script.file_name),
+            "$PROFILE",
+            format!(". ~/.config/powershell/{}", script.file_name),
+        ),
+        ShellKind::Nushell | ShellKind::Cmd | ShellKind::Unknown => return None,
+    };
+    Some(RemoteInstallPlan {
+        shell,
+        script_file_name: script.file_name,
+        remote_directory,
+        remote_script_path,
+        activation_file,
+        activation_line,
+        verification_command: "echo panea-remote-integration-check".to_owned(),
+        security_notes: vec![
+            "review shell hooks before installing them on a remote account",
+            "transfer hooks only through an authenticated SSH connection",
+            "remote integration remains optional and does not affect terminal compatibility",
+        ],
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct HeuristicCommandDetector {
+    state: HeuristicState,
+}
+
+#[derive(Debug, Clone)]
+enum HeuristicState {
+    Idle,
+    Input,
+    Output { started_at: Instant },
+}
+
+impl Default for HeuristicCommandDetector {
+    fn default() -> Self {
+        Self {
+            state: HeuristicState::Idle,
+        }
+    }
+}
+
+impl HeuristicCommandDetector {
+    #[must_use]
+    pub fn observe_input(
+        &mut self,
+        bytes: &[u8],
+        position: BufferPosition,
+        alternate_screen: bool,
+        now: Instant,
+    ) -> Vec<SemanticEvent> {
+        if alternate_screen {
+            self.state = HeuristicState::Idle;
+            return Vec::new();
+        }
+
+        let submitted = bytes
+            .iter()
+            .any(|byte| matches!(byte, b'\r' | b'\n' | 0x03));
+        let text_input = bytes
+            .iter()
+            .any(|byte| *byte >= 0x20 && *byte != 0x7f && *byte != ESC);
+        if !submitted && !text_input {
+            return Vec::new();
+        }
+
+        let mut events = Vec::new();
+        if matches!(self.state, HeuristicState::Output { .. }) {
+            events.extend(self.finish_output(position, now));
+        }
+        if matches!(self.state, HeuristicState::Idle) {
+            events.push(SemanticEvent::InputStarted { position });
+            self.state = HeuristicState::Input;
+        }
+        if submitted && matches!(self.state, HeuristicState::Input) {
+            events.push(SemanticEvent::InputEnded { position });
+            events.push(SemanticEvent::OutputStarted { position });
+            self.state = HeuristicState::Output { started_at: now };
+        }
+        events
+    }
+
+    #[must_use]
+    pub fn finish_session(&mut self, position: BufferPosition, now: Instant) -> Vec<SemanticEvent> {
+        let events = self.finish_output(position, now);
+        self.state = HeuristicState::Idle;
+        events
+    }
+
+    fn finish_output(&mut self, position: BufferPosition, now: Instant) -> Vec<SemanticEvent> {
+        let HeuristicState::Output { started_at } = self.state else {
+            return Vec::new();
+        };
+        let duration = now.saturating_duration_since(started_at);
+        self.state = HeuristicState::Idle;
+        vec![
+            SemanticEvent::OutputEnded { position },
+            SemanticEvent::CommandFinished {
+                position,
+                exit_status: CommandStatus::Unknown,
+                duration,
+            },
+        ]
     }
 }
 
@@ -1072,6 +1289,92 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn heuristic_detector_uses_input_boundaries_without_inventing_status() {
+        let mut detector = HeuristicCommandDetector::default();
+        let first = BufferPosition::new(4, 2);
+        let started = Instant::now();
+        assert!(matches!(
+            detector.observe_input(b"echo panea", first, false, started)[..],
+            [SemanticEvent::InputStarted { position }] if position == first
+        ));
+
+        let submitted = detector.observe_input(
+            b"\r",
+            BufferPosition::new(4, 12),
+            false,
+            started + Duration::from_millis(1),
+        );
+        assert!(matches!(
+            submitted.as_slice(),
+            [
+                SemanticEvent::InputEnded { .. },
+                SemanticEvent::OutputStarted { .. }
+            ]
+        ));
+
+        let next = detector.observe_input(
+            b"p",
+            BufferPosition::new(8, 2),
+            false,
+            started + Duration::from_millis(51),
+        );
+        assert!(matches!(next.as_slice(), [
+            SemanticEvent::OutputEnded { .. },
+            SemanticEvent::CommandFinished {
+                exit_status: CommandStatus::Unknown,
+                duration,
+                ..
+            },
+            SemanticEvent::InputStarted { .. }
+        ] if *duration == Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn heuristic_detector_is_suppressed_in_alternate_screen() {
+        let mut detector = HeuristicCommandDetector::default();
+        assert!(
+            detector
+                .observe_input(
+                    b"editor input\r",
+                    BufferPosition::new(0, 0),
+                    true,
+                    Instant::now(),
+                )
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn remote_install_plans_are_reviewable_and_do_not_connect() {
+        let plan = remote_install_plan(ShellKind::Bash).expect("bash plan");
+        let rendered = plan.render("production");
+        assert!(rendered.contains("panea shell-integration export"));
+        assert!(rendered.contains("~/.bashrc"));
+        assert!(rendered.contains("never connects"));
+        assert!(remote_install_plan(ShellKind::Cmd).is_none());
+    }
+
+    #[test]
+    fn remote_diagnostics_distinguish_configured_active_and_heuristic() {
+        let waiting =
+            remote_integration_diagnostic("remote", true, ShellIntegrationRuntimeMode::Auto, false);
+        assert_eq!(waiting.state, RemoteIntegrationState::AwaitingMarkers);
+
+        let active =
+            remote_integration_diagnostic("remote", true, ShellIntegrationRuntimeMode::Full, true);
+        assert_eq!(active.state, RemoteIntegrationState::Active);
+
+        let heuristic = remote_integration_diagnostic(
+            "remote",
+            true,
+            ShellIntegrationRuntimeMode::Heuristic,
+            false,
+        );
+        assert_eq!(heuristic.state, RemoteIntegrationState::Heuristic);
+        assert!(heuristic.message.contains("low-confidence"));
     }
 
     #[test]

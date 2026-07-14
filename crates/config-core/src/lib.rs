@@ -430,6 +430,8 @@ impl AppConfig {
         }
         if self.mux.enabled != next.mux.enabled
             || self.mux.show_tab_bar != next.mux.show_tab_bar
+            || self.mux.drag_tabs != next.mux.drag_tabs
+            || self.mux.drag_panes != next.mux.drag_panes
             || self.mux.tab_title_format != next.mux.tab_title_format
             || self.mux.status_format != next.mux.status_format
             || self.mux.pane_resize_step != next.mux.pane_resize_step
@@ -1820,6 +1822,8 @@ pub struct MuxConfig {
     pub restore_sessions: bool,
     pub default_workspace: String,
     pub show_tab_bar: bool,
+    pub drag_tabs: bool,
+    pub drag_panes: bool,
     pub tab_title_format: String,
     pub status_format: String,
     pub pane_resize_step: f64,
@@ -1835,6 +1839,8 @@ impl Default for MuxConfig {
             restore_sessions: false,
             default_workspace: "default".to_owned(),
             show_tab_bar: true,
+            drag_tabs: true,
+            drag_panes: true,
             tab_title_format: "{index}: {title}".to_owned(),
             status_format: "{workspace} {shell}".to_owned(),
             pane_resize_step: 0.05,
@@ -2658,6 +2664,9 @@ impl PerformanceConfigPatch {
 pub struct DiagnosticsConfigPatch {
     pub enabled: Option<bool>,
     pub performance_overlay: Option<bool>,
+    pub performance_overlay_position: Option<PerformanceOverlayPosition>,
+    pub performance_overlay_detail: Option<PerformanceOverlayDetail>,
+    pub persist_performance_overlay: Option<bool>,
     pub capability_report: Option<bool>,
     pub log_level: Option<LogLevel>,
 }
@@ -2666,6 +2675,18 @@ impl DiagnosticsConfigPatch {
     fn apply_to(&self, config: &mut DiagnosticsConfig) {
         apply_opt(&mut config.enabled, &self.enabled);
         apply_opt(&mut config.performance_overlay, &self.performance_overlay);
+        apply_opt(
+            &mut config.performance_overlay_position,
+            &self.performance_overlay_position,
+        );
+        apply_opt(
+            &mut config.performance_overlay_detail,
+            &self.performance_overlay_detail,
+        );
+        apply_opt(
+            &mut config.persist_performance_overlay,
+            &self.persist_performance_overlay,
+        );
         apply_opt(&mut config.capability_report, &self.capability_report);
         apply_opt(&mut config.log_level, &self.log_level);
     }
@@ -2714,6 +2735,9 @@ impl ConfigPlatform {
 pub struct DiagnosticsConfig {
     pub enabled: bool,
     pub performance_overlay: bool,
+    pub performance_overlay_position: PerformanceOverlayPosition,
+    pub performance_overlay_detail: PerformanceOverlayDetail,
+    pub persist_performance_overlay: bool,
     pub capability_report: bool,
     pub log_level: LogLevel,
 }
@@ -2723,10 +2747,31 @@ impl Default for DiagnosticsConfig {
         Self {
             enabled: true,
             performance_overlay: false,
+            performance_overlay_position: PerformanceOverlayPosition::TopRight,
+            performance_overlay_detail: PerformanceOverlayDetail::Compact,
+            persist_performance_overlay: true,
             capability_report: true,
             log_level: LogLevel::Info,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PerformanceOverlayPosition {
+    TopLeft,
+    #[default]
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PerformanceOverlayDetail {
+    #[default]
+    Compact,
+    Detailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -3582,6 +3627,20 @@ pub fn export_schema() -> ConfigSchema {
                         false,
                     ),
                     field(
+                        "mux.drag_tabs",
+                        "boolean",
+                        default.mux.drag_tabs,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "mux.drag_panes",
+                        "boolean",
+                        default.mux.drag_panes,
+                        true,
+                        false,
+                    ),
+                    field(
                         "mux.tab_title_format",
                         "string",
                         &default.mux.tab_title_format,
@@ -3655,6 +3714,60 @@ pub fn export_schema() -> ConfigSchema {
                         "mux.appearance.pane_border_width",
                         "integer",
                         default.mux.appearance.pane_border_width,
+                        true,
+                        false,
+                    ),
+                ],
+            },
+            ConfigSchemaSection {
+                name: "diagnostics",
+                fields: vec![
+                    field(
+                        "diagnostics.enabled",
+                        "boolean",
+                        default.diagnostics.enabled,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "diagnostics.performance_overlay",
+                        "boolean",
+                        default.diagnostics.performance_overlay,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "diagnostics.performance_overlay_position",
+                        "performance_overlay_position",
+                        "top_right",
+                        true,
+                        false,
+                    ),
+                    field(
+                        "diagnostics.performance_overlay_detail",
+                        "performance_overlay_detail",
+                        "compact",
+                        true,
+                        false,
+                    ),
+                    field(
+                        "diagnostics.persist_performance_overlay",
+                        "boolean",
+                        default.diagnostics.persist_performance_overlay,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "diagnostics.capability_report",
+                        "boolean",
+                        default.diagnostics.capability_report,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "diagnostics.log_level",
+                        "log_level",
+                        format!("{:?}", default.diagnostics.log_level),
                         true,
                         false,
                     ),
@@ -4047,6 +4160,13 @@ mod tests {
                 .flat_map(|section| section.fields.iter())
                 .any(|field| field.path == "clipboard.osc52.allow_remote")
         );
+        assert!(
+            schema
+                .sections
+                .iter()
+                .flat_map(|section| section.fields.iter())
+                .any(|field| field.path == "diagnostics.performance_overlay_position")
+        );
     }
 
     #[test]
@@ -4279,5 +4399,28 @@ mod tests {
         let macos = config.resolved_for_platform(ConfigPlatform::MacOs);
         assert!(!windows.notifications.transport_errors);
         assert!(macos.notifications.transport_errors);
+    }
+
+    #[test]
+    fn desktop_ux_defaults_are_portable_and_live_reloadable() {
+        let config = AppConfig::default();
+        assert!(config.mux.drag_tabs);
+        assert!(config.mux.drag_panes);
+        assert_eq!(
+            config.diagnostics.performance_overlay_position,
+            PerformanceOverlayPosition::TopRight
+        );
+        assert_eq!(
+            config.diagnostics.performance_overlay_detail,
+            PerformanceOverlayDetail::Compact
+        );
+        assert!(config.diagnostics.persist_performance_overlay);
+
+        let mut next = config.clone();
+        next.mux.drag_panes = false;
+        next.diagnostics.performance_overlay_detail = PerformanceOverlayDetail::Detailed;
+        let plan = config.reload_plan_from(&next);
+        assert!(plan.live.contains(&ReloadableSection::Mux));
+        assert!(plan.live.contains(&ReloadableSection::Diagnostics));
     }
 }

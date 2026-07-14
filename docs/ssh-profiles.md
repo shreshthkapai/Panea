@@ -39,3 +39,19 @@ actions. Password/passphrase entry is masked; Tab toggles opt-in native
 keychain persistence. A disconnected pane preserves scrollback and can run the
 `reconnect_session` action (default `Ctrl+Alt+R`). Unavailable secure storage is
 reported and never replaced with plaintext config.
+
+Remote semantic hooks can be prepared without weakening SSH trust:
+
+```powershell
+panea shell-integration remote-plan --shell zsh --profile production
+panea shell-integration export --shell zsh --output panea.zsh
+```
+
+The helper only emits a reviewable plan and local hook file. It never connects
+to or modifies the remote account. Panea reports remote integration as active
+only after semantic markers are observed in that SSH session.
+
+`proxy_jump` is reserved for a later transport extension. Profiles that set it
+currently receive a validation warning and the connection is rejected
+explicitly; Panea does not silently ignore it or invoke a platform-specific
+OpenSSH process behind the shared SSH transport contract.

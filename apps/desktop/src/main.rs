@@ -17,10 +17,10 @@ use config_core::{
     AppConfig, ClipboardConfig, CommandBlockStyle, ConfigDiagnostic, ConfigDiagnosticSeverity,
     ConfigPlatform, DecorationStrategyConfig, InputOutputGroupingStyle, LinuxBackendConfig,
     LogLevel, MuxLayoutConfig, MuxSplitAxisConfig, MuxTransportConfig, NotificationConfig,
-    PasteConfig, PerformanceConfig, PerformanceProfile, PresentModePreference,
-    PromptDecorationStyle, ReloadPlan, ReloadableSection, ShellIntegrationActivationConfig,
-    ShellProfile, ShellProfileKind, SshAuthMethod, SshKnownHostsPolicy, SshProfile,
-    WindowModeConfig,
+    PasteConfig, PerformanceConfig, PerformanceOverlayDetail, PerformanceOverlayPosition,
+    PerformanceProfile, PresentModePreference, PromptDecorationStyle, ReloadPlan,
+    ReloadableSection, ShellIntegrationActivationConfig, ShellProfile, ShellProfileKind,
+    SshAuthMethod, SshKnownHostsPolicy, SshProfile, WindowModeConfig,
 };
 use diagnostics::{PerformanceBudget, PerformanceOverlay};
 use font_system::{CellMetrics, FontConfig as RuntimeFontConfig, FontSource, FontSystem};
@@ -67,9 +67,9 @@ use semantics::{
     SemanticTimelineStore, TerminalTextProvider,
 };
 use shell_integration::{
-    IntegrationActivation, SemanticEscapeParser, ShellIntegrationActivationAction,
-    ShellIntegrationActivationPlan, ShellIntegrationPolicy, ShellIntegrationRuntimeMode, ShellKind,
-    detect_shell_kind,
+    HeuristicCommandDetector, IntegrationActivation, SemanticEscapeParser,
+    ShellIntegrationActivationAction, ShellIntegrationActivationPlan, ShellIntegrationPolicy,
+    ShellIntegrationRuntimeMode, ShellKind, detect_shell_kind, remote_install_plan,
 };
 use term_core::{
     CellAttributes, ClipboardTarget, Color, CursorShape, GridPosition, KeypadKey,
@@ -107,6 +107,7 @@ fn run_cli() -> Option<i32> {
     match command.as_str() {
         "doctor" => Some(run_doctor_cli(&args[1..])),
         "shell-smoke" => Some(run_shell_smoke_cli(&args[1..])),
+        "shell-integration" => Some(run_shell_integration_cli(&args[1..])),
         "help" | "--help" | "-h" => {
             print_cli_help();
             Some(0)
@@ -120,6 +121,88 @@ fn print_cli_help() {
         "usage: panea doctor [window|renderer|config|shell|ssh|fonts|clipboard|notifications] [--json]"
     );
     eprintln!("usage: panea shell-smoke [--json] [--timeout-ms <ms>]");
+    eprintln!(
+        "usage: panea shell-integration export --shell <bash|zsh|fish|powershell> --output <path>"
+    );
+    eprintln!("usage: panea shell-integration remote-plan --shell <shell> [--profile <name>]");
+}
+
+fn run_shell_integration_cli(args: &[String]) -> i32 {
+    let Some(command) = args.first().map(String::as_str) else {
+        eprintln!("shell-integration requires export or remote-plan");
+        return 2;
+    };
+    let mut shell = None;
+    let mut output = None;
+    let mut profile = "remote".to_owned();
+    let mut index = 1;
+    while index < args.len() {
+        let option = args[index].as_str();
+        index += 1;
+        let Some(value) = args.get(index) else {
+            eprintln!("{option} requires a value");
+            return 2;
+        };
+        match option {
+            "--shell" => shell = Some(ShellKind::parse(value)),
+            "--output" => output = Some(PathBuf::from(value)),
+            "--profile" => profile = value.clone(),
+            _ => {
+                eprintln!("unknown shell-integration option: {option}");
+                return 2;
+            }
+        }
+        index += 1;
+    }
+    let Some(shell) = shell.filter(|shell| *shell != ShellKind::Unknown) else {
+        eprintln!("--shell must name bash, zsh, fish, powershell, or pwsh");
+        return 2;
+    };
+
+    match command {
+        "export" => {
+            let Some(output) = output else {
+                eprintln!("shell-integration export requires --output <path>");
+                return 2;
+            };
+            let Some(script) = shell_integration::script_for_shell(shell) else {
+                eprintln!("Panea has no integration hook for {shell:?}");
+                return 2;
+            };
+            if let Some(parent) = output
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                && let Err(error) = fs::create_dir_all(parent)
+            {
+                eprintln!("could not create {}: {error}", parent.display());
+                return 1;
+            }
+            match fs::write(&output, script.contents) {
+                Ok(()) => {
+                    println!("exported reviewed Panea hook to {}", output.display());
+                    0
+                }
+                Err(error) => {
+                    eprintln!("could not write {}: {error}", output.display());
+                    1
+                }
+            }
+        }
+        "remote-plan" => match remote_install_plan(shell) {
+            Some(plan) => {
+                println!("{}", plan.render(&profile));
+                0
+            }
+            None => {
+                eprintln!("Panea has no remote integration plan for {shell:?}");
+                2
+            }
+        },
+        _ => {
+            eprintln!("unknown shell-integration command: {command}");
+            2
+        }
+    }
 }
 
 fn run_doctor_cli(args: &[String]) -> i32 {
@@ -667,6 +750,7 @@ fn doctor_runtime_snapshot(
     let notification_diagnostic = notification_provider.diagnostic();
     let keychain = PlatformKeychainProvider::for_current_platform();
     let keychain_capability = keychain.capability();
+    let performance_overlay_ui = PerformanceOverlayUiState::new(&config.diagnostics);
 
     diagnostics::DoctorRuntimeSnapshot {
         renderer_backend: gpu_probe.as_ref().map_or_else(
@@ -684,7 +768,8 @@ fn doctor_runtime_snapshot(
         dpi_scale: None,
         font_discovery: font_discovery_label(config),
         config_parse_status: config_parse_status.to_owned(),
-        shell_integration_status: "no active terminal session during doctor".to_owned(),
+        shell_integration_status: shell_integration_config_status(config),
+        performance_overlay_status: performance_overlay_ui.diagnostic(),
         clipboard_provider: format!(
             "arboard system clipboard {:?}: {}",
             clipboard_diagnostic.availability,
@@ -713,6 +798,34 @@ fn doctor_runtime_snapshot(
             keychain_capability.available
         ),
     }
+}
+
+fn shell_integration_config_status(config: &AppConfig) -> String {
+    if !config.shell_integration.enabled
+        || matches!(
+            config.shell_integration.activation,
+            ShellIntegrationActivationConfig::Disabled
+        )
+    {
+        return "disabled by config".to_owned();
+    }
+    let remote_profiles = config
+        .ssh_profiles
+        .iter()
+        .filter(|profile| profile.shell_integration)
+        .count();
+    if matches!(
+        config.shell_integration.activation,
+        ShellIntegrationActivationConfig::Heuristic
+    ) {
+        return format!(
+            "heuristic low-confidence mode; runtime shell/cwd/exit metadata unavailable; remote_profiles={remote_profiles}"
+        );
+    }
+    format!(
+        "configured {:?}; no active session during doctor; remote_profiles={} remain inactive until markers are observed",
+        config.shell_integration.activation, remote_profiles
+    )
 }
 
 fn window_backend_label(config: &AppConfig) -> String {
@@ -849,8 +962,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     let mut scheduler = FrameScheduler::new();
     let mut damage_tracker = DamageTracker::new();
-    let mut performance_overlay =
-        PerformanceOverlay::new(config.diagnostics.performance_overlay, "wgpu");
+    let mut performance_overlay_ui = PerformanceOverlayUiState::new(&config.diagnostics);
+    let mut performance_overlay = PerformanceOverlay::new(performance_overlay_ui.enabled, "wgpu");
     update_performance_overlay_context(
         &mut performance_overlay,
         &config,
@@ -897,6 +1010,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         append_performance_overlay(
                             &mut scene,
                             &performance_overlay,
+                            &performance_overlay_ui,
                             performance_budget,
                             metrics,
                         );
@@ -1178,10 +1292,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                                             }
                                         }
                                         "toggle_performance_overlay" => {
-                                            config.diagnostics.performance_overlay =
-                                                !config.diagnostics.performance_overlay;
+                                            performance_overlay_ui.toggle();
                                             performance_overlay.set_enabled(
-                                                config.diagnostics.performance_overlay,
+                                                performance_overlay_ui.enabled,
                                             );
                                             let power_state = power_monitor.power_state();
                                             update_performance_overlay_context(
@@ -1279,6 +1392,22 @@ fn run() -> Result<(), Box<dyn Error>> {
                                     pointer_visible = true;
                                 }
                                 if let Ok(metrics) = fonts.cell_metrics() {
+                                    if handle_performance_overlay_mouse(
+                                        mouse,
+                                        &performance_overlay,
+                                        &mut performance_overlay_ui,
+                                        performance_budget,
+                                        metrics,
+                                        mux_runtime.surface_cols,
+                                        mux_runtime.surface_rows,
+                                        &config,
+                                    ) {
+                                        performance_overlay
+                                            .set_enabled(performance_overlay_ui.enabled);
+                                        scheduler.terminal_content_changed();
+                                        window.request_redraw();
+                                        continue;
+                                    }
                                     let outcome = mux_runtime.handle_mouse(
                                         mouse,
                                         metrics,
@@ -1422,6 +1551,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 &mut osc52_policy,
                                 &mut notification_provider,
                                 &mut performance_overlay,
+                                &mut performance_overlay_ui,
                                 &mut performance_budget,
                                 &mut renderer,
                                 &window,
@@ -1626,6 +1756,7 @@ fn apply_live_config_reload(
     runtime_osc52_policy: &mut Osc52ClipboardPolicy,
     notification_provider: &mut DesktopNotificationProvider,
     performance_overlay: &mut PerformanceOverlay,
+    performance_overlay_ui: &mut PerformanceOverlayUiState,
     runtime_performance_budget: &mut PerformanceBudget,
     renderer: &mut GpuTerminalRenderer,
     window: &winit::window::Window,
@@ -1648,7 +1779,8 @@ fn apply_live_config_reload(
             ReloadableSection::Cursor => current.cursor = next.cursor.clone(),
             ReloadableSection::Diagnostics => {
                 current.diagnostics = next.diagnostics.clone();
-                performance_overlay.set_enabled(current.diagnostics.performance_overlay);
+                performance_overlay_ui.apply_config(&current.diagnostics);
+                performance_overlay.set_enabled(performance_overlay_ui.enabled);
             }
             ReloadableSection::Font => current.font = next.font.clone(),
             ReloadableSection::Input => {
@@ -1913,34 +2045,43 @@ fn spawn_session_transport(
                         spec.profile_name
                     ))
                 })?;
-            let parse_semantic_events = config.shell_integration.enabled
-                && profile.shell_integration
-                && !matches!(
-                    config.shell_integration.activation,
-                    ShellIntegrationActivationConfig::Disabled
-                );
+            let semantic_mode = if !config.shell_integration.enabled || !profile.shell_integration {
+                IntegrationMode::Disabled
+            } else if matches!(
+                config.shell_integration.activation,
+                ShellIntegrationActivationConfig::Heuristic
+            ) {
+                IntegrationMode::Heuristic
+            } else if matches!(
+                config.shell_integration.activation,
+                ShellIntegrationActivationConfig::Disabled
+            ) {
+                IntegrationMode::Disabled
+            } else {
+                IntegrationMode::EscapeSequences
+            };
+            let parse_semantic_events = semantic_mode == IntegrationMode::EscapeSequences;
             let mut connection = ssh_connection_profile(profile);
             if let Some(directory) = &spec.working_directory {
                 connection.remote_working_directory = Some(directory.clone());
             }
             Ok(InitialTransport {
                 transport: PaneTransport::connecting_ssh(connection, size),
-                semantic_mode: if parse_semantic_events {
-                    IntegrationMode::EscapeSequences
-                } else {
-                    IntegrationMode::Disabled
-                },
+                semantic_mode,
                 parse_semantic_events,
-                activation_diagnostics: vec![if parse_semantic_events {
-                    format!(
-                        "SSH profile '{}' accepts remote semantic markers; remote hooks must be installed",
+                activation_diagnostics: vec![match semantic_mode {
+                    IntegrationMode::EscapeSequences => format!(
+                        "SSH profile '{}' accepts remote semantic markers but remains inactive until a marker is observed; run `panea shell-integration remote-plan --shell <shell> --profile {}` for installation help",
+                        profile.name, profile.name
+                    ),
+                    IntegrationMode::Heuristic => format!(
+                        "SSH profile '{}' uses low-confidence input-boundary heuristics; exit status, prompt, and remote cwd metadata are unavailable",
                         profile.name
-                    )
-                } else {
-                    format!(
+                    ),
+                    IntegrationMode::Disabled => format!(
                         "SSH semantic integration disabled for profile '{}'",
                         profile.name
-                    )
+                    ),
                 }],
                 remote_metadata: Some(RemoteMetadata {
                     transport: Some("ssh".to_owned()),
@@ -3080,6 +3221,174 @@ fn mux_state_path() -> PathBuf {
         .join("mux-state.json")
 }
 
+fn desktop_ui_state_path() -> PathBuf {
+    mux_state_path()
+        .parent()
+        .map_or_else(std::env::temp_dir, Path::to_path_buf)
+        .join("ui-state.json")
+}
+
+#[derive(Debug, Clone)]
+struct PerformanceOverlayUiState {
+    enabled: bool,
+    position: PerformanceOverlayPosition,
+    detail: PerformanceOverlayDetail,
+    menu_open: bool,
+    persist: bool,
+    loaded_from_state: bool,
+    state_path: PathBuf,
+}
+
+impl PerformanceOverlayUiState {
+    fn new(config: &config_core::DiagnosticsConfig) -> Self {
+        let state_path = desktop_ui_state_path();
+        let mut state = Self {
+            enabled: config.performance_overlay,
+            position: config.performance_overlay_position,
+            detail: config.performance_overlay_detail,
+            menu_open: false,
+            persist: config.persist_performance_overlay,
+            loaded_from_state: false,
+            state_path,
+        };
+        if state.persist {
+            state.load();
+        }
+        state
+    }
+
+    fn load(&mut self) {
+        let Ok(contents) = fs::read_to_string(&self.state_path) else {
+            return;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+            eprintln!(
+                "performance overlay preference ignored: {} is invalid JSON",
+                self.state_path.display()
+            );
+            return;
+        };
+        if let Some(enabled) = value.get("enabled").and_then(serde_json::Value::as_bool) {
+            self.enabled = enabled;
+        }
+        if let Some(position) = value.get("position").and_then(serde_json::Value::as_str) {
+            self.position = match position {
+                "top_left" => PerformanceOverlayPosition::TopLeft,
+                "bottom_left" => PerformanceOverlayPosition::BottomLeft,
+                "bottom_right" => PerformanceOverlayPosition::BottomRight,
+                _ => PerformanceOverlayPosition::TopRight,
+            };
+        }
+        if let Some(detail) = value.get("detail").and_then(serde_json::Value::as_str) {
+            self.detail = if detail == "detailed" {
+                PerformanceOverlayDetail::Detailed
+            } else {
+                PerformanceOverlayDetail::Compact
+            };
+        }
+        self.loaded_from_state = true;
+    }
+
+    fn apply_config(&mut self, config: &config_core::DiagnosticsConfig) {
+        self.persist = config.persist_performance_overlay;
+        if !self.persist || !self.loaded_from_state {
+            self.enabled = config.performance_overlay;
+            self.position = config.performance_overlay_position;
+            self.detail = config.performance_overlay_detail;
+        }
+        if !self.enabled {
+            self.menu_open = false;
+        }
+    }
+
+    fn toggle(&mut self) {
+        self.enabled = !self.enabled;
+        self.menu_open = false;
+        self.persist();
+    }
+
+    fn cycle_detail(&mut self) {
+        self.detail = match self.detail {
+            PerformanceOverlayDetail::Compact => PerformanceOverlayDetail::Detailed,
+            PerformanceOverlayDetail::Detailed => PerformanceOverlayDetail::Compact,
+        };
+        self.persist();
+    }
+
+    fn cycle_position(&mut self) {
+        self.position = match self.position {
+            PerformanceOverlayPosition::TopLeft => PerformanceOverlayPosition::TopRight,
+            PerformanceOverlayPosition::TopRight => PerformanceOverlayPosition::BottomRight,
+            PerformanceOverlayPosition::BottomRight => PerformanceOverlayPosition::BottomLeft,
+            PerformanceOverlayPosition::BottomLeft => PerformanceOverlayPosition::TopLeft,
+        };
+        self.persist();
+    }
+
+    fn hide(&mut self) {
+        self.enabled = false;
+        self.menu_open = false;
+        self.persist();
+    }
+
+    fn persist(&mut self) {
+        if !self.persist {
+            return;
+        }
+        let Some(parent) = self.state_path.parent() else {
+            return;
+        };
+        if let Err(error) = fs::create_dir_all(parent) {
+            eprintln!("performance overlay preference directory failed: {error}");
+            return;
+        }
+        let value = serde_json::json!({
+            "enabled": self.enabled,
+            "position": performance_overlay_position_name(self.position),
+            "detail": performance_overlay_detail_name(self.detail),
+        });
+        if let Err(error) = serde_json::to_string_pretty(&value)
+            .map_err(|error| error.to_string())
+            .and_then(|json| fs::write(&self.state_path, json).map_err(|error| error.to_string()))
+        {
+            eprintln!("performance overlay preference save failed: {error}");
+            return;
+        }
+        self.loaded_from_state = true;
+    }
+
+    fn diagnostic(&self) -> String {
+        format!(
+            "enabled={} position={} detail={} persistence={} source={}",
+            self.enabled,
+            performance_overlay_position_name(self.position),
+            performance_overlay_detail_name(self.detail),
+            self.persist,
+            if self.loaded_from_state {
+                "runtime preference"
+            } else {
+                "config"
+            }
+        )
+    }
+}
+
+const fn performance_overlay_position_name(position: PerformanceOverlayPosition) -> &'static str {
+    match position {
+        PerformanceOverlayPosition::TopLeft => "top_left",
+        PerformanceOverlayPosition::TopRight => "top_right",
+        PerformanceOverlayPosition::BottomLeft => "bottom_left",
+        PerformanceOverlayPosition::BottomRight => "bottom_right",
+    }
+}
+
+const fn performance_overlay_detail_name(detail: PerformanceOverlayDetail) -> &'static str {
+    match detail {
+        PerformanceOverlayDetail::Compact => "compact",
+        PerformanceOverlayDetail::Detailed => "detailed",
+    }
+}
+
 fn initial_mux_model(config: &AppConfig, state_path: &PathBuf) -> MuxModel {
     let fallback = session_spec_for_config(config);
     if config.mux.restore_sessions {
@@ -3225,6 +3534,13 @@ struct MuxRuntime {
     performance: RuntimePerformanceCounters,
     restore_sessions: bool,
     state_path: PathBuf,
+    drag: Option<MuxDragState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MuxDragState {
+    Tab { source: TabId, target: TabId },
+    Pane { source: PaneId, target: PaneId },
 }
 
 impl MuxRuntime {
@@ -3264,6 +3580,7 @@ impl MuxRuntime {
             performance: RuntimePerformanceCounters::new(),
             restore_sessions: config.mux.restore_sessions,
             state_path,
+            drag: None,
         };
         runtime.resize_all(width, height, metrics, config);
         runtime
@@ -3785,9 +4102,18 @@ impl MuxRuntime {
         paste_config: &PasteConfig,
         clipboard: &mut ClipboardBridge,
     ) -> MouseHandling {
+        if let Some(outcome) = self.update_mux_drag(mouse, metrics, config) {
+            return outcome;
+        }
         if let Some(tab_id) = self.tab_at_mouse(mouse, metrics, config) {
             if matches!(mouse.kind, MouseEventKind::Pressed(MouseButton::Left)) {
                 if self.model.switch_tab(tab_id).is_ok() {
+                    if config.mux.drag_tabs {
+                        self.drag = Some(MuxDragState::Tab {
+                            source: tab_id,
+                            target: tab_id,
+                        });
+                    }
                     self.resize_active_tab(metrics, config);
                     return MouseHandling {
                         changed: true,
@@ -3824,6 +4150,21 @@ impl MuxRuntime {
         let Some((pane_id, local_mouse)) = self.local_mouse_event(mouse, metrics, config) else {
             return MouseHandling::default();
         };
+        if config.mux.drag_panes
+            && local_mouse.modifiers.ctrl
+            && local_mouse.modifiers.shift
+            && matches!(local_mouse.kind, MouseEventKind::Pressed(MouseButton::Left))
+        {
+            let _ = self.model.focus_pane(pane_id);
+            self.drag = Some(MuxDragState::Pane {
+                source: pane_id,
+                target: pane_id,
+            });
+            return MouseHandling {
+                changed: true,
+                open_url: None,
+            };
+        }
         if matches!(mouse.kind, MouseEventKind::Pressed(_)) {
             let _ = self.model.focus_pane(pane_id);
             self.sync_active_tab_title();
@@ -3915,6 +4256,70 @@ impl MuxRuntime {
         }
     }
 
+    fn update_mux_drag(
+        &mut self,
+        mouse: MouseEvent,
+        metrics: CellMetrics,
+        config: &AppConfig,
+    ) -> Option<MouseHandling> {
+        let drag = self.drag?;
+        match mouse.kind {
+            MouseEventKind::Moved => {
+                let next = match drag {
+                    MuxDragState::Tab { source, target: _ } => self
+                        .tab_at_mouse(mouse, metrics, config)
+                        .map_or(drag, |target| MuxDragState::Tab { source, target }),
+                    MuxDragState::Pane { source, target: _ } => self
+                        .local_mouse_event(mouse, metrics, config)
+                        .map_or(drag, |(target, _)| MuxDragState::Pane { source, target }),
+                };
+                let changed = next != drag;
+                self.drag = Some(next);
+                Some(MouseHandling {
+                    changed,
+                    open_url: None,
+                })
+            }
+            MouseEventKind::Released(MouseButton::Left) => {
+                self.drag = None;
+                let changed = match drag {
+                    MuxDragState::Tab { source, target } if source != target => {
+                        let target_index = self
+                            .model
+                            .active_workspace()
+                            .active_window()
+                            .tabs
+                            .iter()
+                            .position(|tab| tab.id == target);
+                        target_index.is_some_and(|target_index| {
+                            self.model.move_tab(source, target_index).is_ok()
+                        })
+                    }
+                    MuxDragState::Pane { source, target } if source != target => self
+                        .model
+                        .swap_panes(source, target)
+                        .map(|_| self.resize_active_tab(metrics, config))
+                        .is_ok(),
+                    MuxDragState::Tab { .. } | MuxDragState::Pane { .. } => true,
+                };
+                Some(MouseHandling {
+                    changed,
+                    open_url: None,
+                })
+            }
+            MouseEventKind::Released(_) => {
+                self.drag = None;
+                Some(MouseHandling {
+                    changed: true,
+                    open_url: None,
+                })
+            }
+            MouseEventKind::Pressed(_) | MouseEventKind::Wheel { .. } => {
+                Some(MouseHandling::default())
+            }
+        }
+    }
+
     fn local_mouse_event(
         &self,
         mouse: MouseEvent,
@@ -3970,15 +4375,7 @@ impl MuxRuntime {
         let window = workspace.active_window();
         let mut start = 0usize;
         for (index, tab) in window.tabs.iter().enumerate() {
-            let width = config
-                .mux
-                .tab_title_format
-                .replace("{index}", &(index + 1).to_string())
-                .replace("{title}", &tab.name)
-                .replace("{workspace}", &workspace.name)
-                .chars()
-                .count()
-                .saturating_add(2);
+            let width = formatted_tab_width(config, &workspace.name, index, tab);
             let end = start.saturating_add(width);
             if (start..end).contains(&mouse_col) {
                 return Some(tab.id);
@@ -4224,6 +4621,7 @@ struct PaneRuntime {
     terminal: TerminalEmulator,
     semantic_parser: SemanticEscapeParser,
     semantic_timeline: SemanticTimelineStore,
+    heuristic_detector: Option<HeuristicCommandDetector>,
     parse_semantic_events: bool,
     remote_session: bool,
     session_spec: SessionSpec,
@@ -4508,12 +4906,7 @@ impl PaneRuntime {
                 Ok(initial) => {
                     semantic_timeline.set_integration_mode(initial.semantic_mode);
                     if let Some(metadata) = initial.remote_metadata {
-                        semantic_timeline.apply_event(
-                            semantics::SemanticEvent::RemoteMetadataChanged {
-                                position: BufferPosition::new(0, 0),
-                                metadata,
-                            },
-                        );
+                        semantic_timeline.set_remote_session_metadata(metadata);
                     }
                     for diagnostic in initial.activation_diagnostics {
                         eprintln!("shell integration: {diagnostic}");
@@ -4529,10 +4922,14 @@ impl PaneRuntime {
                 }
             };
 
+        let heuristic_detector = (semantic_timeline.integration_mode()
+            == IntegrationMode::Heuristic)
+            .then(HeuristicCommandDetector::default);
         Self {
             terminal,
             semantic_parser: SemanticEscapeParser::new(),
             semantic_timeline,
+            heuristic_detector,
             parse_semantic_events,
             remote_session: matches!(spec.transport, SessionTransportKind::Ssh),
             session_spec: spec.clone(),
@@ -4915,6 +5312,22 @@ impl PaneRuntime {
     }
 
     fn write_input(&mut self, bytes: &[u8]) {
+        if self.transport.is_some()
+            && let Some(detector) = self.heuristic_detector.as_mut()
+        {
+            let cursor = self.terminal.state().cursor_buffer_position();
+            let events = detector.observe_input(
+                bytes,
+                BufferPosition::new(cursor.row, cursor.col),
+                self.terminal
+                    .modes()
+                    .contains(&TerminalMode::AlternateScreen),
+                Instant::now(),
+            );
+            for event in events {
+                self.semantic_timeline.apply_event(event);
+            }
+        }
         if let Some(transport) = self.transport.as_mut() {
             write_transport_input(transport, bytes);
         }
@@ -4989,11 +5402,13 @@ impl PaneRuntime {
                             cursor.position.row,
                             cursor.position.col,
                         ));
-                        self.semantic_timeline.apply_event(if self.remote_session {
+                        let event = if self.remote_session {
+                            self.semantic_timeline.mark_remote_integration_active();
                             event.in_remote_session()
                         } else {
                             event
-                        });
+                        };
+                        self.semantic_timeline.apply_event(event);
                     }
                     if !apply_terminal_bytes(&mut self.terminal, &output.bytes[applied..]) {
                         break;
@@ -5014,6 +5429,14 @@ impl PaneRuntime {
                 stats.content_changed = true;
             }
             if output.closed {
+                if let Some(detector) = self.heuristic_detector.as_mut() {
+                    let cursor = self.terminal.state().cursor_buffer_position();
+                    for event in detector
+                        .finish_session(BufferPosition::new(cursor.row, cursor.col), Instant::now())
+                    {
+                        self.semantic_timeline.apply_event(event);
+                    }
+                }
                 self.connection_state = PaneConnectionState::Disconnected(if self.remote_session {
                     "SSH session disconnected".to_owned()
                 } else {
@@ -5040,13 +5463,10 @@ impl PaneRuntime {
                 self.parse_semantic_events = initial.parse_semantic_events;
                 self.semantic_timeline
                     .set_integration_mode(initial.semantic_mode);
+                self.heuristic_detector = (initial.semantic_mode == IntegrationMode::Heuristic)
+                    .then(HeuristicCommandDetector::default);
                 if let Some(metadata) = initial.remote_metadata {
-                    self.semantic_timeline.apply_event(
-                        semantics::SemanticEvent::RemoteMetadataChanged {
-                            position: BufferPosition::new(0, 0),
-                            metadata,
-                        },
-                    );
+                    self.semantic_timeline.set_remote_session_metadata(metadata);
                 }
                 for diagnostic in initial.activation_diagnostics {
                     eprintln!("shell integration: {diagnostic}");
@@ -5082,6 +5502,14 @@ impl PaneRuntime {
 
     fn shutdown(&mut self) {
         self.osc52_prompt = None;
+        if let Some(detector) = self.heuristic_detector.as_mut() {
+            let cursor = self.terminal.state().cursor_buffer_position();
+            for event in
+                detector.finish_session(BufferPosition::new(cursor.row, cursor.col), Instant::now())
+            {
+                self.semantic_timeline.apply_event(event);
+            }
+        }
         shutdown_transport(self.transport.as_mut());
     }
 
@@ -5212,6 +5640,7 @@ fn scene_from_mux(
 
     if let Some(metrics) = metrics {
         append_pane_borders(&mut scene, runtime, tab_bar_rows, metrics, config);
+        append_mux_drag_overlay(&mut scene, runtime, metrics, config);
         if let Some(cursor_animator) = cursor_animator {
             cursor_animator.populate_scene(&mut scene, metrics, cursor_animation_settings(config));
         }
@@ -5223,6 +5652,85 @@ fn scene_from_mux(
     }
 
     scene
+}
+
+fn append_mux_drag_overlay(
+    scene: &mut RenderScene,
+    runtime: &MuxRuntime,
+    metrics: CellMetrics,
+    config: &AppConfig,
+) {
+    let Some(drag) = runtime.drag else {
+        return;
+    };
+    let bounds = match drag {
+        MuxDragState::Pane { target, .. } => runtime
+            .active_layouts(config)
+            .into_iter()
+            .find(|layout| layout.pane_id == target)
+            .map(|layout| rect_from_layout(layout.rect, metrics)),
+        MuxDragState::Tab { target, .. } => {
+            let workspace = runtime.model.active_workspace();
+            let mut start = 0usize;
+            workspace
+                .active_window()
+                .tabs
+                .iter()
+                .enumerate()
+                .find_map(|(index, tab)| {
+                    let width = formatted_tab_width(config, &workspace.name, index, tab);
+                    let rect = (tab.id == target).then(|| RenderRect {
+                        x: (start as f32 * metrics.cell_width).floor() as i32,
+                        y: 0,
+                        width: (width as f32 * metrics.cell_width).ceil() as u32,
+                        height: metrics.cell_height.ceil() as u32,
+                    });
+                    start = start.saturating_add(width);
+                    rect
+                })
+        }
+    };
+    let Some(bounds) = bounds else {
+        return;
+    };
+    scene.semantic_overlays.push(OverlayPrimitive {
+        kind: OverlayKind::DragTarget,
+        bounds,
+        color: RenderColor {
+            red: 72,
+            green: 142,
+            blue: 230,
+            alpha: 42,
+        },
+        border_color: Some(RenderColor {
+            red: 112,
+            green: 178,
+            blue: 255,
+            alpha: 245,
+        }),
+        border_width_px: 2,
+        corner_radius_px: 3,
+        z_index: 1600,
+        label: None,
+        label_color: None,
+    });
+}
+
+fn formatted_tab_width(
+    config: &AppConfig,
+    workspace_name: &str,
+    index: usize,
+    tab: &mux::Tab,
+) -> usize {
+    config
+        .mux
+        .tab_title_format
+        .replace("{index}", &(index + 1).to_string())
+        .replace("{title}", &tab.name)
+        .replace("{workspace}", workspace_name)
+        .chars()
+        .count()
+        .saturating_add(2)
 }
 
 fn append_active_ime_overlay(scene: &mut RenderScene, runtime: &MuxRuntime, metrics: CellMetrics) {
@@ -5616,54 +6124,189 @@ fn append_pane_borders(
 fn append_performance_overlay(
     scene: &mut RenderScene,
     overlay: &PerformanceOverlay,
+    ui: &PerformanceOverlayUiState,
     budget: PerformanceBudget,
     metrics: CellMetrics,
 ) {
-    let Some(lines) = overlay.render_lines(budget) else {
+    let Some((lines, metric_lines)) = performance_overlay_lines(overlay, ui, budget) else {
         return;
     };
-    let cols = scene.grid.columns.max(1);
-    let max_chars = usize::from(cols.saturating_sub(4).max(20));
-    let line_height = metrics.cell_height.ceil().max(14.0) as u32;
-    let padding = 6u32;
-    let panel_width = ((max_chars as f32 * metrics.cell_width).ceil() as u32)
-        .saturating_add(padding.saturating_mul(2));
-    let x = ((f32::from(cols) * metrics.cell_width).ceil() as i32)
-        .saturating_sub(panel_width as i32)
-        .saturating_sub(8)
-        .max(0);
-    let mut y = 8i32;
-
-    for line in lines.into_iter().take(4) {
-        let label = truncate_overlay_label(&line, max_chars);
+    let layout = performance_overlay_layout(
+        &lines,
+        scene.grid.columns,
+        scene.grid.rows,
+        metrics,
+        ui.position,
+    );
+    for (index, (line, bounds)) in lines.into_iter().zip(layout.rows).enumerate() {
+        let max_chars =
+            ((bounds.width.saturating_sub(14) as f32 / metrics.cell_width).floor() as usize).max(1);
         scene.semantic_overlays.push(OverlayPrimitive {
             kind: OverlayKind::PerformanceOverlay,
-            bounds: RenderRect {
-                x,
-                y,
-                width: panel_width,
-                height: line_height.saturating_add(4),
-            },
-            color: RenderColor {
-                red: 10,
-                green: 14,
-                blue: 20,
-                alpha: 210,
+            bounds,
+            color: if index >= metric_lines {
+                RenderColor {
+                    red: 24,
+                    green: 31,
+                    blue: 42,
+                    alpha: 242,
+                }
+            } else {
+                RenderColor {
+                    red: 10,
+                    green: 14,
+                    blue: 20,
+                    alpha: 224,
+                }
             },
             border_color: Some(RenderColor {
-                red: 90,
-                green: 104,
-                blue: 122,
-                alpha: 180,
+                red: if index == 0 { 96 } else { 70 },
+                green: if index == 0 { 172 } else { 82 },
+                blue: if index == 0 { 238 } else { 98 },
+                alpha: 210,
             }),
             border_width_px: 1,
             corner_radius_px: 4,
             z_index: 1000,
-            label: Some(label),
+            label: Some(truncate_overlay_label(&line, max_chars)),
             label_color: None,
         });
-        y = y.saturating_add(line_height as i32 + 5);
     }
+}
+
+#[derive(Debug, Clone)]
+struct PerformanceOverlayLayout {
+    rows: Vec<RenderRect>,
+}
+
+fn performance_overlay_lines(
+    overlay: &PerformanceOverlay,
+    ui: &PerformanceOverlayUiState,
+    budget: PerformanceBudget,
+) -> Option<(Vec<String>, usize)> {
+    let mut lines = overlay.render_lines(budget)?;
+    let metric_lines = match ui.detail {
+        PerformanceOverlayDetail::Compact => 2,
+        PerformanceOverlayDetail::Detailed => 4,
+    };
+    lines.truncate(metric_lines);
+    let metric_lines = lines.len();
+    if ui.menu_open {
+        lines.extend([
+            format!("View  {}", performance_overlay_detail_name(ui.detail)),
+            format!(
+                "Position  {}",
+                performance_overlay_position_name(ui.position)
+            ),
+            "Hide".to_owned(),
+        ]);
+    }
+    Some((lines, metric_lines))
+}
+
+fn performance_overlay_layout(
+    lines: &[String],
+    cols: u16,
+    rows: u16,
+    metrics: CellMetrics,
+    position: PerformanceOverlayPosition,
+) -> PerformanceOverlayLayout {
+    let surface_width = (f32::from(cols.max(1)) * metrics.cell_width).ceil() as u32;
+    let surface_height = (f32::from(rows.max(1)) * metrics.cell_height).ceil() as u32;
+    let max_chars = usize::from(cols.saturating_sub(4).clamp(12, 72));
+    let content_chars = lines
+        .iter()
+        .map(|line| line.chars().count().min(max_chars))
+        .max()
+        .unwrap_or(12)
+        .max(12);
+    let padding = 7u32;
+    let width = ((content_chars as f32 * metrics.cell_width).ceil() as u32)
+        .saturating_add(padding * 2)
+        .min(surface_width.saturating_sub(16).max(1));
+    let row_height = metrics.cell_height.ceil().max(14.0) as u32 + 5;
+    let gap = 3u32;
+    let total_height = row_height
+        .saturating_mul(lines.len() as u32)
+        .saturating_add(gap.saturating_mul(lines.len().saturating_sub(1) as u32));
+    let left = matches!(
+        position,
+        PerformanceOverlayPosition::TopLeft | PerformanceOverlayPosition::BottomLeft
+    );
+    let top = matches!(
+        position,
+        PerformanceOverlayPosition::TopLeft | PerformanceOverlayPosition::TopRight
+    );
+    let x = if left {
+        8
+    } else {
+        surface_width.saturating_sub(width).saturating_sub(8) as i32
+    };
+    let start_y = if top {
+        8
+    } else {
+        surface_height
+            .saturating_sub(total_height)
+            .saturating_sub(8) as i32
+    };
+    let rows = lines
+        .iter()
+        .enumerate()
+        .map(|(index, _)| RenderRect {
+            x,
+            y: start_y.saturating_add((index as u32 * (row_height + gap)) as i32),
+            width,
+            height: row_height,
+        })
+        .collect();
+    PerformanceOverlayLayout { rows }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_performance_overlay_mouse(
+    mouse: MouseEvent,
+    overlay: &PerformanceOverlay,
+    ui: &mut PerformanceOverlayUiState,
+    budget: PerformanceBudget,
+    metrics: CellMetrics,
+    cols: u16,
+    rows: u16,
+    config: &AppConfig,
+) -> bool {
+    if !ui.enabled || !matches!(mouse.kind, MouseEventKind::Pressed(MouseButton::Left)) {
+        return false;
+    }
+    let Some((lines, metric_lines)) = performance_overlay_lines(overlay, ui, budget) else {
+        return false;
+    };
+    let layout = performance_overlay_layout(&lines, cols, rows, metrics, ui.position);
+    let x = mouse.x - f64::from(horizontal_content_inset(config));
+    let y = mouse.y - f64::from(vertical_content_inset(config));
+    let Some(index) = layout
+        .rows
+        .iter()
+        .position(|rect| point_in_rect(x, y, *rect))
+    else {
+        return false;
+    };
+    if index < metric_lines {
+        ui.menu_open = !ui.menu_open;
+    } else {
+        match index - metric_lines {
+            0 => ui.cycle_detail(),
+            1 => ui.cycle_position(),
+            2 => ui.hide(),
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn point_in_rect(x: f64, y: f64, rect: RenderRect) -> bool {
+    x >= f64::from(rect.x)
+        && y >= f64::from(rect.y)
+        && x < f64::from(rect.x) + f64::from(rect.width)
+        && y < f64::from(rect.y) + f64::from(rect.height)
 }
 
 fn truncate_overlay_label(text: &str, max_chars: usize) -> String {
@@ -7152,6 +7795,7 @@ mod tests {
             terminal: TerminalEmulator::new(CoreTerminalSize::new(cols, rows)),
             semantic_parser: SemanticEscapeParser::new(),
             semantic_timeline: SemanticTimelineStore::new(),
+            heuristic_detector: None,
             parse_semantic_events: false,
             remote_session: false,
             session_spec: SessionSpec::local("default"),
@@ -7545,6 +8189,7 @@ mod tests {
             performance: RuntimePerformanceCounters::new(),
             restore_sessions: false,
             state_path: std::env::temp_dir().join("panea-test-mux-state.json"),
+            drag: None,
         };
 
         let layout = runtime.active_layouts(&config);
@@ -7562,6 +8207,126 @@ mod tests {
         let layout = runtime.active_layouts(&config);
         assert_eq!(layout[0].rect.y, 0.0);
         assert_eq!(layout[0].terminal_size.rows, 30);
+    }
+
+    #[test]
+    fn tab_drag_reorders_without_replacing_session_models() {
+        let config = AppConfig::default();
+        let mut model = MuxModel::new(SessionSpec::local("default"));
+        let first = model.active_tab().id;
+        let second = model
+            .new_tab("2", SessionSpec::local("default"))
+            .expect("new tab");
+        let mut runtime = MuxRuntime {
+            model,
+            panes: HashMap::new(),
+            surface_cols: 100,
+            surface_rows: 30,
+            performance: RuntimePerformanceCounters::new(),
+            restore_sessions: false,
+            state_path: std::env::temp_dir().join("panea-test-mux-state.json"),
+            drag: None,
+        };
+        let metrics = test_metrics();
+        let mut clipboard = ClipboardBridge::new();
+        let mut press = mouse_event(MouseEventKind::Pressed(MouseButton::Left));
+        press.x = f64::from(horizontal_content_inset(&config)) + 4.0;
+        press.y = f64::from(vertical_content_inset(&config)) + 4.0;
+        assert!(
+            runtime
+                .handle_mouse(
+                    press,
+                    metrics,
+                    &config,
+                    &config.clipboard,
+                    &config.paste,
+                    &mut clipboard,
+                )
+                .changed
+        );
+        assert_eq!(
+            runtime.drag,
+            Some(MuxDragState::Tab {
+                source: first,
+                target: first
+            })
+        );
+
+        let first_width = formatted_tab_width(
+            &config,
+            &runtime.model.active_workspace().name,
+            0,
+            &runtime.model.active_workspace().active_window().tabs[0],
+        );
+        let mut moved = press;
+        moved.kind = MouseEventKind::Moved;
+        moved.x = f64::from(horizontal_content_inset(&config))
+            + (first_width as f64 + 1.0) * f64::from(metrics.cell_width);
+        assert!(
+            runtime
+                .handle_mouse(
+                    moved,
+                    metrics,
+                    &config,
+                    &config.clipboard,
+                    &config.paste,
+                    &mut clipboard,
+                )
+                .changed
+        );
+        assert_eq!(
+            runtime.drag,
+            Some(MuxDragState::Tab {
+                source: first,
+                target: second
+            })
+        );
+
+        moved.kind = MouseEventKind::Released(MouseButton::Left);
+        runtime.handle_mouse(
+            moved,
+            metrics,
+            &config,
+            &config.clipboard,
+            &config.paste,
+            &mut clipboard,
+        );
+        assert_eq!(
+            runtime
+                .model
+                .active_workspace()
+                .active_window()
+                .tabs
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>(),
+            vec![second, first]
+        );
+    }
+
+    #[test]
+    fn pane_drag_target_is_visual_only() {
+        let config = AppConfig::default();
+        let mut model = MuxModel::new(SessionSpec::local("default"));
+        let source = model.active_tab().active_pane;
+        let target = model
+            .split_active_pane(SplitAxis::Vertical, SessionSpec::local("default"))
+            .expect("split");
+        let runtime = MuxRuntime {
+            model,
+            panes: HashMap::new(),
+            surface_cols: 80,
+            surface_rows: 24,
+            performance: RuntimePerformanceCounters::new(),
+            restore_sessions: false,
+            state_path: std::env::temp_dir().join("panea-test-mux-state.json"),
+            drag: Some(MuxDragState::Pane { source, target }),
+        };
+        let mut scene = RenderScene::default();
+        append_mux_drag_overlay(&mut scene, &runtime, test_metrics(), &config);
+        assert_eq!(scene.semantic_overlays.len(), 1);
+        assert_eq!(scene.semantic_overlays[0].kind, OverlayKind::DragTarget);
+        assert!(scene.grid.cells.is_empty());
     }
 
     #[test]
@@ -8032,6 +8797,15 @@ mod tests {
         append_performance_overlay(
             &mut scene,
             &overlay,
+            &PerformanceOverlayUiState {
+                enabled: false,
+                position: PerformanceOverlayPosition::TopRight,
+                detail: PerformanceOverlayDetail::Compact,
+                menu_open: false,
+                persist: false,
+                loaded_from_state: false,
+                state_path: std::env::temp_dir().join("panea-test-ui-state.json"),
+            },
             PerformanceBudget::default(),
             test_metrics(),
         );
@@ -8055,6 +8829,15 @@ mod tests {
         append_performance_overlay(
             &mut scene,
             &overlay,
+            &PerformanceOverlayUiState {
+                enabled: true,
+                position: PerformanceOverlayPosition::TopRight,
+                detail: PerformanceOverlayDetail::Compact,
+                menu_open: false,
+                persist: false,
+                loaded_from_state: false,
+                state_path: std::env::temp_dir().join("panea-test-ui-state.json"),
+            },
             PerformanceBudget::default(),
             test_metrics(),
         );
@@ -8066,6 +8849,59 @@ mod tests {
                 .all(|overlay| overlay.kind == OverlayKind::PerformanceOverlay)
         );
         assert!(scene.grid.cells.is_empty());
+    }
+
+    #[test]
+    fn performance_overlay_click_menu_changes_runtime_preferences() {
+        let config = AppConfig::default();
+        let metrics = test_metrics();
+        let mut overlay = PerformanceOverlay::new(true, "test");
+        overlay.record(RenderInstrumentation {
+            frame_time: Duration::from_millis(16),
+            ..RenderInstrumentation::default()
+        });
+        let mut ui = PerformanceOverlayUiState {
+            enabled: true,
+            position: PerformanceOverlayPosition::TopLeft,
+            detail: PerformanceOverlayDetail::Compact,
+            menu_open: false,
+            persist: false,
+            loaded_from_state: false,
+            state_path: std::env::temp_dir().join("panea-test-ui-state.json"),
+        };
+        let mut click = mouse_event(MouseEventKind::Pressed(MouseButton::Left));
+        click.x = f64::from(horizontal_content_inset(&config)) + 12.0;
+        click.y = f64::from(vertical_content_inset(&config)) + 12.0;
+        assert!(handle_performance_overlay_mouse(
+            click,
+            &overlay,
+            &mut ui,
+            PerformanceBudget::default(),
+            metrics,
+            80,
+            24,
+            &config,
+        ));
+        assert!(ui.menu_open);
+
+        let lines = performance_overlay_lines(&overlay, &ui, PerformanceBudget::default())
+            .expect("overlay lines")
+            .0;
+        let layout = performance_overlay_layout(&lines, 80, 24, metrics, ui.position);
+        let detail_row = layout.rows[2];
+        click.x = f64::from(horizontal_content_inset(&config)) + f64::from(detail_row.x) + 2.0;
+        click.y = f64::from(vertical_content_inset(&config)) + f64::from(detail_row.y) + 2.0;
+        assert!(handle_performance_overlay_mouse(
+            click,
+            &overlay,
+            &mut ui,
+            PerformanceBudget::default(),
+            metrics,
+            80,
+            24,
+            &config,
+        ));
+        assert_eq!(ui.detail, PerformanceOverlayDetail::Detailed);
     }
 
     #[test]

@@ -79,6 +79,11 @@ Internal gates:
   glyph atlas/cache stats, damage/draw counts, PTY/parser throughput, and
   memory estimates
 
+The installed overlay supports compact/detailed views, all four window
+corners, click controls, `Ctrl+Shift+F12`, and an optional persisted runtime
+preference. Persistence writes only on a user setting change; disabled mode
+does not collect mux throughput/memory samples or project overlay primitives.
+
 Do not claim the terminal is faster than another terminal until benchmarks are
 reproducible, fair, and documented.
 

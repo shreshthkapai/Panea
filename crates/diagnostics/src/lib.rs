@@ -672,6 +672,7 @@ pub struct DoctorRuntimeSnapshot {
     pub font_discovery: String,
     pub config_parse_status: String,
     pub shell_integration_status: String,
+    pub performance_overlay_status: String,
     pub clipboard_provider: String,
     pub notification_provider: String,
     pub keychain_provider: String,
@@ -691,6 +692,7 @@ impl Default for DoctorRuntimeSnapshot {
             font_discovery: "not probed".to_owned(),
             config_parse_status: "loaded".to_owned(),
             shell_integration_status: "runtime session not active during doctor".to_owned(),
+            performance_overlay_status: "disabled; config defaults active".to_owned(),
             clipboard_provider: "not probed".to_owned(),
             notification_provider: "not probed".to_owned(),
             keychain_provider: "not probed".to_owned(),
@@ -1091,6 +1093,23 @@ fn append_shell_integration_report(input: &DoctorInput, report: &mut DoctorRepor
             message: "semantic command features are disabled by config".to_owned(),
         });
     }
+    for profile in &input.config.ssh_profiles {
+        report.lines.push(format!(
+            "  remote_profile={} integration={} status={}",
+            profile.name,
+            profile.shell_integration,
+            if !profile.shell_integration || !input.config.shell_integration.enabled {
+                "disabled"
+            } else if matches!(
+                input.config.shell_integration.activation,
+                config_core::ShellIntegrationActivationConfig::Heuristic
+            ) {
+                "heuristic (low confidence; no remote metadata or exit status)"
+            } else {
+                "configured; runtime remains inactive until remote markers are observed"
+            }
+        ));
+    }
 }
 
 fn append_clipboard_report(input: &DoctorInput, report: &mut DoctorReport) {
@@ -1171,6 +1190,7 @@ fn append_performance_report(input: &DoctorInput, report: &mut DoctorReport) {
             input.config.performance.max_active_animations,
             input.config.performance.max_animated_region_pixels
         ),
+        format!("  overlay={}", input.runtime.performance_overlay_status),
     ]);
 
     if input.config.diagnostics.performance_overlay {
@@ -1197,13 +1217,25 @@ fn append_ssh_report(input: &DoctorInput, report: &mut DoctorReport) {
 
     for profile in &input.config.ssh_profiles {
         report.lines.push(format!(
-            "  profile={} target={}:{} auth={:?} host_key_policy={}",
+            "  profile={} target={}:{} auth={:?} host_key_policy={} shell_integration={} proxy_jump={}",
             profile.name,
             profile.host,
             profile.port,
             profile.auth_method,
-            known_hosts_policy_name(&profile.known_hosts_policy)
+            known_hosts_policy_name(&profile.known_hosts_policy),
+            profile.shell_integration,
+            profile.proxy_jump.as_deref().unwrap_or("none")
         ));
+        if profile.proxy_jump.is_some() {
+            report.findings.push(DoctorFinding {
+                severity: DoctorSeverity::Warning,
+                area: "ssh",
+                message: format!(
+                    "profile '{}' requests proxy_jump, which remains a later transport extension and is rejected before connection",
+                    profile.name
+                ),
+            });
+        }
         if matches!(
             profile.known_hosts_policy,
             SshKnownHostsPolicy::TrustOnFirstUse
