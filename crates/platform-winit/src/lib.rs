@@ -386,6 +386,7 @@ pub struct WindowSettings {
     pub title: String,
     pub initial_width: u32,
     pub initial_height: u32,
+    pub visible_on_create: bool,
     pub mode: WindowMode,
     pub linux_backend: LinuxWindowBackend,
     pub decoration_mode: DecorationMode,
@@ -398,6 +399,7 @@ impl Default for WindowSettings {
             title: "Panea".to_owned(),
             initial_width: 960,
             initial_height: 560,
+            visible_on_create: true,
             mode: WindowMode::Windowed,
             linux_backend: LinuxWindowBackend::Auto,
             decoration_mode: DecorationMode::Auto,
@@ -429,6 +431,7 @@ impl DesktopWindow {
                 settings.initial_width,
                 settings.initial_height,
             ))
+            .with_visible(settings.visible_on_create)
             .with_decorations(decorations)
             .with_transparent(settings.opacity < 1.0)
             .with_maximized(matches!(settings.mode, WindowMode::Maximized))

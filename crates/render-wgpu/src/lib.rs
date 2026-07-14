@@ -51,6 +51,7 @@ pub struct RendererOptions {
     pub gpu_timestamps: bool,
     pub transparent: bool,
     pub glyph_cache_entries: usize,
+    pub background: RenderColor,
 }
 
 impl Default for RendererOptions {
@@ -61,6 +62,7 @@ impl Default for RendererOptions {
             gpu_timestamps: false,
             transparent: false,
             glyph_cache_entries: 8192,
+            background: RenderColor::rgb(12, 12, 12),
         }
     }
 }
@@ -4634,6 +4636,7 @@ struct GpuBackend {
     device_loss_signal: Arc<Mutex<Option<DeviceLossSignal>>>,
     gpu_timing: GpuTiming,
     transparent: bool,
+    background: RenderColor,
 }
 
 struct CursorImageGpuResources {
@@ -4845,6 +4848,58 @@ impl GpuTerminalRenderer {
         self.options.glyph_cache_entries = entries;
         self.rasterizer = TerminalRasterizer::new(entries, 2048, 2048);
         self.requires_full_redraw = true;
+    }
+
+    pub fn set_background(&mut self, background: RenderColor) {
+        if self.options.background == background {
+            return;
+        }
+        self.options.background = background;
+        if let Some(backend) = self.backend.as_mut() {
+            backend.background = background;
+        }
+        self.requires_full_redraw = true;
+    }
+
+    /// Presents the configured background before the native window becomes
+    /// visible, avoiding an OS-default flash while GPU resources initialize.
+    pub fn present_startup_background(&mut self) -> Result<(), RendererError> {
+        let outcome = self
+            .backend
+            .as_mut()
+            .ok_or_else(|| {
+                RendererError::DeviceUnavailable(
+                    "renderer backend is unavailable until GPU recovery succeeds".to_owned(),
+                )
+            })?
+            .present_background()?;
+        match outcome {
+            PresentOutcome::Submitted => Ok(()),
+            PresentOutcome::SurfaceReconfigured(reason) => {
+                self.record_surface_recovery(reason);
+                let retry = self
+                    .backend
+                    .as_mut()
+                    .ok_or_else(|| {
+                        RendererError::DeviceUnavailable(
+                            "renderer backend became unavailable during startup".to_owned(),
+                        )
+                    })?
+                    .present_background()?;
+                match retry {
+                    PresentOutcome::Submitted => Ok(()),
+                    PresentOutcome::SurfaceReconfigured(_) => Err(RendererError::Surface(
+                        "startup surface remained unavailable after reconfiguration".to_owned(),
+                    )),
+                    PresentOutcome::Timeout => Err(RendererError::Surface(
+                        "startup surface presentation timed out".to_owned(),
+                    )),
+                }
+            }
+            PresentOutcome::Timeout => Err(RendererError::Surface(
+                "startup surface presentation timed out".to_owned(),
+            )),
+        }
     }
 
     pub fn request_full_redraw(&mut self) {
@@ -5263,6 +5318,7 @@ impl GpuBackend {
             device_loss_signal,
             gpu_timing,
             transparent: options.transparent && alpha_mode != wgpu::CompositeAlphaMode::Opaque,
+            background: options.background,
         })
     }
 
@@ -5682,7 +5738,7 @@ impl GpuBackend {
                 wgpu::LoadOp::Clear(if self.transparent {
                     wgpu::Color::TRANSPARENT
                 } else {
-                    wgpu::Color::BLACK
+                    surface_clear_color(self.background, self.config.format)
                 })
             };
         let mut encoder = self
@@ -5770,6 +5826,84 @@ impl GpuBackend {
         }
         output.present();
         Ok(PresentOutcome::Submitted)
+    }
+
+    fn present_background(&mut self) -> Result<PresentOutcome, RendererError> {
+        let output = match self.surface.get_current_texture() {
+            Ok(output) => output,
+            Err(wgpu::SurfaceError::Lost) => {
+                self.surface.configure(&self.device, &self.config);
+                return Ok(PresentOutcome::SurfaceReconfigured(
+                    RenderRecoveryReason::SurfaceLost,
+                ));
+            }
+            Err(wgpu::SurfaceError::Outdated) => {
+                self.surface.configure(&self.device, &self.config);
+                return Ok(PresentOutcome::SurfaceReconfigured(
+                    RenderRecoveryReason::SurfaceOutdated,
+                ));
+            }
+            Err(wgpu::SurfaceError::Timeout) => return Ok(PresentOutcome::Timeout),
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                return Err(RendererError::DeviceLost {
+                    reason: RenderRecoveryReason::OutOfMemory,
+                    message: "surface reported out-of-memory while presenting startup background"
+                        .to_owned(),
+                });
+            }
+        };
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("panea-startup-background-encoder"),
+            });
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("panea-startup-background-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(if self.transparent {
+                            wgpu::Color::TRANSPARENT
+                        } else {
+                            surface_clear_color(self.background, self.config.format)
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+        }
+        self.queue.submit(Some(encoder.finish()));
+        output.present();
+        Ok(PresentOutcome::Submitted)
+    }
+}
+
+fn surface_clear_color(color: RenderColor, format: wgpu::TextureFormat) -> wgpu::Color {
+    let convert = |channel: u8| {
+        let encoded = f64::from(channel) / 255.0;
+        if format.is_srgb() {
+            if encoded <= 0.04045 {
+                encoded / 12.92
+            } else {
+                ((encoded + 0.055) / 1.055).powf(2.4)
+            }
+        } else {
+            encoded
+        }
+    };
+    wgpu::Color {
+        r: convert(color.red),
+        g: convert(color.green),
+        b: convert(color.blue),
+        a: f64::from(color.alpha) / 255.0,
     }
 }
 
@@ -6072,6 +6206,24 @@ mod tests {
         assert!(should_prepare_full_frame(false, false, true));
         assert!(should_prepare_full_frame(false, true, false));
         assert!(!should_prepare_full_frame(false, true, true));
+    }
+
+    #[test]
+    fn surface_clear_color_matches_scene_color_space() {
+        let color = RenderColor {
+            red: 12,
+            green: 64,
+            blue: 255,
+            alpha: 128,
+        };
+        let unorm = surface_clear_color(color, wgpu::TextureFormat::Bgra8Unorm);
+        let srgb = surface_clear_color(color, wgpu::TextureFormat::Bgra8UnormSrgb);
+
+        assert!((unorm.r - 12.0 / 255.0).abs() < f64::EPSILON);
+        assert!(srgb.r < unorm.r);
+        assert!(srgb.g < unorm.g);
+        assert!((srgb.b - 1.0).abs() < f64::EPSILON);
+        assert!((srgb.a - 128.0 / 255.0).abs() < f64::EPSILON);
     }
 
     #[test]

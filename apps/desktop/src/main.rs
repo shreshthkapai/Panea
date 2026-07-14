@@ -1094,6 +1094,11 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
         Arc::clone(&window),
         renderer_options(&config),
     ))?;
+    if let Err(error) = renderer.present_startup_background() {
+        eprintln!(
+            "renderer startup background fallback: {error}; revealing the window for normal first-frame rendering"
+        );
+    }
     if config.renderer.damage_tracking && !renderer.damage_tracking_active() {
         eprintln!(
             "renderer fallback: retained damage presentation is disabled because cross-frame correctness is not verified; using event-driven full-frame GPU batches"
@@ -1142,6 +1147,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
     );
 
     input_translator.arm_initial_focus_handoff();
+    window.set_visible(true);
     scheduler.terminal_content_changed();
     let gui_smoke_deadline = gui_smoke
         .as_ref()
@@ -2159,7 +2165,10 @@ fn apply_live_config_reload(
 
     for section in &plan.live {
         match section {
-            ReloadableSection::Colors => current.colors = next.colors.clone(),
+            ReloadableSection::Colors => {
+                current.colors = next.colors.clone();
+                renderer.set_background(render_color(current.colors.background));
+            }
             ReloadableSection::Cursor => current.cursor = next.cursor.clone(),
             ReloadableSection::Diagnostics => {
                 current.diagnostics = next.diagnostics.clone();
@@ -2308,6 +2317,7 @@ fn renderer_options(config: &AppConfig) -> RendererOptions {
         gpu_timestamps: config.renderer.gpu_timestamps,
         transparent: config.window.opacity < 1.0,
         glyph_cache_entries: config.performance.glyph_cache_entries,
+        background: render_color(config.colors.background),
     }
 }
 
@@ -3586,6 +3596,7 @@ fn window_settings(config: &AppConfig) -> WindowSettings {
         title: config.window.title.clone(),
         initial_width: config.window.initial_width,
         initial_height: config.window.initial_height,
+        visible_on_create: false,
         mode: map_window_mode(config.window.mode),
         linux_backend: map_linux_backend(config.window.linux_backend),
         decoration_mode: map_decoration_mode(config.window.decoration_strategy),
@@ -8224,6 +8235,23 @@ fn ansi_color(index: u8, config: &AppConfig) -> RenderColor {
 mod tests {
     use super::*;
     use semantics::{SemanticEventKind, SemanticTimeline};
+
+    #[test]
+    fn desktop_startup_uses_configured_background_before_window_reveal() {
+        let mut config = AppConfig::default();
+        config.colors.background = config_core::RgbaColor {
+            red: 17,
+            green: 34,
+            blue: 51,
+            alpha: 255,
+        };
+
+        assert!(!window_settings(&config).visible_on_create);
+        assert_eq!(
+            renderer_options(&config).background,
+            RenderColor::rgb(17, 34, 51)
+        );
+    }
 
     #[derive(Debug, Default)]
     struct RecordingNotificationProvider {
