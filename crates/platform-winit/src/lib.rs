@@ -32,12 +32,46 @@ use winit::{
     event::{ElementState, Ime, MouseScrollDelta, WindowEvent},
     event_loop::{EventLoop, EventLoopBuilder, EventLoopWindowTarget},
     keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey},
-    window::{Fullscreen, Window, WindowBuilder},
+    window::{Fullscreen, Icon, Window, WindowBuilder},
 };
 
 const POWER_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const NOTIFICATION_QUEUE_CAPACITY: usize = 16;
 const INITIAL_ACTIVATION_KEY_GUARD: Duration = Duration::from_millis(750);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowIcon {
+    rgba: Arc<[u8]>,
+    width: u32,
+    height: u32,
+}
+
+impl WindowIcon {
+    pub fn from_rgba(rgba: Vec<u8>, width: u32, height: u32) -> Result<Self, String> {
+        let expected = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| "window icon dimensions overflow".to_owned())?;
+        if width == 0 || height == 0 {
+            return Err("window icon dimensions must be non-zero".to_owned());
+        }
+        if rgba.len() != expected as usize {
+            return Err(format!(
+                "window icon contains {} RGBA bytes; expected {expected}",
+                rgba.len()
+            ));
+        }
+        Ok(Self {
+            rgba: rgba.into(),
+            width,
+            height,
+        })
+    }
+
+    fn to_winit(&self) -> Option<Icon> {
+        Icon::from_rgba(self.rgba.to_vec(), self.width, self.height).ok()
+    }
+}
 
 #[derive(Debug)]
 pub struct DesktopNotificationProvider {
@@ -391,6 +425,7 @@ pub struct WindowSettings {
     pub linux_backend: LinuxWindowBackend,
     pub decoration_mode: DecorationMode,
     pub opacity: f64,
+    pub icon: Option<WindowIcon>,
 }
 
 impl Default for WindowSettings {
@@ -404,6 +439,7 @@ impl Default for WindowSettings {
             linux_backend: LinuxWindowBackend::Auto,
             decoration_mode: DecorationMode::Auto,
             opacity: 1.0,
+            icon: None,
         }
     }
 }
@@ -427,6 +463,7 @@ impl DesktopWindow {
 
         let window = WindowBuilder::new()
             .with_title(settings.title.clone())
+            .with_window_icon(settings.icon.as_ref().and_then(WindowIcon::to_winit))
             .with_inner_size(LogicalSize::new(
                 settings.initial_width,
                 settings.initial_height,
@@ -1276,6 +1313,16 @@ fn clipboard_diagnostic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_icon_rejects_invalid_rgba_and_accepts_exact_dimensions() {
+        assert!(WindowIcon::from_rgba(vec![0; 15], 2, 2).is_err());
+        assert!(WindowIcon::from_rgba(vec![0; 4], 0, 1).is_err());
+
+        let icon = WindowIcon::from_rgba(vec![255; 16], 2, 2)
+            .expect("four RGBA pixels should form a valid icon");
+        assert!(icon.to_winit().is_some());
+    }
 
     #[test]
     fn initial_window_activation_key_is_quarantined_until_release() {

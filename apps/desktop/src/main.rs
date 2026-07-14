@@ -3668,7 +3668,33 @@ fn window_settings(config: &AppConfig) -> WindowSettings {
         linux_backend: map_linux_backend(config.window.linux_backend),
         decoration_mode: map_decoration_mode(config.window.decoration_strategy),
         opacity: config.window.opacity,
+        icon: panea_window_icon(),
     }
+}
+
+fn panea_window_icon() -> Option<platform_winit::WindowIcon> {
+    const PANEA_ICON_PNG: &[u8] =
+        include_bytes!("../../../crates/assets/branding/generated/panea-icon-128.png");
+    static ICON: std::sync::OnceLock<Option<platform_winit::WindowIcon>> =
+        std::sync::OnceLock::new();
+    ICON.get_or_init(|| {
+        let decoded = match image::load_from_memory(PANEA_ICON_PNG) {
+            Ok(decoded) => decoded.into_rgba8(),
+            Err(error) => {
+                eprintln!("window icon fallback: failed to decode Panea icon: {error}");
+                return None;
+            }
+        };
+        let (width, height) = decoded.dimensions();
+        match platform_winit::WindowIcon::from_rgba(decoded.into_raw(), width, height) {
+            Ok(icon) => Some(icon),
+            Err(error) => {
+                eprintln!("window icon fallback: invalid Panea icon: {error}");
+                None
+            }
+        }
+    })
+    .clone()
 }
 
 fn apply_window_mode_logged(
@@ -8608,7 +8634,9 @@ mod tests {
             alpha: 255,
         };
 
-        assert!(!window_settings(&config).visible_on_create);
+        let settings = window_settings(&config);
+        assert!(!settings.visible_on_create);
+        assert!(settings.icon.is_some());
         assert_eq!(
             renderer_options(&config).background,
             RenderColor::rgb(17, 34, 51)

@@ -12,8 +12,9 @@ Config keys: none; branding is a product asset rather than user configuration.
 macOS behavior: the app bundle contains `Panea.icns` and references it through
 `CFBundleIconFile`.
 
-Windows behavior: the desktop executable embeds `panea.ico`; portable packages
-also include the ICO under `share/panea/icons`.
+Windows behavior: the desktop executable embeds `panea.ico`, and the desktop
+window explicitly receives the shared Panea RGBA icon through winit. Portable
+packages also include the ICO under `share/panea/icons`.
 
 Linux X11 behavior: packages install the 512 px PNG through the freedesktop
 hicolor icon layout and reference it as `panea` from the desktop entry.
@@ -21,8 +22,9 @@ hicolor icon layout and reference it as `panea` from the desktop entry.
 Linux Wayland behavior: identical to Linux X11; the compositor or launcher
 selects the appropriate hicolor icon.
 
-Fallback behavior: the unbranded executable remains launchable if a desktop
-environment ignores package icon metadata. Packaging verification reports a
+Fallback behavior: the executable remains launchable if runtime icon decoding
+or desktop icon metadata is unavailable. The platform window falls back to its
+native default icon and logs the reason. Packaging verification reports a
 missing required icon as an error.
 
 Diagnostics: package-content smoke tests verify each platform asset. Runtime

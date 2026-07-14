@@ -292,7 +292,7 @@ pub fn load(options: ConfigLoadOptions) -> Result<LoadedConfig, ConfigTomlError>
         return load_path(path, true, options.platform);
     }
 
-    for path in candidate_paths_for_current_platform() {
+    for path in candidate_paths_from_platform(options.platform) {
         if path.exists() {
             return load_path(path, false, options.platform);
         }

@@ -2239,6 +2239,7 @@ dependencies = [
  "config-toml",
  "diagnostics",
  "font-system",
+ "image",
  "mux",
  "platform-core",
  "platform-winit",

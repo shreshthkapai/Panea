@@ -30,6 +30,7 @@ config-lua = { path = "../../crates/config-lua" }
 config-toml = { path = "../../crates/config-toml" }
 diagnostics = { path = "../../crates/diagnostics" }
 font-system = { path = "../../crates/font-system" }
+image.workspace = true
 mux = { path = "../../crates/mux" }
 platform-core = { path = "../../crates/platform-core" }
 platform-winit = { path = "../../crates/platform-winit" }
