@@ -688,6 +688,11 @@ fn known_paths() -> BTreeSet<&'static str> {
         "window.mode",
         "window.linux_backend",
         "window.decoration_strategy",
+        "window.fullscreen_titlebar",
+        "window.fullscreen_titlebar.enabled",
+        "window.fullscreen_titlebar.height",
+        "window.fullscreen_titlebar.reveal_height",
+        "window.fullscreen_titlebar.show_window_controls",
         "renderer",
         "renderer.backend",
         "renderer.vsync",
@@ -1534,6 +1539,31 @@ mod tests {
             loaded.config.cursor.vector.path,
             "assets/cursor.panea-cursor.json"
         );
+        assert!(loaded.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn portable_fullscreen_titlebar_config_parses_without_unknown_keys() {
+        let loaded = parse_str(
+            r#"
+            schema_version = 2
+
+            [window]
+            mode = "borderless_fullscreen"
+
+            [window.fullscreen_titlebar]
+            enabled = true
+            height = 38
+            reveal_height = 4
+            show_window_controls = true
+            "#,
+            None,
+            ConfigPlatform::Windows,
+        )
+        .expect("portable fullscreen titlebar config should parse");
+
+        assert!(loaded.config.window.fullscreen_titlebar.enabled);
+        assert_eq!(loaded.config.window.fullscreen_titlebar.height, 38);
         assert!(loaded.diagnostics.is_empty());
     }
 

@@ -19,11 +19,11 @@ use config_core::{
     AppConfig, ClipboardConfigPatch, ColorConfigPatch, CommandBlockStyle, CommandBlocksConfigPatch,
     ConfigDiagnostic, ConfigDiagnosticSeverity, ConfigPlatform, ConfigProvider,
     ConfigProviderError, CursorConfigPatch, CursorShape, DecorationStrategyConfig,
-    DiagnosticsConfigPatch, FontConfigPatch, InputOutputGroupingStyle, KeyBinding,
-    LinuxBackendConfig, LoadedAppConfig, LogLevel, MouseBinding, NotificationConfigPatch,
-    Osc52ClipboardConfigPatch, PerformanceConfigPatch, PerformanceOverlayDetail,
-    PerformanceOverlayPosition, PerformanceProfile, PlatformOverride, PlatformOverrides,
-    PresentModePreference, PromptDecorationStyle, PromptDecorationsConfigPatch,
+    DiagnosticsConfigPatch, FontConfigPatch, FullscreenTitlebarConfigPatch,
+    InputOutputGroupingStyle, KeyBinding, LinuxBackendConfig, LoadedAppConfig, LogLevel,
+    MouseBinding, NotificationConfigPatch, Osc52ClipboardConfigPatch, PerformanceConfigPatch,
+    PerformanceOverlayDetail, PerformanceOverlayPosition, PerformanceProfile, PlatformOverride,
+    PlatformOverrides, PresentModePreference, PromptDecorationStyle, PromptDecorationsConfigPatch,
     RendererBackendPreference, RendererConfigPatch, RgbaColor, ShellIntegrationActivationConfig,
     ShellIntegrationConfigPatch, ShellProfile, ShellProfileKind, SshProfile, WindowConfigPatch,
     WindowModeConfig,
@@ -862,6 +862,18 @@ fn set_config_value(config: &mut AppConfig, path: &str, value: &ConfigValue) -> 
             config.window.decoration_strategy =
                 parse_decoration_strategy(value_as_string_ref(value)?)?;
         }
+        "window.fullscreen_titlebar.enabled" => {
+            config.window.fullscreen_titlebar.enabled = value_as_bool(value)?;
+        }
+        "window.fullscreen_titlebar.height" => {
+            config.window.fullscreen_titlebar.height = value_as_u16(value)?;
+        }
+        "window.fullscreen_titlebar.reveal_height" => {
+            config.window.fullscreen_titlebar.reveal_height = value_as_u16(value)?;
+        }
+        "window.fullscreen_titlebar.show_window_controls" => {
+            config.window.fullscreen_titlebar.show_window_controls = value_as_bool(value)?;
+        }
         "renderer.backend" => {
             config.renderer.backend = parse_renderer_backend(value_as_string_ref(value)?)?;
         }
@@ -1139,6 +1151,38 @@ fn set_platform_override_value(
                 .get_or_insert_with(WindowConfigPatch::default)
                 .decoration_strategy =
                 Some(parse_decoration_strategy(value_as_string_ref(value)?)?);
+        }
+        "window.fullscreen_titlebar.enabled" => {
+            entry
+                .window
+                .get_or_insert_with(WindowConfigPatch::default)
+                .fullscreen_titlebar
+                .get_or_insert_with(FullscreenTitlebarConfigPatch::default)
+                .enabled = Some(value_as_bool(value)?);
+        }
+        "window.fullscreen_titlebar.height" => {
+            entry
+                .window
+                .get_or_insert_with(WindowConfigPatch::default)
+                .fullscreen_titlebar
+                .get_or_insert_with(FullscreenTitlebarConfigPatch::default)
+                .height = Some(value_as_u16(value)?);
+        }
+        "window.fullscreen_titlebar.reveal_height" => {
+            entry
+                .window
+                .get_or_insert_with(WindowConfigPatch::default)
+                .fullscreen_titlebar
+                .get_or_insert_with(FullscreenTitlebarConfigPatch::default)
+                .reveal_height = Some(value_as_u16(value)?);
+        }
+        "window.fullscreen_titlebar.show_window_controls" => {
+            entry
+                .window
+                .get_or_insert_with(WindowConfigPatch::default)
+                .fullscreen_titlebar
+                .get_or_insert_with(FullscreenTitlebarConfigPatch::default)
+                .show_window_controls = Some(value_as_bool(value)?);
         }
         "renderer.backend" => {
             entry
@@ -1810,5 +1854,23 @@ mod tests {
             loaded.config.cursor.vector.path,
             "assets/cursor.panea-cursor.json"
         );
+    }
+
+    #[test]
+    fn programmable_config_compiles_fullscreen_titlebar_settings() {
+        let loaded = parse_str(
+            r#"
+            panea.set("window.fullscreen_titlebar.enabled", true)
+            panea.set("window.fullscreen_titlebar.height", 40)
+            panea.platform_set("windows", "window.fullscreen_titlebar.reveal_height", 5)
+            "#,
+            None,
+            ConfigPlatform::Windows,
+        )
+        .expect("fullscreen titlebar programmable config should compile");
+
+        assert!(loaded.config.window.fullscreen_titlebar.enabled);
+        assert_eq!(loaded.config.window.fullscreen_titlebar.height, 40);
+        assert_eq!(loaded.config.window.fullscreen_titlebar.reveal_height, 5);
     }
 }

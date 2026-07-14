@@ -920,6 +920,13 @@ fn append_window_report(input: &DoctorInput, report: &mut DoctorReport) {
             input.config.window.decoration_strategy
         ),
         format!(
+            "  fullscreen_titlebar enabled={} height={} reveal_height={} controls={}",
+            input.config.window.fullscreen_titlebar.enabled,
+            input.config.window.fullscreen_titlebar.height,
+            input.config.window.fullscreen_titlebar.reveal_height,
+            input.config.window.fullscreen_titlebar.show_window_controls
+        ),
+        format!(
             "  provider_backend={}",
             input
                 .runtime
@@ -958,6 +965,19 @@ fn append_window_report(input: &DoctorInput, report: &mut DoctorReport) {
             severity: DoctorSeverity::Info,
             area: "window",
             message: "exclusive fullscreen uses the active monitor video modes and falls back to borderless fullscreen when none is exposed"
+                .to_owned(),
+        });
+    }
+    if input.config.window.fullscreen_titlebar.enabled
+        && !matches!(
+            input.config.window.mode,
+            WindowModeConfig::BorderlessFullscreen | WindowModeConfig::FramelessFullscreen
+        )
+    {
+        report.findings.push(DoctorFinding {
+            severity: DoctorSeverity::Info,
+            area: "window",
+            message: "auto-hidden fullscreen titlebar is configured but activates only in borderless_fullscreen or frameless_fullscreen mode"
                 .to_owned(),
         });
     }
@@ -2547,6 +2567,33 @@ mod tests {
             Some(DoctorTopic::Notifications)
         );
         assert!(DoctorTopic::parse("unknown").is_none());
+    }
+
+    #[test]
+    fn window_doctor_reports_dormant_fullscreen_titlebar() {
+        let mut input = DoctorInput {
+            app_version: "0.1.0".to_owned(),
+            config_source: "default".to_owned(),
+            config: AppConfig::default(),
+            config_diagnostics: Vec::new(),
+            platform: PlatformSnapshot {
+                platform: ConfigPlatform::Windows,
+                os: "windows".to_owned(),
+                arch: "x86_64".to_owned(),
+                linux_backend: Some(DesktopPlatform::Windows),
+                compositor_or_desktop: None,
+                dpi_behavior: DpiBehavior::PerMonitor,
+                known_fallbacks: Vec::new(),
+            },
+            runtime: DoctorRuntimeSnapshot::default(),
+            recent_errors: Vec::new(),
+        };
+        input.config.window.fullscreen_titlebar.enabled = true;
+
+        let report = doctor_report(&input, DoctorTopic::Window);
+        let text = report.render_text();
+        assert!(text.contains("fullscreen_titlebar enabled=true"));
+        assert!(text.contains("activates only in borderless_fullscreen"));
     }
 
     #[test]

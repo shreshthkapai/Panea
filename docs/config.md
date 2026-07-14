@@ -221,6 +221,24 @@ Window `padding_x`/`padding_y` and `margin_x`/`margin_y` are exact pixel insets.
 Opacity requests transparent window/surface composition and reports an opaque
 fallback if the active backend cannot provide it.
 
+Borderless fullscreen can expose an auto-hidden, theme-colored titlebar without
+reducing the terminal grid. Move the pointer to the top edge to reveal it:
+
+```toml
+[window]
+mode = "borderless_fullscreen"
+
+[window.fullscreen_titlebar]
+enabled = true
+height = 36          # logical pixels
+reveal_height = 3    # logical pixels at the top edge
+show_window_controls = true
+```
+
+The bar is an overlay and does not change terminal contents, selection, PTY
+dimensions, or mouse coordinates while hidden. See
+[Auto-Hidden Fullscreen Titlebar](fullscreen-titlebar.md).
+
 Renderer diagnostics can optionally request GPU timestamp queries:
 
 ```toml

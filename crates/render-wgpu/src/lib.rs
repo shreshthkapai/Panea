@@ -276,6 +276,7 @@ pub struct DamageTracker {
     previous_visuals: Vec<DamageRegion>,
     previous_search_highlights: Vec<OverlayPrimitive>,
     previous_semantic_overlays: Vec<OverlayPrimitive>,
+    previous_surface_overlays: Vec<OverlayPrimitive>,
     previous_decorations: Vec<RenderDecoration>,
     previous_selections: Vec<SelectionVisual>,
     previous_animations: Vec<AnimationHandle>,
@@ -389,6 +390,7 @@ impl DamageTracker {
     fn visuals_changed(&self, scene: &RenderScene) -> bool {
         self.previous_search_highlights != scene.search_highlights
             || self.previous_semantic_overlays != scene.semantic_overlays
+            || self.previous_surface_overlays != scene.surface_overlays
             || self.previous_decorations != scene.decorations
             || self.previous_selections != scene.selections
             || self.previous_animations != scene.animations
@@ -399,6 +401,7 @@ impl DamageTracker {
     fn remember_visuals(&mut self, scene: &RenderScene) {
         self.previous_search_highlights = scene.search_highlights.clone();
         self.previous_semantic_overlays = scene.semantic_overlays.clone();
+        self.previous_surface_overlays = scene.surface_overlays.clone();
         self.previous_decorations = scene.decorations.clone();
         self.previous_selections = scene.selections.clone();
         self.previous_animations = scene.animations.clone();
@@ -413,6 +416,7 @@ fn visual_regions(scene: &RenderScene, metrics: CellMetrics) -> Vec<DamageRegion
         .iter()
         .chain(scene.semantic_overlays.iter())
         .map(|overlay| offset_region(overlay.bounds, scene.content_offset))
+        .chain(scene.surface_overlays.iter().map(|overlay| overlay.bounds))
         .chain(
             scene
                 .decorations
@@ -486,6 +490,24 @@ fn scene_grid_region(scene: &RenderScene, metrics: CellMetrics) -> DamageRegion 
     region.height = region
         .height
         .saturating_add(scene.content_offset.y.max(0) as u32 * 2);
+    for overlay in &scene.surface_overlays {
+        region.width = region.width.max(
+            overlay
+                .bounds
+                .x
+                .max(0)
+                .unsigned_abs()
+                .saturating_add(overlay.bounds.width),
+        );
+        region.height = region.height.max(
+            overlay
+                .bounds
+                .y
+                .max(0)
+                .unsigned_abs()
+                .saturating_add(overlay.bounds.height),
+        );
+    }
     region
 }
 
@@ -1914,11 +1936,18 @@ impl RenderBatchPlanner {
             .search_highlights
             .iter()
             .chain(scene.semantic_overlays.iter())
+            .map(|overlay| (overlay, scene.content_offset))
+            .chain(
+                scene
+                    .surface_overlays
+                    .iter()
+                    .map(|overlay| (overlay, render_core::RenderOffset::default())),
+            )
             .collect::<Vec<_>>();
-        overlays.sort_by_key(|overlay| overlay.z_index);
+        overlays.sort_by_key(|(overlay, _)| overlay.z_index);
 
-        for overlay in overlays {
-            let bounds = offset_region(overlay.bounds, scene.content_offset);
+        for (overlay, offset) in overlays {
+            let bounds = offset_region(overlay.bounds, offset);
             if intersects_any(bounds, &damage_regions) {
                 let batch = if overlay_draws_behind_terminal_text(overlay.kind) {
                     &mut background
@@ -1945,7 +1974,7 @@ impl RenderBatchPlanner {
                     instrumentation: &mut instrumentation,
                     fonts,
                     metrics,
-                    rect: offset_region(overlay_label_rect(overlay, metrics), scene.content_offset),
+                    rect: offset_region(overlay_label_rect(overlay, metrics), offset),
                 };
                 self.push_overlay_label_glyphs(&mut overlay_glyphs, overlay, &mut glyph_context)?;
             }
@@ -2301,6 +2330,7 @@ fn overlay_label_color(kind: OverlayKind) -> RenderColor {
     match kind {
         OverlayKind::Badge | OverlayKind::ContentMask => RenderColor::rgb(245, 248, 252),
         OverlayKind::PerformanceOverlay
+        | OverlayKind::WindowChrome
         | OverlayKind::DragTarget
         | OverlayKind::SessionStatus
         | OverlayKind::ImePreedit => RenderColor::rgb(225, 232, 240),
@@ -3872,14 +3902,32 @@ impl TerminalRasterizer {
         let started = Instant::now();
         let batches = self.batch_planner.prepare_full(scene, fonts)?;
         let metrics = fonts.cell_metrics()?;
-        let width = ((f32::from(scene.grid.columns) * metrics.cell_width)
+        let mut width = ((f32::from(scene.grid.columns) * metrics.cell_width)
             .ceil()
             .max(1.0) as u32)
             .saturating_add(scene.content_offset.x.max(0) as u32 * 2);
-        let height = ((f32::from(scene.grid.rows) * metrics.cell_height)
+        let mut height = ((f32::from(scene.grid.rows) * metrics.cell_height)
             .ceil()
             .max(1.0) as u32)
             .saturating_add(scene.content_offset.y.max(0) as u32 * 2);
+        for overlay in &scene.surface_overlays {
+            width = width.max(
+                overlay
+                    .bounds
+                    .x
+                    .max(0)
+                    .unsigned_abs()
+                    .saturating_add(overlay.bounds.width),
+            );
+            height = height.max(
+                overlay
+                    .bounds
+                    .y
+                    .max(0)
+                    .unsigned_abs()
+                    .saturating_add(overlay.bounds.height),
+            );
+        }
         let mut frame = CpuFrame {
             width,
             height,
@@ -3902,18 +3950,25 @@ impl TerminalRasterizer {
             .search_highlights
             .iter()
             .chain(scene.semantic_overlays.iter())
+            .map(|overlay| (overlay, scene.content_offset))
+            .chain(
+                scene
+                    .surface_overlays
+                    .iter()
+                    .map(|overlay| (overlay, render_core::RenderOffset::default())),
+            )
             .collect::<Vec<_>>();
-        overlays.sort_by_key(|overlay| overlay.z_index);
+        overlays.sort_by_key(|(overlay, _)| overlay.z_index);
 
         for cell in &scene.grid.cells {
             draw_cell_background(&mut frame, cell, metrics, scene.content_offset);
         }
 
-        for overlay in &overlays {
+        for (overlay, offset) in &overlays {
             if !overlay_draws_behind_terminal_text(overlay.kind) {
                 continue;
             }
-            let bounds = offset_region(overlay.bounds, scene.content_offset);
+            let bounds = offset_region(overlay.bounds, *offset);
             blend_rounded_rect(
                 &mut frame,
                 bounds,
@@ -3961,11 +4016,11 @@ impl TerminalRasterizer {
             )?;
         }
 
-        for overlay in overlays {
+        for (overlay, offset) in overlays {
             if overlay_draws_behind_terminal_text(overlay.kind) {
                 continue;
             }
-            let bounds = offset_region(overlay.bounds, scene.content_offset);
+            let bounds = offset_region(overlay.bounds, offset);
             blend_rounded_rect(
                 &mut frame,
                 bounds,
@@ -3988,7 +4043,7 @@ impl TerminalRasterizer {
                 overlay,
                 fonts,
                 metrics,
-                scene.content_offset,
+                offset,
                 &mut instrumentation,
             )?;
         }
@@ -7208,5 +7263,37 @@ mod tests {
         let layout_diff = compare_screenshots(&base, &layout, ScreenshotTolerance::default());
         assert_eq!(layout_diff.kind, ScreenshotDiffKind::TextLayoutFailure);
         assert!(!layout_diff.passed);
+    }
+
+    #[test]
+    fn surface_overlay_damage_uses_surface_coordinates() {
+        let mut tracker = DamageTracker::new();
+        let mut first = scene(vec![cell(0, 0, "a")]);
+        first.content_offset = render_core::RenderOffset { x: 30, y: 20 };
+        first.surface_overlays.push(OverlayPrimitive {
+            kind: OverlayKind::WindowChrome,
+            bounds: RenderRect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 36,
+            },
+            color: RenderColor::rgb(20, 20, 20),
+            border_color: None,
+            border_width_px: 0,
+            corner_radius_px: 0,
+            z_index: 100,
+            label: None,
+            label_color: None,
+        });
+        let initial = tracker.update(&first, metrics());
+        assert!(initial.iter().any(|region| region.width >= 800));
+
+        let mut hidden = first.clone();
+        hidden.surface_overlays.clear();
+        let damage = tracker.update(&hidden, metrics());
+        assert!(damage.iter().any(|region| {
+            region.x == 0 && region.y == 0 && region.width >= 800 && region.height >= 36
+        }));
     }
 }

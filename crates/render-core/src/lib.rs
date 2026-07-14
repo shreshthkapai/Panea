@@ -154,6 +154,7 @@ pub enum OverlayKind {
     ContentMask,
     Badge,
     PerformanceOverlay,
+    WindowChrome,
     DragTarget,
     SecurityPrompt,
     SessionStatus,
@@ -353,6 +354,8 @@ pub struct RenderScene {
     pub selections: Vec<SelectionVisual>,
     pub search_highlights: Vec<OverlayPrimitive>,
     pub semantic_overlays: Vec<OverlayPrimitive>,
+    /// App chrome positioned in physical surface pixels rather than terminal-content pixels.
+    pub surface_overlays: Vec<OverlayPrimitive>,
     pub decorations: Vec<RenderDecoration>,
     pub animations: Vec<AnimationHandle>,
     pub damage_regions: Vec<DamageRegion>,

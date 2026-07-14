@@ -185,6 +185,21 @@ impl AppConfig {
                 "window padding and margins must be between 0 and 256 pixels",
             );
         }
+        if !(24..=96).contains(&self.window.fullscreen_titlebar.height) {
+            report.error(
+                "window.fullscreen_titlebar.height",
+                "fullscreen titlebar height must be between 24 and 96 logical pixels",
+            );
+        }
+        if self.window.fullscreen_titlebar.reveal_height == 0
+            || self.window.fullscreen_titlebar.reveal_height
+                > self.window.fullscreen_titlebar.height
+        {
+            report.error(
+                "window.fullscreen_titlebar.reveal_height",
+                "fullscreen titlebar reveal height must be greater than zero and no larger than the titlebar height",
+            );
+        }
         if matches!(
             self.window.mode,
             WindowModeConfig::FramelessFullscreen | WindowModeConfig::FramelessWindowed
@@ -360,6 +375,9 @@ impl AppConfig {
         }
         if self.window.title != next.window.title {
             plan.live.push(ReloadableSection::WindowTitle);
+        }
+        if self.window.fullscreen_titlebar != next.window.fullscreen_titlebar {
+            plan.live.push(ReloadableSection::WindowChrome);
         }
         if self.keyboard != next.keyboard {
             plan.live.push(ReloadableSection::Keybindings);
@@ -964,6 +982,7 @@ pub struct WindowConfig {
     pub mode: WindowModeConfig,
     pub linux_backend: LinuxBackendConfig,
     pub decoration_strategy: DecorationStrategyConfig,
+    pub fullscreen_titlebar: FullscreenTitlebarConfig,
 }
 
 impl Default for WindowConfig {
@@ -982,6 +1001,29 @@ impl Default for WindowConfig {
             mode: WindowModeConfig::Windowed,
             linux_backend: LinuxBackendConfig::Auto,
             decoration_strategy: DecorationStrategyConfig::Auto,
+            fullscreen_titlebar: FullscreenTitlebarConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FullscreenTitlebarConfig {
+    pub enabled: bool,
+    /// Height in logical pixels, scaled for the active monitor.
+    pub height: u16,
+    /// Top-edge hover strip in logical pixels.
+    pub reveal_height: u16,
+    pub show_window_controls: bool,
+}
+
+impl Default for FullscreenTitlebarConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            height: 36,
+            reveal_height: 3,
+            show_window_controls: true,
         }
     }
 }
@@ -2245,6 +2287,7 @@ pub struct WindowConfigPatch {
     pub mode: Option<WindowModeConfig>,
     pub linux_backend: Option<LinuxBackendConfig>,
     pub decoration_strategy: Option<DecorationStrategyConfig>,
+    pub fullscreen_titlebar: Option<FullscreenTitlebarConfigPatch>,
 }
 
 impl WindowConfigPatch {
@@ -2262,6 +2305,27 @@ impl WindowConfigPatch {
         apply_opt(&mut config.mode, &self.mode);
         apply_opt(&mut config.linux_backend, &self.linux_backend);
         apply_opt(&mut config.decoration_strategy, &self.decoration_strategy);
+        if let Some(fullscreen_titlebar) = &self.fullscreen_titlebar {
+            fullscreen_titlebar.apply_to(&mut config.fullscreen_titlebar);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct FullscreenTitlebarConfigPatch {
+    pub enabled: Option<bool>,
+    pub height: Option<u16>,
+    pub reveal_height: Option<u16>,
+    pub show_window_controls: Option<bool>,
+}
+
+impl FullscreenTitlebarConfigPatch {
+    fn apply_to(&self, config: &mut FullscreenTitlebarConfig) {
+        apply_opt(&mut config.enabled, &self.enabled);
+        apply_opt(&mut config.height, &self.height);
+        apply_opt(&mut config.reveal_height, &self.reveal_height);
+        apply_opt(&mut config.show_window_controls, &self.show_window_controls);
     }
 }
 
@@ -2894,6 +2958,7 @@ pub enum ReloadableSection {
     Notifications,
     Performance,
     VisualSemantics,
+    WindowChrome,
     WindowPadding,
     WindowTitle,
 }
@@ -3011,6 +3076,34 @@ pub fn export_schema() -> ConfigSchema {
                         format!("{:?}", default.window.linux_backend),
                         false,
                         true,
+                    ),
+                    field(
+                        "window.fullscreen_titlebar.enabled",
+                        "boolean",
+                        default.window.fullscreen_titlebar.enabled,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "window.fullscreen_titlebar.height",
+                        "integer",
+                        default.window.fullscreen_titlebar.height,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "window.fullscreen_titlebar.reveal_height",
+                        "integer",
+                        default.window.fullscreen_titlebar.reveal_height,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "window.fullscreen_titlebar.show_window_controls",
+                        "boolean",
+                        default.window.fullscreen_titlebar.show_window_controls,
+                        true,
+                        false,
                     ),
                 ],
             },
@@ -4499,5 +4592,49 @@ mod tests {
         let plan = config.reload_plan_from(&next);
         assert!(plan.live.contains(&ReloadableSection::Mux));
         assert!(plan.live.contains(&ReloadableSection::Diagnostics));
+    }
+
+    #[test]
+    fn fullscreen_titlebar_is_opt_in_validated_and_live_reloadable() {
+        let config = AppConfig::default();
+        assert!(!config.window.fullscreen_titlebar.enabled);
+        assert!(!config.validate().has_errors());
+
+        let mut next = config.clone();
+        next.window.fullscreen_titlebar.enabled = true;
+        assert!(
+            config
+                .reload_plan_from(&next)
+                .live
+                .contains(&ReloadableSection::WindowChrome)
+        );
+
+        next.window.fullscreen_titlebar.reveal_height = next.window.fullscreen_titlebar.height + 1;
+        assert!(
+            next.validate().diagnostics.iter().any(|diagnostic| {
+                diagnostic.path == "window.fullscreen_titlebar.reveal_height"
+            })
+        );
+    }
+
+    #[test]
+    fn fullscreen_titlebar_platform_override_refines_shared_config() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            [window.fullscreen_titlebar]
+            enabled = true
+            height = 36
+
+            [platform.windows.window.fullscreen_titlebar]
+            height = 42
+            "#,
+        )
+        .expect("fullscreen titlebar override should parse");
+
+        let windows = config.resolved_for_platform(ConfigPlatform::Windows);
+        let linux = config.resolved_for_platform(ConfigPlatform::LinuxWayland);
+        assert!(windows.window.fullscreen_titlebar.enabled);
+        assert_eq!(windows.window.fullscreen_titlebar.height, 42);
+        assert_eq!(linux.window.fullscreen_titlebar.height, 36);
     }
 }
