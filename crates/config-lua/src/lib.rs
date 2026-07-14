@@ -932,6 +932,8 @@ fn set_config_value(config: &mut AppConfig, path: &str, value: &ConfigValue) -> 
         "cursor.image.warn_if_expensive" => {
             config.cursor.image.warn_if_expensive = value_as_bool(value)?;
         }
+        "cursor.vector.enabled" => config.cursor.vector.enabled = value_as_bool(value)?,
+        "cursor.vector.path" => config.cursor.vector.path = value_as_string(value)?,
         "command_blocks.enabled" => config.command_blocks.enabled = value_as_bool(value)?,
         "command_blocks.style" => {
             config.command_blocks.style = parse_command_block_style(value_as_string_ref(value)?)?;
@@ -1790,5 +1792,23 @@ mod tests {
             ProgrammableConfigWatchEvent::Failed { .. }
         ));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn programmable_config_compiles_vector_cursor_settings() {
+        let loaded = parse_str(
+            r#"
+            panea.set("cursor.vector.enabled", true)
+            panea.set("cursor.vector.path", "assets/cursor.panea-cursor.json")
+            "#,
+            None,
+            ConfigPlatform::LinuxX11,
+        )
+        .expect("vector cursor programmable config should compile");
+        assert!(loaded.config.cursor.vector.enabled);
+        assert_eq!(
+            loaded.config.cursor.vector.path,
+            "assets/cursor.panea-cursor.json"
+        );
     }
 }

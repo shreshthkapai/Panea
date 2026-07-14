@@ -98,6 +98,32 @@ pub struct CursorImageVisual {
     pub opacity: u8,
 }
 
+/// A bounded, data-only vector primitive. Coordinates use a 0..=1000
+/// normalized canvas so the same asset scales identically on every backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorVectorPrimitive {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    pub corner_radius: u16,
+    pub color: Option<RenderColor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorVectorAsset {
+    pub id: u64,
+    pub primitives: Arc<[CursorVectorPrimitive]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorVectorVisual {
+    pub asset: Arc<CursorVectorAsset>,
+    pub bounds: RenderRect,
+    pub color: RenderColor,
+    pub opacity: u8,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderRect {
     pub x: i32,
@@ -323,6 +349,7 @@ pub struct RenderScene {
     pub content_offset: RenderOffset,
     pub cursor: Option<CursorVisual>,
     pub cursor_image: Option<CursorImageVisual>,
+    pub cursor_vector: Option<CursorVectorVisual>,
     pub selections: Vec<SelectionVisual>,
     pub search_highlights: Vec<OverlayPrimitive>,
     pub semantic_overlays: Vec<OverlayPrimitive>,

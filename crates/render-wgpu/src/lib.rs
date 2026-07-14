@@ -23,11 +23,13 @@ use font_system::{
 use image::{AnimationDecoder, ImageDecoder};
 use render_core::{
     AnimationHandle, AnimationKind, CellPosition, CursorImageAsset, CursorImageFrame,
-    CursorImageVisual, CursorVisual, DamageRegion, FrameRequestReason, GpuTimingStatus,
-    OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle, RenderColor, RenderCursorShape,
-    RenderDecoration, RenderGrid, RenderInstrumentation, RenderRecoveryEvent, RenderRecoveryReason,
-    RenderRecoveryStatus, RenderRect, RenderScene, RenderSurfaceStatus, SelectionVisual,
+    CursorImageVisual, CursorVectorAsset, CursorVectorPrimitive, CursorVectorVisual, CursorVisual,
+    DamageRegion, FrameRequestReason, GpuTimingStatus, OverlayKind, OverlayPrimitive, RenderCell,
+    RenderCellStyle, RenderColor, RenderCursorShape, RenderDecoration, RenderGrid,
+    RenderInstrumentation, RenderRecoveryEvent, RenderRecoveryReason, RenderRecoveryStatus,
+    RenderRect, RenderScene, RenderSurfaceStatus, SelectionVisual,
 };
+use serde::Deserialize;
 use winit::window::Window;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,6 +262,7 @@ pub struct DamageTracker {
     previous_cells: HashMap<CellPosition, CellFingerprint>,
     previous_cursor: Option<CursorVisual>,
     previous_cursor_image: Option<CursorImageVisual>,
+    previous_cursor_vector: Option<CursorVectorVisual>,
     previous_size: Option<(u16, u16)>,
     previous_offset: render_core::RenderOffset,
     previous_visuals: Vec<DamageRegion>,
@@ -302,6 +305,7 @@ impl DamageTracker {
                 .collect();
             self.previous_cursor = scene.cursor;
             self.previous_cursor_image = scene.cursor_image.clone();
+            self.previous_cursor_vector = scene.cursor_vector.clone();
             self.previous_visuals = visual_regions(scene, metrics);
             self.remember_visuals(scene);
             return vec![scene_grid_region(scene, metrics)];
@@ -369,6 +373,7 @@ impl DamageTracker {
             || self.previous_selections != scene.selections
             || self.previous_animations != scene.animations
             || self.previous_cursor_image != scene.cursor_image
+            || self.previous_cursor_vector != scene.cursor_vector
     }
 
     fn remember_visuals(&mut self, scene: &RenderScene) {
@@ -378,6 +383,7 @@ impl DamageTracker {
         self.previous_selections = scene.selections.clone();
         self.previous_animations = scene.animations.clone();
         self.previous_cursor_image = scene.cursor_image.clone();
+        self.previous_cursor_vector = scene.cursor_vector.clone();
     }
 }
 
@@ -402,6 +408,9 @@ fn visual_regions(scene: &RenderScene, metrics: CellMetrics) -> Vec<DamageRegion
         .collect::<Vec<_>>();
     if let Some(cursor_image) = &scene.cursor_image {
         regions.push(offset_region(cursor_image.bounds, scene.content_offset));
+    }
+    if let Some(cursor_vector) = &scene.cursor_vector {
+        regions.push(offset_region(cursor_vector.bounds, scene.content_offset));
     }
     regions.extend(scene.selections.iter().flat_map(|selection| {
         selection
@@ -1346,6 +1355,270 @@ fn cursor_image_asset_id(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+pub const CURSOR_VECTOR_FORMAT_VERSION: u16 = 1;
+pub const CURSOR_VECTOR_CANVAS_UNITS: u16 = 1000;
+pub const CURSOR_VECTOR_MAX_PRIMITIVES: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorVectorRequest {
+    pub path: PathBuf,
+    pub max_size_kb: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedCursorVector {
+    pub path: PathBuf,
+    pub size_kb: u32,
+    pub asset: Arc<CursorVectorAsset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CursorVectorStatus {
+    Disabled,
+    Loading { path: PathBuf },
+    Ready(DecodedCursorVector),
+    Failed { path: PathBuf, message: String },
+}
+
+#[derive(Debug, Default)]
+pub struct CursorVectorCache {
+    current: Option<CursorVectorStatus>,
+    pending: Option<Receiver<CursorVectorStatus>>,
+}
+
+impl CursorVectorCache {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn disable(&mut self) {
+        self.current = Some(CursorVectorStatus::Disabled);
+        self.pending = None;
+    }
+
+    pub fn request(&mut self, request: CursorVectorRequest) {
+        if request.path.as_os_str().is_empty() {
+            self.current = Some(CursorVectorStatus::Failed {
+                path: request.path,
+                message: "cursor vector path is empty".to_owned(),
+            });
+            self.pending = None;
+            return;
+        }
+        if matches!(
+            &self.current,
+            Some(CursorVectorStatus::Ready(vector)) if vector.path == request.path
+        ) {
+            return;
+        }
+
+        let path = request.path.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.current = Some(CursorVectorStatus::Loading { path: path.clone() });
+        self.pending = Some(receiver);
+        let spawn_result = thread::Builder::new()
+            .name("panea-cursor-vector-decode".to_owned())
+            .spawn(move || {
+                let status = decode_cursor_vector_request(request);
+                let _ = sender.send(status);
+            });
+        if let Err(error) = spawn_result {
+            self.current = Some(CursorVectorStatus::Failed {
+                path,
+                message: format!("failed to start cursor vector decoder: {error}"),
+            });
+            self.pending = None;
+        }
+    }
+
+    pub fn poll(&mut self) -> CursorVectorStatus {
+        if let Some(receiver) = &self.pending
+            && let Ok(status) = receiver.try_recv()
+        {
+            self.current = Some(status);
+            self.pending = None;
+        }
+        self.current.clone().unwrap_or(CursorVectorStatus::Disabled)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct CursorVectorRuntime {
+    vector: Option<DecodedCursorVector>,
+}
+
+impl CursorVectorRuntime {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_vector(&mut self, vector: &DecodedCursorVector) -> bool {
+        if self
+            .vector
+            .as_ref()
+            .is_some_and(|current| current.asset.id == vector.asset.id)
+        {
+            return false;
+        }
+        self.vector = Some(vector.clone());
+        true
+    }
+
+    pub fn clear(&mut self) -> bool {
+        self.vector.take().is_some()
+    }
+
+    pub fn populate_scene(&self, scene: &mut RenderScene, metrics: CellMetrics) {
+        let (Some(vector), Some(cursor)) = (&self.vector, scene.cursor) else {
+            scene.cursor_vector = None;
+            return;
+        };
+        let blink = scene
+            .animations
+            .iter()
+            .find(|animation| animation.kind == AnimationKind::CursorBlinkEasing);
+        if !cursor.visible && blink.is_none() {
+            scene.cursor_vector = None;
+            return;
+        }
+        let bounds = scene
+            .animations
+            .iter()
+            .find(|animation| animation.kind == AnimationKind::CursorSmoothMovement)
+            .map_or_else(
+                || cell_region(cursor.position, metrics),
+                |animation| {
+                    interpolate_region(
+                        animation.start_region,
+                        animation.end_region,
+                        ease_out_cubic(animation_progress(*animation)),
+                    )
+                },
+            );
+        scene.cursor_vector = Some(CursorVectorVisual {
+            asset: Arc::clone(&vector.asset),
+            bounds,
+            color: cursor.color,
+            opacity: blink.map_or(u8::MAX, |animation| {
+                let progress = animation_progress(*animation);
+                let alpha = if cursor.visible {
+                    progress
+                } else {
+                    1.0 - progress
+                };
+                (alpha.clamp(0.0, 1.0) * 255.0).round() as u8
+            }),
+        });
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CursorVectorDocument {
+    version: u16,
+    primitives: Vec<CursorVectorDocumentPrimitive>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CursorVectorDocumentPrimitive {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    #[serde(default)]
+    corner_radius: u16,
+    color: Option<[u8; 4]>,
+}
+
+fn decode_cursor_vector_request(request: CursorVectorRequest) -> CursorVectorStatus {
+    let path = request.path;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return CursorVectorStatus::Failed {
+                path,
+                message: format!("failed to read cursor vector: {error}"),
+            };
+        }
+    };
+    let size_kb = u32::try_from(bytes.len().div_ceil(1024)).unwrap_or(u32::MAX);
+    if size_kb > request.max_size_kb {
+        return CursorVectorStatus::Failed {
+            path,
+            message: format!(
+                "cursor vector is {size_kb} KiB, above the configured {} KiB limit",
+                request.max_size_kb
+            ),
+        };
+    }
+    match decode_cursor_vector(&bytes) {
+        Ok(primitives) => CursorVectorStatus::Ready(DecodedCursorVector {
+            path,
+            size_kb,
+            asset: Arc::new(CursorVectorAsset {
+                id: cursor_image_asset_id(&bytes),
+                primitives: primitives.into(),
+            }),
+        }),
+        Err(message) => CursorVectorStatus::Failed { path, message },
+    }
+}
+
+fn decode_cursor_vector(bytes: &[u8]) -> Result<Vec<CursorVectorPrimitive>, String> {
+    let document: CursorVectorDocument = serde_json::from_slice(bytes)
+        .map_err(|error| format!("cursor vector must be valid Panea JSON: {error}"))?;
+    if document.version != CURSOR_VECTOR_FORMAT_VERSION {
+        return Err(format!(
+            "unsupported cursor vector version {}; expected {}",
+            document.version, CURSOR_VECTOR_FORMAT_VERSION
+        ));
+    }
+    if document.primitives.is_empty() {
+        return Err("cursor vector must contain at least one primitive".to_owned());
+    }
+    if document.primitives.len() > CURSOR_VECTOR_MAX_PRIMITIVES {
+        return Err(format!(
+            "cursor vector exceeds the {CURSOR_VECTOR_MAX_PRIMITIVES}-primitive limit"
+        ));
+    }
+
+    document
+        .primitives
+        .into_iter()
+        .enumerate()
+        .map(|(index, primitive)| {
+            let right = primitive.x.saturating_add(primitive.width);
+            let bottom = primitive.y.saturating_add(primitive.height);
+            if primitive.width == 0
+                || primitive.height == 0
+                || right > CURSOR_VECTOR_CANVAS_UNITS
+                || bottom > CURSOR_VECTOR_CANVAS_UNITS
+                || primitive.corner_radius > CURSOR_VECTOR_CANVAS_UNITS / 2
+            {
+                return Err(format!(
+                    "cursor vector primitive {index} is outside the 1000x1000 canvas or has invalid geometry"
+                ));
+            }
+            Ok(CursorVectorPrimitive {
+                x: primitive.x,
+                y: primitive.y,
+                width: primitive.width,
+                height: primitive.height,
+                corner_radius: primitive.corner_radius,
+                color: primitive.color.map(|color| RenderColor {
+                    red: color[0],
+                    green: color[1],
+                    blue: color[2],
+                    alpha: color[3],
+                }),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 fn decode_cursor_image_header(bytes: &[u8]) -> Option<(u32, u32, u16)> {
     if bytes.len() >= 10 && (&bytes[0..6] == b"GIF87a" || &bytes[0..6] == b"GIF89a") {
@@ -1643,12 +1916,13 @@ impl RenderBatchPlanner {
             &scene.animations,
             &damage_regions,
             scene.content_offset,
-            scene.cursor_image.is_some(),
+            scene.cursor_image.is_some() || scene.cursor_vector.is_some(),
         );
 
         if let Some(cursor_visual) = scene.cursor
             && cursor_visual.visible
             && scene.cursor_image.is_none()
+            && scene.cursor_vector.is_none()
             && !scene
                 .animations
                 .iter()
@@ -1679,6 +1953,10 @@ impl RenderBatchPlanner {
                 None
             }
         });
+
+        if let Some(vector) = &scene.cursor_vector {
+            push_cursor_vector_quads(&mut cursor, vector, &damage_regions, scene.content_offset);
+        }
 
         instrumentation.draw_call_count = count_non_empty_batches([
             !background.is_empty(),
@@ -2343,6 +2621,40 @@ fn push_cursor_quads(
         u32::from(cursor.corner_radius_px),
         cursor.color,
     );
+}
+
+fn push_cursor_vector_quads(
+    batch: &mut QuadBatch,
+    vector: &CursorVectorVisual,
+    damage_regions: &[DamageRegion],
+    offset: render_core::RenderOffset,
+) {
+    let bounds = offset_region(vector.bounds, offset);
+    if !intersects_any(bounds, damage_regions) {
+        return;
+    }
+    for primitive in vector.asset.primitives.iter() {
+        let scale = |value: u16, extent: u32| {
+            (u64::from(value) * u64::from(extent) / u64::from(CURSOR_VECTOR_CANVAS_UNITS)) as u32
+        };
+        let rect = RenderRect {
+            x: bounds.x.saturating_add(
+                i32::try_from(scale(primitive.x, bounds.width)).unwrap_or(i32::MAX),
+            ),
+            y: bounds.y.saturating_add(
+                i32::try_from(scale(primitive.y, bounds.height)).unwrap_or(i32::MAX),
+            ),
+            width: scale(primitive.width, bounds.width).max(1),
+            height: scale(primitive.height, bounds.height).max(1),
+        };
+        let mut color = primitive.color.unwrap_or(vector.color);
+        color.alpha = ((u16::from(color.alpha) * u16::from(vector.opacity)) / 255) as u8;
+        let radius = scale(
+            primitive.corner_radius,
+            rect.width.min(rect.height).saturating_mul(2),
+        );
+        push_rounded_quads(batch, rect, radius, color);
+    }
 }
 
 fn push_rounded_quads(batch: &mut QuadBatch, rect: RenderRect, radius: u32, color: RenderColor) {
@@ -6030,6 +6342,58 @@ mod tests {
     }
 
     #[test]
+    fn panea_vector_cursor_format_is_bounded_and_batches_primitives() {
+        let bytes = br#"{
+            "version": 1,
+            "primitives": [
+                {"x": 0, "y": 0, "width": 250, "height": 1000, "corner_radius": 0},
+                {"x": 250, "y": 400, "width": 750, "height": 200, "corner_radius": 0,
+                 "color": [10, 20, 30, 255]}
+            ]
+        }"#;
+        let primitives = decode_cursor_vector(bytes).expect("valid vector cursor");
+        assert_eq!(primitives.len(), 2);
+        let visual = CursorVectorVisual {
+            asset: Arc::new(CursorVectorAsset {
+                id: 1,
+                primitives: primitives.into(),
+            }),
+            bounds: RenderRect {
+                x: 10,
+                y: 20,
+                width: 20,
+                height: 40,
+            },
+            color: RenderColor::rgb(255, 255, 255),
+            opacity: 255,
+        };
+        let mut batch = QuadBatch::new(QuadBatchKind::Cursor);
+        push_cursor_vector_quads(
+            &mut batch,
+            &visual,
+            &[RenderRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }],
+            render_core::RenderOffset::default(),
+        );
+        assert_eq!(batch.quad_count(), 2);
+    }
+
+    #[test]
+    fn panea_vector_cursor_rejects_unknown_or_out_of_bounds_data() {
+        let unknown = br#"{"version":1,"unknown":true,"primitives":[]}"#;
+        assert!(decode_cursor_vector(unknown).is_err());
+        let outside = br#"{
+            "version": 1,
+            "primitives": [{"x": 900, "y": 0, "width": 200, "height": 10}]
+        }"#;
+        assert!(decode_cursor_vector(outside).is_err());
+    }
+
+    #[test]
     fn animated_gif_frames_decode_to_cached_rgba_with_limits() {
         let mut encoded = Vec::new();
         {
@@ -6126,6 +6490,60 @@ mod tests {
             .frame_index = 1;
         let damage = tracker.update(&second, metrics());
         assert_eq!(damage, vec![bounds]);
+    }
+
+    #[test]
+    fn vector_cursor_is_batched_and_damages_only_old_and_new_bounds() {
+        let asset = Arc::new(CursorVectorAsset {
+            id: 9,
+            primitives: vec![CursorVectorPrimitive {
+                x: 0,
+                y: 0,
+                width: 1000,
+                height: 1000,
+                corner_radius: 0,
+                color: None,
+            }]
+            .into(),
+        });
+        let first_bounds = RenderRect {
+            x: 8,
+            y: 16,
+            width: 8,
+            height: 16,
+        };
+        let mut first = scene(vec![cell(0, 0, "a")]);
+        first.cursor_vector = Some(CursorVectorVisual {
+            asset: Arc::clone(&asset),
+            bounds: first_bounds,
+            color: RenderColor::rgb(40, 80, 120),
+            opacity: 255,
+        });
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let batches = RenderBatchPlanner::default()
+            .prepare_full(&first, &mut fonts)
+            .expect("vector cursor scene should prepare");
+        assert!(batches.cursor.quad_count() >= 1);
+        assert!(batches.cursor_image.is_empty());
+
+        let mut tracker = DamageTracker::new();
+        let _ = tracker.update(&first, metrics());
+        let mut second = first.clone();
+        let second_bounds = RenderRect {
+            x: 12,
+            ..first_bounds
+        };
+        second.cursor_vector.as_mut().expect("cursor vector").bounds = second_bounds;
+        let damage = tracker.update(&second, metrics());
+        assert_eq!(
+            damage,
+            vec![RenderRect {
+                x: 8,
+                y: 16,
+                width: 12,
+                height: 16,
+            }]
+        );
     }
 
     #[test]

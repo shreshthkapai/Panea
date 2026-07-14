@@ -283,6 +283,20 @@ impl AppConfig {
                 );
             }
         }
+        if self.cursor.vector.enabled {
+            if self.cursor.vector.path.trim().is_empty() {
+                report.error(
+                    "cursor.vector.path",
+                    "vector cursors require a non-empty asset path",
+                );
+            }
+            if self.cursor.image.enabled {
+                report.error(
+                    "cursor.vector.enabled",
+                    "image and vector cursor assets cannot be enabled at the same time",
+                );
+            }
+        }
         if self.cursor.animations_enabled {
             let requested_effects = [
                 self.cursor.smooth_movement,
@@ -1312,6 +1326,7 @@ pub struct CursorConfig {
     pub short_lived_glow: bool,
     pub shadow: bool,
     pub image: CursorImageConfig,
+    pub vector: CursorVectorConfig,
 }
 
 impl Default for CursorConfig {
@@ -1335,6 +1350,7 @@ impl Default for CursorConfig {
             short_lived_glow: false,
             shadow: false,
             image: CursorImageConfig::default(),
+            vector: CursorVectorConfig::default(),
         }
     }
 }
@@ -1346,6 +1362,13 @@ pub struct CursorImageConfig {
     pub path: String,
     pub fps: u16,
     pub warn_if_expensive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CursorVectorConfig {
+    pub enabled: bool,
+    pub path: String,
 }
 
 impl Default for CursorImageConfig {
@@ -2381,6 +2404,7 @@ pub struct CursorConfigPatch {
     pub short_lived_glow: Option<bool>,
     pub shadow: Option<bool>,
     pub image: Option<CursorImageConfigPatch>,
+    pub vector: Option<CursorVectorConfigPatch>,
 }
 
 impl CursorConfigPatch {
@@ -2409,6 +2433,9 @@ impl CursorConfigPatch {
         if let Some(image) = &self.image {
             image.apply_to(&mut config.image);
         }
+        if let Some(vector) = &self.vector {
+            vector.apply_to(&mut config.vector);
+        }
     }
 }
 
@@ -2427,6 +2454,20 @@ impl CursorImageConfigPatch {
         apply_opt(&mut config.path, &self.path);
         apply_opt(&mut config.fps, &self.fps);
         apply_opt(&mut config.warn_if_expensive, &self.warn_if_expensive);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CursorVectorConfigPatch {
+    pub enabled: Option<bool>,
+    pub path: Option<String>,
+}
+
+impl CursorVectorConfigPatch {
+    fn apply_to(&self, config: &mut CursorVectorConfig) {
+        apply_opt(&mut config.enabled, &self.enabled);
+        apply_opt(&mut config.path, &self.path);
     }
 }
 
@@ -3199,6 +3240,20 @@ pub fn export_schema() -> ConfigSchema {
                         "cursor.image.warn_if_expensive",
                         "boolean",
                         default.cursor.image.warn_if_expensive,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "cursor.vector.enabled",
+                        "boolean",
+                        default.cursor.vector.enabled,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "cursor.vector.path",
+                        "string",
+                        &default.cursor.vector.path,
                         true,
                         false,
                     ),
@@ -3978,6 +4033,27 @@ mod tests {
         let report = config.validate();
         assert!(report.diagnostics.iter().any(|diagnostic| {
             diagnostic.path == "performance.max_cursor_asset_size_kb"
+                && diagnostic.severity == ConfigDiagnosticSeverity::Error
+        }));
+    }
+
+    #[test]
+    fn vector_cursor_is_opt_in_and_mutually_exclusive_with_images() {
+        let mut config = AppConfig::default();
+        assert!(!config.cursor.vector.enabled);
+        config.cursor.vector.enabled = true;
+        let report = config.validate();
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == "cursor.vector.path"
+                && diagnostic.severity == ConfigDiagnosticSeverity::Error
+        }));
+
+        config.cursor.vector.path = "cursor.panea-cursor.json".to_owned();
+        config.cursor.image.enabled = true;
+        config.cursor.image.path = "cursor.png".to_owned();
+        let report = config.validate();
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == "cursor.vector.enabled"
                 && diagnostic.severity == ConfigDiagnosticSeverity::Error
         }));
     }

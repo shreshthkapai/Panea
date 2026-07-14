@@ -14,6 +14,8 @@ bytemuck.workspace = true
 font-system = { path = "../font-system" }
 image.workspace = true
 render-core = { path = "../render-core" }
+serde.workspace = true
+serde_json.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 

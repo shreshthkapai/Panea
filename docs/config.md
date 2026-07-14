@@ -286,6 +286,10 @@ path = ""
 fps = 24
 warn_if_expensive = true
 
+[cursor.vector]
+enabled = false
+path = ""
+
 [prompt_decorations]
 enabled = true
 style = "minimal_separator"
@@ -322,6 +326,11 @@ resolved from the config file directory; `~/...` uses the current platform home
 directory. Image cursors are opt-in, decoded off the render thread, and bounded
 by the performance cursor-asset and animation budgets. See
 `crates/assets/config-examples/custom-cursor.toml`.
+
+`cursor.vector.path` accepts Panea's versioned, data-only static vector JSON
+format. It is compiled off the render thread into a cached GPU cursor batch,
+uses the same asset-size budget, and is mutually exclusive with `cursor.image`.
+See `docs/cursor-customization.md` and the packaged `cursor-vectors/` example.
 
 Command block styles are `traditional`, `subtle`, `card`, `split`,
 `minimal_header`, and `custom_theme`. `Ctrl+Shift+G` toggles collapse for the

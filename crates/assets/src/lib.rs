@@ -67,7 +67,16 @@ pub const CURSOR_PROFILES: &[ConfigExample] = &[
         name: "image-template.toml",
         contents: include_str!("../cursor-profiles/image-template.toml"),
     },
+    ConfigExample {
+        name: "vector-template.toml",
+        contents: include_str!("../cursor-profiles/vector-template.toml"),
+    },
 ];
+
+pub const CURSOR_VECTOR_ASSETS: &[ConfigExample] = &[ConfigExample {
+    name: "chevron.panea-cursor.json",
+    contents: include_str!("../cursor-vectors/chevron.panea-cursor.json"),
+}];
 
 #[must_use]
 pub fn config_example(name: &str) -> Option<&'static str> {
@@ -88,7 +97,8 @@ mod tests {
         assert!(config_example("foundational-customization.toml").is_some());
         assert_eq!(PROGRAMMABLE_CONFIG_EXAMPLES.len(), 1);
         assert_eq!(THEMES.len(), 2);
-        assert_eq!(CURSOR_PROFILES.len(), 3);
+        assert_eq!(CURSOR_PROFILES.len(), 4);
+        assert_eq!(CURSOR_VECTOR_ASSETS.len(), 1);
     }
 
     #[test]

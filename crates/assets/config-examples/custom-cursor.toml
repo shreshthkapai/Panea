@@ -18,6 +18,12 @@ path = "assets/my-cursor.gif"
 fps = 24
 warn_if_expensive = true
 
+# Panea vector cursors are bounded, data-only JSON and are rendered through
+# the same GPU cursor batch. Image and vector assets are mutually exclusive.
+[cursor.vector]
+enabled = false
+path = "assets/my-cursor.panea-cursor.json"
+
 [performance]
 max_animation_fps = 60
 max_cursor_asset_size_kb = 256

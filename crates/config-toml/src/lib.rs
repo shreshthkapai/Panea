@@ -786,6 +786,9 @@ fn known_paths() -> BTreeSet<&'static str> {
         "cursor.image.path",
         "cursor.image.fps",
         "cursor.image.warn_if_expensive",
+        "cursor.vector",
+        "cursor.vector.enabled",
+        "cursor.vector.path",
         "command_blocks",
         "command_blocks.enabled",
         "command_blocks.style",
@@ -1510,6 +1513,27 @@ mod tests {
             config_core::PerformanceOverlayDetail::Detailed
         );
         assert!(!loaded.config.diagnostics.persist_performance_overlay);
+        assert!(loaded.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn portable_vector_cursor_config_parses_without_unknown_keys() {
+        let loaded = parse_str(
+            r#"
+            schema_version = 2
+            [cursor.vector]
+            enabled = true
+            path = "assets/cursor.panea-cursor.json"
+            "#,
+            None,
+            ConfigPlatform::Windows,
+        )
+        .expect("vector cursor config should parse");
+        assert!(loaded.config.cursor.vector.enabled);
+        assert_eq!(
+            loaded.config.cursor.vector.path,
+            "assets/cursor.panea-cursor.json"
+        );
         assert!(loaded.diagnostics.is_empty());
     }
 

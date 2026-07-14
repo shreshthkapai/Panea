@@ -17,8 +17,8 @@ multiplexer, shell-integration, visual, and SSH paths with informed users.
   integration, and reconnect presentation.
 - Clipboard policy, paste protection, bounded OSC 52 handling, diagnostics,
   performance instrumentation, and renderer recovery contracts.
-- Windows portable ZIP and per-user installer with packaged doctor and local
-  shell smoke commands.
+- Windows ZIP/installer, macOS app/ZIP/DMG, and Linux tarball/deb/AppImage/RPM
+  builders with packaged doctor, local-shell, and first-frame GUI smokes.
 
 ## Explicit Limits
 
@@ -28,8 +28,9 @@ multiplexer, shell-integration, visual, and SSH paths with informed users.
 - Editors, TUIs, tmux/screen/zellij, WSL, SSH servers, IME, clipboard, GPU
   device-loss, and compositor behavior still require broader interactive and
   real-host evidence.
-- Windows artifacts are not Authenticode-signed. macOS artifacts are not signed
-  or notarized. Linux AppImage and RPM artifacts are not produced yet.
+- Signing/notarization hooks exist, but public artifacts are not considered
+  signed until release-owner credentials run and verification evidence is
+  collected. Non-Windows formats remain unverified on their native hosts.
 - The native iOS companion remains a shared-engine foundation, not an app.
 - Performance is instrumented and benchmarkable, but Panea makes no claim of
   outperforming another terminal without a controlled reproducible comparison.
@@ -39,7 +40,7 @@ multiplexer, shell-integration, visual, and SSH paths with informed users.
 An alpha build must compile, pass workspace unit tests and layer checks, retain
 the previous valid configuration after reload failure, keep PTY shutdown
 bounded, deny unsafe clipboard and SSH actions by default, and pass its packaged
-doctor and local-shell smoke commands. A platform is listed as verified only
+doctor, local-shell, and first-frame GUI smoke commands. A platform is listed as verified only
 after those checks and the platform-specific manual checklist run on that OS.
 
 Alpha bug reports should include `panea doctor --json` output. Diagnostic

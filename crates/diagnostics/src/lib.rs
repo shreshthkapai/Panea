@@ -160,7 +160,7 @@ pub fn feature_parity_matrix() -> Vec<PlatformFeatureStatus> {
             windows: Partial,
             linux_x11: Partial,
             linux_wayland: Partial,
-            notes: "opt-in config, bounded cursor-region animation runtime, and image asset metadata cache exist; cross-OS visual verification and full image cursor drawing remain open",
+            notes: "opt-in cursor animations, bounded image decode/cache/upload, and bounded data-only static vector cursor batching exist; cross-OS visual verification remains open",
         },
         PlatformFeatureStatus {
             feature: "SSH",
@@ -1601,7 +1601,7 @@ pub fn packaging_plan() -> PackagingPlan {
                 requirements: vec![
                     "artifact builders include binary, assets, config, and shell scripts",
                     "run package smoke on a macOS release host",
-                    "sign and notarize with release-owner credentials before public release",
+                    "codesign/notarytool hooks exist; supply release-owner credentials and collect host evidence",
                 ],
             },
             PackageTarget {
@@ -1609,8 +1609,8 @@ pub fn packaging_plan() -> PackagingPlan {
                 status: ReadinessStatus::Pass,
                 requirements: vec![
                     "per-user install, atomic upgrade, Start menu, PATH, and uninstall are implemented",
-                    "current-host install/doctor/shell/uninstall smoke passed",
-                    "Authenticode signing requires a release certificate",
+                    "current-host install/doctor/shell/GUI/uninstall smoke is the release gate",
+                    "Authenticode sign/verify hooks require a release certificate",
                 ],
             },
             PackageTarget {
@@ -1618,25 +1618,25 @@ pub fn packaging_plan() -> PackagingPlan {
                 status: ReadinessStatus::Pass,
                 requirements: vec![
                     "portable ZIP includes binary, assets, themes, cursor profiles, and scripts",
-                    "current-host packaged doctor and shell smoke passed",
+                    "current-host packaged doctor, shell, and first-frame GUI smokes are required",
                 ],
             },
             PackageTarget {
-                target: "Linux portable tarball",
+                target: "Linux portable tarball and AppImage",
                 status: ReadinessStatus::Warning,
                 requirements: vec![
                     "portable tarball builder includes binary, assets, themes, and scripts",
                     "run package smoke on Linux X11 and Wayland hosts",
-                    "AppImage remains an additional optional distribution format",
+                    "AppImage builder emits a desktop-integrated AppDir artifact through appimagetool",
                 ],
             },
             PackageTarget {
-                target: "Linux distro packages (deb; rpm later)",
+                target: "Linux distro packages (deb and rpm)",
                 status: ReadinessStatus::Warning,
                 requirements: vec![
                     "deb builder includes /usr binary, desktop entry, icon, and resources",
                     "validate package dependencies and installation on supported distributions",
-                    "rpm remains a future distribution format",
+                    "rpm builder emits the same /usr layout through rpmbuild",
                 ],
             },
         ],

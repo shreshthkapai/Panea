@@ -25,7 +25,7 @@ cargo xtask package build --profile release
 ```
 
 Windows emits a portable ZIP and per-user installer EXE. macOS emits an app
-ZIP and DMG. Linux emits a portable tarball and deb. Validate staged binaries
+ZIP and DMG. Linux emits a portable tarball, deb, AppImage, and RPM. Validate staged binaries
 and, on Windows, the full install/uninstall path with:
 
 ```powershell
@@ -33,7 +33,8 @@ cargo xtask package smoke --profile release
 ```
 
 Artifacts are written under `target/packages/`. macOS signing/notarization and
-Windows signing require release-owner credentials. Panea is distributed under
+Windows signing require release-owner credentials; tagged release CI fails if
+those credentials are absent. Panea is distributed under
 the dual `MIT OR Apache-2.0` license.
 
 The app loads the default portable config when no user config exists. Generate a

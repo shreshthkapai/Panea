@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "primitives": [
+    { "x": 80, "y": 80, "width": 220, "height": 840, "corner_radius": 80 },
+    { "x": 300, "y": 390, "width": 620, "height": 220, "corner_radius": 80 }
+  ]
+}

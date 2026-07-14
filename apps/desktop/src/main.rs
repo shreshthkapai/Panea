@@ -7,6 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError},
     },
     thread,
@@ -47,7 +48,8 @@ use render_core::{
 use render_wgpu::{
     AnimatedCursorImageCache, AnimatedCursorImageRequest, AnimatedCursorImageRuntime,
     AnimatedCursorImageStatus, CursorAnimationRuntime, CursorAnimationSettings, CursorBlinkRuntime,
-    DamageTracker, FrameDecision, FrameScheduler, GpuTerminalRenderer, PresentMode, RendererError,
+    CursorVectorCache, CursorVectorRequest, CursorVectorRuntime, CursorVectorStatus, DamageTracker,
+    FrameDecision, FrameScheduler, GpuTerminalRenderer, PresentMode, RendererError,
     RendererOptions,
 };
 use security::{
@@ -90,11 +92,14 @@ use winit::{
 };
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("gui-smoke") {
+        std::process::exit(run_gui_smoke_cli());
+    }
     if let Some(code) = run_cli() {
         std::process::exit(code);
     }
 
-    if let Err(error) = run() {
+    if let Err(error) = run(None) {
         eprintln!("panea desktop failed: {error}");
         std::process::exit(1);
     }
@@ -121,10 +126,71 @@ fn print_cli_help() {
         "usage: panea doctor [window|renderer|config|shell|ssh|fonts|clipboard|notifications] [--json]"
     );
     eprintln!("usage: panea shell-smoke [--json] [--timeout-ms <ms>]");
+    eprintln!("usage: panea gui-smoke [--json] [--timeout-ms <ms>]");
     eprintln!(
         "usage: panea shell-integration export --shell <bash|zsh|fish|powershell> --output <path>"
     );
     eprintln!("usage: panea shell-integration remote-plan --shell <shell> [--profile <name>]");
+}
+
+#[derive(Debug, Clone)]
+struct GuiSmokeOptions {
+    timeout: Duration,
+    completed: Arc<AtomicBool>,
+}
+
+fn run_gui_smoke_cli() -> i32 {
+    let args = std::env::args().skip(2).collect::<Vec<_>>();
+    let json = args.iter().any(|arg| arg == "--json");
+    let mut timeout = Duration::from_secs(10);
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {}
+            "--timeout-ms" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    eprintln!("--timeout-ms requires a value");
+                    return 2;
+                };
+                let Ok(millis) = value.parse::<u64>() else {
+                    eprintln!("invalid --timeout-ms value: {value}");
+                    return 2;
+                };
+                if millis < 1000 {
+                    eprintln!("--timeout-ms must be at least 1000");
+                    return 2;
+                }
+                timeout = Duration::from_millis(millis);
+            }
+            other => {
+                eprintln!("unknown gui-smoke option: {other}");
+                return 2;
+            }
+        }
+        index += 1;
+    }
+
+    let completed = Arc::new(AtomicBool::new(false));
+    let started = Instant::now();
+    let result = run(Some(GuiSmokeOptions {
+        timeout,
+        completed: Arc::clone(&completed),
+    }));
+    let passed = result.is_ok() && completed.load(Ordering::Acquire);
+    if json {
+        println!(
+            "{{\"name\":\"gui-smoke\",\"status\":\"{}\",\"duration_ms\":{},\"milestone\":\"window_renderer_session_first_frame\"}}",
+            if passed { "passed" } else { "failed" },
+            started.elapsed().as_millis()
+        );
+    }
+    if let Err(error) = result {
+        eprintln!("gui smoke failed: {error}");
+    } else if !passed {
+        eprintln!("gui smoke timed out before the first rendered session frame");
+    }
+    i32::from(!passed)
 }
 
 fn run_shell_integration_cli(args: &[String]) -> i32 {
@@ -888,7 +954,10 @@ fn font_discovery_label(config: &AppConfig) -> String {
         .join("; ")
 }
 
-fn run() -> Result<(), Box<dyn Error>> {
+fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
+    if gui_smoke.is_some() {
+        eprintln!("gui-smoke milestone=config-load-start");
+    }
     let loaded_config = load_desktop_config()?;
     log_config_diagnostics(&loaded_config.diagnostics);
     let mut config = loaded_config.config;
@@ -912,6 +981,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     let settings = window_settings(&config);
     let event_loop = create_event_loop(settings.linux_backend)?;
     let desktop_window = DesktopWindow::create(&event_loop, &settings)?;
+    if gui_smoke.is_some() {
+        eprintln!("gui-smoke milestone=window-created");
+    }
     if let Some(fallback) = desktop_window.diagnostics().window_mode.fallback.as_ref() {
         eprintln!(
             "platform fallback [{}]: requested={} effective={} reason={}",
@@ -955,6 +1027,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         Arc::clone(&window),
         renderer_options(&config),
     ))?;
+    if gui_smoke.is_some() {
+        eprintln!("gui-smoke milestone=renderer-created");
+    }
     if config.window.opacity < 1.0 && !renderer.transparency_active() {
         eprintln!(
             "window opacity fallback: GPU/window backend exposes only opaque composition; rendering remains fully opaque"
@@ -977,16 +1052,32 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut cursor_image_cache = AnimatedCursorImageCache::new();
     let mut cursor_image_runtime = AnimatedCursorImageRuntime::new();
     let mut cursor_image_status_reported: Option<String> = None;
+    let mut cursor_vector_cache = CursorVectorCache::new();
+    let mut cursor_vector_runtime = CursorVectorRuntime::new();
+    let mut cursor_vector_status_reported: Option<String> = None;
     request_cursor_image_if_enabled(
         &mut cursor_image_cache,
+        &config,
+        cursor_asset_base_dir.as_deref(),
+    );
+    request_cursor_vector_if_enabled(
+        &mut cursor_vector_cache,
         &config,
         cursor_asset_base_dir.as_deref(),
     );
     let mut surface_size = window.inner_size();
     let mut mux_runtime =
         MuxRuntime::new(&config, metrics, surface_size.width, surface_size.height);
+    if gui_smoke.is_some() {
+        eprintln!("gui-smoke milestone=session-created");
+    }
 
     scheduler.terminal_content_changed();
+    let gui_smoke_deadline = gui_smoke
+        .as_ref()
+        .map(|smoke| Instant::now() + smoke.timeout);
+    let gui_smoke_completed = gui_smoke.map(|smoke| smoke.completed);
+    let gui_smoke_result = gui_smoke_completed.clone();
 
     event_loop.run(move |event, target| {
         target.set_control_flow(ControlFlow::Wait);
@@ -1001,6 +1092,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         &config,
                         Some(&mut cursor_animator),
                         Some(&mut cursor_image_runtime),
+                        Some(&mut cursor_vector_runtime),
                         CursorPresentation {
                             blink_visible: cursor_blink.visible(),
                             window_focused,
@@ -1051,6 +1143,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                                     performance_overlay.render_text(performance_budget)
                             {
                                 eprintln!("performance {text}");
+                            }
+                            if let Some(completed) = &gui_smoke_completed {
+                                eprintln!("gui-smoke milestone=first-frame-presented");
+                                completed.store(true, Ordering::Release);
+                                target.exit();
                             }
                         }
                         Ok(Err(error)) => match error {
@@ -1516,6 +1613,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
             },
             Event::AboutToWait => {
+                if gui_smoke_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    eprintln!("gui-smoke milestone=timeout");
+                    target.exit();
+                    return;
+                }
                 if let Some(config_watcher) = config_watcher.as_mut() {
                     match config_watcher.poll() {
                         DesktopConfigWatchEvent::Unchanged => {}
@@ -1583,6 +1685,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                                         cursor_asset_base_dir.as_deref(),
                                     );
                                     cursor_image_status_reported = None;
+                                    request_cursor_vector_if_enabled(
+                                        &mut cursor_vector_cache,
+                                        &config,
+                                        cursor_asset_base_dir.as_deref(),
+                                    );
+                                    cursor_vector_status_reported = None;
                                     if reloaded {
                                         if let Ok(metrics) = fonts.cell_metrics() {
                                             mux_runtime.resize_all(
@@ -1629,6 +1737,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                         cursor_asset_base_dir.as_deref(),
                     );
                     cursor_image_status_reported = None;
+                    request_cursor_vector_if_enabled(
+                        &mut cursor_vector_cache,
+                        &config,
+                        cursor_asset_base_dir.as_deref(),
+                    );
+                    cursor_vector_status_reported = None;
                     update_performance_overlay_context(
                         &mut performance_overlay,
                         &config,
@@ -1684,6 +1798,33 @@ fn run() -> Result<(), Box<dyn Error>> {
                     AnimatedCursorImageStatus::Loading { .. } => {}
                 }
 
+                match cursor_vector_cache.poll() {
+                    CursorVectorStatus::Ready(vector) => {
+                        if cursor_vector_runtime.set_vector(&vector) {
+                            scheduler.terminal_content_changed();
+                            window.request_redraw();
+                        }
+                    }
+                    CursorVectorStatus::Failed { path, message } => {
+                        if cursor_vector_runtime.clear() {
+                            scheduler.terminal_content_changed();
+                            window.request_redraw();
+                        }
+                        let key = format!("{}:{message}", path.display());
+                        if cursor_vector_status_reported.as_deref() != Some(&key) {
+                            eprintln!("cursor vector {} failed: {message}", path.display());
+                            cursor_vector_status_reported = Some(key);
+                        }
+                    }
+                    CursorVectorStatus::Disabled => {
+                        if cursor_vector_runtime.clear() {
+                            scheduler.terminal_content_changed();
+                            window.request_redraw();
+                        }
+                    }
+                    CursorVectorStatus::Loading { .. } => {}
+                }
+
                 let cursor_settings = cursor_animation_settings(&config);
                 let blink_enabled = window_focused
                     && config.cursor.blink
@@ -1708,6 +1849,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                     }
                     target.set_control_flow(ControlFlow::WaitUntil(Instant::now() + delay));
                 }
+                if let Some(deadline) = gui_smoke_deadline {
+                    target.set_control_flow(ControlFlow::WaitUntil(deadline));
+                }
 
                 if matches!(scheduler.next_frame(), FrameDecision::FrameNeeded(_)) {
                     window.request_redraw();
@@ -1716,6 +1860,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             _ => {}
         }
     })?;
+
+    if gui_smoke_result.is_some() {
+        eprintln!("gui-smoke milestone=event-loop-exited");
+    }
 
     Ok(())
 }
@@ -1970,6 +2118,21 @@ fn request_cursor_image_if_enabled(
             .max(1),
         max_size_kb: config.performance.max_cursor_asset_size_kb,
         warn_if_expensive: config.cursor.image.warn_if_expensive,
+    });
+}
+
+fn request_cursor_vector_if_enabled(
+    cache: &mut CursorVectorCache,
+    config: &AppConfig,
+    config_base_dir: Option<&Path>,
+) {
+    if !config.cursor.vector.enabled {
+        cache.disable();
+        return;
+    }
+    cache.request(CursorVectorRequest {
+        path: resolve_cursor_image_path(&config.cursor.vector.path, config_base_dir),
+        max_size_kb: config.performance.max_cursor_asset_size_kb,
     });
 }
 
@@ -5602,6 +5765,7 @@ fn scene_from_mux(
     config: &AppConfig,
     cursor_animator: Option<&mut CursorAnimationRuntime>,
     cursor_image_runtime: Option<&mut AnimatedCursorImageRuntime>,
+    cursor_vector_runtime: Option<&mut CursorVectorRuntime>,
     cursor: CursorPresentation,
 ) -> RenderScene {
     let mut scene = RenderScene {
@@ -5646,6 +5810,9 @@ fn scene_from_mux(
         }
         if let Some(cursor_image_runtime) = cursor_image_runtime {
             cursor_image_runtime.populate_scene(&mut scene, metrics);
+        }
+        if let Some(cursor_vector_runtime) = cursor_vector_runtime {
+            cursor_vector_runtime.populate_scene(&mut scene, metrics);
         }
         append_active_ime_overlay(&mut scene, runtime, metrics);
         append_ssh_product_overlay(&mut scene, runtime, metrics);

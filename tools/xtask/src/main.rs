@@ -3115,18 +3115,17 @@ fn print_package_plan() {
     println!("Implemented package artifacts:");
     println!("- windows: staged directory, portable ZIP, and per-user installer EXE");
     println!("- macos: Panea.app bundle, distribution ZIP, and DMG");
-    println!("- linux: staged directory, portable tar.gz, and deb package");
+    println!("- linux: staged directory, portable tar.gz, deb, AppImage, and rpm packages");
     println!();
     println!("Build on each target OS:");
     println!("  cargo xtask package build --profile release");
     println!("Smoke the packaged doctor command:");
     println!("  cargo xtask package smoke --profile release --build");
-    println!("The smoke also runs the packaged headless shell-session command:");
+    println!("The smoke also runs packaged headless shell and first-frame GUI commands:");
     println!("  panea shell-smoke --json");
+    println!("  panea gui-smoke --json");
     println!();
-    println!(
-        "Signing/notarization and Linux AppImage/rpm remain credential/toolchain release steps."
-    );
+    println!("Signing and notarization activate through documented release credentials.");
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3313,6 +3312,12 @@ fn smoke_package(options: &PackageOptions) -> ExitCode {
     }
 
     println!("{}", shell_smoke.render_line());
+    let gui_smoke = run_packaged_gui_smoke(&layout.binary_path, options.timeout);
+    if gui_smoke.status != PackageSmokeStatus::Passed {
+        eprintln!("{}", gui_smoke.render_line());
+        return ExitCode::from(1);
+    }
+    println!("{}", gui_smoke.render_line());
     if options.target_platform == CompatPlatform::Windows {
         let installer_smoke = run_windows_installer_smoke(options);
         if installer_smoke.status != PackageSmokeStatus::Passed {
@@ -3483,6 +3488,7 @@ fn emit_windows_artifacts(
     options: &PackageOptions,
     layout: &PackageLayout,
 ) -> Result<Vec<DistributionArtifact>, String> {
+    sign_windows_file(&layout.binary_path)?;
     let archive = options.out_dir.join(format!(
         "{}.zip",
         artifact_stem(options, "windows-portable")
@@ -3531,6 +3537,7 @@ fn emit_windows_artifacts(
         &installer,
     )
     .map_err(|error| format!("failed to copy Windows installer: {error}"))?;
+    sign_windows_file(&installer)?;
 
     Ok(vec![
         DistributionArtifact {
@@ -3549,6 +3556,7 @@ fn emit_macos_artifacts(
     layout: &PackageLayout,
 ) -> Result<Vec<DistributionArtifact>, String> {
     let app = layout.package_dir.join("Panea.app");
+    sign_macos_app(&app)?;
     let zip = options
         .out_dir
         .join(format!("{}.zip", artifact_stem(options, "macos")));
@@ -3560,7 +3568,7 @@ fn emit_macos_artifacts(
             .arg(&zip),
         "macOS application ZIP",
     )?;
-
+    notarize_macos_app_archive(&zip, &app)?;
     let dmg = options
         .out_dir
         .join(format!("{}.dmg", artifact_stem(options, "macos")));
@@ -3573,6 +3581,8 @@ fn emit_macos_artifacts(
             .arg(&dmg),
         "macOS DMG",
     )?;
+    sign_macos_disk_image(&dmg)?;
+    notarize_macos_artifact(&dmg)?;
     Ok(vec![
         DistributionArtifact {
             kind: "macos-app-zip",
@@ -3645,6 +3655,9 @@ fn emit_linux_artifacts(
     fs::remove_dir_all(&deb_root)
         .map_err(|error| format!("failed to clear deb staging: {error}"))?;
 
+    let appimage = emit_linux_appimage(options, layout)?;
+    let rpm = emit_linux_rpm(options, layout)?;
+
     Ok(vec![
         DistributionArtifact {
             kind: "linux-portable-tarball",
@@ -3654,7 +3667,321 @@ fn emit_linux_artifacts(
             kind: "linux-deb",
             path: deb,
         },
+        DistributionArtifact {
+            kind: "linux-appimage",
+            path: appimage,
+        },
+        DistributionArtifact {
+            kind: "linux-rpm",
+            path: rpm,
+        },
     ])
+}
+
+fn signing_required() -> bool {
+    std::env::var("PANEA_REQUIRE_SIGNING").is_ok_and(|value| value == "1")
+}
+
+fn sign_windows_file(path: &Path) -> Result<(), String> {
+    let Some(certificate) = std::env::var("PANEA_WINDOWS_SIGN_CERTIFICATE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return if signing_required() {
+            Err("PANEA_REQUIRE_SIGNING=1 but PANEA_WINDOWS_SIGN_CERTIFICATE is unset".to_owned())
+        } else {
+            Ok(())
+        };
+    };
+    let signtool =
+        std::env::var("PANEA_WINDOWS_SIGNTOOL").unwrap_or_else(|_| "signtool.exe".to_owned());
+    let timestamp = std::env::var("PANEA_WINDOWS_TIMESTAMP_URL")
+        .unwrap_or_else(|_| "http://timestamp.digicert.com".to_owned());
+    let mut command = Command::new(signtool);
+    command
+        .args(["sign", "/fd", "SHA256", "/td", "SHA256", "/tr"])
+        .arg(timestamp)
+        .args(["/f"])
+        .arg(certificate);
+    if let Ok(password) = std::env::var("PANEA_WINDOWS_SIGN_PASSWORD") {
+        command.args(["/p", &password]);
+    }
+    command.arg(path);
+    run_checked(&mut command, "Windows Authenticode signing")?;
+    let signtool =
+        std::env::var("PANEA_WINDOWS_SIGNTOOL").unwrap_or_else(|_| "signtool.exe".to_owned());
+    run_checked(
+        Command::new(signtool)
+            .args(["verify", "/pa", "/all"])
+            .arg(path),
+        "Windows Authenticode verification",
+    )
+}
+
+fn sign_macos_app(app: &Path) -> Result<(), String> {
+    let Some(identity) = std::env::var("PANEA_MACOS_SIGN_IDENTITY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return if signing_required() {
+            Err("PANEA_REQUIRE_SIGNING=1 but PANEA_MACOS_SIGN_IDENTITY is unset".to_owned())
+        } else {
+            Ok(())
+        };
+    };
+    run_checked(
+        Command::new("codesign")
+            .args([
+                "--force",
+                "--deep",
+                "--options",
+                "runtime",
+                "--timestamp",
+                "--sign",
+            ])
+            .arg(identity)
+            .arg(app),
+        "macOS application signing",
+    )?;
+    run_checked(
+        Command::new("codesign")
+            .args(["--verify", "--deep", "--strict"])
+            .arg(app),
+        "macOS signature verification",
+    )
+}
+
+fn notarize_macos_artifact(dmg: &Path) -> Result<(), String> {
+    let Some(profile) = std::env::var("PANEA_MACOS_NOTARY_PROFILE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return if signing_required() {
+            Err("PANEA_REQUIRE_SIGNING=1 but PANEA_MACOS_NOTARY_PROFILE is unset".to_owned())
+        } else {
+            Ok(())
+        };
+    };
+    run_checked(
+        Command::new("xcrun")
+            .args(["notarytool", "submit"])
+            .arg(dmg)
+            .args(["--keychain-profile", &profile, "--wait"]),
+        "macOS notarization",
+    )?;
+    run_checked(
+        Command::new("xcrun").args(["stapler", "staple"]).arg(dmg),
+        "macOS notarization staple",
+    )
+}
+
+fn notarize_macos_app_archive(zip: &Path, app: &Path) -> Result<(), String> {
+    let Some(profile) = std::env::var("PANEA_MACOS_NOTARY_PROFILE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return if signing_required() {
+            Err("PANEA_REQUIRE_SIGNING=1 but PANEA_MACOS_NOTARY_PROFILE is unset".to_owned())
+        } else {
+            Ok(())
+        };
+    };
+    run_checked(
+        Command::new("xcrun")
+            .args(["notarytool", "submit"])
+            .arg(zip)
+            .args(["--keychain-profile", &profile, "--wait"]),
+        "macOS application notarization",
+    )?;
+    run_checked(
+        Command::new("xcrun").args(["stapler", "staple"]).arg(app),
+        "macOS application notarization staple",
+    )?;
+    remove_file_if_exists(zip)?;
+    run_checked(
+        Command::new("ditto")
+            .args(["-c", "-k", "--sequesterRsrc", "--keepParent"])
+            .arg(app)
+            .arg(zip),
+        "macOS stapled application ZIP",
+    )
+}
+
+fn sign_macos_disk_image(dmg: &Path) -> Result<(), String> {
+    let Some(identity) = std::env::var("PANEA_MACOS_SIGN_IDENTITY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return if signing_required() {
+            Err("PANEA_REQUIRE_SIGNING=1 but PANEA_MACOS_SIGN_IDENTITY is unset".to_owned())
+        } else {
+            Ok(())
+        };
+    };
+    run_checked(
+        Command::new("codesign")
+            .args(["--force", "--timestamp", "--sign"])
+            .arg(identity)
+            .arg(dmg),
+        "macOS disk image signing",
+    )
+}
+
+fn emit_linux_appimage(
+    options: &PackageOptions,
+    layout: &PackageLayout,
+) -> Result<PathBuf, String> {
+    let app_dir = options
+        .out_dir
+        .join(format!(".{}-AppDir", artifact_stem(options, "linux")));
+    if app_dir.exists() {
+        fs::remove_dir_all(&app_dir).map_err(|error| format!("failed to clear AppDir: {error}"))?;
+    }
+    copy_dir_recursive(&layout.package_dir.join("bin"), &app_dir.join("usr/bin"))?;
+    copy_dir_recursive(
+        &layout.package_dir.join("share"),
+        &app_dir.join("usr/share"),
+    )?;
+    fs::copy(
+        app_dir.join("usr/share/applications/panea.desktop"),
+        app_dir.join("panea.desktop"),
+    )
+    .map_err(|error| format!("failed to stage AppImage desktop file: {error}"))?;
+    fs::copy(
+        app_dir.join("usr/share/icons/hicolor/512x512/apps/panea.png"),
+        app_dir.join("panea.png"),
+    )
+    .map_err(|error| format!("failed to stage AppImage icon: {error}"))?;
+    let app_run = app_dir.join("AppRun");
+    write_file(
+        &app_run,
+        "#!/bin/sh\nHERE=\"$(dirname \"$(readlink -f \"$0\")\")\"\nexec \"$HERE/usr/bin/panea\" \"$@\"\n",
+    )?;
+    make_executable(&app_run)?;
+
+    let output = options
+        .out_dir
+        .join(format!("{}.AppImage", artifact_stem(options, "linux")));
+    remove_file_if_exists(&output)?;
+    let tool = std::env::var("PANEA_APPIMAGETOOL").unwrap_or_else(|_| "appimagetool".to_owned());
+    let mut command = Command::new(tool);
+    command
+        .env("ARCH", appimage_architecture())
+        .arg(&app_dir)
+        .arg(&output);
+    run_checked(&mut command, "Linux AppImage build")?;
+    fs::remove_dir_all(&app_dir).map_err(|error| format!("failed to clear AppDir: {error}"))?;
+    Ok(output)
+}
+
+fn emit_linux_rpm(options: &PackageOptions, layout: &PackageLayout) -> Result<PathBuf, String> {
+    let top = options
+        .out_dir
+        .join(format!(".{}-rpm", artifact_stem(options, "linux")));
+    if top.exists() {
+        fs::remove_dir_all(&top)
+            .map_err(|error| format!("failed to clear rpm staging: {error}"))?;
+    }
+    for directory in ["BUILD", "BUILDROOT", "RPMS", "SOURCES", "SPECS", "SRPMS"] {
+        fs::create_dir_all(top.join(directory))
+            .map_err(|error| format!("failed to create rpm staging: {error}"))?;
+    }
+    let source_name = format!("panea-{}", env!("CARGO_PKG_VERSION"));
+    let source_root = top.join("SOURCES").join(&source_name);
+    copy_dir_recursive(&layout.package_dir.join("bin"), &source_root.join("bin"))?;
+    copy_dir_recursive(
+        &layout.package_dir.join("share"),
+        &source_root.join("share"),
+    )?;
+    let source_archive = top.join("SOURCES").join(format!("{source_name}.tar.gz"));
+    run_checked(
+        Command::new("tar")
+            .arg("-czf")
+            .arg(&source_archive)
+            .arg("-C")
+            .arg(top.join("SOURCES"))
+            .arg(&source_name),
+        "RPM source archive",
+    )?;
+    fs::remove_dir_all(&source_root)
+        .map_err(|error| format!("failed to clear rpm source tree: {error}"))?;
+    let spec = top.join("SPECS/panea.spec");
+    write_file(
+        &spec,
+        &format!(
+            "Name: panea\nVersion: {}\nRelease: 1%{{?dist}}\nSummary: GPU-first cross-platform terminal emulator\nLicense: MIT OR Apache-2.0\nURL: https://github.com/shreshthkapai/Panea\nSource0: %{{name}}-%{{version}}.tar.gz\nBuildArch: {}\n\n%description\nPanea terminal emulator.\n\n%prep\n%setup -q\n\n%build\n\n%install\nmkdir -p %{{buildroot}}/usr\ncp -a bin share %{{buildroot}}/usr/\n\n%files\n/usr/bin/panea\n/usr/share/panea\n/usr/share/applications/panea.desktop\n/usr/share/icons/hicolor/512x512/apps/panea.png\n\n%changelog\n* Thu Jan 01 1970 Panea contributors - {}-1\n- Automated reproducible package\n",
+            env!("CARGO_PKG_VERSION"),
+            rpm_architecture(),
+            env!("CARGO_PKG_VERSION")
+        ),
+    )?;
+    let canonical_top = top
+        .canonicalize()
+        .map_err(|error| format!("failed to resolve rpm staging: {error}"))?;
+    run_checked(
+        Command::new("rpmbuild")
+            .args(["-bb", "--define"])
+            .arg(format!("_topdir {}", canonical_top.display()))
+            .arg(&spec),
+        "Linux RPM build",
+    )?;
+    let built = find_file_with_extension(&top.join("RPMS"), "rpm")?
+        .ok_or_else(|| "rpmbuild completed without producing an rpm".to_owned())?;
+    let output = options
+        .out_dir
+        .join(format!("{}.rpm", artifact_stem(options, "linux")));
+    remove_file_if_exists(&output)?;
+    fs::copy(&built, &output).map_err(|error| format!("failed to collect rpm: {error}"))?;
+    fs::remove_dir_all(&top).map_err(|error| format!("failed to clear rpm staging: {error}"))?;
+    Ok(output)
+}
+
+fn find_file_with_extension(root: &Path, extension: &str) -> Result<Option<PathBuf>, String> {
+    for entry in
+        fs::read_dir(root).map_err(|error| format!("failed to read {}: {error}", root.display()))?
+    {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path.is_dir() {
+            if let Some(found) = find_file_with_extension(&path, extension)? {
+                return Ok(Some(found));
+            }
+        } else if path.extension().is_some_and(|value| value == extension) {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| error.to_string())?
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).map_err(|error| error.to_string())
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+fn appimage_architecture() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        "x86" => "i686",
+        other => other,
+    }
+}
+
+fn rpm_architecture() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "aarch64",
+        "x86" => "i686",
+        other => other,
+    }
 }
 
 fn deb_architecture() -> &'static str {
@@ -3795,6 +4122,12 @@ fn write_package_resources(options: &PackageOptions, layout: &PackageLayout) -> 
             profile.contents,
         )?;
     }
+    for asset in assets::CURSOR_VECTOR_ASSETS {
+        write_file(
+            &layout.resource_dir.join("cursor-vectors").join(asset.name),
+            asset.contents,
+        )?;
+    }
 
     for shell in [
         ShellKind::Bash,
@@ -3822,6 +4155,8 @@ fn write_package_resources(options: &PackageOptions, layout: &PackageLayout) -> 
     for doc in [
         "docs/getting-started.md",
         "docs/config.md",
+        "docs/compatibility.md",
+        "docs/cursor-customization.md",
         "docs/programmable-config.md",
         "docs/doctor.md",
         "docs/shell-integration.md",
@@ -3968,6 +4303,10 @@ fn verify_package_contents(
             .resource_dir
             .join("cursor-profiles")
             .join("motion.toml"),
+        &layout
+            .resource_dir
+            .join("cursor-vectors")
+            .join("chevron.panea-cursor.json"),
     ] {
         if !path.exists() {
             return Err(format!("missing packaged file {}", path.display()));
@@ -4223,6 +4562,86 @@ fn run_packaged_shell_smoke(binary_path: &Path, timeout: Duration) -> PackageSmo
     }
 }
 
+fn run_packaged_gui_smoke(binary_path: &Path, timeout: Duration) -> PackageSmokeResult {
+    let started = Instant::now();
+    let timeout_ms = timeout.as_millis().to_string();
+    let mut child = match Command::new(binary_path)
+        .args(["gui-smoke", "--json", "--timeout-ms", timeout_ms.as_str()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return PackageSmokeResult {
+                name: "gui-launch",
+                status: PackageSmokeStatus::Failed,
+                duration: started.elapsed(),
+                detail: format!(
+                    "failed to spawn {} gui-smoke: {error}",
+                    binary_path.display()
+                ),
+            };
+        }
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() >= timeout.saturating_add(Duration::from_secs(2)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return PackageSmokeResult {
+                    name: "gui-launch",
+                    status: PackageSmokeStatus::TimedOut,
+                    duration: started.elapsed(),
+                    detail: format!("{} gui-smoke exceeded timeout", binary_path.display()),
+                };
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return PackageSmokeResult {
+                    name: "gui-launch",
+                    status: PackageSmokeStatus::Failed,
+                    duration: started.elapsed(),
+                    detail: format!("failed while waiting for gui smoke: {error}"),
+                };
+            }
+        }
+    }
+    match child.wait_with_output() {
+        Ok(output)
+            if output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("\"status\":\"passed\"") =>
+        {
+            PackageSmokeResult {
+                name: "gui-launch",
+                status: PackageSmokeStatus::Passed,
+                duration: started.elapsed(),
+                detail: format!("{} rendered its first session frame", binary_path.display()),
+            }
+        }
+        Ok(output) => PackageSmokeResult {
+            name: "gui-launch",
+            status: PackageSmokeStatus::Failed,
+            duration: started.elapsed(),
+            detail: format!(
+                "gui-smoke exited {:?}: stdout={} stderr={}",
+                output.status.code(),
+                preview_bytes(&output.stdout),
+                preview_bytes(&output.stderr)
+            ),
+        },
+        Err(error) => PackageSmokeResult {
+            name: "gui-launch",
+            status: PackageSmokeStatus::Failed,
+            duration: started.elapsed(),
+            detail: format!("failed to collect gui-smoke output: {error}"),
+        },
+    }
+}
+
 fn run_windows_installer_smoke(options: &PackageOptions) -> PackageSmokeResult {
     let started = Instant::now();
     let installer = options.out_dir.join(format!(
@@ -4262,6 +4681,7 @@ fn run_windows_installer_smoke(options: &PackageOptions) -> PackageSmokeResult {
     let installed_binary = install_dir.join("panea.exe");
     let doctor = run_packaged_doctor(&installed_binary, options.timeout);
     let shell = run_packaged_shell_smoke(&installed_binary, options.timeout);
+    let gui = run_packaged_gui_smoke(&installed_binary, options.timeout);
     let uninstall = run_bounded_command(
         Command::new(&installer)
             .args(["uninstall", "--install-dir"])
@@ -4272,6 +4692,7 @@ fn run_windows_installer_smoke(options: &PackageOptions) -> PackageSmokeResult {
 
     let passed = doctor.status == PackageSmokeStatus::Passed
         && shell.status == PackageSmokeStatus::Passed
+        && gui.status == PackageSmokeStatus::Passed
         && uninstall.is_ok()
         && !install_dir.exists();
     PackageSmokeResult {
@@ -4283,10 +4704,11 @@ fn run_windows_installer_smoke(options: &PackageOptions) -> PackageSmokeResult {
         },
         duration: started.elapsed(),
         detail: format!(
-            "install={} doctor={} shell={} uninstall={} cleaned={}",
+            "install={} doctor={} shell={} gui={} uninstall={} cleaned={}",
             installer.display(),
             doctor.status.label(),
             shell.status.label(),
+            gui.status.label(),
             uninstall.as_ref().map_or("failed", |_| "passed"),
             !install_dir.exists()
         ),
@@ -4365,7 +4787,8 @@ fn render_package_manifest(options: &PackageOptions, layout: &PackageLayout) -> 
             "  \"resources\": \"{}\",\n",
             "  \"doctor_smoke\": \"panea doctor --json\",\n",
             "  \"shell_launch_smoke\": \"panea shell-smoke --json\",\n",
-            "  \"contains\": [\"binary\", \"application_icon\", \"default_config\", \"config_schema\", \"config_examples\", \"programmable_config_examples\", \"themes\", \"cursor_profiles\", \"shell_integration_scripts\", \"doctor_command\", \"shell_smoke_command\", \"license\", \"readme\"]\n",
+            "  \"gui_launch_smoke\": \"panea gui-smoke --json\",\n",
+            "  \"contains\": [\"binary\", \"application_icon\", \"default_config\", \"config_schema\", \"config_examples\", \"programmable_config_examples\", \"themes\", \"cursor_profiles\", \"cursor_vector_assets\", \"shell_integration_scripts\", \"doctor_command\", \"shell_smoke_command\", \"gui_smoke_command\", \"license\", \"readme\"]\n",
             "}}\n"
         ),
         env!("CARGO_PKG_VERSION"),
@@ -4386,7 +4809,7 @@ fn render_package_manifest(options: &PackageOptions, layout: &PackageLayout) -> 
 }
 
 fn package_install_notes(options: &PackageOptions) -> String {
-    let common = "Panea package artifact\n\nRun `panea doctor --json` first to verify diagnostics. Run `panea shell-smoke --json` to verify that the packaged binary can start a bounded local shell session through Panea's PTY transport.\n\n";
+    let common = "Panea package artifact\n\nRun `panea doctor --json` first to verify diagnostics. Run `panea shell-smoke --json` to verify a bounded local PTY session, then `panea gui-smoke --json` to verify window, renderer, session, and first-frame startup.\n\n";
     match options.target_platform {
         CompatPlatform::Windows => format!(
             "{common}Windows delivery:\n- Run `panea.exe` directly from the portable ZIP.\n- Or run the Panea installer EXE for a per-user install, Start menu shortcuts, and user PATH registration.\n- Uninstall from the Start menu shortcut or `panea-uninstall.exe uninstall`.\n"
@@ -4395,7 +4818,7 @@ fn package_install_notes(options: &PackageOptions) -> String {
             "{common}macOS delivery:\n- Open `Panea.app` or run `Panea.app/Contents/MacOS/panea doctor --json`.\n- Release builds emit ZIP and DMG artifacts. Signing and notarization require distribution credentials.\n"
         ),
         CompatPlatform::LinuxX11 | CompatPlatform::LinuxWayland => format!(
-            "{common}Linux delivery:\n- Extract the portable tarball and run `bin/panea`.\n- Install the generated deb package on Debian-compatible distributions.\n- Desktop metadata and the application icon are included under `share/`.\n"
+            "{common}Linux delivery:\n- Extract the portable tarball and run `bin/panea`.\n- Run the AppImage, install the deb on Debian-compatible distributions, or install the RPM on RPM-compatible distributions.\n- Desktop metadata and the application icon are included under `share/`.\n"
         ),
         CompatPlatform::Any | CompatPlatform::Unix => common.to_owned(),
     }
@@ -5643,6 +6066,8 @@ mod tests {
         assert!(manifest.contains("\"shell_integration_scripts\""));
         assert!(manifest.contains("\"doctor_command\""));
         assert!(manifest.contains("\"shell_smoke_command\""));
+        assert!(manifest.contains("\"gui_smoke_command\""));
+        assert!(manifest.contains("\"cursor_vector_assets\""));
         assert!(manifest.contains("\"programmable_config_examples\""));
         assert!(manifest.contains("\"themes\""));
         assert!(manifest.contains("\"cursor_profiles\""));

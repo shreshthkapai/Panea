@@ -1,0 +1,15 @@
+schema_version = 2
+
+[cursor]
+shape = "custom_static_shape"
+animations_enabled = false
+
+[cursor.image]
+enabled = false
+
+[cursor.vector]
+enabled = true
+path = "../cursor-vectors/chevron.panea-cursor.json"
+
+[performance]
+max_cursor_asset_size_kb = 256

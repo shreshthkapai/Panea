@@ -15,9 +15,13 @@ TERM_PROGRAM_VERSION=<Panea version>
 
 Shell profiles may override these variables explicitly. First-class SSH PTYs
 request `xterm-256color` as the portable remote terminal identity. A custom
-Panea terminfo entry is intentionally deferred until the emulator has enough
-compatibility surface to justify a stable public terminal identity. Panea does
-not advertise a private `TERM` value for which users lack a terminfo entry.
+Panea terminfo entry is not necessary for the alpha contract and is therefore
+not shipped. Panea currently implements and advertises the portable
+`xterm-256color` capability set; inventing `panea` without materially different
+capabilities would reduce SSH and multiplexer portability. Reconsider this
+decision only when Panea has stable protocol features that cannot be expressed
+by `xterm-256color`, plus a remote install and fallback strategy. Panea never
+advertises a private `TERM` value before its terminfo entry is available.
 Inside tmux, use tmux's normal `screen-256color` or `tmux-256color` policy; the
 outer Panea session remains `xterm-256color`.
 
@@ -76,7 +80,8 @@ Details and manual compatibility checklists live in
 - Real local/SSH OSC 52 confirmation smoke on every desktop OS
 - Real app-level Unicode conformance across shells, editors, TUIs, and SSH
 - Full configurable hint pattern engine
-- Optional Panea-specific terminfo identity only if future capabilities require it
+- Re-evaluate a Panea-specific terminfo identity only if stable future
+  capabilities require it; it is intentionally absent today
 - Full automated interactive app driving for editors, TUIs, tmux/screen/zellij,
   WSL, and SSH
 - Cross-OS app compatibility reports across Windows, macOS, Linux X11, and

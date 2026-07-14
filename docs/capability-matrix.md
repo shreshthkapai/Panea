@@ -75,6 +75,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Static cursor styles | tested | implemented | implemented | implemented | Block, beam, underline, and hollow block rendering, thickness, rounded geometry, colors, deterministic blink, inactive and terminal-mode styles, retained-frame-safe cursor damage, and config validation are implemented. Real macOS/Linux visual verification and user-authored custom geometry remain open. |
 | Cursor animations | tested | partial | partial | partial | Windows-host tests cover opt-in config, bounded cursor-neighborhood damage, desktop runtime wiring, and batched animation quads; cross-OS visual verification remains. |
 | Animated image cursor | partial | tested | partial | partial | User GIF and static PNG assets use off-thread bounded pixel decode, immutable frame caching, one-time GPU texture-array upload, textured drawing, and local damage; macOS/Linux interactive visual verification remains. |
+| Static vector cursor | partial | tested | partial | partial | Versioned data-only normalized JSON is strictly validated, size/count bounded, worker-compiled, immutable-cached, GPU-quad batched, and cursor-locally damaged; macOS/Linux interactive visual verification remains. |
 | SSH profile config | tested | implemented | implemented | implemented | Portable config model exists. |
 | SSH host-key policy | tested | implemented | implemented | implemented | Unknown/changed-host decisions use a masked desktop security modal; pinned mismatches remain blocking. Real-server reports remain. |
 | SSH transport | partial | partial | partial | partial | Backend and `cargo xtask ssh-smoke` real-server harness exist; collected server reports remain unverified. |
@@ -83,7 +84,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 | Doctor diagnostics | tested | implemented | implemented | implemented | Installed `panea doctor` and `cargo xtask doctor` share one diagnostics model with human-readable and JSON output; macOS/Linux runtime output still needs host verification. |
 | Bug-report snapshot | tested | implemented | implemented | implemented | Privacy-aware model exists; product export UX remains. |
 | Native notifications | tested | implemented | implemented | implemented | Lazy bounded delivery uses Windows toast, macOS Notification Center, or freedesktop D-Bus behind one provider contract. Current-host contract/routing tests pass; real native permission and delivery reports remain open. |
-| Packaging artifacts | tested | implemented | implemented | implemented | Windows portable ZIP and per-user installer, macOS app/ZIP/DMG, and Linux tarball/deb builders include binary, themes, cursor profiles, config/schema/examples, shell scripts, docs, icons, and smoke commands. Windows install/uninstall smoke passed; non-Windows reports, signing/notarization, AppImage, and rpm remain. |
+| Packaging artifacts | tested | implemented | implemented | implemented | Windows ZIP/installer, macOS app/ZIP/DMG, Linux tarball/deb/AppImage/RPM, signing/notarization hooks, and bounded doctor/shell/GUI smokes exist. Windows staged and temporary-installed full smoke passes; credentialed signing and non-Windows artifact reports remain. |
 | Release validation suite | partial | partial | partial | partial | Reports/gates exist; full cross-OS suite is unimplemented. |
 
 ## Mobile Matrix
@@ -105,7 +106,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 
 | Platform | Overall status | Why |
 | --- | --- | --- |
-| Windows | partial | Current-host build/test/lint, local PTY, compatibility, installed doctor, portable package, and installer install/doctor/real-PTY/uninstall smokes are verified. Renderer GUI workflows, optional app matrix, real SSH server report, signing, and alpha usage remain. |
+| Windows | partial | Current-host build/test/lint, PTY, compatibility, doctor, and rebuilt staged/installed package lifecycle including first-frame GPU GUI smoke are verified. Optional app matrix, real SSH report, credentialed signing, and alpha usage remain. |
 | macOS | partial | Platform-neutral code and a macOS CI runner definition exist, but runtime behavior and verification reports are not yet collected. |
 | Linux X11 | partial | Platform-neutral code, X11 strategy, and a Linux X11 runner definition exist, but real X11 window manager/compositor behavior and reports are unverified. |
 | Linux Wayland | partial | Platform-neutral code, Wayland strategy, and a Linux Wayland runner definition exist, but real compositor behavior and reports are unverified. |

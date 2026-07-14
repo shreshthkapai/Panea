@@ -12,9 +12,9 @@ Supported shape model:
 - `custom_static_shape`
 
 The static geometry renderer implements `block`, `beam`, `underline`, and
-`hollow_block`. `custom` and `custom_static_shape` remain reserved compatibility
-values and currently use block geometry. A user-authored static image cursor is
-supported by setting `[cursor.image]` to a PNG.
+`hollow_block`. `custom` and `custom_static_shape` use block geometry unless a
+validated `[cursor.vector]` asset is enabled. Static PNG cursors remain
+available through `[cursor.image]`.
 
 ## Static Cursor Design Note
 
@@ -35,7 +35,7 @@ Linux X11 behavior: same config and renderer batches; real X11 verification is
 pending.
 Linux Wayland behavior: same config and renderer batches; real Wayland
 verification is pending.
-Fallback behavior: unsupported reserved custom shapes use static block geometry;
+Fallback behavior: custom shapes without a valid vector asset use static block geometry;
 an unfocused window uses the configured inactive style; terminal DECSCUSR shape
 requests are honored unless a matching mode-specific style overrides them.
 Diagnostics: invalid thickness, radius, blink intervals, and mode names fail
@@ -117,3 +117,51 @@ damages only the old/new cursor bounds. Decode failure leaves the normal cursor
 active and emits a diagnostic.
 
 Example: `crates/assets/config-examples/custom-cursor.toml`.
+
+## Static Vector Cursor
+
+Feature name: portable user-authored static vector cursor
+Layer: config-core, render-core, render-wgpu, desktop app, assets
+User-facing behavior: a custom cursor composed from normalized rounded
+rectangles, using either the configured cursor color or per-primitive RGBA
+Config keys: `cursor.vector.enabled`, `cursor.vector.path`, and the shared
+`performance.max_cursor_asset_size_kb`
+macOS behavior: same parser, immutable scene asset, and WGPU cursor batch;
+native visual verification remains pending
+Windows behavior: parsing, validation, batching, damage, and direct GUI startup
+tests pass on the current host
+Linux X11 behavior: same config and renderer path; native X11 verification remains pending
+Linux Wayland behavior: same config and renderer path; native Wayland verification remains pending
+Fallback behavior: malformed, oversized, unsupported-version, or unavailable
+assets emit a clear runtime error and leave the normal static cursor active
+Diagnostics: config rejects missing paths and image/vector conflicts; the
+loader reports file, JSON, version, count, size, and geometry failures
+Performance cost when disabled: zero file reads, worker threads, scene assets,
+batch geometry, and redraws
+Performance cost when enabled: one bounded worker parse on asset change, one
+immutable cached asset, cursor-local damage, and one existing GPU cursor draw call
+Tests: portable TOML/Lua config, validation, strict format parsing, bounds and
+unknown-field rejection, primitive limits, GPU quad batching, and local damage
+
+`[cursor.vector]` enables a user-authored `.panea-cursor.json` asset. The format
+is deliberately data-only and portable: version 1 contains up to 64 rounded
+rectangle primitives on a normalized 1000x1000 canvas. Each primitive may use
+the configured terminal cursor color or an explicit `[red, green, blue, alpha]`
+color. Coordinates, dimensions, unknown fields, file size, and format version
+are validated before the immutable asset enters the render path.
+
+```json
+{
+  "version": 1,
+  "primitives": [
+    { "x": 80, "y": 80, "width": 220, "height": 840, "corner_radius": 80 },
+    { "x": 300, "y": 390, "width": 620, "height": 220, "color": [80, 180, 255, 255] }
+  ]
+}
+```
+
+The file is read and compiled on a worker thread, cached by content, and drawn
+in the existing GPU cursor batch. It is not SVG: scripts, fonts, external
+resources, filters, and platform-specific parsing are intentionally excluded.
+When disabled, no file polling, parsing, scene projection, or batch work runs.
+Image and vector cursor assets cannot be enabled together.
