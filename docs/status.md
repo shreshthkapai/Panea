@@ -170,7 +170,11 @@ Terminal output ordering is also explicit at the desktop boundary. A local PTY
 wakeup drains parser output immediately, non-redraw window events drain pending
 PTY output before input or resize handling, and generated DA/DSR replies are
 written before user input. The real PowerShell cursor/grid smoke now exercises
-dynamic terminal replies instead of a hard-coded cursor position.
+dynamic terminal replies instead of a hard-coded cursor position. Resize reflow
+also preserves a cursor positioned after trimmed trailing blanks, including the
+space at the end of a PowerShell prompt. A character-by-character real
+PowerShell regression covers immediate post-resize PSReadLine redraws and emits
+the PTY/query/response trace on failure.
 
 ## Immediate Next Slice
 

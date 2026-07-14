@@ -9763,6 +9763,7 @@ mod tests {
         let mut transport = LocalPtyTransport::spawn(profile, size).expect("spawn shell");
         let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(size.cols, size.rows));
         let startup_deadline = Instant::now() + Duration::from_secs(2);
+        let mut protocol_trace = Vec::new();
 
         while Instant::now() < startup_deadline {
             let output = transport.poll_output().expect("poll shell output");
@@ -9770,7 +9771,18 @@ mod tests {
                 terminal
                     .apply_bytes(&output.bytes)
                     .expect("apply startup output");
-                flush_terminal_responses(&mut terminal, &mut transport);
+                let responses = terminal.state_mut().take_pending_output();
+                protocol_trace.push(format!(
+                    "startup output={:?} cursor={:?} response={:?}",
+                    String::from_utf8_lossy(&output.bytes),
+                    terminal.cursor_state().position,
+                    String::from_utf8_lossy(&responses)
+                ));
+                if !responses.is_empty() {
+                    transport
+                        .write_input(&responses)
+                        .expect("write startup terminal response");
+                }
             }
             if terminal_visible_lines(&terminal)
                 .iter()
@@ -9789,39 +9801,66 @@ mod tests {
         transport
             .resize(resized)
             .expect("repeat native resize event before input");
-        let resize_deadline = Instant::now() + Duration::from_millis(300);
-        while Instant::now() < resize_deadline {
-            let output = transport.poll_output().expect("poll resize output");
-            if !output.bytes.is_empty() {
-                terminal
-                    .apply_bytes(&output.bytes)
-                    .expect("apply resize output");
-                flush_terminal_responses(&mut terminal, &mut transport);
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-
         const MARKER: &str = "panea-grid-cursor-check";
         const INPUT: &str = "Write-Output panea-grid-cursor-check";
-        transport
-            .write_input(INPUT.as_bytes())
-            .expect("write input without submitting it");
-        let echo_deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < echo_deadline {
-            let output = transport.poll_output().expect("poll input echo");
-            if !output.bytes.is_empty() {
-                terminal
-                    .apply_bytes(&output.bytes)
-                    .expect("apply input echo");
-                flush_terminal_responses(&mut terminal, &mut transport);
+        let mut typed = String::new();
+        for character in INPUT.chars() {
+            let mut encoded = [0u8; 4];
+            let bytes = character.encode_utf8(&mut encoded).as_bytes();
+            protocol_trace.push(format!(
+                "input={character:?} cursor={:?}",
+                terminal.cursor_state().position
+            ));
+            write_terminal_input(&mut terminal, &mut transport, bytes);
+            typed.push(character);
+            let visible_prefix = typed.trim_end();
+
+            let echo_deadline = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < echo_deadline {
+                let output = transport.poll_output().expect("poll input echo");
+                if !output.bytes.is_empty() {
+                    terminal
+                        .apply_bytes(&output.bytes)
+                        .expect("apply input echo");
+                    let responses = terminal.state_mut().take_pending_output();
+                    protocol_trace.push(format!(
+                        "echo output={:?} cursor={:?} response={:?}",
+                        String::from_utf8_lossy(&output.bytes),
+                        terminal.cursor_state().position,
+                        String::from_utf8_lossy(&responses)
+                    ));
+                    if !responses.is_empty() {
+                        transport
+                            .write_input(&responses)
+                            .expect("write input terminal response");
+                    }
+                }
+                if terminal_visible_lines(&terminal).iter().any(|line| {
+                    line.trim_start().starts_with("PS ") && line.contains(visible_prefix)
+                }) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(2));
             }
-            if terminal_visible_lines(&terminal)
+
+            let lines = terminal_visible_lines(&terminal);
+            let input_row = lines
                 .iter()
-                .any(|line| line.contains(INPUT))
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
+                .position(|line| {
+                    line.trim_start().starts_with("PS ") && line.contains(visible_prefix)
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "PowerShell did not echo typed prefix {typed:?}; cursor={:?}; visible={lines:?}; trace:\n{protocol_trace}",
+                        terminal.cursor_state().position,
+                        protocol_trace = protocol_trace.join("\n")
+                    )
+                });
+            assert!(
+                lines[input_row].trim_start().starts_with("PS "),
+                "typed prefix moved away from its prompt; prefix={typed:?}; cursor={:?}; visible={lines:?}",
+                terminal.cursor_state().position
+            );
         }
 
         let lines = terminal_visible_lines(&terminal);

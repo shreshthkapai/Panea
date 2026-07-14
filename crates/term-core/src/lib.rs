@@ -1901,8 +1901,16 @@ impl ScreenBuffer {
         let mut cursor_physical = 0usize;
         let mut cursor_col = 0usize;
         let mut cursor_wrap_pending = false;
-        for (logical_index, cells) in logical.into_iter().enumerate() {
+        for (logical_index, mut cells) in logical.into_iter().enumerate() {
             if logical_index == target_logical {
+                // Non-wrapped lines omit trailing blank cells from the logical
+                // reflow model. Keep enough blank occupancy to preserve a
+                // cursor positioned after that visible content. Interactive
+                // line editors rely on the cursor column surviving resize
+                // exactly, even when a prompt ends in a space.
+                if cells.len() < target_offset {
+                    cells.resize(target_offset, Cell::blank(CellAttributes::default()));
+                }
                 let mapped = reflow_cursor_position(&cells, target_offset, size.cols);
                 cursor_physical = reflowed.len().saturating_add(mapped.0);
                 cursor_col = mapped.1;
@@ -2705,6 +2713,26 @@ mod tests {
         assert_eq!(line_text(&terminal, 1), "界");
         assert!(terminal.cell(1, 1).unwrap().wide_continuation);
         assert_eq!(line_text(&terminal, 2), "b");
+    }
+
+    #[test]
+    fn resize_preserves_cursor_after_prompt_trailing_space() {
+        let mut terminal = TerminalState::new(TerminalSize::new(86, 26));
+        terminal
+            .apply_actions("PS C:\\Users\\shres> ".chars().map(TerminalAction::Print))
+            .unwrap();
+        assert_eq!(terminal.cursor_state().position, GridPosition::new(0, 19));
+
+        terminal.resize(TerminalSize::new(171, 42)).unwrap();
+
+        assert_eq!(terminal.cursor_state().position, GridPosition::new(0, 19));
+        terminal.apply_action(TerminalAction::Print('W')).unwrap();
+        terminal.apply_action(TerminalAction::Backspace).unwrap();
+        terminal
+            .apply_actions("Wr".chars().map(TerminalAction::Print))
+            .unwrap();
+        assert_eq!(line_text(&terminal, 0), "PS C:\\Users\\shres> Wr");
+        assert_eq!(terminal.cursor_state().position, GridPosition::new(0, 21));
     }
 
     #[test]
