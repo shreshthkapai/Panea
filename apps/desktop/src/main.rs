@@ -127,7 +127,7 @@ fn print_cli_help() {
     );
     eprintln!("usage: panea shell-smoke [--json] [--timeout-ms <ms>]");
     eprintln!(
-        "usage: panea gui-smoke [--terminal-io] [--hold-ms <ms>] [--json] [--timeout-ms <ms>]"
+        "usage: panea gui-smoke [--startup|--terminal-io] [--hold-ms <ms>] [--json] [--timeout-ms <ms>]"
     );
     eprintln!(
         "usage: panea shell-integration export --shell <bash|zsh|fish|powershell> --output <path>"
@@ -146,6 +146,7 @@ struct GuiSmokeOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GuiSmokeMode {
     FirstFrame,
+    Startup,
     TerminalIo,
 }
 
@@ -161,6 +162,7 @@ fn run_gui_smoke_cli() -> i32 {
     while index < args.len() {
         match args[index].as_str() {
             "--json" => {}
+            "--startup" => mode = GuiSmokeMode::Startup,
             "--terminal-io" => mode = GuiSmokeMode::TerminalIo,
             "--hold-ms" => {
                 index += 1;
@@ -218,6 +220,7 @@ fn run_gui_smoke_cli() -> i32 {
             started.elapsed().as_millis(),
             match mode {
                 GuiSmokeMode::FirstFrame => "window_renderer_session_first_frame",
+                GuiSmokeMode::Startup => "single_shell_prompt_rendered_without_input",
                 GuiSmokeMode::TerminalIo => "shell_prompt_input_output_rendered",
             }
         );
@@ -1131,6 +1134,8 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
     let gui_smoke_completed = gui_smoke.map(|smoke| smoke.completed);
     let gui_smoke_result = gui_smoke_completed.clone();
     let mut gui_smoke_command_sent = false;
+    let mut gui_smoke_startup_prompt_observed_at = None;
+    let mut gui_smoke_startup_validated = false;
     let mut gui_smoke_success_presented = false;
     let mut gui_smoke_hold_until = None;
 
@@ -1201,6 +1206,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                             }
                             if let Some(completed) = &gui_smoke_completed {
                                 let milestone_reached = match gui_smoke_mode {
+                                    Some(GuiSmokeMode::Startup) => gui_smoke_startup_validated,
                                     Some(GuiSmokeMode::TerminalIo) => {
                                         gui_smoke_command_sent
                                             && mux_runtime
@@ -1699,7 +1705,10 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                     && gui_smoke_deadline.is_some_and(|deadline| Instant::now() >= deadline)
                 {
                     eprintln!("gui-smoke milestone=timeout");
-                    if gui_smoke_mode == Some(GuiSmokeMode::TerminalIo) {
+                    if matches!(
+                        gui_smoke_mode,
+                        Some(GuiSmokeMode::Startup | GuiSmokeMode::TerminalIo)
+                    ) {
                         let preview = mux_runtime.active_visible_text();
                         eprintln!(
                             "gui-smoke terminal-preview={:?} command-sent={gui_smoke_command_sent}",
@@ -1867,6 +1876,39 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                     eprintln!("gui-smoke milestone=prompt-observed-input-sent");
                 }
 
+                if gui_smoke_mode == Some(GuiSmokeMode::Startup)
+                    && !gui_smoke_startup_validated
+                {
+                    let visible = mux_runtime.active_visible_text();
+                    if shell_prompt_visible(&visible) {
+                        let observed_at = gui_smoke_startup_prompt_observed_at
+                            .get_or_insert_with(Instant::now);
+                        let settled_at = *observed_at + Duration::from_millis(500);
+                        if Instant::now() >= settled_at {
+                            let prompt_count = shell_prompt_line_count(&visible);
+                            eprintln!(
+                                "gui-smoke startup-prompt-count={prompt_count} terminal-preview={:?}",
+                                visible.chars().take(1024).collect::<String>()
+                            );
+                            if prompt_count != 1 {
+                                eprintln!(
+                                    "gui-smoke startup failed: expected exactly one prompt without user input"
+                                );
+                                mux_runtime.shutdown_all();
+                                target.exit();
+                                return;
+                            }
+                            gui_smoke_startup_validated = true;
+                            scheduler.terminal_content_changed();
+                            window.request_redraw();
+                        } else {
+                            // The shared wake-deadline calculation below includes
+                            // this settle deadline without overwriting animation,
+                            // transport, hold, or overall smoke deadlines.
+                        }
+                    }
+                }
+
                 match cursor_image_cache.poll() {
                     AnimatedCursorImageStatus::Ready(image) => {
                         if cursor_image_runtime.set_image(&image) {
@@ -1958,16 +2000,28 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                 .into_iter()
                 .flatten()
                 .min();
-                if let Some(delay) = next_delay {
-                    if animation_delay.is_some() || cursor_image_delay.is_some() {
-                        scheduler.animation_changed();
-                    }
-                    target.set_control_flow(ControlFlow::WaitUntil(Instant::now() + delay));
+                let mut next_wake = next_delay.map(|delay| Instant::now() + delay);
+                if next_delay.is_some()
+                    && (animation_delay.is_some() || cursor_image_delay.is_some())
+                {
+                    scheduler.animation_changed();
+                }
+                if gui_smoke_mode == Some(GuiSmokeMode::Startup)
+                    && !gui_smoke_startup_validated
+                    && let Some(observed_at) = gui_smoke_startup_prompt_observed_at
+                {
+                    retain_earliest_deadline(
+                        &mut next_wake,
+                        observed_at + Duration::from_millis(500),
+                    );
                 }
                 if let Some(deadline) = gui_smoke_deadline {
-                    target.set_control_flow(ControlFlow::WaitUntil(deadline));
+                    retain_earliest_deadline(&mut next_wake, deadline);
                 }
                 if let Some(deadline) = gui_smoke_hold_until {
+                    retain_earliest_deadline(&mut next_wake, deadline);
+                }
+                if let Some(deadline) = next_wake {
                     target.set_control_flow(ControlFlow::WaitUntil(deadline));
                 }
 
@@ -1984,6 +2038,12 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+fn retain_earliest_deadline(current: &mut Option<Instant>, candidate: Instant) {
+    if current.is_none_or(|deadline| candidate < deadline) {
+        *current = Some(candidate);
+    }
 }
 
 fn log_config_diagnostics(diagnostics: &[config_core::ConfigDiagnostic]) {
@@ -4891,11 +4951,14 @@ impl MuxRuntime {
 }
 
 fn shell_prompt_visible(text: &str) -> bool {
+    shell_prompt_line_count(text) > 0
+}
+
+fn shell_prompt_line_count(text: &str) -> usize {
     text.lines()
         .rev()
         .filter(|line| !line.trim().is_empty())
-        .take(4)
-        .any(|line| {
+        .filter(|line| {
             let line = line.trim_end();
             (line.starts_with("PS ") && line.ends_with('>'))
                 || line.ends_with('$')
@@ -4903,6 +4966,7 @@ fn shell_prompt_visible(text: &str) -> bool {
                 || line.ends_with('%')
                 || (cfg!(windows) && line.ends_with('>'))
         })
+        .count()
 }
 
 fn session_status_for_pane(pane: &PaneRuntime) -> SessionStatus {
@@ -8236,6 +8300,12 @@ mod tests {
         assert!(shell_prompt_visible(
             "Windows PowerShell\nPS C:\\Users\\panea>"
         ));
+        assert_eq!(
+            shell_prompt_line_count(
+                "Windows PowerShell\nPS C:\\Users\\panea>\nPS C:\\Users\\panea>"
+            ),
+            2
+        );
         assert!(shell_prompt_visible(
             "Windows PowerShell\nPS C:\\Users\\panea>\n\n\n\n\n"
         ));
@@ -9493,6 +9563,78 @@ mod tests {
             ShellIntegrationActivationAction::InjectRuntimeScript
         );
         run_interactive_shell_activation_smoke(profile);
+    }
+
+    #[test]
+    #[ignore = "spawns an interactive PowerShell process and waits for startup to settle"]
+    fn real_default_powershell_startup_events_keep_one_prompt() {
+        let config = AppConfig {
+            default_shell_profile: Some("powershell".to_owned()),
+            shell_profiles: vec![ShellProfile {
+                name: "powershell".to_owned(),
+                kind: ShellProfileKind::PowerShell,
+                program: "powershell.exe".to_owned(),
+                ..ShellProfile::default()
+            }],
+            ..AppConfig::default()
+        };
+        let (profile, _) = initial_local_shell_profile(&config, None);
+        let initial_size = TransportSize::new(120, 36, 960, 576);
+        let resized = TransportSize::new(147, 42, 1176, 672);
+        let mut transport = LocalPtyTransport::spawn(profile, initial_size).expect("spawn shell");
+        let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(120, 36));
+        let mut raw = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut resized_after_prompt = false;
+        let mut focus_reported_after_prompt = false;
+
+        while Instant::now() < deadline {
+            let output = transport.poll_output().expect("poll shell output");
+            if !output.bytes.is_empty() {
+                answer_real_shell_terminal_queries(&mut transport, &output.bytes);
+                terminal
+                    .apply_bytes(&output.bytes)
+                    .expect("apply startup output");
+                raw.extend_from_slice(&output.bytes);
+            }
+            if !resized_after_prompt && raw.windows(3).any(|window| window == b"PS ") {
+                terminal
+                    .resize(CoreTerminalSize::new(resized.cols, resized.rows))
+                    .expect("resize terminal grid");
+                transport.resize(resized).expect("resize PTY");
+                resized_after_prompt = true;
+            }
+            if resized_after_prompt && !focus_reported_after_prompt {
+                transport
+                    .write_input(b"\x1b[I")
+                    .expect("send initial focus report");
+                focus_reported_after_prompt = true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let visible = terminal
+            .visible_grid()
+            .cells
+            .chunks(usize::from(resized.cols))
+            .map(|cells| term_core::Line {
+                cells: cells.to_vec(),
+                hard_wrapped: false,
+            })
+            .map(|line| line.raw_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt_count = visible
+            .lines()
+            .filter(|line| line.trim_start().starts_with("PS ") || line.trim() == "PS>")
+            .count();
+        let _ = transport.shutdown();
+        assert_eq!(
+            prompt_count,
+            1,
+            "PowerShell startup events produced {prompt_count} prompts; resized_after_prompt={resized_after_prompt}; focus_reported_after_prompt={focus_reported_after_prompt}; visible={visible:?}; raw={:?}",
+            String::from_utf8_lossy(&raw)
+        );
     }
 
     fn run_interactive_shell_activation_smoke(profile: LocalShellProfile) {

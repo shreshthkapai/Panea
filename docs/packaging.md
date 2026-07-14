@@ -25,6 +25,7 @@ Fallback behavior: portable archives remain available for local unsigned
 development builds; tagged release jobs require signing credentials, and Linux
 format builders fail clearly when their release tools are unavailable
 Diagnostics: packaged `panea doctor --json`, `panea shell-smoke --json`, and
+`panea gui-smoke --startup --json` and
 `panea gui-smoke --terminal-io --json` are smoke-tested
 Performance cost when disabled: none; packaging is offline build tooling
 Performance cost when enabled: one desktop binary build plus filesystem staging
@@ -58,6 +59,7 @@ The smoke command verifies required package contents and runs:
 ```text
 panea doctor --json
 panea shell-smoke --json
+panea gui-smoke --startup --json
 panea gui-smoke --terminal-io --json
 ```
 
@@ -66,7 +68,8 @@ all three commands from the installed binary, uninstalls, and verifies cleanup.
 
 `shell-smoke` starts a bounded local PTY session, runs a one-shot marker command
 through the selected/default shell profile, observes output, and shuts the
-transport down. `gui-smoke --terminal-io` creates the real platform window,
+transport down. `gui-smoke --startup` verifies that launch settles on exactly
+one shell prompt without sending input. `gui-smoke --terminal-io` creates the real platform window,
 initializes the GPU renderer and session, waits for the shell prompt, sends a
 marker command, observes both input echo and command output, presents that
 frame, and then shuts down within a bounded timeout. Broader interaction

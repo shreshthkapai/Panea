@@ -3,6 +3,7 @@
 pub const LAYER: &str = "platform parity";
 
 use std::{
+    collections::HashSet,
     sync::{
         Arc, Mutex,
         mpsc::{SyncSender, TrySendError, sync_channel},
@@ -30,7 +31,7 @@ use winit::{
     dpi::LogicalSize,
     event::{ElementState, Ime, MouseScrollDelta, WindowEvent},
     event_loop::{EventLoop, EventLoopBuilder, EventLoopWindowTarget},
-    keyboard::{Key, ModifiersState, NamedKey},
+    keyboard::{Key, ModifiersState, NamedKey, PhysicalKey},
     window::{Fullscreen, Window, WindowBuilder},
 };
 
@@ -480,6 +481,7 @@ pub struct DesktopWindowDiagnostics {
 pub struct InputTranslator {
     modifiers: KeyModifiers,
     cursor_position: (f64, f64),
+    pressed_keys: HashSet<PhysicalKey>,
 }
 
 impl InputTranslator {
@@ -488,6 +490,7 @@ impl InputTranslator {
         Self {
             modifiers: KeyModifiers::default(),
             cursor_position: (0.0, 0.0),
+            pressed_keys: HashSet::new(),
         }
     }
 
@@ -499,7 +502,13 @@ impl InputTranslator {
     pub fn translate_window_event(&mut self, event: &WindowEvent) -> Vec<InputEvent> {
         match event {
             WindowEvent::CloseRequested => vec![InputEvent::CloseRequested],
-            WindowEvent::Focused(focused) => vec![InputEvent::Focused(*focused)],
+            WindowEvent::Focused(focused) => {
+                if !focused {
+                    self.pressed_keys.clear();
+                    self.modifiers = KeyModifiers::default();
+                }
+                vec![InputEvent::Focused(*focused)]
+            }
             WindowEvent::Resized(size) => vec![InputEvent::Resized {
                 width: size.width,
                 height: size.height,
@@ -514,6 +523,14 @@ impl InputTranslator {
                 Vec::new()
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if !should_forward_key_event(
+                    &mut self.pressed_keys,
+                    &event.physical_key,
+                    event.state,
+                    event.repeat,
+                ) {
+                    return Vec::new();
+                }
                 if matches!(event.logical_key, Key::Named(NamedKey::AltGraph)) {
                     self.modifiers.alt_graph = event.state == ElementState::Pressed;
                 }
@@ -563,12 +580,40 @@ impl InputTranslator {
                 Ime::Preedit(text, _) => {
                     vec![InputEvent::Ime(ImeEvent::Preedit { text: text.clone() })]
                 }
-                Ime::Commit(text) => vec![InputEvent::Ime(ImeEvent::Commit { text: text.clone() })],
+                Ime::Commit(text) => ime_commit_text(text).map_or_else(Vec::new, |text| {
+                    vec![InputEvent::Ime(ImeEvent::Commit { text })]
+                }),
                 Ime::Disabled => vec![InputEvent::Ime(ImeEvent::Disabled)],
             },
             _ => Vec::new(),
         }
     }
+}
+
+fn should_forward_key_event(
+    pressed_keys: &mut HashSet<PhysicalKey>,
+    key: &PhysicalKey,
+    state: ElementState,
+    repeat: bool,
+) -> bool {
+    match state {
+        ElementState::Pressed => {
+            if repeat && !pressed_keys.contains(key) {
+                return false;
+            }
+            pressed_keys.insert(*key);
+            true
+        }
+        ElementState::Released => {
+            pressed_keys.remove(key);
+            true
+        }
+    }
+}
+
+fn ime_commit_text(text: &str) -> Option<String> {
+    (!text.is_empty() && text.chars().all(|character| !character.is_control()))
+        .then(|| text.to_owned())
 }
 
 impl Default for InputTranslator {
@@ -1167,6 +1212,50 @@ fn clipboard_diagnostic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use winit::keyboard::KeyCode;
+
+    #[test]
+    fn orphan_key_repeat_is_not_forwarded_as_terminal_input() {
+        let key = PhysicalKey::Code(KeyCode::Enter);
+        let mut pressed = HashSet::new();
+
+        assert!(!should_forward_key_event(
+            &mut pressed,
+            &key,
+            ElementState::Pressed,
+            true,
+        ));
+        assert!(pressed.is_empty());
+
+        assert!(should_forward_key_event(
+            &mut pressed,
+            &key,
+            ElementState::Pressed,
+            false,
+        ));
+        assert!(should_forward_key_event(
+            &mut pressed,
+            &key,
+            ElementState::Pressed,
+            true,
+        ));
+        assert!(should_forward_key_event(
+            &mut pressed,
+            &key,
+            ElementState::Released,
+            false,
+        ));
+        assert!(pressed.is_empty());
+    }
+
+    #[test]
+    fn ime_commit_accepts_composed_text_but_not_command_controls() {
+        assert_eq!(ime_commit_text("日本語").as_deref(), Some("日本語"));
+        assert_eq!(ime_commit_text("e\u{301}").as_deref(), Some("e\u{301}"));
+        assert_eq!(ime_commit_text("\r"), None);
+        assert_eq!(ime_commit_text("\n"), None);
+        assert_eq!(ime_commit_text(""), None);
+    }
 
     #[test]
     fn disabled_power_monitor_does_not_schedule_provider_work() {
