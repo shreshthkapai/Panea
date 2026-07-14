@@ -7,15 +7,15 @@ Feature name: SSH trust, secrets, and keychain providers
 Layer: security, session transport, diagnostics
 User-facing behavior: unknown SSH hosts require explicit trust, changed host keys block, and passwords/passphrases never live in config
 Config keys: ssh_profiles.* plus existing known_hosts_policy/auth_method/identity_file/agent_forwarding fields
-macOS behavior: same SSH trust model; native provider target is macOS Keychain
-Windows behavior: same SSH trust model; native provider target is Credential Manager or equivalent Windows secret storage
-Linux X11 behavior: same SSH trust model; native provider target is Secret Service/libsecret where available
-Linux Wayland behavior: same SSH trust model; native provider target is Secret Service/libsecret where available
+macOS behavior: same SSH trust model; native provider is macOS Keychain
+Windows behavior: same SSH trust model; native provider is Windows Credential Manager
+Linux X11 behavior: same SSH trust model; native provider is Secret Service where available
+Linux Wayland behavior: same SSH trust model; native provider is Secret Service where available
 Fallback behavior: if no provider is available, secrets are not persisted and the session must prompt or fail clearly
 Diagnostics: doctor/security-review reports host-key policy, secret-provider boundaries, and native-provider gaps
 Performance cost when disabled: zero render/input/PTY cost
 Performance cost when enabled: one host-key check per SSH connection and one secret lookup/prompt per auth request; not in render or PTY hot paths
-Tests: security unit tests for host-key decisions, redaction, keychain-backed prompt flow, and explicit provider capability fallback
+Tests: security unit tests for host-key decisions, redaction, keychain-backed prompt flow, provider fallback, and desktop prompt actions/masking
 ```
 
 ## Host Trust Model
@@ -62,10 +62,19 @@ The platform targets are:
 - Linux X11 and Wayland: Secret Service/libsecret-compatible provider.
 - iOS later: Keychain.
 
-The current Rust security layer exposes provider capability reporting and a
-native-provider placeholder for each platform target. Product code must treat
-an unavailable provider as a clear fallback: prompt for the secret or fail with
-a useful error. It must not write plaintext secrets to config or logs.
+The desktop provider uses the native credential store through a maintained safe
+Rust adapter. Product code treats an unavailable provider as a clear fallback:
+the user may continue with a transient secret or cancel. It never writes
+plaintext secrets to config or logs.
+
+Run the opt-in native provider smoke on each target host with:
+
+```text
+cargo test -p security native_platform_keychain_round_trip -- --ignored
+```
+
+The smoke writes and deletes one process-scoped test credential. Normal unit
+tests never write to the user's credential store.
 
 ## Diagnostics and Logging
 
@@ -86,4 +95,3 @@ Diagnostics must not include:
 - raw terminal contents
 - command output
 - clipboard contents
-

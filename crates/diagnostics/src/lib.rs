@@ -5,8 +5,8 @@ pub const LAYER: &str = "diagnostics";
 use std::{collections::VecDeque, fmt, time::Duration};
 
 use config_core::{
-    AppConfig, ConfigDiagnostic, ConfigDiagnosticSeverity, ConfigPlatform, SshAuthMethod,
-    SshKnownHostsPolicy, WindowModeConfig,
+    AppConfig, ConfigDiagnostic, ConfigDiagnosticSeverity, ConfigPlatform,
+    DecorationStrategyConfig, SshAuthMethod, SshKnownHostsPolicy, WindowModeConfig,
 };
 use platform_core::{DesktopPlatform, DpiBehavior};
 use render_core::{
@@ -930,6 +930,27 @@ fn append_window_report(input: &DoctorInput, report: &mut DoctorReport) {
                 .to_owned(),
         });
     }
+    if matches!(
+        input.config.window.decoration_strategy,
+        DecorationStrategyConfig::ClientSide
+            | DecorationStrategyConfig::Custom
+            | DecorationStrategyConfig::FallbackDecorated
+    ) {
+        report.findings.push(DoctorFinding {
+            severity: DoctorSeverity::Info,
+            area: "window",
+            message: "the requested decoration strategy is capability-resolved at window startup; unsupported exact behavior falls back to native decorated mode"
+                .to_owned(),
+        });
+    }
+    if matches!(input.config.window.mode, WindowModeConfig::Fullscreen) {
+        report.findings.push(DoctorFinding {
+            severity: DoctorSeverity::Info,
+            area: "window",
+            message: "exclusive fullscreen uses the active monitor video modes and falls back to borderless fullscreen when none is exposed"
+                .to_owned(),
+        });
+    }
 }
 
 fn append_renderer_report(input: &DoctorInput, report: &mut DoctorReport) {
@@ -1422,23 +1443,25 @@ pub fn security_review_report(input: &DoctorInput) -> ReadinessReport {
     });
     items.push(ReadinessItem {
         area: "key storage",
-        status: ReadinessStatus::Blocked,
-        message:
-            "keychain provider contracts and capability reporting exist; native OS providers still need app-boundary wiring and cross-OS verification"
-                .to_owned(),
+        status: if input.runtime.keychain_provider.contains("available=true") {
+            ReadinessStatus::Pass
+        } else {
+            ReadinessStatus::Warning
+        },
+        message: "desktop secrets use the native OS keychain when available; unavailable providers are explicit and never fall back to plaintext config"
+            .to_owned(),
     });
     items.push(ReadinessItem {
         area: "passphrases",
-        status: ReadinessStatus::Warning,
-        message:
-            "passphrases flow through redacted SecretProvider boundaries and may be persisted only through a KeychainProvider; interactive credential UX is still app work"
-                .to_owned(),
+        status: ReadinessStatus::Pass,
+        message: "passphrases use masked desktop prompts, redacted SecretProvider boundaries, and opt-in native keychain persistence"
+            .to_owned(),
     });
     items.push(ReadinessItem {
         area: "clipboard",
         status: ReadinessStatus::Warning,
         message:
-            "system clipboard bridge, paste sanitization, and OSC 52 policy exist; primary selection and cross-OS smoke remain separate work"
+            "system and Linux primary-selection bridges, paste sanitization, and OSC 52 policy exist; cross-OS smoke remains separate work"
                 .to_owned(),
     });
     items.push(ReadinessItem {
@@ -2551,7 +2574,7 @@ mod tests {
     }
 
     #[test]
-    fn security_review_blocks_unimplemented_secret_and_osc_policy() {
+    fn security_review_reports_native_keychain_and_remaining_osc_warning() {
         let input = DoctorInput {
             app_version: "0.1.0".to_owned(),
             config_source: "default".to_owned(),
@@ -2565,8 +2588,9 @@ mod tests {
         let report = security_review_report(&input);
         let text = report.render_text();
 
-        assert!(report.has_blockers());
-        assert!(text.contains("keychain provider contracts"));
+        assert!(!report.has_blockers());
+        assert!(text.contains("native OS keychain"));
+        assert!(text.contains("masked desktop prompts"));
         assert!(text.contains("OSC 52"));
     }
 

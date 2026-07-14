@@ -27,13 +27,15 @@ Recommended release posture:
 - never include passwords, passphrases, private keys, terminal contents, or
   command output in diagnostics
 
-OS keychain-backed secret providers and interactive trust UI are not complete
-yet as product UI, but the security layer now has explicit provider contracts:
+Panea's desktop SSH panes use these provider contracts:
 
 - `HostTrustProvider` for unknown-host and changed-host decisions
 - `SecretProvider` for password/passphrase requests
-- `KeychainProvider` for platform secret storage capability and persistence
+- `KeychainProvider` for Windows Credential Manager, macOS Keychain, or Linux
+  Secret Service persistence
 
-Until native providers and prompts are wired into the desktop app, unavailable
-secret storage must be reported as a fallback and must not become plaintext
-config.
+Unknown and changed hosts are presented in a renderer overlay with explicit
+actions. Password/passphrase entry is masked; Tab toggles opt-in native
+keychain persistence. A disconnected pane preserves scrollback and can run the
+`reconnect_session` action (default `Ctrl+Alt+R`). Unavailable secure storage is
+reported and never replaced with plaintext config.

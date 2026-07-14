@@ -510,7 +510,7 @@ impl KeychainProviderCapability {
     }
 }
 
-/// OS keychain boundary for future platform-backed secret storage providers.
+/// OS keychain boundary for platform-backed secret storage providers.
 pub trait KeychainProvider: Send {
     fn capability(&self) -> KeychainProviderCapability {
         KeychainProviderCapability::unavailable(
@@ -572,21 +572,56 @@ pub struct PlatformKeychainProvider {
 impl PlatformKeychainProvider {
     #[must_use]
     pub fn for_current_platform() -> Self {
-        Self::for_platform(SecurityPlatform::current())
+        let platform = SecurityPlatform::current();
+        let backend = keychain_backend(platform);
+        let capability = match keyring::Entry::new("panea.capability", "provider-probe") {
+            Ok(_) => KeychainProviderCapability {
+                platform,
+                backend,
+                available: true,
+                persistent: true,
+                secure_storage: true,
+                message: format!(
+                    "native {} credential store initialized; individual operations may still be denied by OS policy",
+                    keychain_backend_name(backend)
+                ),
+            },
+            Err(error) => KeychainProviderCapability {
+                platform,
+                backend,
+                available: false,
+                persistent: false,
+                secure_storage: false,
+                message: format!(
+                    "native {} credential store is unavailable: {error}",
+                    keychain_backend_name(backend)
+                ),
+            },
+        };
+        Self { capability }
     }
 
     #[must_use]
     pub fn for_platform(platform: SecurityPlatform) -> Self {
-        let backend = match platform {
-            SecurityPlatform::Windows => KeychainBackend::WindowsCredentialManager,
-            SecurityPlatform::MacOs => KeychainBackend::MacOsKeychain,
-            SecurityPlatform::Linux => KeychainBackend::LinuxSecretService,
-            SecurityPlatform::Ios => KeychainBackend::IosKeychain,
-            SecurityPlatform::Unknown => KeychainBackend::Unavailable,
-        };
+        if platform == SecurityPlatform::current() {
+            return Self::for_current_platform();
+        }
+        let backend = keychain_backend(platform);
         Self {
             capability: KeychainProviderCapability::unavailable(platform, backend),
         }
+    }
+
+    fn entry(&self, entry: &KeychainEntry) -> SecurityResult<keyring::Entry> {
+        if !self.capability.available {
+            return Err(SecurityError::new(self.capability.message.clone()));
+        }
+        keyring::Entry::new(&entry.service, &entry.account).map_err(|error| {
+            SecurityError::new(format!(
+                "failed to open native {} credential entry: {error}",
+                keychain_backend_name(self.capability.backend)
+            ))
+        })
     }
 }
 
@@ -595,16 +630,63 @@ impl KeychainProvider for PlatformKeychainProvider {
         self.capability.clone()
     }
 
-    fn get_secret(&mut self, _entry: &KeychainEntry) -> SecurityResult<Option<SecretString>> {
-        Ok(None)
+    fn get_secret(&mut self, entry: &KeychainEntry) -> SecurityResult<Option<SecretString>> {
+        if !self.capability.available {
+            return Ok(None);
+        }
+        match self.entry(entry)?.get_password() {
+            Ok(secret) => Ok(Some(SecretString::new(secret))),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(SecurityError::new(format!(
+                "failed to read native {} credential: {error}",
+                keychain_backend_name(self.capability.backend)
+            ))),
+        }
     }
 
-    fn set_secret(&mut self, _entry: &KeychainEntry, _secret: SecretString) -> SecurityResult<()> {
-        Err(SecurityError::new(self.capability.message.clone()))
+    fn set_secret(&mut self, entry: &KeychainEntry, secret: SecretString) -> SecurityResult<()> {
+        self.entry(entry)?
+            .set_password(secret.expose())
+            .map_err(|error| {
+                SecurityError::new(format!(
+                    "failed to store native {} credential: {error}",
+                    keychain_backend_name(self.capability.backend)
+                ))
+            })
     }
 
-    fn delete_secret(&mut self, _entry: &KeychainEntry) -> SecurityResult<()> {
-        Ok(())
+    fn delete_secret(&mut self, entry: &KeychainEntry) -> SecurityResult<()> {
+        if !self.capability.available {
+            return Ok(());
+        }
+        match self.entry(entry)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(SecurityError::new(format!(
+                "failed to delete native {} credential: {error}",
+                keychain_backend_name(self.capability.backend)
+            ))),
+        }
+    }
+}
+
+const fn keychain_backend(platform: SecurityPlatform) -> KeychainBackend {
+    match platform {
+        SecurityPlatform::Windows => KeychainBackend::WindowsCredentialManager,
+        SecurityPlatform::MacOs => KeychainBackend::MacOsKeychain,
+        SecurityPlatform::Linux => KeychainBackend::LinuxSecretService,
+        SecurityPlatform::Ios => KeychainBackend::IosKeychain,
+        SecurityPlatform::Unknown => KeychainBackend::Unavailable,
+    }
+}
+
+const fn keychain_backend_name(backend: KeychainBackend) -> &'static str {
+    match backend {
+        KeychainBackend::WindowsCredentialManager => "Windows Credential Manager",
+        KeychainBackend::MacOsKeychain => "macOS Keychain",
+        KeychainBackend::LinuxSecretService => "Linux Secret Service",
+        KeychainBackend::IosKeychain => "iOS Keychain",
+        KeychainBackend::MemoryOnly => "memory-only",
+        KeychainBackend::Unavailable => "platform",
     }
 }
 
@@ -941,13 +1023,80 @@ mod tests {
     }
 
     #[test]
-    fn platform_keychain_reports_explicit_unavailable_capability() {
-        let keychain = PlatformKeychainProvider::for_platform(SecurityPlatform::Linux);
+    fn non_current_platform_keychain_reports_explicit_unavailable_capability() {
+        let platform = if SecurityPlatform::current() == SecurityPlatform::Linux {
+            SecurityPlatform::Windows
+        } else {
+            SecurityPlatform::Linux
+        };
+        let keychain = PlatformKeychainProvider::for_platform(platform);
         let capability = keychain.capability();
 
-        assert_eq!(capability.backend, KeychainBackend::LinuxSecretService);
+        assert_eq!(capability.backend, keychain_backend(platform));
         assert!(!capability.available);
         assert!(capability.message.contains("not available"));
+    }
+
+    #[test]
+    fn unavailable_native_keychain_still_allows_transient_prompt_secret() {
+        let platform = if SecurityPlatform::current() == SecurityPlatform::Linux {
+            SecurityPlatform::Windows
+        } else {
+            SecurityPlatform::Linux
+        };
+        let keychain = PlatformKeychainProvider::for_platform(platform);
+        let prompt_provider = RecordingPromptProvider {
+            response: Some(SecretPromptResponse::transient(SecretString::new(
+                "transient",
+            ))),
+            ..RecordingPromptProvider::default()
+        };
+        let mut provider = KeychainBackedSecretProvider::new(keychain, prompt_provider);
+        let secret = provider
+            .request_secret(SecretRequest::SshPassword {
+                profile: "prod".to_owned(),
+                host: "example.com".to_owned(),
+                username: "alice".to_owned(),
+            })
+            .expect("unavailable keychain should fall back to prompt")
+            .expect("transient secret");
+
+        assert_eq!(secret.expose(), "transient");
+    }
+
+    #[test]
+    #[ignore = "writes and deletes one temporary credential in the native OS keychain"]
+    fn native_platform_keychain_round_trip() {
+        let mut keychain = PlatformKeychainProvider::for_current_platform();
+        let capability = keychain.capability();
+        assert!(
+            capability.available,
+            "native keychain unavailable: {}",
+            capability.message
+        );
+        let entry = KeychainEntry::new(
+            "panea.native-keychain-smoke",
+            format!("process-{}", std::process::id()),
+            KeychainSecretKind::GenericToken,
+        );
+        let _ = keychain.delete_secret(&entry);
+        keychain
+            .set_secret(&entry, SecretString::new("panea-keychain-smoke"))
+            .expect("native keychain write");
+        let stored = keychain
+            .get_secret(&entry)
+            .expect("native keychain read")
+            .expect("native keychain entry");
+        assert_eq!(stored.expose(), "panea-keychain-smoke");
+        keychain
+            .delete_secret(&entry)
+            .expect("native keychain cleanup");
+        assert!(
+            keychain
+                .get_secret(&entry)
+                .expect("native keychain read after delete")
+                .is_none()
+        );
     }
 
     #[test]

@@ -167,6 +167,7 @@ pub enum InputEvent {
     Ime(ImeEvent),
     Focused(bool),
     Resized { width: u32, height: u32 },
+    ScaleFactorChanged { scale_factor: f64 },
     CloseRequested,
     WindowAction(WindowAction),
 }
@@ -220,6 +221,13 @@ pub struct ClipboardDiagnostic {
 pub struct WindowModeDiagnostic {
     pub requested: WindowMode,
     pub effective: WindowMode,
+    pub fallback: Option<PlatformFallback>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecorationModeDiagnostic {
+    pub requested: DecorationMode,
+    pub effective: DecorationMode,
     pub fallback: Option<PlatformFallback>,
 }
 

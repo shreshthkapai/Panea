@@ -42,6 +42,7 @@ base64 = "0.22"
 bytemuck = { version = "1", features = ["derive"] }
 fontdb = "0.23"
 image = { version = "0.25", default-features = false, features = ["gif", "ico", "png"] }
+keyring = "4.1"
 rustybuzz = "0.20"
 swash = "0.2"
 pollster = "0.4"

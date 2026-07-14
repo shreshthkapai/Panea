@@ -24,21 +24,21 @@ considered verified until that matrix has real X11 and Wayland host evidence.
 
 | Feature | macOS | Windows | Linux X11 | Linux Wayland | Notes |
 | --- | --- | --- | --- | --- | --- |
-| window modes | partial | partial | partial | partial | Windowed, maximized, borderless fullscreen, and frameless states are modeled; real compositor validation remains open. |
-| frameless modes | partial | partial | fallback | fallback | Implemented through winit decorations with Linux decoration negotiation still requiring compositor tests. |
-| fullscreen modes | partial | partial | partial | fallback | Exclusive fullscreen currently falls back to borderless fullscreen. |
+| window modes | partial | partial | partial | partial | Windowed, maximized, exclusive/borderless fullscreen, and frameless runtime paths exist; native-host validation remains open. |
+| frameless modes | partial | partial | fallback | fallback | Implemented through winit decorations; unsupported strategies report requested/effective fallback and Linux still requires compositor tests. |
+| fullscreen modes | partial | partial | partial | partial | Exclusive mode selects a monitor video mode and explicitly falls back to borderless when unavailable. |
 | clipboard | partial | partial | partial | partial | System clipboard bridge, pane-aware mouse/keyboard selection, portable Ctrl/Super copy/paste, Linux Primary selection provider, paste protection, and OSC 52 policy exist; real cross-OS and Linux compositor smoke remain. |
-| IME | partial | partial | partial | partial | Platform-neutral IME events are represented; real composed-input validation is still required. |
-| DPI/fractional scaling | partial | partial | partial | partial | Monitor scale snapshots exist; fractional behavior needs real host verification. |
+| IME | partial | partial | partial | partial | Enabled/preedit/commit/disabled events are wired; preedit is an overlay and only commit reaches the PTY. Real language/input-method validation remains. |
+| DPI/fractional scaling | partial | partial | partial | partial | Per-monitor scale events resize renderer, mux viewports, terminal grids, and PTYs; native-host fractional behavior needs verification. |
 | font fallback | partial | tested | partial | partial | OpenType shaping, per-grapheme fallback, real style-face lookup, COLR/bitmap color emoji, RGBA atlas rendering, and doctor diagnostics are implemented; installed-font/screenshot reports remain to be collected outside Windows. |
 | GPU backend | partial | partial | partial | partial | WGPU surface/device path exists; GPU backend inventory and screenshot verification remain open. |
 | local PTY | partial | full | partial | partial | Windows real-shell smoke passed on the current host; macOS/Linux real PTY smoke remains unverified. |
 | PowerShell/cmd/WSL | not implemented yet | partial | not implemented yet | not implemented yet | Windows shell profile groundwork exists; WSL runtime smoke is not verified. |
 | shell integration | partial | partial | partial | partial | Semantic parsers, config modes, desktop runtime activation, and real PowerShell smoke exist; bash/zsh/fish, WSL, remote, macOS, and Linux validation remain open. |
-| tabs/panes | partial | partial | partial | partial | Local desktop tabs/splits are wired with per-pane terminal and PTY ownership; real cross-OS GUI smoke, startup layouts, and SSH panes remain open. |
+| tabs/panes | partial | partial | partial | partial | Local and SSH tabs/splits, startup layouts, per-pane transports, resize and reconnect are wired; real cross-OS GUI smoke remains open. |
 | command blocks | partial | partial | partial | partial | Semantic storage and basic overlays exist; real shell-driven UI verification remains open. |
 | cursor animations | partial | tested | partial | partial | Smooth/eased/effect animations and user GIF/PNG cursors use bounded local damage, off-thread decode, cached frames, and one GPU texture-array upload; macOS/Linux interactive visual smoke remains open. |
-| SSH | partial | partial | partial | partial | Secure transport backend, explicit trust/secret provider contracts, and `cargo xtask ssh-smoke` harness exist; native keychain UI/backend wiring and collected server reports remain open. |
+| SSH | partial | partial | partial | partial | First-class mux panes, host trust/auth overlays, native desktop keychains, reconnect presentation, remote semantics, and `cargo xtask ssh-smoke` exist; real server reports remain open. |
 | config reload | partial | tested | partial | partial | Debounced TOML watcher and live applier exist; Windows unit/desktop tests pass, while macOS/Linux runtime validation remains open. |
 | notifications | not implemented yet | not implemented yet | not implemented yet | not implemented yet | Native notification surface has not been implemented. |
 | OSC clipboard | partial | partial | partial | partial | OSC 52 parser and security policy exist; remote confirmation UI and real app/platform smoke remain open. |
@@ -63,10 +63,10 @@ considered verified until that matrix has real X11 and Wayland host evidence.
 - Retina scaling: represented by DPI snapshots, unverified on real Retina hosts.
 - Keyboard shortcuts and Command key conventions: not fully mapped yet.
 - Option/Alt behavior config: not fully mapped yet.
-- Fullscreen behavior: modeled through window modes, unverified.
-- Frameless behavior: modeled, unverified.
+- Fullscreen behavior: exclusive/borderless implementation exists, unverified.
+- Frameless behavior: implementation and recovery actions exist, unverified.
 - Clipboard: bridge exists, unverified.
-- IME: event contract exists, unverified.
+- IME: preedit/commit overlay path exists, unverified.
 - Font fallback: configurable, unverified.
 - Signing/notarization plan: later packaging phase.
 
@@ -80,23 +80,23 @@ considered verified until that matrix has real X11 and Wayland host evidence.
 - ConPTY behavior: bounded lifecycle tests passed on current host.
 - AltGr and modifier handling: translated through platform events; dedicated
   keyboard-layout tests still needed.
-- DPI scaling: per-monitor behavior is represented; full manual matrix remains
+- DPI scaling: per-monitor resize handling exists; full manual matrix remains
   open.
 - Window resize behavior: wired to terminal and transport resize; runtime GUI
   coverage remains shallow.
 - Clipboard: bridge exists.
-- IME: event contract exists; real composed-input coverage remains open.
+- IME: preedit overlay and commit path exist; real composed-input coverage remains open.
 - Font fallback: configurable; installed-font variance still needs coverage.
 - Installer packaging: later packaging phase.
 
 ## Linux X11 Polish Checklist
 
-- Window creation: represented through winit; real X11 host verification needed.
+- Window creation: explicit winit X11 builder exists; real X11 host verification needed.
 - Fullscreen: modeled; real WM behavior unverified.
 - Frameless/custom decoration: modeled with fallback diagnostics; real WM
   behavior unverified.
-- Clipboard: system bridge exists; primary selection remains future work.
-- Selection clipboard: not implemented yet.
+- Clipboard: system and primary-selection bridges exist; real WM verification remains.
+- Selection clipboard: implemented, unverified on real X11 hosts.
 - DPI/scaling: represented; real X11 behavior unverified.
 - Major window managers: unverified.
 - Tiling WM behavior: unverified.
@@ -109,12 +109,12 @@ considered verified until that matrix has real X11 and Wayland host evidence.
 - KDE/KWin: unverified.
 - wlroots/Sway class: unverified.
 - Hyprland class: unverified.
-- Decoration negotiation: modeled as a requested/effective diagnostic, but
+- Decoration negotiation: resolves requested/effective/fallback state, but
   compositor-specific behavior is unverified.
 - Fullscreen behavior: modeled; compositor behavior unverified.
 - Fractional scaling: represented; real compositor behavior unverified.
 - Clipboard: system bridge exists; Wayland-specific failure modes need tests.
-- IME: event contract exists; real composed-input coverage remains open.
+- IME: composition overlay and commit path exist; real composed-input coverage remains open.
 - Fallback diagnostics: backend/decorations fields exist and need real host
   coverage.
 - Verification checklist: see [Linux compositor matrix](linux-compositor-matrix.md).

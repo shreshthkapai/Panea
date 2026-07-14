@@ -128,6 +128,9 @@ pub enum OverlayKind {
     ContentMask,
     Badge,
     PerformanceOverlay,
+    SecurityPrompt,
+    SessionStatus,
+    ImePreedit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

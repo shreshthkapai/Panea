@@ -31,9 +31,10 @@ to app UI for a prompt, and write back only when the user explicitly chooses to
 save the secret. Secret debug output is redacted, and in-memory strings are
 zeroized on drop where practical.
 
-Platform keychain capability reporting exists for Windows, macOS, Linux, and
-iOS targets. Native OS secure-storage wiring and user-facing prompts are still
-follow-up app lifecycle work and must fail clearly while unavailable.
+Desktop secure storage uses Windows Credential Manager, macOS Keychain, or
+Linux Secret Service through `PlatformKeychainProvider`. The app displays
+masked credential prompts and persists only when the user explicitly enables
+the save option. iOS still requires its native Keychain bridge.
 
 ## Clipboard
 
@@ -81,7 +82,6 @@ cargo xtask ssh-smoke run --host 127.0.0.1 --user panea --auth agent
 
 Current blockers for release security posture:
 
-- Native OS keychain-backed secret providers are not wired into the app
 - remote OSC clipboard confirmation UI is not implemented
-- interactive SSH host-key approval and credential prompt UI is not complete
 - shell integration installer trust and update policy still need review
+- real SSH trust/auth reports must be collected on every target OS

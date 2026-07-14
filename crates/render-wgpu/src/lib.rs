@@ -1940,7 +1940,10 @@ fn overlay_label_rect(overlay: &OverlayPrimitive, metrics: CellMetrics) -> Rende
 fn overlay_label_color(kind: OverlayKind) -> RenderColor {
     match kind {
         OverlayKind::Badge | OverlayKind::ContentMask => RenderColor::rgb(245, 248, 252),
-        OverlayKind::PerformanceOverlay => RenderColor::rgb(225, 232, 240),
+        OverlayKind::PerformanceOverlay | OverlayKind::SessionStatus | OverlayKind::ImePreedit => {
+            RenderColor::rgb(225, 232, 240)
+        }
+        OverlayKind::SecurityPrompt => RenderColor::rgb(248, 242, 224),
         OverlayKind::PromptDecoration
         | OverlayKind::CommandBlock
         | OverlayKind::InputOutputGroup => RenderColor::rgb(214, 222, 232),

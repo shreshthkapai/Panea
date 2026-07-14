@@ -431,11 +431,19 @@ to more visible features before the dependencies they rely on are hardened.
   `diagnostics.performance_overlay` is enabled. Real hardware timestamp
   validation, polished installed overlay UX, and CI regression gates remain
   follow-up work.
-- Phase 12 establishes secure SSH transport contracts and a real backend, but
-  desktop host-key approval UI, native OS keychain backend wiring, proxy jump,
-  remote shell-integration install flows, reconnect UI/actions, and collected
-  real SSH server smoke reports across Windows/macOS/Linux remain unverified
-  follow-up work.
+- Product Step 15 completes desktop SSH product wiring: SSH tabs/panes connect
+  off the UI thread, unknown/changed hosts use explicit renderer-modal actions,
+  password/passphrase entry is masked, opt-in persistence uses Windows
+  Credential Manager/macOS Keychain/Linux Secret Service, remote semantic
+  markers feed command overlays, and disconnected panes preserve scrollback
+  with an explicit reconnect action. Proxy jump, remote integration install
+  flows, and collected real-server reports remain follow-up work.
+- Product Step 16 hardens the shared desktop platform path with real winit
+  X11/Wayland backend selection, requested/effective decoration diagnostics,
+  exclusive fullscreen with explicit borderless fallback, DPI scale events,
+  IME preedit overlays, and existing system/primary clipboard providers. These
+  implementations are not cross-OS verified until native macOS, Linux X11,
+  and Linux Wayland reports are collected.
 - Phase 13 adds the parity matrix and diagnostics command foundation, and
   next-pass Phase 18 installs `panea doctor`, but neither step magically
   verifies macOS, Linux X11, or Linux Wayland from this Windows host. Real
@@ -456,8 +464,7 @@ to more visible features before the dependencies they rely on are hardened.
   shell-launch verification. MSI/installer, Start menu/PATH integration, macOS
   DMG/zip, signing/notarization, Linux AppImage/deb/rpm, terminfo installation
   strategy, GUI package launch automation, and macOS/Linux package reports
-  remain follow-up work. OS keychain-backed secret providers, interactive SSH host-key
-  approval UI, remote OSC 52 clipboard confirmation UI, real GPU device-loss
+  remain follow-up work. Remote OSC 52 clipboard confirmation UI, real GPU device-loss
   platform validation, cross-OS config reload validation, and richer config
   error UI also remain release-hardening follow-up work.
 - Phase 15 and next-pass Phase 22 establish a compileable iOS companion path

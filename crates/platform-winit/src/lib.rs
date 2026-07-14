@@ -7,16 +7,16 @@ use std::sync::Arc;
 use arboard::Clipboard;
 use platform_core::{
     ClipboardAvailability, ClipboardDiagnostic, ClipboardOperation, ClipboardProvider,
-    CompositorInfo, DecorationMode, DesktopPlatform, DpiBehavior, DpiInfo, ImeEvent, ImeSupport,
-    InputEvent, KeyEvent, KeyModifiers, KeyState, LinuxWindowBackend, LinuxWindowBackendDiagnostic,
-    MonitorInfo, MouseButton, MouseEvent, MouseEventKind, PlatformCapabilities, PlatformFallback,
-    ShellEnvironmentInfo, UrlOpenDiagnostic, UrlOpener, WindowAction, WindowMode,
-    WindowModeDiagnostic,
+    CompositorInfo, DecorationMode, DecorationModeDiagnostic, DesktopPlatform, DpiBehavior,
+    DpiInfo, ImeEvent, ImeSupport, InputEvent, KeyEvent, KeyModifiers, KeyState,
+    LinuxWindowBackend, LinuxWindowBackendDiagnostic, MonitorInfo, MouseButton, MouseEvent,
+    MouseEventKind, PlatformCapabilities, PlatformFallback, ShellEnvironmentInfo,
+    UrlOpenDiagnostic, UrlOpener, WindowAction, WindowMode, WindowModeDiagnostic,
 };
 use winit::{
     dpi::LogicalSize,
     event::{ElementState, Ime, MouseScrollDelta, WindowEvent},
-    event_loop::EventLoopWindowTarget,
+    event_loop::{EventLoop, EventLoopBuilder, EventLoopWindowTarget},
     keyboard::{Key, ModifiersState, NamedKey},
     window::{Fullscreen, Window, WindowBuilder},
 };
@@ -57,10 +57,11 @@ impl DesktopWindow {
         event_loop: &EventLoopWindowTarget<()>,
         settings: &WindowSettings,
     ) -> Result<Self, winit::error::OsError> {
+        let decoration = resolve_decoration_mode(settings.decoration_mode, detected_platform());
         let decorations = !matches!(
             settings.mode,
             WindowMode::FramelessWindowed | WindowMode::FramelessFullscreen
-        ) && !matches!(settings.decoration_mode, DecorationMode::None);
+        ) && !matches!(decoration.effective, DecorationMode::None);
 
         let window = WindowBuilder::new()
             .with_title(settings.title.clone())
@@ -74,8 +75,10 @@ impl DesktopWindow {
             .build(event_loop)?;
 
         let window = Arc::new(window);
-        let window_mode = apply_window_mode(&window, settings.mode);
-        let linux = linux_backend_diagnostic(settings);
+        window.set_ime_allowed(true);
+        let window_mode =
+            apply_window_mode_with_decoration(&window, settings.mode, decoration.effective);
+        let linux = linux_backend_diagnostic(settings, &decoration);
         let monitors = monitor_infos(event_loop);
         let dpi = window_dpi_info(&window);
 
@@ -85,6 +88,11 @@ impl DesktopWindow {
                 dpi,
                 monitors,
                 window_mode,
+                decoration: DecorationModeDiagnostic {
+                    requested: settings.decoration_mode,
+                    effective: decoration.effective,
+                    fallback: decoration.fallback.clone(),
+                },
                 linux,
             },
         })
@@ -106,6 +114,7 @@ pub struct DesktopWindowDiagnostics {
     pub dpi: DpiInfo,
     pub monitors: Vec<MonitorInfo>,
     pub window_mode: WindowModeDiagnostic,
+    pub decoration: DecorationModeDiagnostic,
     pub linux: Option<LinuxWindowBackendDiagnostic>,
 }
 
@@ -137,6 +146,11 @@ impl InputTranslator {
                 width: size.width,
                 height: size.height,
             }],
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                vec![InputEvent::ScaleFactorChanged {
+                    scale_factor: *scale_factor,
+                }]
+            }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers_from_winit(modifiers.state());
                 Vec::new()
@@ -421,34 +435,46 @@ impl Default for ClipboardBridge {
 }
 
 pub fn apply_window_mode(window: &Window, requested: WindowMode) -> WindowModeDiagnostic {
+    apply_window_mode_with_decoration(window, requested, DecorationMode::Native)
+}
+
+pub fn apply_window_mode_with_decoration(
+    window: &Window,
+    requested: WindowMode,
+    decoration: DecorationMode,
+) -> WindowModeDiagnostic {
     let mut effective = requested;
     let mut fallback = None;
+    let decorated = !matches!(decoration, DecorationMode::None);
 
     match requested {
         WindowMode::Windowed => {
-            window.set_decorations(true);
+            window.set_decorations(decorated);
             window.set_fullscreen(None);
             window.set_maximized(false);
         }
         WindowMode::Maximized => {
-            window.set_decorations(true);
+            window.set_decorations(decorated);
             window.set_fullscreen(None);
             window.set_maximized(true);
         }
         WindowMode::Fullscreen => {
-            window.set_decorations(true);
-            window.set_fullscreen(Some(Fullscreen::Borderless(window.current_monitor())));
-            effective = WindowMode::BorderlessFullscreen;
-            fallback = Some(PlatformFallback {
-                feature: "window_mode".to_owned(),
-                requested: "fullscreen".to_owned(),
-                effective: "borderless_fullscreen".to_owned(),
-                reason: "exclusive fullscreen requires backend-specific video-mode selection"
-                    .to_owned(),
-            });
+            window.set_decorations(decorated);
+            if let Some(video_mode) = preferred_video_mode(window) {
+                window.set_fullscreen(Some(Fullscreen::Exclusive(video_mode)));
+            } else {
+                window.set_fullscreen(Some(Fullscreen::Borderless(window.current_monitor())));
+                effective = WindowMode::BorderlessFullscreen;
+                fallback = Some(PlatformFallback {
+                    feature: "window_mode".to_owned(),
+                    requested: "fullscreen".to_owned(),
+                    effective: "borderless_fullscreen".to_owned(),
+                    reason: "the active monitor did not expose an exclusive video mode".to_owned(),
+                });
+            }
         }
         WindowMode::BorderlessFullscreen => {
-            window.set_decorations(true);
+            window.set_decorations(false);
             window.set_fullscreen(Some(Fullscreen::Borderless(window.current_monitor())));
         }
         WindowMode::FramelessWindowed => {
@@ -468,6 +494,77 @@ pub fn apply_window_mode(window: &Window, requested: WindowMode) -> WindowModeDi
     }
 }
 
+fn preferred_video_mode(window: &Window) -> Option<winit::monitor::VideoMode> {
+    let size = window.inner_size();
+    window.current_monitor()?.video_modes().max_by_key(|mode| {
+        let mode_size = mode.size();
+        let size_match = u8::from(mode_size == size);
+        (size_match, mode.refresh_rate_millihertz(), mode.bit_depth())
+    })
+}
+
+#[derive(Debug, Clone)]
+struct DecorationResolution {
+    effective: DecorationMode,
+    fallback: Option<PlatformFallback>,
+}
+
+fn resolve_decoration_mode(
+    requested: DecorationMode,
+    platform: DesktopPlatform,
+) -> DecorationResolution {
+    let (effective, reason) = match requested {
+        DecorationMode::Auto => (DecorationMode::Native, None),
+        DecorationMode::Native | DecorationMode::None => (requested, None),
+        DecorationMode::ServerSide if platform == DesktopPlatform::LinuxX11 => {
+            (DecorationMode::Native, None)
+        }
+        DecorationMode::ClientSide if platform == DesktopPlatform::LinuxWayland => (
+            DecorationMode::Native,
+            Some(
+                "winit negotiates Wayland decorations with the compositor; exact client-side selection is not guaranteed",
+            ),
+        ),
+        DecorationMode::ServerSide
+        | DecorationMode::ClientSide
+        | DecorationMode::Custom
+        | DecorationMode::FallbackDecorated => (
+            DecorationMode::Native,
+            Some("the active window backend cannot guarantee the requested decoration strategy"),
+        ),
+    };
+    DecorationResolution {
+        effective,
+        fallback: reason.map(|reason| PlatformFallback {
+            feature: "window_decorations".to_owned(),
+            requested: format!("{requested:?}"),
+            effective: format!("{effective:?}"),
+            reason: reason.to_owned(),
+        }),
+    }
+}
+
+pub fn create_event_loop(
+    requested: LinuxWindowBackend,
+) -> Result<EventLoop<()>, winit::error::EventLoopError> {
+    let mut builder = EventLoopBuilder::new();
+    #[cfg(target_os = "linux")]
+    match requested {
+        LinuxWindowBackend::Auto => {}
+        LinuxWindowBackend::X11 => {
+            use winit::platform::x11::EventLoopBuilderExtX11;
+            builder.with_x11();
+        }
+        LinuxWindowBackend::Wayland => {
+            use winit::platform::wayland::EventLoopBuilderExtWayland;
+            builder.with_wayland();
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = requested;
+    builder.build()
+}
+
 #[must_use]
 pub fn platform_capabilities(
     event_loop: &EventLoopWindowTarget<()>,
@@ -478,6 +575,7 @@ pub fn platform_capabilities(
         window_modes_supported: vec![
             WindowMode::Windowed,
             WindowMode::Maximized,
+            WindowMode::Fullscreen,
             WindowMode::BorderlessFullscreen,
             WindowMode::FramelessWindowed,
             WindowMode::FramelessFullscreen,
@@ -606,17 +704,16 @@ fn window_dpi_info(window: &Window) -> DpiInfo {
     }
 }
 
-fn linux_backend_diagnostic(settings: &WindowSettings) -> Option<LinuxWindowBackendDiagnostic> {
+fn linux_backend_diagnostic(
+    settings: &WindowSettings,
+    decoration: &DecorationResolution,
+) -> Option<LinuxWindowBackendDiagnostic> {
     if !cfg!(target_os = "linux") {
         return None;
     }
 
     let backend_used = detected_platform();
-    let decoration_used = match settings.decoration_mode {
-        DecorationMode::Auto | DecorationMode::Native => DecorationMode::Native,
-        other => other,
-    };
-    let fallback = match (settings.linux_backend, backend_used) {
+    let backend_fallback = match (settings.linux_backend, backend_used) {
         (LinuxWindowBackend::X11, DesktopPlatform::LinuxWayland)
         | (LinuxWindowBackend::Wayland, DesktopPlatform::LinuxX11) => Some(PlatformFallback {
             feature: "linux_window_backend".to_owned(),
@@ -627,13 +724,14 @@ fn linux_backend_diagnostic(settings: &WindowSettings) -> Option<LinuxWindowBack
         }),
         _ => None,
     };
+    let fallback = backend_fallback.or_else(|| decoration.fallback.clone());
 
     Some(LinuxWindowBackendDiagnostic {
         requested_backend: settings.linux_backend,
         backend_used,
         compositor: compositor_info(),
         decoration_requested: settings.decoration_mode,
-        decoration_used,
+        decoration_used: decoration.effective,
         fallback,
     })
 }
@@ -762,6 +860,33 @@ mod tests {
             clipboard_capabilities()
                 .contains(&platform_core::ClipboardCapability::PrimarySelection),
             cfg!(target_os = "linux")
+        );
+    }
+
+    #[test]
+    fn unsupported_custom_decorations_report_an_explicit_fallback() {
+        let resolution = resolve_decoration_mode(DecorationMode::Custom, DesktopPlatform::Windows);
+
+        assert_eq!(resolution.effective, DecorationMode::Native);
+        let fallback = resolution
+            .fallback
+            .expect("custom mode must report fallback");
+        assert_eq!(fallback.feature, "window_decorations");
+        assert!(fallback.reason.contains("cannot guarantee"));
+    }
+
+    #[test]
+    fn wayland_client_side_request_reports_negotiation() {
+        let resolution =
+            resolve_decoration_mode(DecorationMode::ClientSide, DesktopPlatform::LinuxWayland);
+
+        assert_eq!(resolution.effective, DecorationMode::Native);
+        assert!(
+            resolution
+                .fallback
+                .expect("Wayland negotiation must be visible")
+                .reason
+                .contains("compositor")
         );
     }
 }

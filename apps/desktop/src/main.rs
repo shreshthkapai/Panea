@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        mpsc::{self, Receiver, TryRecvError},
+        mpsc::{self, Receiver, SyncSender, TryRecvError},
     },
     thread,
     time::{Duration, Instant},
@@ -34,7 +34,7 @@ use platform_core::{
 };
 use platform_winit::{
     ClipboardBridge, DesktopUrlOpener, DesktopWindow, InputTranslator, WindowSettings,
-    apply_window_mode, platform_capabilities,
+    apply_window_mode_with_decoration, create_event_loop, platform_capabilities,
 };
 use render_core::{
     CellPosition, CursorVisual, OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle,
@@ -47,7 +47,11 @@ use render_wgpu::{
     DamageTracker, FrameDecision, FrameScheduler, GpuTerminalRenderer, PresentMode, RendererError,
     RendererOptions,
 };
-use security::KeychainProvider;
+use security::{
+    HostKeyTrustAction, HostKeyTrustReason, HostKeyTrustRequest, HostTrustProvider,
+    KeychainBackedSecretProvider, KeychainProvider, KeychainProviderCapability,
+    SecretPromptProvider, SecretPromptResponse, SecretRequest, SecretString,
+};
 use security::{
     Osc52ClipboardDecision, Osc52ClipboardPolicy, Osc52ClipboardRequest as SecurityOsc52Request,
     Osc52ClipboardTarget, PlatformKeychainProvider, evaluate_osc52_clipboard_write,
@@ -78,7 +82,7 @@ use transport_ssh::{SshConnectionProfile, SshTransport};
 use unicode_segmentation::UnicodeSegmentation;
 use winit::{
     event::{Event, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
+    event_loop::ControlFlow,
 };
 
 fn main() {
@@ -667,7 +671,7 @@ fn doctor_runtime_snapshot(
         gpu_features: gpu_probe
             .as_ref()
             .map_or_else(Vec::new, |probe| probe.features.clone()),
-        window_backend: Some(window_backend_label()),
+        window_backend: Some(window_backend_label(config)),
         x11_wayland_status: Some(x11_wayland_status()),
         dpi_scale: None,
         font_discovery: font_discovery_label(config),
@@ -690,19 +694,30 @@ fn doctor_runtime_snapshot(
             keychain_capability.message
         ),
         pty_backend: pty_backend_label(),
-        ssh_provider_status: "ssh2 transport backend configured; host trust is explicit".to_owned(),
+        ssh_provider_status: format!(
+            "ssh2 transport; interactive host trust and credential prompts enabled; native keychain available={}",
+            keychain_capability.available
+        ),
     }
 }
 
-fn window_backend_label() -> String {
+fn window_backend_label(config: &AppConfig) -> String {
     if cfg!(windows) {
         "winit/windows".to_owned()
     } else if cfg!(target_os = "macos") {
         "winit/macos".to_owned()
     } else if cfg!(target_os = "linux") {
-        std::env::var("WINIT_UNIX_BACKEND")
-            .map(|backend| format!("winit/linux requested={backend}"))
-            .unwrap_or_else(|_| "winit/linux auto".to_owned())
+        let detected = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            "wayland"
+        } else if std::env::var_os("DISPLAY").is_some() {
+            "x11"
+        } else {
+            "unavailable"
+        };
+        format!(
+            "winit/linux requested={:?} detected={detected}",
+            config.window.linux_backend
+        )
     } else {
         "winit/unknown".to_owned()
     }
@@ -757,8 +772,32 @@ fn run() -> Result<(), Box<dyn Error>> {
         .iter()
         .map(ssh_connection_profile)
         .collect();
-    let event_loop = EventLoop::new()?;
-    let desktop_window = DesktopWindow::create(&event_loop, &window_settings(&config))?;
+    let settings = window_settings(&config);
+    let event_loop = create_event_loop(settings.linux_backend)?;
+    let desktop_window = DesktopWindow::create(&event_loop, &settings)?;
+    if let Some(fallback) = desktop_window.diagnostics().window_mode.fallback.as_ref() {
+        eprintln!(
+            "platform fallback [{}]: requested={} effective={} reason={}",
+            fallback.feature, fallback.requested, fallback.effective, fallback.reason
+        );
+    }
+    if let Some(fallback) = desktop_window.diagnostics().decoration.fallback.as_ref() {
+        eprintln!(
+            "platform fallback [{}]: requested={} effective={} reason={}",
+            fallback.feature, fallback.requested, fallback.effective, fallback.reason
+        );
+    }
+    if let Some(fallback) = desktop_window
+        .diagnostics()
+        .linux
+        .as_ref()
+        .and_then(|diagnostic| diagnostic.fallback.as_ref())
+    {
+        eprintln!(
+            "platform fallback [{}]: requested={} effective={} reason={}",
+            fallback.feature, fallback.requested, fallback.effective, fallback.reason
+        );
+    }
     let window = desktop_window.window();
     let capabilities = platform_capabilities(&event_loop, &window);
     let _diagnostics =
@@ -766,7 +805,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut input_translator = InputTranslator::new();
     let mut clipboard = ClipboardBridge::new();
     let mut url_opener = DesktopUrlOpener::new();
-    let mut current_window_mode = map_window_mode(config.window.mode);
+    let mut current_window_mode = desktop_window.diagnostics().window_mode.effective;
+    let decoration_mode = map_decoration_mode(config.window.decoration_strategy);
     let mut clipboard_config = config.clipboard.clone();
     let mut paste_config = config.paste.clone();
     let mut osc52_policy = osc52_policy(&clipboard_config);
@@ -830,6 +870,20 @@ fn run() -> Result<(), Box<dyn Error>> {
                             performance_budget,
                             metrics,
                         );
+                        if let Some(cursor) = scene.cursor {
+                            let x = scene.content_offset.x.max(0) as f64
+                                + f64::from(cursor.position.col) * f64::from(metrics.cell_width);
+                            let y = scene.content_offset.y.max(0) as f64
+                                + cursor.position.row.max(0) as f64
+                                    * f64::from(metrics.cell_height);
+                            window.set_ime_cursor_area(
+                                winit::dpi::PhysicalPosition::new(x, y),
+                                winit::dpi::PhysicalSize::new(
+                                    f64::from(metrics.cell_width),
+                                    f64::from(metrics.cell_height),
+                                ),
+                            );
+                        }
                         scene.damage_regions = damage_tracker.update(&scene, metrics);
                     }
                     let idle_wakeups = scheduler.take_idle_wakeups();
@@ -903,6 +957,23 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 }
                                 if let Ok(metrics) = fonts.cell_metrics() {
                                     mux_runtime.resize_all(width, height, metrics, &config);
+                                }
+                                scheduler.window_resized();
+                                window.request_redraw();
+                            }
+                            InputEvent::ScaleFactorChanged { scale_factor } => {
+                                surface_size = window.inner_size();
+                                renderer.resize(surface_size.width, surface_size.height);
+                                if let Ok(metrics) = fonts.cell_metrics() {
+                                    mux_runtime.resize_all(
+                                        surface_size.width,
+                                        surface_size.height,
+                                        metrics,
+                                        &config,
+                                    );
+                                }
+                                if matches!(config.diagnostics.log_level, LogLevel::Debug | LogLevel::Trace) {
+                                    eprintln!("DPI scale changed to {scale_factor:.3}");
                                 }
                                 scheduler.window_resized();
                                 window.request_redraw();
@@ -1060,6 +1131,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                                                 window.request_redraw();
                                             }
                                         }
+                                        "reconnect_session" => {
+                                            if mux_runtime.reconnect_active(&config, metrics) {
+                                                scheduler.terminal_content_changed();
+                                                window.request_redraw();
+                                            }
+                                        }
                                         "toggle_fullscreen" => {
                                             current_window_mode = if matches!(
                                                 current_window_mode,
@@ -1069,11 +1146,19 @@ fn run() -> Result<(), Box<dyn Error>> {
                                             } else {
                                                 WindowMode::Windowed
                                             };
-                                            let _ = apply_window_mode(&window, current_window_mode);
+                                            current_window_mode = apply_window_mode_logged(
+                                                &window,
+                                                current_window_mode,
+                                                decoration_mode,
+                                            );
                                         }
                                         "restore_window_decorations" => {
                                             current_window_mode = WindowMode::Windowed;
-                                            let _ = apply_window_mode(&window, current_window_mode);
+                                            current_window_mode = apply_window_mode_logged(
+                                                &window,
+                                                current_window_mode,
+                                                decoration_mode,
+                                            );
                                         }
                                         "toggle_frameless" => {
                                             current_window_mode = if matches!(
@@ -1084,7 +1169,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                                             } else {
                                                 WindowMode::FramelessWindowed
                                             };
-                                            let _ = apply_window_mode(&window, current_window_mode);
+                                            current_window_mode = apply_window_mode_logged(
+                                                &window,
+                                                current_window_mode,
+                                                decoration_mode,
+                                            );
                                         }
                                         "close_window" => {
                                             mux_runtime.shutdown_all();
@@ -1155,7 +1244,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                             InputEvent::Ime(platform_core::ImeEvent::Commit { text }) => {
-                                if mux_runtime.append_search_text(&text) {
+                                let _ = mux_runtime.update_active_ime_preedit(String::new());
+                                if mux_runtime.append_modal_text(&text)
+                                    || mux_runtime.append_search_text(&text)
+                                {
                                     scheduler.terminal_content_changed();
                                     window.request_redraw();
                                 } else {
@@ -1164,6 +1256,19 @@ fn run() -> Result<(), Box<dyn Error>> {
                                         scheduler.cursor_blink_changed();
                                     }
                                     mux_runtime.write_active(text.as_bytes());
+                                }
+                            }
+                            InputEvent::Ime(platform_core::ImeEvent::Preedit { text }) => {
+                                if mux_runtime.update_active_ime_preedit(text) {
+                                    scheduler.terminal_content_changed();
+                                    window.request_redraw();
+                                }
+                            }
+                            InputEvent::Ime(platform_core::ImeEvent::Enabled) => {}
+                            InputEvent::Ime(platform_core::ImeEvent::Disabled) => {
+                                if mux_runtime.update_active_ime_preedit(String::new()) {
+                                    scheduler.terminal_content_changed();
+                                    window.request_redraw();
                                 }
                             }
                             InputEvent::Focused(focused) => {
@@ -1183,11 +1288,19 @@ fn run() -> Result<(), Box<dyn Error>> {
                                         } else {
                                             WindowMode::Windowed
                                         };
-                                    let _ = apply_window_mode(&window, current_window_mode);
+                                    current_window_mode = apply_window_mode_logged(
+                                        &window,
+                                        current_window_mode,
+                                        decoration_mode,
+                                    );
                                 }
                                 WindowAction::RestoreWindowDecorations => {
                                     current_window_mode = WindowMode::Windowed;
-                                    let _ = apply_window_mode(&window, current_window_mode);
+                                    current_window_mode = apply_window_mode_logged(
+                                        &window,
+                                        current_window_mode,
+                                        decoration_mode,
+                                    );
                                 }
                                 WindowAction::ToggleFrameless => {
                                     current_window_mode = if matches!(
@@ -1198,7 +1311,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                                     } else {
                                         WindowMode::FramelessWindowed
                                     };
-                                    let _ = apply_window_mode(&window, current_window_mode);
+                                    current_window_mode = apply_window_mode_logged(
+                                        &window,
+                                        current_window_mode,
+                                        decoration_mode,
+                                    );
                                 }
                                 WindowAction::CloseWindow => {
                                     mux_runtime.shutdown_all();
@@ -1210,7 +1327,6 @@ fn run() -> Result<(), Box<dyn Error>> {
                                     );
                                 }
                             },
-                            _ => {}
                         }
                     }
                 }
@@ -1674,8 +1790,64 @@ const MAX_PENDING_SSH_INPUT_BYTES: usize = 64 * 1024;
 
 struct PendingSshTransport {
     result: Receiver<TransportResult<SshTransport>>,
+    interactions: Receiver<SshInteractionRequest>,
     requested_size: TransportSize,
     pending_input: Vec<u8>,
+}
+
+enum SshInteractionRequest {
+    HostTrust {
+        request: HostKeyTrustRequest,
+        response: SyncSender<HostKeyTrustAction>,
+    },
+    Secret {
+        request: SecretRequest,
+        keychain: KeychainProviderCapability,
+        response: SyncSender<Option<SecretPromptResponse>>,
+    },
+}
+
+struct ChannelHostTrustProvider {
+    requests: SyncSender<SshInteractionRequest>,
+}
+
+impl HostTrustProvider for ChannelHostTrustProvider {
+    fn decide_host_trust(
+        &mut self,
+        request: HostKeyTrustRequest,
+    ) -> security::SecurityResult<HostKeyTrustAction> {
+        let (response, result) = mpsc::sync_channel(1);
+        self.requests
+            .send(SshInteractionRequest::HostTrust { request, response })
+            .map_err(|_| security::SecurityError::new("SSH trust prompt was cancelled"))?;
+        result
+            .recv()
+            .map_err(|_| security::SecurityError::new("SSH trust prompt was cancelled"))
+    }
+}
+
+struct ChannelSecretPromptProvider {
+    requests: SyncSender<SshInteractionRequest>,
+    keychain: KeychainProviderCapability,
+}
+
+impl SecretPromptProvider for ChannelSecretPromptProvider {
+    fn prompt_secret(
+        &mut self,
+        request: &SecretRequest,
+    ) -> security::SecurityResult<Option<SecretPromptResponse>> {
+        let (response, result) = mpsc::sync_channel(1);
+        self.requests
+            .send(SshInteractionRequest::Secret {
+                request: request.clone(),
+                keychain: self.keychain.clone(),
+                response,
+            })
+            .map_err(|_| security::SecurityError::new("SSH credential prompt was cancelled"))?;
+        result
+            .recv()
+            .map_err(|_| security::SecurityError::new("SSH credential prompt was cancelled"))
+    }
 }
 
 enum PaneTransport {
@@ -1688,15 +1860,42 @@ enum PaneTransport {
 impl PaneTransport {
     fn connecting_ssh(profile: SshConnectionProfile, size: TransportSize) -> Self {
         let (sender, result) = mpsc::sync_channel(1);
+        let (interaction_sender, interactions) = mpsc::sync_channel(1);
         thread::spawn(move || {
-            let transport = SshTransport::connect(profile, size);
+            let mut trust_provider = ChannelHostTrustProvider {
+                requests: interaction_sender.clone(),
+            };
+            let keychain = PlatformKeychainProvider::for_current_platform();
+            let prompt_provider = ChannelSecretPromptProvider {
+                requests: interaction_sender,
+                keychain: keychain.capability(),
+            };
+            let mut secret_provider = KeychainBackedSecretProvider::new(keychain, prompt_provider);
+            let transport = SshTransport::connect_with_providers(
+                profile,
+                size,
+                &mut secret_provider,
+                &mut trust_provider,
+            );
             let _ = sender.send(transport);
         });
         Self::ConnectingSsh(PendingSshTransport {
             result,
+            interactions,
             requested_size: size,
             pending_input: Vec::new(),
         })
+    }
+
+    fn take_interaction(&mut self) -> Option<SshInteractionRequest> {
+        let Self::ConnectingSsh(pending) = self else {
+            return None;
+        };
+        pending.interactions.try_recv().ok()
+    }
+
+    fn is_connected(&self) -> bool {
+        matches!(self, Self::Local(_) | Self::Ssh(_))
     }
 
     fn promote_ssh(&mut self) -> TransportResult<()> {
@@ -2557,6 +2756,21 @@ fn window_settings(config: &AppConfig) -> WindowSettings {
     }
 }
 
+fn apply_window_mode_logged(
+    window: &winit::window::Window,
+    requested: WindowMode,
+    decoration: DecorationMode,
+) -> WindowMode {
+    let diagnostic = apply_window_mode_with_decoration(window, requested, decoration);
+    if let Some(fallback) = diagnostic.fallback.as_ref() {
+        eprintln!(
+            "platform fallback [{}]: requested={} effective={} reason={}",
+            fallback.feature, fallback.requested, fallback.effective, fallback.reason
+        );
+    }
+    diagnostic.effective
+}
+
 fn map_window_mode(mode: WindowModeConfig) -> WindowMode {
     match mode {
         WindowModeConfig::Windowed => WindowMode::Windowed,
@@ -2802,13 +3016,7 @@ impl MuxRuntime {
         let mut panes = HashMap::new();
         for (pane_id, spec) in pane_session_specs(&model) {
             let pane = PaneRuntime::new(config, &spec, initial_size, metrics);
-            let status = if pane.transport.is_some() {
-                SessionStatus::Running
-            } else {
-                SessionStatus::Failed {
-                    message: "transport failed to start".to_owned(),
-                }
-            };
+            let status = session_status_for_pane(&pane);
             panes.insert(pane_id, pane);
             mark_session_status(&mut model, pane_id, status);
         }
@@ -3022,7 +3230,7 @@ impl MuxRuntime {
             }
         };
         let pane = PaneRuntime::new(config, &spec, size, metrics);
-        mark_session_status(&mut self.model, pane_id, SessionStatus::Running);
+        mark_session_status(&mut self.model, pane_id, session_status_for_pane(&pane));
         self.panes.insert(pane_id, pane);
     }
 
@@ -3230,6 +3438,28 @@ impl MuxRuntime {
     fn append_search_text(&mut self, text: &str) -> bool {
         self.active_pane_mut()
             .is_some_and(|pane| pane.append_search_text(text))
+    }
+
+    fn append_modal_text(&mut self, text: &str) -> bool {
+        self.active_pane_mut()
+            .is_some_and(|pane| pane.append_modal_text(text))
+    }
+
+    fn update_active_ime_preedit(&mut self, text: String) -> bool {
+        self.active_pane_mut()
+            .is_some_and(|pane| pane.update_ime_preedit(text))
+    }
+
+    fn reconnect_active(&mut self, config: &AppConfig, metrics: CellMetrics) -> bool {
+        let pane_id = self.model.active_tab().active_pane;
+        let reconnected = self
+            .panes
+            .get_mut(&pane_id)
+            .is_some_and(|pane| pane.reconnect(config, metrics));
+        if let Some(pane) = self.panes.get(&pane_id) {
+            mark_session_status(&mut self.model, pane_id, session_status_for_pane(pane));
+        }
+        reconnected
     }
 
     fn start_keyboard_selection(&mut self, kind: SelectionKind) {
@@ -3532,16 +3762,7 @@ impl MuxRuntime {
             if poll.content_changed {
                 content_changed = true;
             }
-            if poll.error {
-                status_updates.push((
-                    *pane_id,
-                    SessionStatus::Failed {
-                        message: "transport error; see pane output and diagnostics".to_owned(),
-                    },
-                ));
-            } else if poll.closed {
-                status_updates.push((*pane_id, SessionStatus::Exited { exit_code: None }));
-            }
+            status_updates.push((*pane_id, session_status_for_pane(pane)));
             metadata_updates.push((
                 *pane_id,
                 pane.terminal.state().title().map(ToOwned::to_owned),
@@ -3672,6 +3893,19 @@ impl MuxRuntime {
     }
 }
 
+fn session_status_for_pane(pane: &PaneRuntime) -> SessionStatus {
+    match &pane.connection_state {
+        PaneConnectionState::Connecting => SessionStatus::Pending,
+        PaneConnectionState::Connected => SessionStatus::Running,
+        PaneConnectionState::Disconnected(message) if pane.remote_session => {
+            SessionStatus::Failed {
+                message: message.clone(),
+            }
+        }
+        PaneConnectionState::Disconnected(_) => SessionStatus::Exited { exit_code: None },
+    }
+}
+
 struct PaneTextProvider<'a> {
     terminal: &'a TerminalEmulator,
 }
@@ -3692,6 +3926,11 @@ struct PaneRuntime {
     semantic_timeline: SemanticTimelineStore,
     parse_semantic_events: bool,
     remote_session: bool,
+    session_spec: SessionSpec,
+    last_size: TerminalGridSize,
+    connection_state: PaneConnectionState,
+    ssh_prompt: Option<SshPromptState>,
+    ime_preedit: String,
     transport: Option<PaneTransport>,
     mouse_protocol: MouseProtocolState,
     selection_anchor: Option<GridPosition>,
@@ -3701,6 +3940,139 @@ struct PaneRuntime {
     /// Per-command presentation override. `true` is collapsed, `false` keeps
     /// an otherwise auto-collapsed block expanded. Raw terminal data is untouched.
     command_output_collapsed: HashMap<u64, bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PaneConnectionState {
+    Connecting,
+    Connected,
+    Disconnected(String),
+}
+
+enum SshPromptState {
+    HostTrust {
+        request: HostKeyTrustRequest,
+        response: Option<SyncSender<HostKeyTrustAction>>,
+    },
+    Secret {
+        request: SecretRequest,
+        keychain: KeychainProviderCapability,
+        response: Option<SyncSender<Option<SecretPromptResponse>>>,
+        input: String,
+        save_to_keychain: bool,
+    },
+}
+
+impl SshPromptState {
+    fn from_request(request: SshInteractionRequest) -> Self {
+        match request {
+            SshInteractionRequest::HostTrust { request, response } => Self::HostTrust {
+                request,
+                response: Some(response),
+            },
+            SshInteractionRequest::Secret {
+                request,
+                keychain,
+                response,
+            } => Self::Secret {
+                request,
+                keychain,
+                response: Some(response),
+                input: String::new(),
+                save_to_keychain: false,
+            },
+        }
+    }
+
+    fn handle_key(&mut self, event: &KeyEvent) -> bool {
+        match self {
+            Self::HostTrust { request, response } => {
+                let action = match event.logical_key.to_ascii_lowercase().as_str() {
+                    "escape" => Some(HostKeyTrustAction::Reject),
+                    "o" if request.reason == HostKeyTrustReason::UnknownHost => {
+                        Some(HostKeyTrustAction::TrustOnce)
+                    }
+                    "s" if request.reason == HostKeyTrustReason::UnknownHost => {
+                        Some(HostKeyTrustAction::TrustAndStore)
+                    }
+                    "r" if request.reason == HostKeyTrustReason::ChangedHostKey => {
+                        Some(HostKeyTrustAction::ReplaceStoredKey)
+                    }
+                    _ => None,
+                };
+                if let Some(action) = action
+                    && let Some(response) = response.take()
+                {
+                    let _ = response.send(action);
+                }
+                action.is_some()
+            }
+            Self::Secret {
+                response,
+                input,
+                keychain,
+                save_to_keychain,
+                ..
+            } => match event.logical_key.as_str() {
+                "Escape" => {
+                    if let Some(response) = response.take() {
+                        let _ = response.send(None);
+                    }
+                    true
+                }
+                "Enter" if !input.is_empty() => {
+                    if let Some(response) = response.take() {
+                        let secret = SecretString::new(std::mem::take(input));
+                        let response_value = if *save_to_keychain {
+                            SecretPromptResponse::persistent(secret)
+                        } else {
+                            SecretPromptResponse::transient(secret)
+                        };
+                        let _ = response.send(Some(response_value));
+                    }
+                    true
+                }
+                "Tab" => {
+                    if keychain.available {
+                        *save_to_keychain = !*save_to_keychain;
+                    }
+                    false
+                }
+                "Backspace" => {
+                    if let Some((index, _)) = input.grapheme_indices(true).next_back() {
+                        input.truncate(index);
+                    }
+                    false
+                }
+                _ if !event.modifiers.ctrl
+                    && !event.modifiers.super_key
+                    && (!event.modifiers.alt || event.modifiers.alt_graph) =>
+                {
+                    if let Some(text) = event.text.as_deref() {
+                        append_secret_input(input, text);
+                    }
+                    false
+                }
+                _ => false,
+            },
+        }
+    }
+
+    fn append_text(&mut self, text: &str) -> bool {
+        let Self::Secret { input, .. } = self else {
+            return false;
+        };
+        append_secret_input(input, text)
+    }
+}
+
+fn append_secret_input(input: &mut String, text: &str) -> bool {
+    const MAX_SECRET_BYTES: usize = 4096;
+    if text.is_empty() || input.len().saturating_add(text.len()) > MAX_SECRET_BYTES {
+        return false;
+    }
+    input.push_str(text);
+    true
 }
 
 #[derive(Debug, Default)]
@@ -3854,6 +4226,21 @@ impl PaneRuntime {
             semantic_timeline,
             parse_semantic_events,
             remote_session: matches!(spec.transport, SessionTransportKind::Ssh),
+            session_spec: spec.clone(),
+            last_size: size,
+            connection_state: if matches!(spec.transport, SessionTransportKind::Ssh) {
+                if transport.is_some() {
+                    PaneConnectionState::Connecting
+                } else {
+                    PaneConnectionState::Disconnected("SSH transport failed to start".to_owned())
+                }
+            } else if transport.is_some() {
+                PaneConnectionState::Connected
+            } else {
+                PaneConnectionState::Disconnected("transport failed to start".to_owned())
+            },
+            ssh_prompt: None,
+            ime_preedit: String::new(),
             transport,
             mouse_protocol: MouseProtocolState::default(),
             selection_anchor: None,
@@ -3943,6 +4330,13 @@ impl PaneRuntime {
     }
 
     fn handle_modal_key(&mut self, event: &KeyEvent) -> Option<bool> {
+        if let Some(prompt) = self.ssh_prompt.as_mut() {
+            let completed = prompt.handle_key(event);
+            if completed {
+                self.ssh_prompt = None;
+            }
+            return Some(true);
+        }
         if self.search.input_active {
             return Some(self.handle_search_key(event));
         }
@@ -3950,6 +4344,20 @@ impl PaneRuntime {
             return Some(self.handle_keyboard_selection_key(event));
         }
         None
+    }
+
+    fn append_modal_text(&mut self, text: &str) -> bool {
+        self.ssh_prompt
+            .as_mut()
+            .is_some_and(|prompt| prompt.append_text(text))
+    }
+
+    fn update_ime_preedit(&mut self, text: String) -> bool {
+        if self.ime_preedit == text {
+            return false;
+        }
+        self.ime_preedit = text;
+        true
     }
 
     fn append_search_text(&mut self, text: &str) -> bool {
@@ -4140,6 +4548,7 @@ impl PaneRuntime {
     }
 
     fn resize(&mut self, size: TerminalGridSize, metrics: CellMetrics) {
+        self.last_size = size;
         let _ = self
             .terminal
             .resize(CoreTerminalSize::new(size.cols, size.rows));
@@ -4165,11 +4574,18 @@ impl PaneRuntime {
         };
 
         let mut stats = PanePollStats::default();
+        if self.ssh_prompt.is_none()
+            && let Some(request) = transport.take_interaction()
+        {
+            self.ssh_prompt = Some(SshPromptState::from_request(request));
+            stats.content_changed = true;
+        }
         for _ in 0..64 {
             let output = match catch_unwind(AssertUnwindSafe(|| transport.poll_output())) {
                 Ok(Ok(output)) => output,
                 Ok(Err(error)) => {
                     eprintln!("transport poll error: {error}");
+                    self.connection_state = PaneConnectionState::Disconnected(error.to_string());
                     let _ = self
                         .terminal
                         .apply_bytes(format!("\r\ntransport error: {error}\r\n").as_bytes());
@@ -4182,11 +4598,15 @@ impl PaneRuntime {
                     break;
                 }
             };
+            if transport.is_connected() {
+                self.connection_state = PaneConnectionState::Connected;
+            }
             if output.bytes.is_empty() && output.lifecycle.is_empty() && !output.closed {
                 break;
             }
 
             if !output.bytes.is_empty() {
+                self.connection_state = PaneConnectionState::Connected;
                 let byte_count = u64::try_from(output.bytes.len()).unwrap_or(u64::MAX);
                 stats.pty_bytes = stats.pty_bytes.saturating_add(byte_count);
                 if self.parse_semantic_events {
@@ -4233,12 +4653,54 @@ impl PaneRuntime {
                 stats.content_changed = true;
             }
             if output.closed {
+                self.connection_state = PaneConnectionState::Disconnected(if self.remote_session {
+                    "SSH session disconnected".to_owned()
+                } else {
+                    "session exited".to_owned()
+                });
                 stats.content_changed = true;
                 stats.closed = true;
                 break;
             }
         }
         stats
+    }
+
+    fn reconnect(&mut self, config: &AppConfig, metrics: CellMetrics) -> bool {
+        if !self.remote_session {
+            return false;
+        }
+        self.shutdown();
+        self.ssh_prompt = None;
+        let transport_size = terminal_transport_size(self.last_size, metrics);
+        match spawn_session_transport(config, &self.session_spec, transport_size) {
+            Ok(initial) => {
+                self.transport = Some(initial.transport);
+                self.parse_semantic_events = initial.parse_semantic_events;
+                self.semantic_timeline
+                    .set_integration_mode(initial.semantic_mode);
+                if let Some(metadata) = initial.remote_metadata {
+                    self.semantic_timeline.apply_event(
+                        semantics::SemanticEvent::RemoteMetadataChanged {
+                            position: BufferPosition::new(0, 0),
+                            metadata,
+                        },
+                    );
+                }
+                self.connection_state = PaneConnectionState::Connecting;
+                let _ = self
+                    .terminal
+                    .apply_bytes(b"\r\n[Panea reconnecting SSH session...]\r\n");
+                true
+            }
+            Err(error) => {
+                self.connection_state = PaneConnectionState::Disconnected(error.to_string());
+                let _ = self
+                    .terminal
+                    .apply_bytes(format!("\r\nSSH reconnect failed: {error}\r\n").as_bytes());
+                false
+            }
+        }
     }
 
     fn shutdown(&mut self) {
@@ -4378,9 +4840,212 @@ fn scene_from_mux(
         if let Some(cursor_image_runtime) = cursor_image_runtime {
             cursor_image_runtime.populate_scene(&mut scene, metrics);
         }
+        append_active_ime_overlay(&mut scene, runtime, metrics);
+        append_ssh_product_overlay(&mut scene, runtime, metrics);
     }
 
     scene
+}
+
+fn append_active_ime_overlay(scene: &mut RenderScene, runtime: &MuxRuntime, metrics: CellMetrics) {
+    let Some(pane) = runtime.active_pane() else {
+        return;
+    };
+    if pane.ime_preedit.is_empty() || pane.ssh_prompt.is_some() {
+        return;
+    }
+    let Some(cursor) = scene.cursor else {
+        return;
+    };
+    let width = ((pane.ime_preedit.chars().count().max(1) as f32 * metrics.cell_width).ceil()
+        as u32)
+        .saturating_add(8);
+    scene.semantic_overlays.push(OverlayPrimitive {
+        kind: OverlayKind::ImePreedit,
+        bounds: RenderRect {
+            x: scene.content_offset.x
+                + (f32::from(cursor.position.col) * metrics.cell_width).floor() as i32,
+            y: scene.content_offset.y
+                + ((cursor.position.row + 1) as f32 * metrics.cell_height).floor() as i32,
+            width,
+            height: metrics.cell_height.ceil() as u32 + 4,
+        },
+        color: RenderColor {
+            red: 24,
+            green: 28,
+            blue: 36,
+            alpha: 245,
+        },
+        border_color: Some(RenderColor {
+            red: 110,
+            green: 170,
+            blue: 255,
+            alpha: 255,
+        }),
+        border_width_px: 1,
+        corner_radius_px: 3,
+        z_index: 1800,
+        label: Some(pane.ime_preedit.clone()),
+        label_color: None,
+    });
+}
+
+fn append_ssh_product_overlay(scene: &mut RenderScene, runtime: &MuxRuntime, metrics: CellMetrics) {
+    let Some(pane) = runtime.active_pane() else {
+        return;
+    };
+    if let Some(prompt) = pane.ssh_prompt.as_ref() {
+        let lines = ssh_prompt_lines(prompt);
+        let max_chars = lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(20);
+        let width = ((max_chars as f32 * metrics.cell_width).ceil() as u32)
+            .saturating_add(24)
+            .min((f32::from(scene.grid.columns) * metrics.cell_width).ceil() as u32);
+        let line_height = metrics.cell_height.ceil() as u32 + 5;
+        let total_height = line_height.saturating_mul(lines.len() as u32);
+        let surface_width = (f32::from(scene.grid.columns) * metrics.cell_width).ceil() as i32;
+        let surface_height = (f32::from(scene.grid.rows) * metrics.cell_height).ceil() as i32;
+        let x = ((surface_width - width as i32) / 2).max(0);
+        let mut y = ((surface_height - total_height as i32) / 2).max(0);
+        for (index, line) in lines.into_iter().enumerate() {
+            scene.semantic_overlays.push(OverlayPrimitive {
+                kind: OverlayKind::SecurityPrompt,
+                bounds: RenderRect {
+                    x,
+                    y,
+                    width,
+                    height: line_height,
+                },
+                color: RenderColor {
+                    red: 18,
+                    green: 22,
+                    blue: 29,
+                    alpha: 252,
+                },
+                border_color: (index == 0).then_some(RenderColor {
+                    red: 245,
+                    green: 185,
+                    blue: 72,
+                    alpha: 255,
+                }),
+                border_width_px: u8::from(index == 0),
+                corner_radius_px: u8::from(index == 0) * 4,
+                z_index: 2000,
+                label: Some(line),
+                label_color: None,
+            });
+            y = y.saturating_add(line_height as i32);
+        }
+        return;
+    }
+
+    let label = match &pane.connection_state {
+        PaneConnectionState::Connecting => Some(format!(
+            "Connecting SSH profile '{}'...",
+            pane.session_spec.profile_name
+        )),
+        PaneConnectionState::Disconnected(message) if pane.remote_session => {
+            Some(format!("SSH disconnected: {message}"))
+        }
+        PaneConnectionState::Connected | PaneConnectionState::Disconnected(_) => None,
+    };
+    let Some(label) = label else {
+        return;
+    };
+    let width = ((label.chars().count() as f32 * metrics.cell_width).ceil() as u32)
+        .saturating_add(16)
+        .min((f32::from(scene.grid.columns) * metrics.cell_width).ceil() as u32);
+    scene.semantic_overlays.push(OverlayPrimitive {
+        kind: OverlayKind::SessionStatus,
+        bounds: RenderRect {
+            x: 8,
+            y: ((f32::from(scene.grid.rows) * metrics.cell_height).ceil() as i32)
+                .saturating_sub(metrics.cell_height.ceil() as i32)
+                .saturating_sub(12),
+            width,
+            height: metrics.cell_height.ceil() as u32 + 6,
+        },
+        color: RenderColor {
+            red: 22,
+            green: 28,
+            blue: 37,
+            alpha: 240,
+        },
+        border_color: Some(RenderColor {
+            red: 115,
+            green: 134,
+            blue: 160,
+            alpha: 255,
+        }),
+        border_width_px: 1,
+        corner_radius_px: 4,
+        z_index: 1700,
+        label: Some(label),
+        label_color: None,
+    });
+}
+
+fn ssh_prompt_lines(prompt: &SshPromptState) -> Vec<String> {
+    match prompt {
+        SshPromptState::HostTrust { request, .. } => {
+            let mut lines = vec![
+                match request.reason {
+                    HostKeyTrustReason::UnknownHost => "Unknown SSH host".to_owned(),
+                    HostKeyTrustReason::ChangedHostKey => {
+                        "WARNING: SSH host key changed".to_owned()
+                    }
+                    HostKeyTrustReason::PinnedFingerprintMismatch => {
+                        "BLOCKED: pinned SSH fingerprint mismatch".to_owned()
+                    }
+                },
+                format!("Host: {}:{}", request.key.host, request.key.port),
+                format!("Key: {}", request.key.algorithm),
+                format!("Fingerprint: {}", request.key.sha256_fingerprint),
+            ];
+            if let Some(expected) = request.expected_fingerprint.as_deref() {
+                lines.push(format!("Expected: {expected}"));
+            }
+            lines.push(match request.reason {
+                HostKeyTrustReason::UnknownHost => {
+                    "O trust once   S trust and store   Esc reject".to_owned()
+                }
+                HostKeyTrustReason::ChangedHostKey => {
+                    "R replace stored key   Esc reject".to_owned()
+                }
+                HostKeyTrustReason::PinnedFingerprintMismatch => {
+                    "Esc reject; update the pinned fingerprint in config to continue".to_owned()
+                }
+            });
+            lines
+        }
+        SshPromptState::Secret {
+            request,
+            input,
+            keychain,
+            save_to_keychain,
+            ..
+        } => {
+            let storage = if keychain.available {
+                format!(
+                    "Tab save to OS keychain: {}   Enter continue   Esc cancel",
+                    if *save_to_keychain { "yes" } else { "no" }
+                )
+            } else {
+                format!(
+                    "OS keychain unavailable; secret stays transient ({})",
+                    keychain.message
+                )
+            };
+            vec![
+                request.prompt_label(),
+                format!("Secret: {}", "*".repeat(input.graphemes(true).count())),
+                storage,
+            ]
+        }
+    }
 }
 
 fn append_pane_scene(
@@ -5995,6 +6660,11 @@ mod tests {
             semantic_timeline: SemanticTimelineStore::new(),
             parse_semantic_events: false,
             remote_session: false,
+            session_spec: SessionSpec::local("default"),
+            last_size: TerminalGridSize::new(cols, rows),
+            connection_state: PaneConnectionState::Disconnected("test".to_owned()),
+            ssh_prompt: None,
+            ime_preedit: String::new(),
             transport: None,
             mouse_protocol: MouseProtocolState::default(),
             selection_anchor: None,
@@ -6003,6 +6673,67 @@ mod tests {
             search: PaneSearch::default(),
             command_output_collapsed: HashMap::new(),
         }
+    }
+
+    fn text_key(text: &str) -> KeyEvent {
+        KeyEvent {
+            physical_key: None,
+            logical_key: text.to_owned(),
+            text: Some(text.to_owned()),
+            state: KeyState::Pressed,
+            modifiers: KeyModifiers::default(),
+            repeat: false,
+        }
+    }
+
+    #[test]
+    fn unknown_ssh_host_prompt_requires_explicit_trust_action() {
+        let key = security::HostKey::from_raw("host.example", 22, "ssh-ed25519", b"key");
+        let request = HostKeyTrustRequest::unknown(key, "explicit decision required");
+        let (response, decision) = mpsc::sync_channel(1);
+        let mut prompt = SshPromptState::HostTrust {
+            request,
+            response: Some(response),
+        };
+
+        assert!(!prompt.handle_key(&text_key("x")));
+        assert!(matches!(decision.try_recv(), Err(TryRecvError::Empty)));
+        assert!(prompt.handle_key(&text_key("s")));
+        assert_eq!(decision.recv().unwrap(), HostKeyTrustAction::TrustAndStore);
+    }
+
+    #[test]
+    fn ssh_secret_prompt_masks_and_returns_persistence_intent() {
+        let request = SecretRequest::SshPassword {
+            profile: "prod".to_owned(),
+            host: "host.example".to_owned(),
+            username: "alice".to_owned(),
+        };
+        let (response, result) = mpsc::sync_channel(1);
+        let mut prompt = SshPromptState::Secret {
+            request,
+            keychain: KeychainProviderCapability {
+                platform: security::SecurityPlatform::Windows,
+                backend: security::KeychainBackend::WindowsCredentialManager,
+                available: true,
+                persistent: true,
+                secure_storage: true,
+                message: "available".to_owned(),
+            },
+            response: Some(response),
+            input: String::new(),
+            save_to_keychain: false,
+        };
+
+        assert!(!prompt.handle_key(&text_key("secret")));
+        let rendered = ssh_prompt_lines(&prompt).join("\n");
+        assert!(rendered.contains("******"));
+        assert!(!rendered.contains("Secret: secret"));
+        assert!(!prompt.handle_key(&key_event("Tab", KeyModifiers::default())));
+        assert!(prompt.handle_key(&key_event("Enter", KeyModifiers::default())));
+        let response = result.recv().unwrap().expect("secret response");
+        assert!(response.save_to_keychain);
+        assert_eq!(response.secret.expose(), "secret");
     }
 
     fn smoke_size() -> TransportSize {

@@ -390,6 +390,8 @@ Named keybinding actions can open a specific profile, for example
 `new_ssh_tab:prod`, `split_ssh_vertical:prod`, `new_local_tab:dev`, or
 `split_local_horizontal:dev`. Workspace actions support
 `new_workspace:name`, `switch_workspace:name`, and `rename_workspace:name`.
+`reconnect_session` reconnects the active SSH pane while preserving its local
+scrollback; the default binding is `Ctrl+Alt+R`.
 Restoration recreates layouts and starts fresh transports; it does not claim
 process resurrection.
 

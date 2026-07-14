@@ -107,6 +107,21 @@ impl SshTransport {
         )
     }
 
+    pub fn connect_with_providers(
+        profile: SshConnectionProfile,
+        size: TerminalSize,
+        secret_provider: &mut dyn SecretProvider,
+        trust_provider: &mut dyn HostTrustProvider,
+    ) -> TransportResult<Self> {
+        Self::connect_with_security(
+            profile,
+            size,
+            &default_known_hosts_path(),
+            secret_provider,
+            trust_provider,
+        )
+    }
+
     pub fn connect_with_security(
         profile: SshConnectionProfile,
         size: TerminalSize,
