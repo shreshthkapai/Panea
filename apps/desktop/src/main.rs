@@ -81,7 +81,7 @@ use term_core::{
 use term_parser::TerminalEmulator;
 use transport_core::{
     TerminalSize as TransportSize, TerminalTransport, TransportOutput, TransportResult,
-    TransportState,
+    TransportState, TransportWakeHandle,
 };
 use transport_pty::{LocalPtyTransport, LocalShellKind, LocalShellProfile};
 use transport_ssh::{SshConnectionProfile, SshTransport};
@@ -126,7 +126,9 @@ fn print_cli_help() {
         "usage: panea doctor [window|renderer|config|shell|ssh|fonts|clipboard|notifications] [--json]"
     );
     eprintln!("usage: panea shell-smoke [--json] [--timeout-ms <ms>]");
-    eprintln!("usage: panea gui-smoke [--json] [--timeout-ms <ms>]");
+    eprintln!(
+        "usage: panea gui-smoke [--terminal-io] [--hold-ms <ms>] [--json] [--timeout-ms <ms>]"
+    );
     eprintln!(
         "usage: panea shell-integration export --shell <bash|zsh|fish|powershell> --output <path>"
     );
@@ -137,16 +139,45 @@ fn print_cli_help() {
 struct GuiSmokeOptions {
     timeout: Duration,
     completed: Arc<AtomicBool>,
+    mode: GuiSmokeMode,
+    hold_after_success: Duration,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuiSmokeMode {
+    FirstFrame,
+    TerminalIo,
+}
+
+const GUI_SMOKE_MARKER: &str = "PANEAE2E_OUTPUT";
 
 fn run_gui_smoke_cli() -> i32 {
     let args = std::env::args().skip(2).collect::<Vec<_>>();
     let json = args.iter().any(|arg| arg == "--json");
     let mut timeout = Duration::from_secs(10);
+    let mut mode = GuiSmokeMode::FirstFrame;
+    let mut hold_after_success = Duration::ZERO;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--json" => {}
+            "--terminal-io" => mode = GuiSmokeMode::TerminalIo,
+            "--hold-ms" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    eprintln!("--hold-ms requires a value");
+                    return 2;
+                };
+                let Ok(millis) = value.parse::<u64>() else {
+                    eprintln!("invalid --hold-ms value: {value}");
+                    return 2;
+                };
+                if millis > 30_000 {
+                    eprintln!("--hold-ms must not exceed 30000");
+                    return 2;
+                }
+                hold_after_success = Duration::from_millis(millis);
+            }
             "--timeout-ms" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -176,19 +207,25 @@ fn run_gui_smoke_cli() -> i32 {
     let result = run(Some(GuiSmokeOptions {
         timeout,
         completed: Arc::clone(&completed),
+        mode,
+        hold_after_success,
     }));
     let passed = result.is_ok() && completed.load(Ordering::Acquire);
     if json {
         println!(
-            "{{\"name\":\"gui-smoke\",\"status\":\"{}\",\"duration_ms\":{},\"milestone\":\"window_renderer_session_first_frame\"}}",
+            "{{\"name\":\"gui-smoke\",\"status\":\"{}\",\"duration_ms\":{},\"milestone\":\"{}\"}}",
             if passed { "passed" } else { "failed" },
-            started.elapsed().as_millis()
+            started.elapsed().as_millis(),
+            match mode {
+                GuiSmokeMode::FirstFrame => "window_renderer_session_first_frame",
+                GuiSmokeMode::TerminalIo => "shell_prompt_input_output_rendered",
+            }
         );
     }
     if let Err(error) = result {
         eprintln!("gui smoke failed: {error}");
     } else if !passed {
-        eprintln!("gui smoke timed out before the first rendered session frame");
+        eprintln!("gui smoke timed out before its required render milestone");
     }
     i32::from(!passed)
 }
@@ -980,6 +1017,12 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
         .collect();
     let settings = window_settings(&config);
     let event_loop = create_event_loop(settings.linux_backend)?;
+    let transport_waker = TransportWakeHandle::new({
+        let event_loop_proxy = event_loop.create_proxy();
+        move || {
+            let _ = event_loop_proxy.send_event(());
+        }
+    });
     let desktop_window = DesktopWindow::create(&event_loop, &settings)?;
     if gui_smoke.is_some() {
         eprintln!("gui-smoke milestone=window-created");
@@ -1066,8 +1109,13 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
         cursor_asset_base_dir.as_deref(),
     );
     let mut surface_size = window.inner_size();
-    let mut mux_runtime =
-        MuxRuntime::new(&config, metrics, surface_size.width, surface_size.height);
+    let mut mux_runtime = MuxRuntime::new(
+        &config,
+        metrics,
+        surface_size.width,
+        surface_size.height,
+        transport_waker,
+    );
     if gui_smoke.is_some() {
         eprintln!("gui-smoke milestone=session-created");
     }
@@ -1076,8 +1124,15 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
     let gui_smoke_deadline = gui_smoke
         .as_ref()
         .map(|smoke| Instant::now() + smoke.timeout);
+    let gui_smoke_mode = gui_smoke.as_ref().map(|smoke| smoke.mode);
+    let gui_smoke_hold = gui_smoke
+        .as_ref()
+        .map_or(Duration::ZERO, |smoke| smoke.hold_after_success);
     let gui_smoke_completed = gui_smoke.map(|smoke| smoke.completed);
     let gui_smoke_result = gui_smoke_completed.clone();
+    let mut gui_smoke_command_sent = false;
+    let mut gui_smoke_success_presented = false;
+    let mut gui_smoke_hold_until = None;
 
     event_loop.run(move |event, target| {
         target.set_control_flow(ControlFlow::Wait);
@@ -1145,9 +1200,28 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                 eprintln!("performance {text}");
                             }
                             if let Some(completed) = &gui_smoke_completed {
-                                eprintln!("gui-smoke milestone=first-frame-presented");
-                                completed.store(true, Ordering::Release);
-                                target.exit();
+                                let milestone_reached = match gui_smoke_mode {
+                                    Some(GuiSmokeMode::TerminalIo) => {
+                                        gui_smoke_command_sent
+                                            && mux_runtime
+                                                .active_visible_text()
+                                                .matches(GUI_SMOKE_MARKER)
+                                                .count()
+                                                >= 2
+                                    }
+                                    Some(GuiSmokeMode::FirstFrame) | None => true,
+                                };
+                                if milestone_reached && !gui_smoke_success_presented {
+                                    eprintln!("gui-smoke milestone=frame-presented");
+                                    gui_smoke_success_presented = true;
+                                    if gui_smoke_hold.is_zero() {
+                                        completed.store(true, Ordering::Release);
+                                        mux_runtime.shutdown_all();
+                                        target.exit();
+                                    } else {
+                                        gui_smoke_hold_until = Some(Instant::now() + gui_smoke_hold);
+                                    }
+                                }
                             }
                         }
                         Ok(Err(error)) => match error {
@@ -1613,8 +1687,26 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                 }
             },
             Event::AboutToWait => {
-                if gui_smoke_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                if gui_smoke_hold_until.is_some_and(|deadline| Instant::now() >= deadline) {
+                    if let Some(completed) = &gui_smoke_completed {
+                        completed.store(true, Ordering::Release);
+                    }
+                    mux_runtime.shutdown_all();
+                    target.exit();
+                    return;
+                }
+                if !gui_smoke_success_presented
+                    && gui_smoke_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                {
                     eprintln!("gui-smoke milestone=timeout");
+                    if gui_smoke_mode == Some(GuiSmokeMode::TerminalIo) {
+                        let preview = mux_runtime.active_visible_text();
+                        eprintln!(
+                            "gui-smoke terminal-preview={:?} command-sent={gui_smoke_command_sent}",
+                            preview.chars().take(1024).collect::<String>()
+                        );
+                    }
+                    mux_runtime.shutdown_all();
                     target.exit();
                     return;
                 }
@@ -1764,6 +1856,17 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                     scheduler.terminal_content_changed();
                 }
 
+                if gui_smoke_mode == Some(GuiSmokeMode::TerminalIo)
+                    && !gui_smoke_command_sent
+                    && shell_prompt_visible(&mux_runtime.active_visible_text())
+                {
+                    mux_runtime.write_active(
+                        format!("echo {GUI_SMOKE_MARKER}\r").as_bytes(),
+                    );
+                    gui_smoke_command_sent = true;
+                    eprintln!("gui-smoke milestone=prompt-observed-input-sent");
+                }
+
                 match cursor_image_cache.poll() {
                     AnimatedCursorImageStatus::Ready(image) => {
                         if cursor_image_runtime.set_image(&image) {
@@ -1839,10 +1942,22 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                 let cursor_image_delay = cursor_image_runtime.next_frame_after();
                 let blink_delay = cursor_blink.next_frame_after();
                 let power_delay = power_monitor.next_refresh_after();
-                let next_delay = [animation_delay, cursor_image_delay, blink_delay, power_delay]
-                    .into_iter()
-                    .flatten()
-                    .min();
+                // SSH currently exposes non-blocking reads without a native
+                // readiness callback. Keep that backend responsive with a
+                // bounded fallback; local PTYs wake this event loop directly.
+                let transport_poll_delay = mux_runtime
+                    .requires_periodic_transport_poll()
+                    .then_some(Duration::from_millis(8));
+                let next_delay = [
+                    animation_delay,
+                    cursor_image_delay,
+                    blink_delay,
+                    power_delay,
+                    transport_poll_delay,
+                ]
+                .into_iter()
+                .flatten()
+                .min();
                 if let Some(delay) = next_delay {
                     if animation_delay.is_some() || cursor_image_delay.is_some() {
                         scheduler.animation_changed();
@@ -1850,6 +1965,9 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                     target.set_control_flow(ControlFlow::WaitUntil(Instant::now() + delay));
                 }
                 if let Some(deadline) = gui_smoke_deadline {
+                    target.set_control_flow(ControlFlow::WaitUntil(deadline));
+                }
+                if let Some(deadline) = gui_smoke_hold_until {
                     target.set_control_flow(ControlFlow::WaitUntil(deadline));
                 }
 
@@ -2169,6 +2287,7 @@ fn spawn_session_transport(
     config: &AppConfig,
     spec: &SessionSpec,
     size: TransportSize,
+    output_waker: &TransportWakeHandle,
 ) -> transport_core::TransportResult<InitialTransport> {
     match spec.transport {
         SessionTransportKind::LocalPty | SessionTransportKind::WindowsPseudoconsole => {
@@ -2188,9 +2307,10 @@ fn spawn_session_transport(
             if let Some(directory) = &spec.working_directory {
                 profile.working_directory = Some(PathBuf::from(directory));
             }
-            let transport = LocalPtyTransport::spawn(profile, size)?;
+            let mut transport = LocalPtyTransport::spawn(profile, size)?;
+            transport.set_output_waker(Some(output_waker.clone()));
             Ok(InitialTransport {
-                transport: PaneTransport::Local(transport),
+                transport: PaneTransport::Local(Box::new(transport)),
                 semantic_mode: semantic_mode_for_activation(&activation),
                 parse_semantic_events: activation.parses_escape_sequences(),
                 activation_diagnostics: activation.diagnostics,
@@ -2229,7 +2349,7 @@ fn spawn_session_transport(
                 connection.remote_working_directory = Some(directory.clone());
             }
             Ok(InitialTransport {
-                transport: PaneTransport::connecting_ssh(connection, size),
+                transport: PaneTransport::connecting_ssh(connection, size, output_waker.clone()),
                 semantic_mode,
                 parse_semantic_events,
                 activation_diagnostics: vec![match semantic_mode {
@@ -2288,6 +2408,7 @@ struct PendingSshTransport {
     interactions: Receiver<SshInteractionRequest>,
     requested_size: TransportSize,
     pending_input: Vec<u8>,
+    output_waker: TransportWakeHandle,
 }
 
 enum SshInteractionRequest {
@@ -2304,6 +2425,7 @@ enum SshInteractionRequest {
 
 struct ChannelHostTrustProvider {
     requests: SyncSender<SshInteractionRequest>,
+    output_waker: TransportWakeHandle,
 }
 
 impl HostTrustProvider for ChannelHostTrustProvider {
@@ -2315,6 +2437,7 @@ impl HostTrustProvider for ChannelHostTrustProvider {
         self.requests
             .send(SshInteractionRequest::HostTrust { request, response })
             .map_err(|_| security::SecurityError::new("SSH trust prompt was cancelled"))?;
+        self.output_waker.wake();
         result
             .recv()
             .map_err(|_| security::SecurityError::new("SSH trust prompt was cancelled"))
@@ -2324,6 +2447,7 @@ impl HostTrustProvider for ChannelHostTrustProvider {
 struct ChannelSecretPromptProvider {
     requests: SyncSender<SshInteractionRequest>,
     keychain: KeychainProviderCapability,
+    output_waker: TransportWakeHandle,
 }
 
 impl SecretPromptProvider for ChannelSecretPromptProvider {
@@ -2339,6 +2463,7 @@ impl SecretPromptProvider for ChannelSecretPromptProvider {
                 response,
             })
             .map_err(|_| security::SecurityError::new("SSH credential prompt was cancelled"))?;
+        self.output_waker.wake();
         result
             .recv()
             .map_err(|_| security::SecurityError::new("SSH credential prompt was cancelled"))
@@ -2346,24 +2471,31 @@ impl SecretPromptProvider for ChannelSecretPromptProvider {
 }
 
 enum PaneTransport {
-    Local(LocalPtyTransport),
+    Local(Box<LocalPtyTransport>),
     ConnectingSsh(PendingSshTransport),
-    Ssh(SshTransport),
+    Ssh(Box<SshTransport>),
     Failed { message: String, reported: bool },
 }
 
 impl PaneTransport {
-    fn connecting_ssh(profile: SshConnectionProfile, size: TransportSize) -> Self {
+    fn connecting_ssh(
+        profile: SshConnectionProfile,
+        size: TransportSize,
+        output_waker: TransportWakeHandle,
+    ) -> Self {
         let (sender, result) = mpsc::sync_channel(1);
         let (interaction_sender, interactions) = mpsc::sync_channel(1);
+        let worker_waker = output_waker.clone();
         thread::spawn(move || {
             let mut trust_provider = ChannelHostTrustProvider {
                 requests: interaction_sender.clone(),
+                output_waker: worker_waker.clone(),
             };
             let keychain = PlatformKeychainProvider::for_current_platform();
             let prompt_provider = ChannelSecretPromptProvider {
                 requests: interaction_sender,
                 keychain: keychain.capability(),
+                output_waker: worker_waker.clone(),
             };
             let mut secret_provider = KeychainBackedSecretProvider::new(keychain, prompt_provider);
             let transport = SshTransport::connect_with_providers(
@@ -2373,12 +2505,14 @@ impl PaneTransport {
                 &mut trust_provider,
             );
             let _ = sender.send(transport);
+            worker_waker.wake();
         });
         Self::ConnectingSsh(PendingSshTransport {
             result,
             interactions,
             requested_size: size,
             pending_input: Vec::new(),
+            output_waker,
         })
     }
 
@@ -2406,11 +2540,12 @@ impl PaneTransport {
         };
         match result {
             Ok(mut transport) => {
+                transport.set_output_waker(Some(pending.output_waker.clone()));
                 transport.resize(pending.requested_size)?;
                 if !pending.pending_input.is_empty() {
                     transport.write_input(&pending.pending_input)?;
                 }
-                *self = Self::Ssh(transport);
+                *self = Self::Ssh(Box::new(transport));
                 Ok(())
             }
             Err(error) => {
@@ -2484,6 +2619,10 @@ impl PaneTransport {
             Self::Ssh(transport) => transport.shutdown(),
             Self::ConnectingSsh(_) | Self::Failed { .. } => Ok(()),
         }
+    }
+
+    fn requires_periodic_poll(&self) -> bool {
+        matches!(self, Self::ConnectingSsh(_) | Self::Ssh(_))
     }
 }
 
@@ -3708,6 +3847,7 @@ struct MuxRuntime {
     restore_sessions: bool,
     state_path: PathBuf,
     drag: Option<MuxDragState>,
+    output_waker: TransportWakeHandle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3717,7 +3857,13 @@ enum MuxDragState {
 }
 
 impl MuxRuntime {
-    fn new(config: &AppConfig, metrics: CellMetrics, width: u32, height: u32) -> Self {
+    fn new(
+        config: &AppConfig,
+        metrics: CellMetrics,
+        width: u32,
+        height: u32,
+        output_waker: TransportWakeHandle,
+    ) -> Self {
         let state_path = mux_state_path();
         let mut model = initial_mux_model(config, &state_path);
 
@@ -3739,7 +3885,7 @@ impl MuxRuntime {
         );
         let mut panes = HashMap::new();
         for (pane_id, spec) in pane_session_specs(&model) {
-            let pane = PaneRuntime::new(config, &spec, initial_size, metrics);
+            let pane = PaneRuntime::new(config, &spec, initial_size, metrics, output_waker.clone());
             let status = session_status_for_pane(&pane);
             panes.insert(pane_id, pane);
             mark_session_status(&mut model, pane_id, status);
@@ -3754,6 +3900,7 @@ impl MuxRuntime {
             restore_sessions: config.mux.restore_sessions,
             state_path,
             drag: None,
+            output_waker,
         };
         runtime.resize_all(width, height, metrics, config);
         runtime
@@ -3954,7 +4101,7 @@ impl MuxRuntime {
                 return;
             }
         };
-        let pane = PaneRuntime::new(config, &spec, size, metrics);
+        let pane = PaneRuntime::new(config, &spec, size, metrics, self.output_waker.clone());
         mark_session_status(&mut self.model, pane_id, session_status_for_pane(&pane));
         self.panes.insert(pane_id, pane);
     }
@@ -4616,6 +4763,34 @@ impl MuxRuntime {
         content_changed
     }
 
+    fn requires_periodic_transport_poll(&self) -> bool {
+        self.panes.values().any(|pane| {
+            pane.transport
+                .as_ref()
+                .is_some_and(PaneTransport::requires_periodic_poll)
+        })
+    }
+
+    fn active_visible_text(&self) -> String {
+        self.active_pane()
+            .map(|pane| {
+                let visible = pane.terminal.visible_grid();
+                visible
+                    .cells
+                    .chunks(usize::from(visible.viewport.size.cols.max(1)))
+                    .map(|cells| {
+                        term_core::Line {
+                            cells: cells.to_vec(),
+                            hard_wrapped: false,
+                        }
+                        .raw_text()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    }
+
     fn populate_performance_sample(&mut self, sample: &mut RenderInstrumentation) {
         let throughput = self.performance.sample_throughput();
         sample.pty_read_bytes_per_second = throughput.pty_read_bytes_per_second;
@@ -4713,6 +4888,21 @@ impl MuxRuntime {
             }
         }
     }
+}
+
+fn shell_prompt_visible(text: &str) -> bool {
+    text.lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .take(4)
+        .any(|line| {
+            let line = line.trim_end();
+            (line.starts_with("PS ") && line.ends_with('>'))
+                || line.ends_with('$')
+                || line.ends_with('#')
+                || line.ends_with('%')
+                || (cfg!(windows) && line.ends_with('>'))
+        })
 }
 
 fn session_status_for_pane(pane: &PaneRuntime) -> SessionStatus {
@@ -4813,6 +5003,7 @@ struct PaneRuntime {
     /// Per-command presentation override. `true` is collapsed, `false` keeps
     /// an otherwise auto-collapsed block expanded. Raw terminal data is untouched.
     command_output_collapsed: HashMap<u64, bool>,
+    output_waker: TransportWakeHandle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5070,12 +5261,13 @@ impl PaneRuntime {
         spec: &SessionSpec,
         size: TerminalGridSize,
         metrics: CellMetrics,
+        output_waker: TransportWakeHandle,
     ) -> Self {
         let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(size.cols, size.rows));
         let transport_size = terminal_transport_size(size, metrics);
         let mut semantic_timeline = SemanticTimelineStore::new();
         let (transport, parse_semantic_events) =
-            match spawn_session_transport(config, spec, transport_size) {
+            match spawn_session_transport(config, spec, transport_size, &output_waker) {
                 Ok(initial) => {
                     semantic_timeline.set_integration_mode(initial.semantic_mode);
                     if let Some(metadata) = initial.remote_metadata {
@@ -5129,6 +5321,7 @@ impl PaneRuntime {
             keyboard_selection: None,
             search: PaneSearch::default(),
             command_output_collapsed: HashMap::new(),
+            output_waker,
         }
     }
 
@@ -5630,7 +5823,12 @@ impl PaneRuntime {
         self.osc52_prompt = None;
         self.semantic_parser = SemanticEscapeParser::new();
         let transport_size = terminal_transport_size(self.last_size, metrics);
-        match spawn_session_transport(config, &self.session_spec, transport_size) {
+        match spawn_session_transport(
+            config,
+            &self.session_spec,
+            transport_size,
+            &self.output_waker,
+        ) {
             Ok(initial) => {
                 self.transport = Some(initial.transport);
                 self.parse_semantic_events = initial.parse_semantic_events;
@@ -7978,6 +8176,10 @@ mod tests {
         }
     }
 
+    fn test_transport_waker() -> TransportWakeHandle {
+        TransportWakeHandle::new(|| {})
+    }
+
     #[test]
     fn terminal_input_ignores_modifier_and_unknown_named_keys() {
         for key in [
@@ -8029,6 +8231,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gui_terminal_io_smoke_recognizes_common_cross_platform_prompts() {
+        assert!(shell_prompt_visible(
+            "Windows PowerShell\nPS C:\\Users\\panea>"
+        ));
+        assert!(shell_prompt_visible(
+            "Windows PowerShell\nPS C:\\Users\\panea>\n\n\n\n\n"
+        ));
+        assert!(shell_prompt_visible("panea@host:~$"));
+        assert!(shell_prompt_visible("root@host:/#"));
+        assert!(shell_prompt_visible("host%"));
+        assert!(!shell_prompt_visible(
+            "Copyright (C) Microsoft Corporation."
+        ));
+    }
+
     fn test_pane(cols: u16, rows: u16) -> PaneRuntime {
         PaneRuntime {
             terminal: TerminalEmulator::new(CoreTerminalSize::new(cols, rows)),
@@ -8051,6 +8269,7 @@ mod tests {
             keyboard_selection: None,
             search: PaneSearch::default(),
             command_output_collapsed: HashMap::new(),
+            output_waker: test_transport_waker(),
         }
     }
 
@@ -8429,6 +8648,7 @@ mod tests {
             restore_sessions: false,
             state_path: std::env::temp_dir().join("panea-test-mux-state.json"),
             drag: None,
+            output_waker: test_transport_waker(),
         };
 
         let layout = runtime.active_layouts(&config);
@@ -8465,6 +8685,7 @@ mod tests {
             restore_sessions: false,
             state_path: std::env::temp_dir().join("panea-test-mux-state.json"),
             drag: None,
+            output_waker: test_transport_waker(),
         };
         let metrics = test_metrics();
         let mut clipboard = ClipboardBridge::new();
@@ -8560,6 +8781,7 @@ mod tests {
             restore_sessions: false,
             state_path: std::env::temp_dir().join("panea-test-mux-state.json"),
             drag: Some(MuxDragState::Pane { source, target }),
+            output_waker: test_transport_waker(),
         };
         let mut scene = RenderScene::default();
         append_mux_drag_overlay(&mut scene, &runtime, test_metrics(), &config);

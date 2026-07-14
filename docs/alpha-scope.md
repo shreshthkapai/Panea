@@ -18,7 +18,7 @@ multiplexer, shell-integration, visual, and SSH paths with informed users.
 - Clipboard policy, paste protection, bounded OSC 52 handling, diagnostics,
   performance instrumentation, and renderer recovery contracts.
 - Windows ZIP/installer, macOS app/ZIP/DMG, and Linux tarball/deb/AppImage/RPM
-  builders with packaged doctor, local-shell, and first-frame GUI smokes.
+  builders with packaged doctor, local-shell, and terminal-I/O GUI smokes.
 
 ## Explicit Limits
 
@@ -40,7 +40,7 @@ multiplexer, shell-integration, visual, and SSH paths with informed users.
 An alpha build must compile, pass workspace unit tests and layer checks, retain
 the previous valid configuration after reload failure, keep PTY shutdown
 bounded, deny unsafe clipboard and SSH actions by default, and pass its packaged
-doctor, local-shell, and first-frame GUI smoke commands. A platform is listed as verified only
+doctor, local-shell, and terminal-I/O GUI smoke commands. A platform is listed as verified only
 after those checks and the platform-specific manual checklist run on that OS.
 
 Alpha bug reports should include `panea doctor --json` output. Diagnostic

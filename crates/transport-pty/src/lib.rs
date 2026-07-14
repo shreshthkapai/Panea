@@ -6,7 +6,10 @@ use std::{
     collections::{BTreeMap, VecDeque},
     io::{Read, Write},
     path::PathBuf,
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -14,7 +17,7 @@ use std::{
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use transport_core::{
     SessionMetadata, TerminalSize, TerminalTransport, TransportError, TransportKind,
-    TransportLifecycleEvent, TransportOutput, TransportResult, TransportState,
+    TransportLifecycleEvent, TransportOutput, TransportResult, TransportState, TransportWakeHandle,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +238,7 @@ pub struct LocalPtyTransport {
     process_id: Option<u32>,
     reader_rx: Receiver<ReaderMessage>,
     reader_thread: Option<JoinHandle<()>>,
+    output_waker: Arc<Mutex<Option<TransportWakeHandle>>>,
     diagnostics: LocalPtyDiagnostics,
     metadata: SessionMetadata,
     state: TransportState,
@@ -316,7 +320,8 @@ impl LocalPtyTransport {
             .map_err(|error| TransportError::new(format!("failed to open PTY writer: {error}")))?;
 
         let process_id = child.process_id();
-        let (reader_rx, reader_thread) = spawn_reader(reader);
+        let output_waker = Arc::new(Mutex::new(None));
+        let (reader_rx, reader_thread) = spawn_reader(reader, Arc::clone(&output_waker));
 
         let mut pending_lifecycle = VecDeque::new();
         pending_lifecycle.push_back(TransportLifecycleEvent::Started);
@@ -328,6 +333,7 @@ impl LocalPtyTransport {
             process_id,
             reader_rx,
             reader_thread: Some(reader_thread),
+            output_waker,
             diagnostics: LocalPtyDiagnostics::new(
                 command_label,
                 process_id,
@@ -492,6 +498,12 @@ impl LocalPtyTransport {
 }
 
 impl TerminalTransport for LocalPtyTransport {
+    fn set_output_waker(&mut self, waker: Option<TransportWakeHandle>) {
+        if let Ok(mut output_waker) = self.output_waker.lock() {
+            *output_waker = waker;
+        }
+    }
+
     fn write_input(&mut self, bytes: &[u8]) -> TransportResult<()> {
         if matches!(
             self.state,
@@ -672,17 +684,24 @@ enum ReaderMessage {
     Stopped,
 }
 
-fn spawn_reader(mut reader: Box<dyn Read + Send>) -> (Receiver<ReaderMessage>, JoinHandle<()>) {
+fn spawn_reader(
+    mut reader: Box<dyn Read + Send>,
+    output_waker: Arc<Mutex<Option<TransportWakeHandle>>>,
+) -> (Receiver<ReaderMessage>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
 
     let handle = thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
-        let _ = tx.send(ReaderMessage::Started);
+        if tx.send(ReaderMessage::Started).is_ok() {
+            wake_output(&output_waker);
+        }
 
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => {
-                    let _ = tx.send(ReaderMessage::Closed);
+                    if tx.send(ReaderMessage::Closed).is_ok() {
+                        wake_output(&output_waker);
+                    }
                     break;
                 }
                 Ok(count) => {
@@ -692,18 +711,33 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>) -> (Receiver<ReaderMessage>, J
                     {
                         break;
                     }
+                    wake_output(&output_waker);
                 }
                 Err(error) => {
-                    let _ = tx.send(ReaderMessage::Failed(error.to_string()));
+                    if tx.send(ReaderMessage::Failed(error.to_string())).is_ok() {
+                        wake_output(&output_waker);
+                    }
                     break;
                 }
             }
         }
 
-        let _ = tx.send(ReaderMessage::Stopped);
+        if tx.send(ReaderMessage::Stopped).is_ok() {
+            wake_output(&output_waker);
+        }
     });
 
     (rx, handle)
+}
+
+fn wake_output(output_waker: &Arc<Mutex<Option<TransportWakeHandle>>>) {
+    let waker = output_waker
+        .lock()
+        .ok()
+        .and_then(|output_waker| output_waker.clone());
+    if let Some(waker) = waker {
+        waker.wake();
+    }
 }
 
 fn to_pty_size(size: TerminalSize) -> PtySize {
@@ -740,6 +774,8 @@ mod tests {
     use super::*;
     use std::{
         fmt::Write as _,
+        io::Cursor,
+        sync::atomic::{AtomicUsize, Ordering},
         thread,
         time::{Duration, Instant},
     };
@@ -747,6 +783,27 @@ mod tests {
 
     fn test_size() -> TerminalSize {
         TerminalSize::new(80, 24, 640, 384)
+    }
+
+    #[test]
+    fn reader_wakes_consumer_when_output_is_queued() {
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&wake_count);
+        let output_waker = Arc::new(Mutex::new(Some(TransportWakeHandle::new(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+        }))));
+        let (messages, reader) = spawn_reader(
+            Box::new(Cursor::new(b"panea-output".to_vec())),
+            output_waker,
+        );
+
+        reader.join().expect("reader thread");
+        let messages = messages.try_iter().collect::<Vec<_>>();
+
+        assert!(messages.iter().any(|message| {
+            matches!(message, ReaderMessage::Bytes(bytes) if bytes == b"panea-output")
+        }));
+        assert!(wake_count.load(Ordering::Relaxed) >= 2);
     }
 
     #[test]

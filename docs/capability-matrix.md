@@ -106,7 +106,7 @@ and Linux cells stay `partial`, `stubbed`, or `planned`.
 
 | Platform | Overall status | Why |
 | --- | --- | --- |
-| Windows | partial | Current-host build/test/lint, PTY, compatibility, doctor, and rebuilt staged/installed package lifecycle including first-frame GPU GUI smoke are verified. Optional app matrix, real SSH report, credentialed signing, and alpha usage remain. |
+| Windows | partial | Current-host build/test/lint, PTY, compatibility, doctor, and rebuilt staged/installed package lifecycle including terminal-I/O GPU GUI smoke are verified. Optional app matrix, real SSH report, credentialed signing, and alpha usage remain. |
 | macOS | partial | Platform-neutral code and a macOS CI runner definition exist, but runtime behavior and verification reports are not yet collected. |
 | Linux X11 | partial | Platform-neutral code, X11 strategy, and a Linux X11 runner definition exist, but real X11 window manager/compositor behavior and reports are unverified. |
 | Linux Wayland | partial | Platform-neutral code, Wayland strategy, and a Linux Wayland runner definition exist, but real compositor behavior and reports are unverified. |

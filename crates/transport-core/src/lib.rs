@@ -5,10 +5,35 @@ pub const LAYER: &str = "session transport";
 use std::{
     error::Error,
     fmt,
-    sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
+
+/// Platform-neutral callback used to wake an application event loop when a
+/// transport has output or lifecycle state ready to consume.
+#[derive(Clone)]
+pub struct TransportWakeHandle(Arc<dyn Fn() + Send + Sync + 'static>);
+
+impl TransportWakeHandle {
+    #[must_use]
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(wake))
+    }
+
+    pub fn wake(&self) {
+        (self.0)();
+    }
+}
+
+impl fmt::Debug for TransportWakeHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TransportWakeHandle(..)")
+    }
+}
 
 /// A terminal viewport size expressed in character cells and physical pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,6 +328,10 @@ impl Drop for TransportEventLoop {
 
 /// Responsible only for bytes in, bytes out, sizing, and lifecycle.
 pub trait TerminalTransport: Send {
+    /// Registers a readiness callback. Backends with reader threads should
+    /// invoke it after queueing output or lifecycle changes.
+    fn set_output_waker(&mut self, _waker: Option<TransportWakeHandle>) {}
+
     fn write_input(&mut self, bytes: &[u8]) -> TransportResult<()>;
 
     fn resize(&mut self, size: TerminalSize) -> TransportResult<()>;
@@ -318,6 +347,27 @@ pub trait TerminalTransport: Send {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::TransportWakeHandle;
+
+    #[test]
+    fn transport_wake_handle_is_cloneable_and_backend_agnostic() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let wake = TransportWakeHandle::new(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+        });
+
+        wake.wake();
+        wake.clone().wake();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
     #[test]
     fn transport_core_has_no_crate_dependencies() {
         let manifest = include_str!("../Cargo.toml");

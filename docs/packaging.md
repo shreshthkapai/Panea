@@ -25,11 +25,11 @@ Fallback behavior: portable archives remain available for local unsigned
 development builds; tagged release jobs require signing credentials, and Linux
 format builders fail clearly when their release tools are unavailable
 Diagnostics: packaged `panea doctor --json`, `panea shell-smoke --json`, and
-`panea gui-smoke --json` are smoke-tested
+`panea gui-smoke --terminal-io --json` are smoke-tested
 Performance cost when disabled: none; packaging is offline build tooling
 Performance cost when enabled: one desktop binary build plus filesystem staging
 Tests: xtask unit tests, package content verification, packaged doctor and
-headless shell-session smoke, first-frame GPU GUI smoke, Windows
+headless shell-session smoke, terminal-I/O GPU GUI smoke, Windows
 install/installed-binary/uninstall smoke, and cross-OS release runners
 
 ## Commands
@@ -58,7 +58,7 @@ The smoke command verifies required package contents and runs:
 ```text
 panea doctor --json
 panea shell-smoke --json
-panea gui-smoke --json
+panea gui-smoke --terminal-io --json
 ```
 
 On Windows it also installs into a temporary per-user-style directory, runs
@@ -66,9 +66,11 @@ all three commands from the installed binary, uninstalls, and verifies cleanup.
 
 `shell-smoke` starts a bounded local PTY session, runs a one-shot marker command
 through the selected/default shell profile, observes output, and shuts the
-transport down. `gui-smoke` creates the real platform window, initializes the
-GPU renderer and session, presents the first frame, then shuts down within a
-bounded timeout. Interaction remains a separate manual release check.
+transport down. `gui-smoke --terminal-io` creates the real platform window,
+initializes the GPU renderer and session, waits for the shell prompt, sends a
+marker command, observes both input echo and command output, presents that
+frame, and then shuts down within a bounded timeout. Broader interaction
+remains a separate manual release check.
 
 ## Generated Layouts
 
@@ -208,7 +210,7 @@ after stable, distinct capabilities and a remote fallback strategy exist.
   credentials and final host verification remain external release evidence.
 - Linux tarball, deb, AppImage, and RPM generation are implemented but still
   require collected Linux-host release reports.
-- Automated first-frame GUI launch exists; full interaction remains manual on
+- Automated terminal-I/O GUI launch exists; broader interaction remains manual on
   every target OS.
 - Source and packaged artifacts carry the dual `MIT OR Apache-2.0` license.
   Package layouts include the license selector and both complete license texts.

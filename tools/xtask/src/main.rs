@@ -3121,9 +3121,9 @@ fn print_package_plan() {
     println!("  cargo xtask package build --profile release");
     println!("Smoke the packaged doctor command:");
     println!("  cargo xtask package smoke --profile release --build");
-    println!("The smoke also runs packaged headless shell and first-frame GUI commands:");
+    println!("The smoke also runs packaged headless shell and terminal-I/O GUI commands:");
     println!("  panea shell-smoke --json");
-    println!("  panea gui-smoke --json");
+    println!("  panea gui-smoke --terminal-io --json");
     println!();
     println!("Signing and notarization activate through documented release credentials.");
 }
@@ -4591,7 +4591,13 @@ fn run_packaged_gui_smoke(binary_path: &Path, timeout: Duration) -> PackageSmoke
     let timeout_ms = timeout.as_millis().to_string();
     let gui_binary = packaged_gui_binary(binary_path);
     let mut child = match Command::new(&gui_binary)
-        .args(["gui-smoke", "--json", "--timeout-ms", timeout_ms.as_str()])
+        .args([
+            "gui-smoke",
+            "--terminal-io",
+            "--json",
+            "--timeout-ms",
+            timeout_ms.as_str(),
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -4644,7 +4650,10 @@ fn run_packaged_gui_smoke(binary_path: &Path, timeout: Duration) -> PackageSmoke
                 name: "gui-launch",
                 status: PackageSmokeStatus::Passed,
                 duration: started.elapsed(),
-                detail: format!("{} rendered its first session frame", gui_binary.display()),
+                detail: format!(
+                    "{} rendered a shell prompt, input echo, and command output",
+                    gui_binary.display()
+                ),
             }
         }
         Ok(output) => PackageSmokeResult {
@@ -4837,7 +4846,7 @@ fn render_package_manifest(options: &PackageOptions, layout: &PackageLayout) -> 
             "  \"resources\": \"{}\",\n",
             "  \"doctor_smoke\": \"panea doctor --json\",\n",
             "  \"shell_launch_smoke\": \"panea shell-smoke --json\",\n",
-            "  \"gui_launch_smoke\": \"panea gui-smoke --json\",\n",
+            "  \"gui_launch_smoke\": \"panea gui-smoke --terminal-io --json\",\n",
             "  \"contains\": [\"binary\", \"gui_entrypoint\", \"application_icon\", \"default_config\", \"config_schema\", \"config_examples\", \"programmable_config_examples\", \"themes\", \"cursor_profiles\", \"cursor_vector_assets\", \"shell_integration_scripts\", \"doctor_command\", \"shell_smoke_command\", \"gui_smoke_command\", \"license\", \"readme\"]\n",
             "}}\n"
         ),
@@ -4860,7 +4869,7 @@ fn render_package_manifest(options: &PackageOptions, layout: &PackageLayout) -> 
 }
 
 fn package_install_notes(options: &PackageOptions) -> String {
-    let common = "Panea package artifact\n\nRun `panea doctor --json` first to verify diagnostics. Run `panea shell-smoke --json` to verify a bounded local PTY session, then `panea gui-smoke --json` to verify window, renderer, session, and first-frame startup.\n\n";
+    let common = "Panea package artifact\n\nRun `panea doctor --json` first to verify diagnostics. Run `panea shell-smoke --json` to verify a bounded local PTY session, then `panea gui-smoke --terminal-io --json` to verify a rendered shell prompt, input echo, and command output.\n\n";
     match options.target_platform {
         CompatPlatform::Windows => format!(
             "{common}Windows delivery:\n- Run `panea-gui.exe` from the portable ZIP for a console-free desktop launch.\n- Use `panea.exe` for CLI diagnostics and smoke commands.\n- Or run the Panea installer EXE for a per-user install, Start menu shortcuts, and user PATH registration.\n- Uninstall from the Start menu shortcut or `panea-uninstall.exe uninstall`.\n"

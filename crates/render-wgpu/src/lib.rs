@@ -4860,7 +4860,11 @@ impl GpuTerminalRenderer {
         if self.requires_full_redraw {
             backend.retained_frame_initialized = false;
         }
-        let mut batches = if self.requires_full_redraw || !backend.supports_retained_damage() {
+        let mut batches = if should_prepare_full_frame(
+            self.requires_full_redraw,
+            self.options.damage_tracking,
+            backend.supports_retained_damage(),
+        ) {
             self.rasterizer.prepare_full_batches(scene, fonts)?
         } else {
             self.rasterizer.prepare_batches(scene, fonts)?
@@ -5004,6 +5008,14 @@ impl GpuTerminalRenderer {
         self.invalidate_gpu_resident_resources();
         self.recovery_status = RenderRecoveryStatus::Lost { reason, message };
     }
+}
+
+fn should_prepare_full_frame(
+    requires_full_redraw: bool,
+    damage_tracking_enabled: bool,
+    retained_damage_supported: bool,
+) -> bool {
+    requires_full_redraw || !damage_tracking_enabled || !retained_damage_supported
 }
 
 impl GpuBackend {
@@ -5895,6 +5907,14 @@ mod tests {
             background: RenderColor::rgb(12, 12, 12),
             style: RenderCellStyle::default(),
         }
+    }
+
+    #[test]
+    fn full_frame_fallback_honors_config_and_surface_capability() {
+        assert!(should_prepare_full_frame(true, true, true));
+        assert!(should_prepare_full_frame(false, false, true));
+        assert!(should_prepare_full_frame(false, true, false));
+        assert!(!should_prepare_full_frame(false, true, true));
     }
 
     fn scene(cells: Vec<RenderCell>) -> RenderScene {
