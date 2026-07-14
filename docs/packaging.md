@@ -159,5 +159,5 @@ recomputes every listed digest before launching packaged binaries.
   be validated on Linux. AppImage/rpm remain additional distribution formats.
 - Full GUI launch and interaction remain manual release checks on every target
   OS; headless doctor and real-PTY shell startup are automated.
-- The repository is currently marked unlicensed. Public OSS distribution
-  requires the owner to select and apply an open-source license first.
+- Source and packaged artifacts carry the dual `MIT OR Apache-2.0` license.
+  Package layouts include the license selector and both complete license texts.

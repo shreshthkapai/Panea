@@ -37,15 +37,15 @@ The remaining high-level work is:
 
 - Cross-OS installed-font, shaping, color-emoji, screenshot, and real-app
   evidence for the implemented Unicode/font renderer.
-- Stronger architecture/layer-boundary checks.
+- Accumulated architecture/layer-boundary CI evidence across target hosts.
 - Long-running fuzz history and crash-regression intake from the fuzzing
   harness.
 - macOS, Linux X11, and Linux Wayland screenshot baseline capture plus
   accumulated runtime evidence for the batched GPU glyph renderer.
 - Real Linux X11/Wayland compositor host verification using the committed
   target matrix.
-- Remote OSC 52 confirmation UI and real cross-OS clipboard/primary-selection
-  smoke coverage.
+- Real cross-OS OSC 52, clipboard, notification, and primary-selection smoke
+  coverage.
 - App compatibility tests now have a bounded runner; full interactive shells,
   editors, TUIs, tmux/screen/zellij, WSL, SSH, and cross-OS reports remain.
 - Runtime config watching/live reload cross-OS validation and richer error UI.

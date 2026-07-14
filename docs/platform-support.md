@@ -40,8 +40,8 @@ considered verified until that matrix has real X11 and Wayland host evidence.
 | cursor animations | partial | tested | partial | partial | Smooth/eased/effect animations and user GIF/PNG cursors use bounded local damage, off-thread decode, cached frames, and one GPU texture-array upload; macOS/Linux interactive visual smoke remains open. |
 | SSH | partial | partial | partial | partial | First-class mux panes, host trust/auth overlays, native desktop keychains, reconnect presentation, remote semantics, and `cargo xtask ssh-smoke` exist; real server reports remain open. |
 | config reload | partial | tested | partial | partial | Debounced TOML watcher and live applier exist; Windows unit/desktop tests pass, while macOS/Linux runtime validation remains open. |
-| notifications | not implemented yet | not implemented yet | not implemented yet | not implemented yet | Native notification surface has not been implemented. |
-| OSC clipboard | partial | partial | partial | partial | OSC 52 parser and security policy exist; remote confirmation UI and real app/platform smoke remain open. |
+| notifications | partial | partial | partial | partial | Native provider and bounded background delivery exist for Windows toast, macOS Notification Center, and freedesktop D-Bus; real-host permission/delivery evidence remains open. |
+| OSC clipboard | partial | partial | partial | partial | OSC 52 parser, bounded policy, and remote one-time confirmation overlay exist; real app/platform smoke remains open. |
 
 ## Current Verification Status
 

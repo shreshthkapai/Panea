@@ -60,8 +60,10 @@ allow_remote = true
 confirm_remote_writes = true
 ```
 
-The confirmation UI is not complete yet, so remote requests that require
-confirmation are blocked rather than silently accepted.
+When confirmation is enabled, Panea displays a renderer overlay with the remote
+session identity, clipboard target, and bounded payload size. It never displays
+the clipboard contents. `Y` permits one write after the full policy is checked
+again; `N` or Escape rejects it. Only one request can wait per pane.
 
 ## Diagnostics and Logs
 
@@ -82,6 +84,6 @@ cargo xtask ssh-smoke run --host 127.0.0.1 --user panea --auth agent
 
 Current blockers for release security posture:
 
-- remote OSC clipboard confirmation UI is not implemented
+- real remote OSC clipboard application smoke is still required on every OS
 - shell integration installer trust and update policy still need review
 - real SSH trust/auth reports must be collected on every target OS

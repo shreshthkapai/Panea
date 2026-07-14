@@ -180,11 +180,11 @@ pub fn feature_parity_matrix() -> Vec<PlatformFeatureStatus> {
         },
         PlatformFeatureStatus {
             feature: "notifications",
-            macos: NotImplementedYet,
-            windows: NotImplementedYet,
-            linux_x11: NotImplementedYet,
-            linux_wayland: NotImplementedYet,
-            notes: "native notification surface has not been implemented",
+            macos: Partial,
+            windows: Partial,
+            linux_x11: Partial,
+            linux_wayland: Partial,
+            notes: "native backends and bounded background delivery exist; real-host permission and delivery verification remains open",
         },
         PlatformFeatureStatus {
             feature: "OSC clipboard",
@@ -192,7 +192,7 @@ pub fn feature_parity_matrix() -> Vec<PlatformFeatureStatus> {
             windows: Partial,
             linux_x11: Partial,
             linux_wayland: Partial,
-            notes: "OSC 52 parser and security policy exist; remote confirmation UI and real app/platform smoke remain open",
+            notes: "OSC 52 parser, bounded policy, and remote one-time confirmation overlay exist; real app/platform smoke remains open",
         },
     ]
 }
@@ -556,6 +556,7 @@ pub enum DoctorTopic {
     Window,
     Fonts,
     Clipboard,
+    Notifications,
 }
 
 impl DoctorTopic {
@@ -572,6 +573,7 @@ impl DoctorTopic {
             "window" => Some(Self::Window),
             "fonts" | "font" => Some(Self::Fonts),
             "clipboard" => Some(Self::Clipboard),
+            "notifications" | "notification" => Some(Self::Notifications),
             _ => None,
         }
     }
@@ -589,6 +591,7 @@ impl DoctorTopic {
             Self::Window => "doctor window",
             Self::Fonts => "doctor fonts",
             Self::Clipboard => "doctor clipboard",
+            Self::Notifications => "doctor notifications",
         }
     }
 }
@@ -670,6 +673,7 @@ pub struct DoctorRuntimeSnapshot {
     pub config_parse_status: String,
     pub shell_integration_status: String,
     pub clipboard_provider: String,
+    pub notification_provider: String,
     pub keychain_provider: String,
     pub pty_backend: String,
     pub ssh_provider_status: String,
@@ -688,6 +692,7 @@ impl Default for DoctorRuntimeSnapshot {
             config_parse_status: "loaded".to_owned(),
             shell_integration_status: "runtime session not active during doctor".to_owned(),
             clipboard_provider: "not probed".to_owned(),
+            notification_provider: "not probed".to_owned(),
             keychain_provider: "not probed".to_owned(),
             pty_backend: "not probed".to_owned(),
             ssh_provider_status: "not probed".to_owned(),
@@ -803,6 +808,9 @@ pub fn doctor_report(input: &DoctorInput, topic: DoctorTopic) -> DoctorReport {
     }
     if matches!(topic, DoctorTopic::All | DoctorTopic::Clipboard) {
         append_clipboard_report(input, &mut report);
+    }
+    if matches!(topic, DoctorTopic::All | DoctorTopic::Notifications) {
+        append_notification_report(input, &mut report);
     }
     if matches!(topic, DoctorTopic::All | DoctorTopic::Performance) {
         append_performance_report(input, &mut report);
@@ -1117,6 +1125,31 @@ fn append_clipboard_report(input: &DoctorInput, report: &mut DoctorReport) {
     }
 }
 
+fn append_notification_report(input: &DoctorInput, report: &mut DoctorReport) {
+    report.lines.extend([
+        "notifications:".to_owned(),
+        format!(
+            "  enabled={} only_when_unfocused={} session_closed={} transport_errors={}",
+            input.config.notifications.enabled,
+            input.config.notifications.only_when_unfocused,
+            input.config.notifications.session_closed,
+            input.config.notifications.transport_errors
+        ),
+        format!("  provider={}", input.runtime.notification_provider),
+    ]);
+
+    if input.config.notifications.enabled
+        && input.runtime.notification_provider.contains("unavailable")
+    {
+        report.findings.push(DoctorFinding {
+            severity: DoctorSeverity::Warning,
+            area: "notifications",
+            message: "native notifications are enabled but the active provider is unavailable"
+                .to_owned(),
+        });
+    }
+}
+
 fn append_performance_report(input: &DoctorInput, report: &mut DoctorReport) {
     report.lines.extend([
         "performance:".to_owned(),
@@ -1219,6 +1252,7 @@ fn doctor_topic_key(topic: DoctorTopic) -> &'static str {
         DoctorTopic::Window => "window",
         DoctorTopic::Fonts => "fonts",
         DoctorTopic::Clipboard => "clipboard",
+        DoctorTopic::Notifications => "notifications",
     }
 }
 
@@ -1468,7 +1502,7 @@ pub fn security_review_report(input: &DoctorInput) -> ReadinessReport {
         area: "OSC clipboard",
         status: ReadinessStatus::Warning,
         message:
-            "OSC 52 local writes are policy-controlled and bounded; remote confirmation UI is not complete"
+            "OSC 52 writes are policy-controlled and bounded; opted-in remote writes require an explicit one-time confirmation, while cross-OS smoke remains separate work"
                 .to_owned(),
     });
     items.push(ReadinessItem {
@@ -2476,6 +2510,10 @@ mod tests {
             DoctorTopic::parse("clipboard"),
             Some(DoctorTopic::Clipboard)
         );
+        assert_eq!(
+            DoctorTopic::parse("notifications"),
+            Some(DoctorTopic::Notifications)
+        );
         assert!(DoctorTopic::parse("unknown").is_none());
     }
 
@@ -2520,6 +2558,33 @@ mod tests {
         assert!(fonts.contains("discovery=primary:monospace=unresolved"));
         assert!(fonts.contains("could not be resolved"));
         assert!(clipboard.contains("provider=system unavailable"));
+    }
+
+    #[test]
+    fn doctor_notifications_reports_config_and_provider_fallback() {
+        let input = DoctorInput {
+            app_version: "0.1.0".to_owned(),
+            config_source: "default".to_owned(),
+            config: AppConfig::default(),
+            config_diagnostics: Vec::new(),
+            platform: PlatformSnapshot::detect(),
+            runtime: DoctorRuntimeSnapshot {
+                notification_provider: "freedesktop unavailable".to_owned(),
+                ..DoctorRuntimeSnapshot::default()
+            },
+            recent_errors: Vec::new(),
+        };
+
+        let report = doctor_report(&input, DoctorTopic::Notifications);
+        let text = report.render_text();
+        assert!(text.contains("only_when_unfocused=true"));
+        assert!(text.contains("freedesktop unavailable"));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.area == "notifications")
+        );
     }
 
     #[test]
@@ -2590,7 +2655,7 @@ mod tests {
     }
 
     #[test]
-    fn security_review_reports_native_keychain_and_remaining_osc_warning() {
+    fn security_review_reports_native_keychain_and_osc_confirmation() {
         let input = DoctorInput {
             app_version: "0.1.0".to_owned(),
             config_source: "default".to_owned(),
@@ -2608,6 +2673,7 @@ mod tests {
         assert!(text.contains("native OS keychain"));
         assert!(text.contains("masked desktop prompts"));
         assert!(text.contains("OSC 52"));
+        assert!(text.contains("explicit one-time confirmation"));
     }
 
     #[test]

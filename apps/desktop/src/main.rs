@@ -16,10 +16,11 @@ use std::{
 use config_core::{
     AppConfig, ClipboardConfig, CommandBlockStyle, ConfigDiagnostic, ConfigDiagnosticSeverity,
     ConfigPlatform, DecorationStrategyConfig, InputOutputGroupingStyle, LinuxBackendConfig,
-    LogLevel, MuxLayoutConfig, MuxSplitAxisConfig, MuxTransportConfig, PasteConfig,
-    PerformanceConfig, PerformanceProfile, PresentModePreference, PromptDecorationStyle,
-    ReloadPlan, ReloadableSection, ShellIntegrationActivationConfig, ShellProfile,
-    ShellProfileKind, SshAuthMethod, SshKnownHostsPolicy, SshProfile, WindowModeConfig,
+    LogLevel, MuxLayoutConfig, MuxSplitAxisConfig, MuxTransportConfig, NotificationConfig,
+    PasteConfig, PerformanceConfig, PerformanceProfile, PresentModePreference,
+    PromptDecorationStyle, ReloadPlan, ReloadableSection, ShellIntegrationActivationConfig,
+    ShellProfile, ShellProfileKind, SshAuthMethod, SshKnownHostsPolicy, SshProfile,
+    WindowModeConfig,
 };
 use diagnostics::{PerformanceBudget, PerformanceOverlay};
 use font_system::{CellMetrics, FontConfig as RuntimeFontConfig, FontSource, FontSystem};
@@ -30,12 +31,13 @@ use mux::{
 };
 use platform_core::{
     DecorationMode, InputEvent, KeyEvent, KeyModifiers, KeyState, LinuxWindowBackend, MouseButton,
-    MouseEvent, MouseEventKind, PowerSource, PowerState, PowerStateProvider, UrlOpener,
-    WindowAction, WindowMode,
+    MouseEvent, MouseEventKind, NotificationProvider, NotificationRequest, NotificationUrgency,
+    PowerSource, PowerState, PowerStateProvider, UrlOpener, WindowAction, WindowMode,
 };
 use platform_winit::{
-    ClipboardBridge, DesktopPowerMonitor, DesktopUrlOpener, DesktopWindow, InputTranslator,
-    WindowSettings, apply_window_mode_with_decoration, create_event_loop, platform_capabilities,
+    ClipboardBridge, DesktopNotificationProvider, DesktopPowerMonitor, DesktopUrlOpener,
+    DesktopWindow, InputTranslator, WindowSettings, apply_window_mode_with_decoration,
+    create_event_loop, platform_capabilities,
 };
 use render_core::{
     CellPosition, CursorVisual, OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle,
@@ -55,7 +57,8 @@ use security::{
 };
 use security::{
     Osc52ClipboardDecision, Osc52ClipboardPolicy, Osc52ClipboardRequest as SecurityOsc52Request,
-    Osc52ClipboardTarget, PlatformKeychainProvider, evaluate_osc52_clipboard_write,
+    Osc52ClipboardTarget, PlatformKeychainProvider, approve_osc52_clipboard_write,
+    evaluate_osc52_clipboard_write,
 };
 use semantics::detect_url_hints;
 use semantics::{
@@ -113,7 +116,9 @@ fn run_cli() -> Option<i32> {
 }
 
 fn print_cli_help() {
-    eprintln!("usage: panea doctor [window|renderer|config|shell|ssh|fonts|clipboard] [--json]");
+    eprintln!(
+        "usage: panea doctor [window|renderer|config|shell|ssh|fonts|clipboard|notifications] [--json]"
+    );
     eprintln!("usage: panea shell-smoke [--json] [--timeout-ms <ms>]");
 }
 
@@ -129,7 +134,7 @@ fn run_doctor_cli(args: &[String]) -> i32 {
     );
     let Some(topic) = topic else {
         eprintln!(
-            "unknown doctor topic; expected window, renderer, config, shell, ssh, fonts, clipboard, platform, or performance"
+            "unknown doctor topic; expected window, renderer, config, shell, ssh, fonts, clipboard, notifications, platform, or performance"
         );
         return 2;
     };
@@ -658,6 +663,8 @@ fn doctor_runtime_snapshot(
     let gpu_probe = pollster::block_on(render_wgpu::probe_gpu_adapter());
     let clipboard = ClipboardBridge::new();
     let clipboard_diagnostic = clipboard.last_diagnostic().clone();
+    let notification_provider = DesktopNotificationProvider::new(config.notifications.enabled);
+    let notification_diagnostic = notification_provider.diagnostic();
     let keychain = PlatformKeychainProvider::for_current_platform();
     let keychain_capability = keychain.capability();
 
@@ -685,6 +692,12 @@ fn doctor_runtime_snapshot(
                 .message
                 .as_deref()
                 .unwrap_or("provider initialized")
+        ),
+        notification_provider: format!(
+            "{:?} {:?}: {}",
+            notification_diagnostic.backend,
+            notification_diagnostic.availability,
+            notification_diagnostic.message
         ),
         keychain_provider: format!(
             "{:?} available={} secure={} persistent={} ({})",
@@ -815,6 +828,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         DesktopDiagnosticsPlaceholder::new(desktop_window.diagnostics().clone(), capabilities);
     let mut input_translator = InputTranslator::new();
     let mut clipboard = ClipboardBridge::new();
+    let mut notification_provider = DesktopNotificationProvider::new(config.notifications.enabled);
     let mut url_opener = DesktopUrlOpener::new();
     let mut current_window_mode = desktop_window.diagnostics().window_mode.effective;
     let decoration_mode = map_decoration_mode(config.window.decoration_strategy);
@@ -1008,7 +1022,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                                     pointer_visible = false;
                                 }
 
-                                if let Some(changed) = mux_runtime.handle_modal_key(&key) {
+                                if let Some(changed) = mux_runtime.handle_modal_key(
+                                    &key,
+                                    &mut clipboard,
+                                    &osc52_policy,
+                                    &clipboard_config,
+                                ) {
                                     if changed {
                                         scheduler.terminal_content_changed();
                                         window.request_redraw();
@@ -1401,6 +1420,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 &mut clipboard_config,
                                 &mut paste_config,
                                 &mut osc52_policy,
+                                &mut notification_provider,
                                 &mut performance_overlay,
                                 &mut performance_budget,
                                 &mut renderer,
@@ -1489,7 +1509,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                     window.request_redraw();
                 }
 
-                if mux_runtime.poll_outputs(&mut clipboard, &osc52_policy, &clipboard_config) {
+                if mux_runtime.poll_outputs(
+                    &mut clipboard,
+                    &osc52_policy,
+                    &clipboard_config,
+                    &mut notification_provider,
+                    &config.notifications,
+                    window_focused,
+                ) {
                     scheduler.terminal_content_changed();
                 }
 
@@ -1597,6 +1624,7 @@ fn apply_live_config_reload(
     clipboard_config: &mut ClipboardConfig,
     paste_config: &mut PasteConfig,
     runtime_osc52_policy: &mut Osc52ClipboardPolicy,
+    notification_provider: &mut DesktopNotificationProvider,
     performance_overlay: &mut PerformanceOverlay,
     runtime_performance_budget: &mut PerformanceBudget,
     renderer: &mut GpuTerminalRenderer,
@@ -1633,6 +1661,10 @@ fn apply_live_config_reload(
             }
             ReloadableSection::Keybindings => current.keyboard = next.keyboard.clone(),
             ReloadableSection::Mux => current.mux = next.mux.clone(),
+            ReloadableSection::Notifications => {
+                current.notifications = next.notifications.clone();
+                notification_provider.set_enabled(current.notifications.enabled);
+            }
             ReloadableSection::Performance => {
                 renderer.set_glyph_cache_capacity(next.performance.glyph_cache_entries);
                 current.performance = next.performance.clone();
@@ -2803,6 +2835,7 @@ fn process_pending_clipboard_requests(
     policy: &Osc52ClipboardPolicy,
     config: &ClipboardConfig,
     session_is_remote: bool,
+    pending_prompt: &mut Option<Osc52PromptState>,
 ) {
     if !config.enabled {
         let dropped = terminal.state_mut().take_pending_clipboard_requests();
@@ -2816,18 +2849,35 @@ fn process_pending_clipboard_requests(
     }
 
     for request in terminal.state_mut().take_pending_clipboard_requests() {
-        match evaluate_osc52_clipboard_write(
-            &security_osc52_request(request, session_is_remote),
-            policy,
-        ) {
+        let security_request = security_osc52_request(request, session_is_remote);
+        match evaluate_osc52_clipboard_write(&security_request, policy) {
             Osc52ClipboardDecision::Allow { text, bytes } => {
-                copy_text_with_diagnostics(clipboard, &text, config, "OSC 52");
+                copy_osc52_text_with_diagnostics(
+                    clipboard,
+                    &text,
+                    config,
+                    security_request.target,
+                    "OSC 52",
+                );
                 if config.log_operations {
                     eprintln!("clipboard OSC 52: accepted {bytes} byte request");
                 }
             }
-            Osc52ClipboardDecision::PromptRequired { reason } => {
-                eprintln!("clipboard OSC 52 blocked pending UI confirmation: {reason}");
+            Osc52ClipboardDecision::PromptRequired { reason, bytes } => {
+                if pending_prompt.is_none() {
+                    *pending_prompt = Some(Osc52PromptState {
+                        request: security_request,
+                        reason,
+                        bytes,
+                    });
+                    eprintln!(
+                        "clipboard OSC 52: remote write is waiting for explicit confirmation"
+                    );
+                } else {
+                    eprintln!(
+                        "clipboard OSC 52 denied: another remote clipboard decision is already pending"
+                    );
+                }
             }
             Osc52ClipboardDecision::Deny { reason } => {
                 if config.log_operations {
@@ -2836,6 +2886,32 @@ fn process_pending_clipboard_requests(
             }
         }
     }
+}
+
+fn copy_osc52_text_with_diagnostics(
+    clipboard: &mut ClipboardBridge,
+    text: &str,
+    config: &ClipboardConfig,
+    target: Osc52ClipboardTarget,
+    source: &str,
+) {
+    if matches!(target, Osc52ClipboardTarget::PrimarySelection) {
+        match clipboard.copy_primary_text(text) {
+            Ok(()) => {
+                if config.log_operations {
+                    eprintln!(
+                        "clipboard {source}: wrote {} bytes to primary selection",
+                        text.len()
+                    );
+                }
+                return;
+            }
+            Err(diagnostic) => eprintln!(
+                "clipboard {source}: primary selection unavailable; falling back to system clipboard: {diagnostic:?}"
+            ),
+        }
+    }
+    copy_text_with_diagnostics(clipboard, text, config, source);
 }
 
 fn security_osc52_request(request: Osc52ClipboardRequest, remote: bool) -> SecurityOsc52Request {
@@ -3639,8 +3715,15 @@ impl MuxRuntime {
             .is_some_and(|pane| pane.toggle_current_command_output(config))
     }
 
-    fn handle_modal_key(&mut self, event: &KeyEvent) -> Option<bool> {
-        self.active_pane_mut()?.handle_modal_key(event)
+    fn handle_modal_key(
+        &mut self,
+        event: &KeyEvent,
+        clipboard: &mut ClipboardBridge,
+        policy: &Osc52ClipboardPolicy,
+        clipboard_config: &ClipboardConfig,
+    ) -> Option<bool> {
+        self.active_pane_mut()?
+            .handle_modal_key(event, clipboard, policy, clipboard_config)
     }
 
     fn scroll_active_page(&mut self, toward_older: bool) -> bool {
@@ -3910,6 +3993,9 @@ impl MuxRuntime {
         clipboard: &mut ClipboardBridge,
         policy: &Osc52ClipboardPolicy,
         clipboard_config: &ClipboardConfig,
+        notification_provider: &mut dyn NotificationProvider,
+        notification_config: &NotificationConfig,
+        window_focused: bool,
     ) -> bool {
         let mut content_changed = false;
         let mut status_updates = Vec::new();
@@ -3921,6 +4007,13 @@ impl MuxRuntime {
             if poll.content_changed {
                 content_changed = true;
             }
+            notify_for_pane_transition(
+                notification_provider,
+                notification_config,
+                window_focused,
+                pane,
+                poll,
+            );
             status_updates.push((*pane_id, session_status_for_pane(pane)));
             metadata_updates.push((
                 *pane_id,
@@ -4065,6 +4158,54 @@ fn session_status_for_pane(pane: &PaneRuntime) -> SessionStatus {
     }
 }
 
+fn notify_for_pane_transition(
+    provider: &mut dyn NotificationProvider,
+    config: &NotificationConfig,
+    window_focused: bool,
+    pane: &PaneRuntime,
+    poll: PanePollStats,
+) {
+    if !config.enabled || (config.only_when_unfocused && window_focused) {
+        return;
+    }
+    let (title, body, urgency) = if poll.error && config.transport_errors {
+        (
+            if pane.remote_session {
+                "Panea SSH transport error"
+            } else {
+                "Panea terminal transport error"
+            },
+            format!(
+                "The {} session for profile '{}' stopped with an error. Open Panea for details.",
+                if pane.remote_session { "SSH" } else { "local" },
+                pane.session_spec.profile_name
+            ),
+            NotificationUrgency::Critical,
+        )
+    } else if poll.closed && config.session_closed {
+        (
+            if pane.remote_session {
+                "Panea SSH session disconnected"
+            } else {
+                "Panea terminal session exited"
+            },
+            format!(
+                "The {} session for profile '{}' has closed.",
+                if pane.remote_session { "SSH" } else { "local" },
+                pane.session_spec.profile_name
+            ),
+            NotificationUrgency::Normal,
+        )
+    } else {
+        return;
+    };
+    if let Err(diagnostic) =
+        provider.notify(NotificationRequest::new(title, body).with_urgency(urgency))
+    {
+        eprintln!("notification fallback: {}", diagnostic.message);
+    }
+}
+
 struct PaneTextProvider<'a> {
     terminal: &'a TerminalEmulator,
 }
@@ -4088,7 +4229,9 @@ struct PaneRuntime {
     session_spec: SessionSpec,
     last_size: TerminalGridSize,
     connection_state: PaneConnectionState,
+    disconnect_notified: bool,
     ssh_prompt: Option<SshPromptState>,
+    osc52_prompt: Option<Osc52PromptState>,
     ime_preedit: String,
     transport: Option<PaneTransport>,
     mouse_protocol: MouseProtocolState,
@@ -4120,6 +4263,13 @@ enum SshPromptState {
         input: String,
         save_to_keychain: bool,
     },
+}
+
+#[derive(Debug, Clone)]
+struct Osc52PromptState {
+    request: SecurityOsc52Request,
+    reason: String,
+    bytes: usize,
 }
 
 impl SshPromptState {
@@ -4398,7 +4548,9 @@ impl PaneRuntime {
             } else {
                 PaneConnectionState::Disconnected("transport failed to start".to_owned())
             },
+            disconnect_notified: false,
             ssh_prompt: None,
+            osc52_prompt: None,
             ime_preedit: String::new(),
             transport,
             mouse_protocol: MouseProtocolState::default(),
@@ -4488,13 +4640,59 @@ impl PaneRuntime {
         result
     }
 
-    fn handle_modal_key(&mut self, event: &KeyEvent) -> Option<bool> {
+    fn handle_modal_key(
+        &mut self,
+        event: &KeyEvent,
+        clipboard: &mut ClipboardBridge,
+        policy: &Osc52ClipboardPolicy,
+        clipboard_config: &ClipboardConfig,
+    ) -> Option<bool> {
         if let Some(prompt) = self.ssh_prompt.as_mut() {
             let completed = prompt.handle_key(event);
             if completed {
                 self.ssh_prompt = None;
             }
             return Some(true);
+        }
+        if self.osc52_prompt.is_some() {
+            match event.logical_key.to_ascii_lowercase().as_str() {
+                "y" => {
+                    let Some(prompt) = self.osc52_prompt.take() else {
+                        return Some(true);
+                    };
+                    match approve_osc52_clipboard_write(&prompt.request, policy) {
+                        Osc52ClipboardDecision::Allow { text, bytes } => {
+                            copy_osc52_text_with_diagnostics(
+                                clipboard,
+                                &text,
+                                clipboard_config,
+                                prompt.request.target,
+                                "confirmed remote OSC 52",
+                            );
+                            eprintln!(
+                                "clipboard OSC 52: user approved one remote {bytes} byte write"
+                            );
+                        }
+                        Osc52ClipboardDecision::Deny { reason } => {
+                            eprintln!(
+                                "clipboard OSC 52: approved request failed policy recheck: {reason}"
+                            );
+                        }
+                        Osc52ClipboardDecision::PromptRequired { .. } => {
+                            eprintln!(
+                                "clipboard OSC 52: approved request unexpectedly required another prompt"
+                            );
+                        }
+                    }
+                    return Some(true);
+                }
+                "n" | "escape" => {
+                    self.osc52_prompt = None;
+                    eprintln!("clipboard OSC 52: user denied remote clipboard write");
+                    return Some(true);
+                }
+                _ => return Some(true),
+            }
         }
         if self.search.input_active {
             return Some(self.handle_search_key(event));
@@ -4749,7 +4947,8 @@ impl PaneRuntime {
                         .terminal
                         .apply_bytes(format!("\r\ntransport error: {error}\r\n").as_bytes());
                     stats.content_changed = true;
-                    stats.error = true;
+                    stats.error = !self.disconnect_notified;
+                    self.disconnect_notified = true;
                     break;
                 }
                 Err(panic) => {
@@ -4759,6 +4958,7 @@ impl PaneRuntime {
             };
             if transport.is_connected() {
                 self.connection_state = PaneConnectionState::Connected;
+                self.disconnect_notified = false;
             }
             if output.bytes.is_empty() && output.lifecycle.is_empty() && !output.closed {
                 break;
@@ -4766,6 +4966,7 @@ impl PaneRuntime {
 
             if !output.bytes.is_empty() {
                 self.connection_state = PaneConnectionState::Connected;
+                self.disconnect_notified = false;
                 let byte_count = u64::try_from(output.bytes.len()).unwrap_or(u64::MAX);
                 stats.pty_bytes = stats.pty_bytes.saturating_add(byte_count);
                 if self.parse_semantic_events {
@@ -4807,6 +5008,7 @@ impl PaneRuntime {
                     policy,
                     clipboard_config,
                     self.remote_session,
+                    &mut self.osc52_prompt,
                 );
                 flush_terminal_responses(&mut self.terminal, transport);
                 stats.content_changed = true;
@@ -4818,7 +5020,8 @@ impl PaneRuntime {
                     "session exited".to_owned()
                 });
                 stats.content_changed = true;
-                stats.closed = true;
+                stats.closed = !self.disconnect_notified;
+                self.disconnect_notified = true;
                 break;
             }
         }
@@ -4828,6 +5031,7 @@ impl PaneRuntime {
     fn reconnect(&mut self, config: &AppConfig, metrics: CellMetrics) -> bool {
         self.shutdown();
         self.ssh_prompt = None;
+        self.osc52_prompt = None;
         self.semantic_parser = SemanticEscapeParser::new();
         let transport_size = terminal_transport_size(self.last_size, metrics);
         match spawn_session_transport(config, &self.session_spec, transport_size) {
@@ -4852,6 +5056,7 @@ impl PaneRuntime {
                 } else {
                     PaneConnectionState::Connected
                 };
+                self.disconnect_notified = false;
                 let message = if self.remote_session {
                     b"\r\n[Panea reconnecting SSH session...]\r\n".as_slice()
                 } else {
@@ -4876,6 +5081,7 @@ impl PaneRuntime {
     }
 
     fn shutdown(&mut self) {
+        self.osc52_prompt = None;
         shutdown_transport(self.transport.as_mut());
     }
 
@@ -5023,7 +5229,7 @@ fn append_active_ime_overlay(scene: &mut RenderScene, runtime: &MuxRuntime, metr
     let Some(pane) = runtime.active_pane() else {
         return;
     };
-    if pane.ime_preedit.is_empty() || pane.ssh_prompt.is_some() {
+    if pane.ime_preedit.is_empty() || pane.ssh_prompt.is_some() || pane.osc52_prompt.is_some() {
         return;
     }
     let Some(cursor) = scene.cursor else {
@@ -5066,51 +5272,32 @@ fn append_ssh_product_overlay(scene: &mut RenderScene, runtime: &MuxRuntime, met
     let Some(pane) = runtime.active_pane() else {
         return;
     };
+    if let Some(prompt) = pane.osc52_prompt.as_ref() {
+        append_centered_security_overlay(
+            scene,
+            osc52_prompt_lines(pane, prompt),
+            metrics,
+            RenderColor {
+                red: 240,
+                green: 96,
+                blue: 96,
+                alpha: 255,
+            },
+        );
+        return;
+    }
     if let Some(prompt) = pane.ssh_prompt.as_ref() {
-        let lines = ssh_prompt_lines(prompt);
-        let max_chars = lines
-            .iter()
-            .map(|line| line.chars().count())
-            .max()
-            .unwrap_or(20);
-        let width = ((max_chars as f32 * metrics.cell_width).ceil() as u32)
-            .saturating_add(24)
-            .min((f32::from(scene.grid.columns) * metrics.cell_width).ceil() as u32);
-        let line_height = metrics.cell_height.ceil() as u32 + 5;
-        let total_height = line_height.saturating_mul(lines.len() as u32);
-        let surface_width = (f32::from(scene.grid.columns) * metrics.cell_width).ceil() as i32;
-        let surface_height = (f32::from(scene.grid.rows) * metrics.cell_height).ceil() as i32;
-        let x = ((surface_width - width as i32) / 2).max(0);
-        let mut y = ((surface_height - total_height as i32) / 2).max(0);
-        for (index, line) in lines.into_iter().enumerate() {
-            scene.semantic_overlays.push(OverlayPrimitive {
-                kind: OverlayKind::SecurityPrompt,
-                bounds: RenderRect {
-                    x,
-                    y,
-                    width,
-                    height: line_height,
-                },
-                color: RenderColor {
-                    red: 18,
-                    green: 22,
-                    blue: 29,
-                    alpha: 252,
-                },
-                border_color: (index == 0).then_some(RenderColor {
-                    red: 245,
-                    green: 185,
-                    blue: 72,
-                    alpha: 255,
-                }),
-                border_width_px: u8::from(index == 0),
-                corner_radius_px: u8::from(index == 0) * 4,
-                z_index: 2000,
-                label: Some(line),
-                label_color: None,
-            });
-            y = y.saturating_add(line_height as i32);
-        }
+        append_centered_security_overlay(
+            scene,
+            ssh_prompt_lines(prompt),
+            metrics,
+            RenderColor {
+                red: 245,
+                green: 185,
+                blue: 72,
+                alpha: 255,
+            },
+        );
         return;
     }
 
@@ -5158,6 +5345,68 @@ fn append_ssh_product_overlay(scene: &mut RenderScene, runtime: &MuxRuntime, met
         label: Some(label),
         label_color: None,
     });
+}
+
+fn append_centered_security_overlay(
+    scene: &mut RenderScene,
+    lines: Vec<String>,
+    metrics: CellMetrics,
+    accent: RenderColor,
+) {
+    let max_chars = lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(20);
+    let width = ((max_chars as f32 * metrics.cell_width).ceil() as u32)
+        .saturating_add(24)
+        .min((f32::from(scene.grid.columns) * metrics.cell_width).ceil() as u32);
+    let line_height = metrics.cell_height.ceil() as u32 + 5;
+    let total_height = line_height.saturating_mul(lines.len() as u32);
+    let surface_width = (f32::from(scene.grid.columns) * metrics.cell_width).ceil() as i32;
+    let surface_height = (f32::from(scene.grid.rows) * metrics.cell_height).ceil() as i32;
+    let x = ((surface_width - width as i32) / 2).max(0);
+    let mut y = ((surface_height - total_height as i32) / 2).max(0);
+    for (index, line) in lines.into_iter().enumerate() {
+        scene.semantic_overlays.push(OverlayPrimitive {
+            kind: OverlayKind::SecurityPrompt,
+            bounds: RenderRect {
+                x,
+                y,
+                width,
+                height: line_height,
+            },
+            color: RenderColor {
+                red: 18,
+                green: 22,
+                blue: 29,
+                alpha: 252,
+            },
+            border_color: (index == 0).then_some(accent),
+            border_width_px: u8::from(index == 0),
+            corner_radius_px: u8::from(index == 0) * 4,
+            z_index: 2000,
+            label: Some(line),
+            label_color: None,
+        });
+        y = y.saturating_add(line_height as i32);
+    }
+}
+
+fn osc52_prompt_lines(pane: &PaneRuntime, prompt: &Osc52PromptState) -> Vec<String> {
+    let target = match prompt.request.target {
+        Osc52ClipboardTarget::Clipboard | Osc52ClipboardTarget::Select => "system clipboard",
+        Osc52ClipboardTarget::PrimarySelection => "primary selection",
+        Osc52ClipboardTarget::Unknown(_) => "unknown target",
+    };
+    vec![
+        "Remote clipboard write requested".to_owned(),
+        format!("Session: {}", pane.session_spec.profile_name),
+        format!("Target: {target}"),
+        format!("Payload size: {} bytes", prompt.bytes),
+        prompt.reason.clone(),
+        "Y allow once   N/Esc deny".to_owned(),
+    ]
 }
 
 fn ssh_prompt_lines(prompt: &SshPromptState) -> Vec<String> {
@@ -6805,6 +7054,29 @@ mod tests {
     use super::*;
     use semantics::{SemanticEventKind, SemanticTimeline};
 
+    #[derive(Debug, Default)]
+    struct RecordingNotificationProvider {
+        requests: Vec<NotificationRequest>,
+    }
+
+    impl NotificationProvider for RecordingNotificationProvider {
+        fn notify(
+            &mut self,
+            request: NotificationRequest,
+        ) -> Result<(), platform_core::NotificationDiagnostic> {
+            self.requests.push(request);
+            Ok(())
+        }
+
+        fn diagnostic(&self) -> platform_core::NotificationDiagnostic {
+            platform_core::NotificationDiagnostic {
+                backend: platform_core::NotificationBackend::Unsupported,
+                availability: platform_core::NotificationAvailability::Available,
+                message: "test provider".to_owned(),
+            }
+        }
+    }
+
     #[test]
     fn battery_policy_is_bounded_and_reversible() {
         let mut configured = PerformanceConfig::default();
@@ -6885,7 +7157,9 @@ mod tests {
             session_spec: SessionSpec::local("default"),
             last_size: TerminalGridSize::new(cols, rows),
             connection_state: PaneConnectionState::Disconnected("test".to_owned()),
+            disconnect_notified: false,
             ssh_prompt: None,
+            osc52_prompt: None,
             ime_preedit: String::new(),
             transport: None,
             mouse_protocol: MouseProtocolState::default(),
@@ -6895,6 +7169,50 @@ mod tests {
             search: PaneSearch::default(),
             command_output_collapsed: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn remote_osc52_prompt_never_displays_clipboard_contents() {
+        let mut pane = test_pane(80, 24);
+        pane.remote_session = true;
+        pane.session_spec = SessionSpec::ssh("prod");
+        let prompt = Osc52PromptState {
+            request: SecurityOsc52Request {
+                target: Osc52ClipboardTarget::Clipboard,
+                payload_base64: "c2VjcmV0LWNsaXBib2FyZA==".to_owned(),
+                remote: true,
+            },
+            reason: "explicit confirmation required".to_owned(),
+            bytes: 16,
+        };
+
+        let lines = osc52_prompt_lines(&pane, &prompt).join("\n");
+
+        assert!(lines.contains("prod"));
+        assert!(lines.contains("16 bytes"));
+        assert!(!lines.contains("secret-clipboard"));
+        assert!(!lines.contains(&prompt.request.payload_base64));
+    }
+
+    #[test]
+    fn session_notifications_are_background_only_by_default() {
+        let mut pane = test_pane(80, 24);
+        pane.remote_session = true;
+        pane.session_spec = SessionSpec::ssh("prod");
+        let config = NotificationConfig::default();
+        let poll = PanePollStats {
+            closed: true,
+            ..PanePollStats::default()
+        };
+        let mut provider = RecordingNotificationProvider::default();
+
+        notify_for_pane_transition(&mut provider, &config, true, &pane, poll);
+        assert!(provider.requests.is_empty());
+
+        notify_for_pane_transition(&mut provider, &config, false, &pane, poll);
+        assert_eq!(provider.requests.len(), 1);
+        assert!(provider.requests[0].title.contains("SSH"));
+        assert!(provider.requests[0].body.contains("prod"));
     }
 
     fn text_key(text: &str) -> KeyEvent {

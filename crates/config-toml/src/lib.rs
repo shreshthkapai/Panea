@@ -836,6 +836,11 @@ fn known_paths() -> BTreeSet<&'static str> {
         "clipboard.osc52.allow_remote",
         "clipboard.osc52.max_bytes",
         "clipboard.osc52.confirm_remote_writes",
+        "notifications",
+        "notifications.enabled",
+        "notifications.only_when_unfocused",
+        "notifications.session_closed",
+        "notifications.transport_errors",
         "paste",
         "paste.bracketed_paste",
         "paste.normalize_newlines",
@@ -1199,6 +1204,34 @@ mod tests {
         assert!(schema.contains("\"schema_version\""));
         assert!(schema.contains("font.family"));
         assert!(schema.contains("ssh_profiles.known_hosts_policy"));
+        assert!(schema.contains("notifications.only_when_unfocused"));
+    }
+
+    #[test]
+    fn notification_config_parses_with_portable_defaults() {
+        let loaded = parse_str(
+            r#"
+            [notifications]
+            enabled = true
+            only_when_unfocused = false
+            session_closed = false
+            transport_errors = true
+            "#,
+            None,
+            ConfigPlatform::Unknown,
+        )
+        .expect("notification config should parse");
+
+        assert!(loaded.config.notifications.enabled);
+        assert!(!loaded.config.notifications.only_when_unfocused);
+        assert!(!loaded.config.notifications.session_closed);
+        assert!(loaded.config.notifications.transport_errors);
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("unknown setting"))
+        );
     }
 
     #[test]

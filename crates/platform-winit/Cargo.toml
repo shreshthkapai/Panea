@@ -3,6 +3,7 @@ name = "platform-winit"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Desktop window and event integration."
 
 [lints]
@@ -10,6 +11,7 @@ workspace = true
 
 [dependencies]
 arboard.workspace = true
+notify-rust.workspace = true
 platform-core = { path = "../platform-core" }
 starship-battery.workspace = true
 webbrowser.workspace = true

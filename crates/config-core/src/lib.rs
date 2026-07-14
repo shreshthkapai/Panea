@@ -26,6 +26,7 @@ pub struct AppConfig {
     pub keyboard: KeyboardConfig,
     pub mouse: MouseConfig,
     pub clipboard: ClipboardConfig,
+    pub notifications: NotificationConfig,
     pub paste: PasteConfig,
     pub default_shell_profile: Option<String>,
     pub shell_profiles: Vec<ShellProfile>,
@@ -54,6 +55,7 @@ impl Default for AppConfig {
             keyboard: KeyboardConfig::default(),
             mouse: MouseConfig::default(),
             clipboard: ClipboardConfig::default(),
+            notifications: NotificationConfig::default(),
             paste: PasteConfig::default(),
             default_shell_profile: None,
             shell_profiles: Vec::new(),
@@ -351,6 +353,9 @@ impl AppConfig {
         if self.mouse != next.mouse || self.clipboard != next.clipboard || self.paste != next.paste
         {
             plan.live.push(ReloadableSection::Input);
+        }
+        if self.notifications != next.notifications {
+            plan.live.push(ReloadableSection::Notifications);
         }
         if self.visual_theme != next.visual_theme
             || self.command_blocks != next.command_blocks
@@ -1638,6 +1643,26 @@ pub struct Osc52ClipboardConfig {
     pub confirm_remote_writes: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationConfig {
+    pub enabled: bool,
+    pub only_when_unfocused: bool,
+    pub session_closed: bool,
+    pub transport_errors: bool,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            only_when_unfocused: true,
+            session_closed: true,
+            transport_errors: true,
+        }
+    }
+}
+
 impl Default for Osc52ClipboardConfig {
     fn default() -> Self {
         Self {
@@ -2123,6 +2148,7 @@ pub struct PlatformOverride {
     pub prompt_decorations: Option<PromptDecorationsConfigPatch>,
     pub shell_integration: Option<ShellIntegrationConfigPatch>,
     pub clipboard: Option<ClipboardConfigPatch>,
+    pub notifications: Option<NotificationConfigPatch>,
     pub performance: Option<PerformanceConfigPatch>,
     pub diagnostics: Option<DiagnosticsConfigPatch>,
 }
@@ -2161,6 +2187,9 @@ impl PlatformOverride {
         }
         if let Some(clipboard) = &self.clipboard {
             clipboard.apply_to(&mut config.clipboard);
+        }
+        if let Some(notifications) = &self.notifications {
+            notifications.apply_to(&mut config.notifications);
         }
         if let Some(performance) = &self.performance {
             performance.apply_to(&mut config.performance);
@@ -2544,6 +2573,24 @@ pub struct Osc52ClipboardConfigPatch {
     pub confirm_remote_writes: Option<bool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct NotificationConfigPatch {
+    pub enabled: Option<bool>,
+    pub only_when_unfocused: Option<bool>,
+    pub session_closed: Option<bool>,
+    pub transport_errors: Option<bool>,
+}
+
+impl NotificationConfigPatch {
+    fn apply_to(&self, config: &mut NotificationConfig) {
+        apply_opt(&mut config.enabled, &self.enabled);
+        apply_opt(&mut config.only_when_unfocused, &self.only_when_unfocused);
+        apply_opt(&mut config.session_closed, &self.session_closed);
+        apply_opt(&mut config.transport_errors, &self.transport_errors);
+    }
+}
+
 impl Osc52ClipboardConfigPatch {
     fn apply_to(&self, config: &mut Osc52ClipboardConfig) {
         apply_opt(&mut config.enabled, &self.enabled);
@@ -2758,6 +2805,7 @@ pub enum ReloadableSection {
     Input,
     Keybindings,
     Mux,
+    Notifications,
     Performance,
     VisualSemantics,
     WindowPadding,
@@ -3357,6 +3405,39 @@ pub fn export_schema() -> ConfigSchema {
                         "clipboard.osc52.confirm_remote_writes",
                         "boolean",
                         default.clipboard.osc52.confirm_remote_writes,
+                        true,
+                        false,
+                    ),
+                ],
+            },
+            ConfigSchemaSection {
+                name: "notifications",
+                fields: vec![
+                    field(
+                        "notifications.enabled",
+                        "boolean",
+                        default.notifications.enabled,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "notifications.only_when_unfocused",
+                        "boolean",
+                        default.notifications.only_when_unfocused,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "notifications.session_closed",
+                        "boolean",
+                        default.notifications.session_closed,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "notifications.transport_errors",
+                        "boolean",
+                        default.notifications.transport_errors,
                         true,
                         false,
                     ),
@@ -4162,5 +4243,41 @@ mod tests {
                 .restart_required
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn notification_defaults_are_portable_and_live_reloadable() {
+        let config = AppConfig::default();
+        assert!(config.notifications.enabled);
+        assert!(config.notifications.only_when_unfocused);
+
+        let mut next = config.clone();
+        next.notifications.session_closed = false;
+        assert!(
+            config
+                .reload_plan_from(&next)
+                .live
+                .contains(&ReloadableSection::Notifications)
+        );
+    }
+
+    #[test]
+    fn notification_platform_override_refines_shared_defaults() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            [notifications]
+            enabled = true
+            only_when_unfocused = true
+
+            [platform.windows.notifications]
+            transport_errors = false
+            "#,
+        )
+        .expect("notification config should parse");
+
+        let windows = config.resolved_for_platform(ConfigPlatform::Windows);
+        let macos = config.resolved_for_platform(ConfigPlatform::MacOs);
+        assert!(!windows.notifications.transport_errors);
+        assert!(macos.notifications.transport_errors);
     }
 }

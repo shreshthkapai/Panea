@@ -20,9 +20,9 @@ use config_core::{
     ConfigDiagnostic, ConfigDiagnosticSeverity, ConfigPlatform, ConfigProvider,
     ConfigProviderError, CursorConfigPatch, CursorShape, DecorationStrategyConfig,
     DiagnosticsConfigPatch, FontConfigPatch, InputOutputGroupingStyle, KeyBinding,
-    LinuxBackendConfig, LoadedAppConfig, LogLevel, MouseBinding, Osc52ClipboardConfigPatch,
-    PerformanceConfigPatch, PerformanceProfile, PlatformOverride, PlatformOverrides,
-    PresentModePreference, PromptDecorationStyle, PromptDecorationsConfigPatch,
+    LinuxBackendConfig, LoadedAppConfig, LogLevel, MouseBinding, NotificationConfigPatch,
+    Osc52ClipboardConfigPatch, PerformanceConfigPatch, PerformanceProfile, PlatformOverride,
+    PlatformOverrides, PresentModePreference, PromptDecorationStyle, PromptDecorationsConfigPatch,
     RendererBackendPreference, RendererConfigPatch, RgbaColor, ShellIntegrationActivationConfig,
     ShellIntegrationConfigPatch, ShellProfile, ShellProfileKind, SshProfile, WindowConfigPatch,
     WindowModeConfig,
@@ -988,6 +988,16 @@ fn set_config_value(config: &mut AppConfig, path: &str, value: &ConfigValue) -> 
         "clipboard.osc52.confirm_remote_writes" => {
             config.clipboard.osc52.confirm_remote_writes = value_as_bool(value)?;
         }
+        "notifications.enabled" => config.notifications.enabled = value_as_bool(value)?,
+        "notifications.only_when_unfocused" => {
+            config.notifications.only_when_unfocused = value_as_bool(value)?;
+        }
+        "notifications.session_closed" => {
+            config.notifications.session_closed = value_as_bool(value)?;
+        }
+        "notifications.transport_errors" => {
+            config.notifications.transport_errors = value_as_bool(value)?;
+        }
         "paste.bracketed_paste" => config.paste.bracketed_paste = value_as_bool(value)?,
         "paste.normalize_newlines" => config.paste.normalize_newlines = value_as_bool(value)?,
         "paste.strip_control_characters" => {
@@ -1210,6 +1220,30 @@ fn set_platform_override_value(
                 .osc52
                 .get_or_insert_with(Osc52ClipboardConfigPatch::default)
                 .allow_remote = Some(value_as_bool(value)?);
+        }
+        "notifications.enabled" => {
+            entry
+                .notifications
+                .get_or_insert_with(NotificationConfigPatch::default)
+                .enabled = Some(value_as_bool(value)?);
+        }
+        "notifications.only_when_unfocused" => {
+            entry
+                .notifications
+                .get_or_insert_with(NotificationConfigPatch::default)
+                .only_when_unfocused = Some(value_as_bool(value)?);
+        }
+        "notifications.session_closed" => {
+            entry
+                .notifications
+                .get_or_insert_with(NotificationConfigPatch::default)
+                .session_closed = Some(value_as_bool(value)?);
+        }
+        "notifications.transport_errors" => {
+            entry
+                .notifications
+                .get_or_insert_with(NotificationConfigPatch::default)
+                .transport_errors = Some(value_as_bool(value)?);
         }
         "performance.profile" => {
             entry
@@ -1626,6 +1660,24 @@ mod tests {
             "windows platform override should resolve"
         );
         assert!(loaded.config.command_blocks.enabled);
+    }
+
+    #[test]
+    fn programmable_notifications_compile_into_app_config() {
+        let loaded = parse_str(
+            r#"
+            panea.set("notifications.enabled", true)
+            panea.set("notifications.only_when_unfocused", false)
+            panea.platform_set("windows", "notifications.transport_errors", false)
+            "#,
+            None,
+            ConfigPlatform::Windows,
+        )
+        .expect("notification config should compile");
+
+        assert!(loaded.config.notifications.enabled);
+        assert!(!loaded.config.notifications.only_when_unfocused);
+        assert!(!loaded.config.notifications.transport_errors);
     }
 
     #[test]

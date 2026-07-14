@@ -65,7 +65,8 @@ stated scope:
 | Shell integration activation foundation | tested | Portable activation plans, config modes, desktop startup hook injection for bash/zsh/fish/PowerShell, disabled/manual/heuristic/off behavior, and ignored real-shell verification tests exist; PowerShell semantic smoke passed on the current Windows host. |
 | Command block visual overlay foundation | tested | Desktop scene projection now creates command-block backgrounds, input/output grouping overlays, status/duration/cwd/shell/host badges, conservative alternate-screen suppression, and renderer-batched overlay label glyphs without mutating terminal cells. |
 | Cursor animation and image cursors | tested | Smooth movement, blink easing, typing pulse/stretch, trail, glow, shadow, enforced FPS/active-region budgets, real off-thread GIF/PNG pixel decoding, immutable frame caching, one-time GPU texture-array upload, textured cursor drawing, static PNG cursors, cursor-local damage, and failure fallback pass Windows-host automated tests. Interactive cross-OS visual smoke remains open. |
-| Clipboard/OSC 52 policy | tested | Portable `clipboard` config, paste protection, bracketed paste forwarding, middle-click paste suppression during mouse reporting, parser pending OSC 52 requests, bounded security policy, local allow/default remote deny behavior, and TOML/security/parser/app tests exist. |
+| Clipboard/OSC 52 policy | tested | Portable `clipboard` config, paste protection, bracketed paste forwarding, middle-click paste suppression during mouse reporting, parser pending OSC 52 requests, bounded security policy, local allow/default remote deny behavior, privacy-preserving one-time remote confirmation overlay, and TOML/security/parser/app tests exist. |
+| Native notification foundation | tested | One platform-neutral provider lazily queues bounded delivery through Windows toast, macOS Notification Center, or freedesktop D-Bus outside input/render/PTY paths. Portable config, live reload, session-transition routing, provider diagnostics, and disabled fast-path tests exist; real native delivery evidence remains open. |
 | SSH transport foundation | tested | SSH profile mapping, explicit host-trust contracts, host-key policy enforcement, secret/keychain-provider boundaries, SSH2 transport, remote PTY request, resize, and shutdown foundations exist. |
 | SSH product integration | tested | SSH tabs/panes use nonblocking connection workers, explicit unknown/changed-host overlays, masked credential entry, opt-in native Windows/macOS/Linux keychain persistence, remote semantic overlays, disconnect status, preserved scrollback, and explicit reconnect. Real-server/cross-OS reports remain separate. |
 | SSH real-server smoke harness | tested | `cargo xtask ssh-smoke` uses the real `transport-ssh` backend, explicit trust providers, smoke-owned known-hosts storage, remote PTY output polling, resize, reconnect, changed-host detection, and remote OSC 52 policy checks. Real server reports still need to be collected per OS. |
@@ -80,16 +81,16 @@ These areas are real foundations but must not be called complete:
 | Area | Status | Missing before completion |
 | --- | --- | --- |
 | Desktop app runtime | partial | Full app lifecycle, polished UI chrome, GUI package smoke, and cross-OS manual validation remain; mux runtime and installer-grade Windows delivery are wired. |
-| Platform windowing | partial | Native winit paths, explicit X11/Wayland builders, exclusive/borderless/frameless modes, decoration fallback reporting, DPI resize propagation, IME preedit overlays, and clipboard providers exist. Real macOS/Linux compositor/IME/DPI validation and native notifications remain. |
+| Platform windowing | partial | Native winit paths, explicit X11/Wayland builders, exclusive/borderless/frameless modes, decoration fallback reporting, DPI resize propagation, IME preedit overlays, clipboard providers, and native notification providers exist. Real macOS/Linux compositor/IME/DPI/notification validation remains. |
 | GPU renderer | tested | WGPU setup, persistent growable GPU batches, retained-frame damage rendering with full-draw fallback, incremental desktop damage projection, shaped-run/glyph/RGBA emoji atlas caching, row-scoped uploads, low-idle scheduling, benchmarks, device-loss backend recreation, screenshot infrastructure, and GPU timing plumbing exist; real sleep/wake/monitor-loss validation, macOS/Linux baselines, and cross-OS render validation remain. |
 | Font and text rendering | tested | OpenType shaping, per-grapheme configured/system fallback, real regular/bold/italic/bold-italic face resolution, CJK/combining/ligature/emoji shaping, COLR/bitmap color glyph rasterization, RGBA atlas batching, run caching, and portable font diagnostics pass automated tests on Windows. |
 | Unicode support | tested | Core/parser grapheme correctness and renderer shaping/fallback/color-glyph paths are covered by automated tests; real installed-font and screenshot/app parity still require macOS/Linux host reports. |
-| Input, clipboard, selection, and scrollback UX | tested | Shared key/application-mode encoding, mouse/focus protocols, absolute normal/rectangular mouse and keyboard selection, selection overlays, anchored wheel/page scrollback, interactive search, portable HTTP(S) URL activation, keyboard copy/paste, Linux primary-selection provider behavior, paste protection, bracketed paste, middle-click paste, and OSC 52 policy exist. Real macOS/Linux runtime verification, remote OSC 52 confirmation UI, and full app compatibility coverage remain. |
+| Input, clipboard, selection, and scrollback UX | tested | Shared key/application-mode encoding, mouse/focus protocols, absolute normal/rectangular mouse and keyboard selection, selection overlays, anchored wheel/page scrollback, interactive search, portable HTTP(S) URL activation, keyboard copy/paste, Linux primary-selection provider behavior, paste protection, bracketed paste, middle-click paste, OSC 52 policy, and remote one-time confirmation overlay exist. Real macOS/Linux runtime verification and full app compatibility coverage remain. |
 | Baseline compatibility | tested | The xterm-256color protocol implementation and Windows required compatibility smoke are tested; full interactive evidence for editors, pagers, TUIs, tmux, screen, zellij, SSH, WSL, and all target OSes remains tracked by app/cross-OS verification. |
 | Shell integration | partial | Local runtime activation planning and desktop injection exist for supported shells, with Windows PowerShell semantic smoke verified. Remote install flows, heuristic command detection, WSL-specific coverage, and real bash/zsh/fish/macOS/Linux session verification remain. |
 | Visual overlays | tested | Prompt separators/boxes/pills, real metadata badges and status accents, distinct command/grouping styles, viewport-correct command cards, presentation-only output collapse/expand, configured spacing/borders/colors, cursor effects and image cursors, alternate-screen suppression, damage tracking, and batched overlay glyphs pass Windows-host automated tests. Real non-Windows shell-driven and cross-OS visual verification remain separate work. |
 | Native mux runtime | tested | Runtime workspaces, tabs, nested local/SSH panes, startup/restored layouts, configurable appearance and SSH reconnect are implemented. Drag UI, cross-OS GUI runs and automated nested external-mux runs remain unverified/deferred. |
-| SSH UX and security | tested | Desktop trust/auth overlays, native desktop keychains, disconnect/reconnect presentation and secure defaults are implemented and unit-tested. Proxy jump, remote integration installation, remote OSC 52 confirmation, and collected real-server/cross-OS reports remain. |
+| SSH UX and security | tested | Desktop trust/auth and remote clipboard overlays, native desktop keychains, disconnect/reconnect presentation and secure defaults are implemented and unit-tested. Proxy jump, remote integration installation, and collected real-server/cross-OS reports remain. |
 | Performance reporting | partial | GPU timestamp query wiring and a developer in-window overlay exist, but real timestamp samples across hardware/backends, polished installed overlay UX, CI regression gates, and reproducible cross-machine benchmark reporting remain. |
 | Hardening/release readiness | partial | GPU recovery, local/SSH session restart, crash-safe config reload, battery adaptation, release workflows, and native distribution builders exist. Real device-loss/platform validation, signing/notarization, AppImage/rpm, GUI package smoke, and platform lab coverage remain. |
 | iOS companion | partial | Shared-engine contracts, native bridge boundaries, mobile connection planning, renderer surface specs, and device checklist exist. Native UIKit/SwiftUI shell, iOS GPU surface implementation, Keychain provider backend, host-key approval UI, key import UX, simulator/device validation, and packaging remain. |
@@ -102,7 +103,6 @@ These areas exist mostly as placeholders, contracts, or documentation:
 | --- | --- | --- |
 | `tools/conformance` | stubbed | Directory and README exist; full terminal conformance fixture suite is not built out. |
 | Additional signed/distro formats | stubbed | Windows Authenticode, macOS signing/notarization, Linux AppImage/rpm, and any custom terminfo installation remain release-owner/toolchain work; Windows installer, macOS ZIP/DMG, and Linux deb builders exist. |
-| Native notifications | stubbed | Tracked in the platform matrix as not implemented. |
 | iOS app shell | stubbed | Rust shared-engine crate and native bridge traits exist; no UIKit/SwiftUI mobile app host exists yet. |
 | Advanced config import/helpers | stubbed | Accepted by rollout rules, but no product implementation exists. |
 
@@ -125,7 +125,7 @@ The following major accepted features have no complete product behavior yet:
 - Cross-OS runtime verification of the batched GPU glyph renderer.
 - Real GPU device-loss validation for sleep/wake, monitor attach/detach, DPI
   changes, and backend failure simulation across desktop OSes.
-- Remote OSC 52 confirmation UI and real Linux primary-selection compositor verification.
+- Real remote OSC 52 and Linux primary-selection compositor verification.
 - Native OS watcher backends and real macOS/Linux runtime reload validation.
 - Cross-OS GUI smoke and interaction polish for the implemented desktop
   tabs/panes/sessions/workspaces runtime.
@@ -140,8 +140,8 @@ The following major accepted features have no complete product behavior yet:
 - Cross-OS verification of the installed doctor command output and packaged
   doctor smoke output.
 - Signed/notarized release artifacts, Linux AppImage/rpm, and collected package
-  reports outside Windows. The current repository license also must be changed
-  from unlicensed before Panea can be distributed as a true OSS project.
+  reports outside Windows. Source and packaged artifacts now use the dual
+  `MIT OR Apache-2.0` OSS license.
 - Native iOS SSH companion app runtime and device-verified release path.
 
 ## Layer Status Matrix

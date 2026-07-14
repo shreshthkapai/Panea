@@ -3,6 +3,7 @@ name = "term-parser"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "ANSI/VT parser adapter and terminal-state application."
 
 [lints]

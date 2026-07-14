@@ -3814,6 +3814,11 @@ fn write_package_resources(options: &PackageOptions, layout: &PackageLayout) -> 
 
     copy_repo_file("README.md", &layout.resource_dir.join("README.md"))?;
     copy_repo_file("LICENSE", &layout.resource_dir.join("LICENSE"))?;
+    copy_repo_file(
+        "LICENSE-APACHE",
+        &layout.resource_dir.join("LICENSE-APACHE"),
+    )?;
+    copy_repo_file("LICENSE-MIT", &layout.resource_dir.join("LICENSE-MIT"))?;
     for doc in [
         "docs/getting-started.md",
         "docs/config.md",
@@ -3823,6 +3828,8 @@ fn write_package_resources(options: &PackageOptions, layout: &PackageLayout) -> 
         "docs/platform-support.md",
         "docs/troubleshooting.md",
         "docs/packaging.md",
+        "docs/alpha-scope.md",
+        "docs/notifications.md",
     ] {
         let file_name = Path::new(doc)
             .file_name()
@@ -3925,6 +3932,8 @@ fn verify_package_contents(
         &layout.manifest_path,
         &layout.resource_dir.join("README.md"),
         &layout.resource_dir.join("LICENSE"),
+        &layout.resource_dir.join("LICENSE-APACHE"),
+        &layout.resource_dir.join("LICENSE-MIT"),
         &layout.resource_dir.join("config").join("default.toml"),
         &layout.resource_dir.join("config").join("schema.json"),
         &layout

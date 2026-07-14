@@ -73,7 +73,7 @@ Details and manual compatibility checklists live in
 
 ## Deferred Compatibility Work
 
-- Remote OSC 52 confirmation UI
+- Real local/SSH OSC 52 confirmation smoke on every desktop OS
 - Real app-level Unicode conformance across shells, editors, TUIs, and SSH
 - Full configurable hint pattern engine
 - Optional Panea-specific terminfo identity only if future capabilities require it

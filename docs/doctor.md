@@ -15,6 +15,7 @@ panea doctor shell
 panea doctor ssh
 panea doctor fonts
 panea doctor clipboard
+panea doctor notifications
 panea doctor --json
 ```
 
@@ -25,7 +26,7 @@ panea doctor --json
 Feature name: installed terminal doctor binary
 
 Layer: diagnostics, with bounded app-level probes for platform, renderer,
-font, clipboard, keychain, PTY, and SSH provider status.
+font, clipboard, notifications, keychain, PTY, and SSH provider status.
 
 User-facing behavior: users can run `panea doctor` or a topic-specific command
 to get human-readable output. `--json` emits machine-readable output for bug
@@ -61,7 +62,7 @@ labeled as not initialized during doctor.
 
 Diagnostics: output includes OS, app version, renderer/GPU status, window
 backend, Linux display environment, config path and parse status, shell
-integration status, clipboard provider, keychain provider, PTY backend, SSH
+integration status, clipboard provider, notification provider, keychain provider, PTY backend, SSH
 provider status, and findings.
 
 Performance cost when disabled: none. Doctor runs only when explicitly invoked.

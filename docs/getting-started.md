@@ -33,8 +33,8 @@ cargo xtask package smoke --profile release
 ```
 
 Artifacts are written under `target/packages/`. macOS signing/notarization and
-Windows signing require release-owner credentials. The repository is currently
-unlicensed, so the owner must select an OSS license before public distribution.
+Windows signing require release-owner credentials. Panea is distributed under
+the dual `MIT OR Apache-2.0` license.
 
 The app loads the default portable config when no user config exists. Generate a
 sample config with:

@@ -315,9 +315,9 @@ to more visible features before the dependencies they rely on are hardened.
   report. Compositor-specific fullscreen/frameless behavior still needs real
   Linux X11/Wayland host runs before it can be called complete.
 - Clipboard copy/paste has a platform bridge and diagnostics; OSC 52 has a
-  bounded policy with safe remote defaults. Linux primary selection provider
-  support, remote OSC 52 confirmation UI, mouse-driven selection UX, and real
-  cross-OS clipboard smoke coverage remain later platform/compatibility work.
+  bounded policy with safe remote defaults. Linux primary selection, mouse and
+  keyboard selection, and remote one-time OSC 52 confirmation are implemented;
+  real cross-OS clipboard smoke coverage remains platform verification work.
 - Real local transport smoke tests remain ignored by default because they spawn
   host shells. On the current Windows host, the one-shot, interactive, and
   event-loop smoke tests pass quickly. macOS and Linux smoke status is still
@@ -337,10 +337,9 @@ to more visible features before the dependencies they rely on are hardened.
   but app-level smoke testing for bash/zsh/fish/PowerShell/cmd/vim/less/TUI
   apps/tmux/screen/zellij/SSH remains unverified until run on the relevant
   host platforms.
-- Primary selection provider support, remote OSC 52 confirmation UI,
-  application keypad output mapping, a custom terminfo entry, configurable hint
-  patterns, and real app-level Unicode conformance remain deferred
-  compatibility work.
+- Application keypad output mapping and primary-selection/OSC confirmation are
+  implemented. A custom terminfo entry, configurable hint patterns, and real
+  app-level Unicode conformance remain deferred compatibility work.
 - Next-pass Phase 9 adds a debounced TOML file watcher and desktop live-reload
   applier. It applies safe sections, reports restart-required settings, and
   keeps the previous active config after parse, validation, or runtime apply
@@ -448,7 +447,7 @@ to more visible features before the dependencies they rely on are hardened.
   next-pass Phase 18 installs `panea doctor`, but neither step magically
   verifies macOS, Linux X11, or Linux Wayland from this Windows host. Real
   platform labs, compositor coverage, GPU backend inventory, native
-  notification support, remote OSC clipboard confirmation UI, and collected
+  notification delivery verification, remote OSC clipboard smoke, and collected
   cross-OS doctor output remain follow-up work before platform parity can be
   called product-complete. Next-pass Phase 19 adds CI runner definitions and
   `cargo xtask verify-os`, but a runner definition is not the same as verified
@@ -464,7 +463,7 @@ to more visible features before the dependencies they rely on are hardened.
   shell-launch verification. MSI/installer, Start menu/PATH integration, macOS
   DMG/zip, signing/notarization, Linux AppImage/deb/rpm, terminfo installation
   strategy, GUI package launch automation, and macOS/Linux package reports
-  remain follow-up work. Remote OSC 52 clipboard confirmation UI, real GPU device-loss
+  remain follow-up work. Real OSC 52 clipboard verification, real GPU device-loss
   platform validation, cross-OS config reload validation, and richer config
   error UI also remain release-hardening follow-up work.
 - Phase 15 and next-pass Phase 22 establish a compileable iOS companion path

@@ -3,6 +3,7 @@ name = "font-system"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Font shaping, fallback, glyph cache policy, and font discovery abstraction."
 
 [lints]

@@ -3,8 +3,8 @@ name = "transport-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Terminal transport traits and session I/O contracts."
 
 [lints]
 workspace = true
-

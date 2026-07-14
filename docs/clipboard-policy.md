@@ -4,13 +4,13 @@
 
 Feature name: Clipboard, selection, and OSC 52 policy
 Layer: security, config portability, platform parity, core correctness
-User-facing behavior: keyboard copy/paste works through the system clipboard, paste is protected by default, middle-click paste is allowed only when terminal mouse reporting is inactive, and OSC 52 writes are controlled by explicit policy.
+User-facing behavior: keyboard copy/paste works through the system clipboard, paste is protected by default, middle-click paste is allowed only when terminal mouse reporting is inactive, and OSC 52 writes are controlled by explicit policy. Remote writes can require an explicit one-time overlay decision.
 Config keys: `clipboard.*`, `clipboard.osc52.*`, and legacy `paste.*` sanitization keys.
 macOS behavior: system clipboard path is used through the platform provider; OSC 52 follows the same policy.
 Windows behavior: system clipboard path is used through the platform provider; OSC 52 follows the same policy.
-Linux X11 behavior: system clipboard path is used through the platform provider; primary selection is modeled but not fully backed yet.
-Linux Wayland behavior: system clipboard path is used through the platform provider; primary selection and compositor-specific clipboard failures need real host verification.
-Fallback behavior: unavailable clipboard providers report diagnostics; blocked OSC 52 writes are denied or held for future confirmation UI instead of silently writing.
+Linux X11 behavior: system and Primary selections use the platform provider; real window-manager verification remains.
+Linux Wayland behavior: system and Primary selections use the platform provider; compositor-specific clipboard failures need real host verification.
+Fallback behavior: unavailable clipboard providers report diagnostics; denied OSC 52 requests never write silently, and only one bounded remote confirmation can be pending per pane.
 Diagnostics: clipboard operations can be logged with `clipboard.log_operations = true`; unavailable providers return platform clipboard diagnostics.
 Performance cost when disabled: pending OSC 52 requests are dropped with no decode or clipboard write, and copy/paste shortcuts are ignored.
 Performance cost when enabled: user-initiated copy/paste is proportional to clipboard text size; OSC 52 decodes only bounded payloads and rejects oversized encoded payloads before decode.
@@ -50,9 +50,10 @@ write the local clipboard.
 - Paste protection normalizes newlines and strips control characters when enabled.
 - Bracketed paste is emitted when the terminal has bracketed paste mode enabled.
 - OSC 52 is parsed into pending terminal requests and evaluated by the security policy before any clipboard write.
+- Malformed, unknown-target, read, and oversized remote requests are rejected before prompting.
+- Remote prompts show session identity, target, and byte count without showing clipboard contents. Approval is one-time and re-runs the full policy.
 
 ## Still Open
 
-- Remote OSC 52 confirmation UI.
 - Real clipboard smoke tests on macOS, Linux X11, and Linux Wayland.
-- OSC 52 behavior inside first-class SSH sessions once SSH tabs/panes are runtime-wired.
+- Real OSC 52 application smoke inside local and SSH panes on each target OS.

@@ -730,7 +730,7 @@ pub struct Osc52ClipboardRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Osc52ClipboardDecision {
     Allow { text: String, bytes: usize },
-    PromptRequired { reason: String },
+    PromptRequired { reason: String, bytes: usize },
     Deny { reason: String },
 }
 
@@ -759,11 +759,6 @@ pub fn evaluate_osc52_clipboard_write(
     if !request.remote && !policy.allow_local {
         return Osc52ClipboardDecision::Deny {
             reason: "local OSC 52 clipboard writes are disabled by policy".to_owned(),
-        };
-    }
-    if request.remote && policy.confirm_remote_writes {
-        return Osc52ClipboardDecision::PromptRequired {
-            reason: "remote OSC 52 clipboard write requires explicit confirmation".to_owned(),
         };
     }
     if matches!(request.target, Osc52ClipboardTarget::Unknown(_)) {
@@ -807,6 +802,12 @@ pub fn evaluate_osc52_clipboard_write(
     }
 
     match String::from_utf8(decoded) {
+        Ok(text) if request.remote && policy.confirm_remote_writes => {
+            Osc52ClipboardDecision::PromptRequired {
+                reason: "remote OSC 52 clipboard write requires explicit confirmation".to_owned(),
+                bytes: text.len(),
+            }
+        }
         Ok(text) => Osc52ClipboardDecision::Allow {
             bytes: text.len(),
             text,
@@ -815,6 +816,18 @@ pub fn evaluate_osc52_clipboard_write(
             reason: format!("OSC 52 decoded payload is not valid UTF-8: {error}"),
         },
     }
+}
+
+/// Re-evaluates a previously prompted request after one explicit user approval.
+/// All target, size, encoding, locality, and enablement checks still apply.
+#[must_use]
+pub fn approve_osc52_clipboard_write(
+    request: &Osc52ClipboardRequest,
+    policy: &Osc52ClipboardPolicy,
+) -> Osc52ClipboardDecision {
+    let mut approved = policy.clone();
+    approved.confirm_remote_writes = false;
+    evaluate_osc52_clipboard_write(request, &approved)
 }
 
 #[derive(Debug, Default)]
@@ -1143,6 +1156,49 @@ mod tests {
         assert!(
             matches!(decision, Osc52ClipboardDecision::Deny { reason } if reason.contains("remote"))
         );
+    }
+
+    #[test]
+    fn osc52_remote_confirmation_requires_explicit_one_time_approval() {
+        let request = Osc52ClipboardRequest {
+            target: Osc52ClipboardTarget::Clipboard,
+            payload_base64: "cGFuZWE=".to_owned(),
+            remote: true,
+        };
+        let policy = Osc52ClipboardPolicy {
+            allow_remote: true,
+            ..Osc52ClipboardPolicy::default()
+        };
+
+        assert!(matches!(
+            evaluate_osc52_clipboard_write(&request, &policy),
+            Osc52ClipboardDecision::PromptRequired { bytes: 5, .. }
+        ));
+        assert_eq!(
+            approve_osc52_clipboard_write(&request, &policy),
+            Osc52ClipboardDecision::Allow {
+                text: "panea".to_owned(),
+                bytes: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn osc52_malformed_remote_payload_is_denied_before_prompting() {
+        let request = Osc52ClipboardRequest {
+            target: Osc52ClipboardTarget::Clipboard,
+            payload_base64: "not base64".to_owned(),
+            remote: true,
+        };
+        let policy = Osc52ClipboardPolicy {
+            allow_remote: true,
+            ..Osc52ClipboardPolicy::default()
+        };
+
+        assert!(matches!(
+            evaluate_osc52_clipboard_write(&request, &policy),
+            Osc52ClipboardDecision::Deny { reason } if reason.contains("base64")
+        ));
     }
 
     #[test]

@@ -3,6 +3,7 @@ name = "panea-ios"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "iOS SSH companion shell contracts around the shared Panea engine."
 
 [lib]

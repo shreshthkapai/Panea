@@ -105,6 +105,94 @@ pub trait PowerStateProvider {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationBackend {
+    WindowsToast,
+    MacOsNotificationCenter,
+    Freedesktop,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationAvailability {
+    Available,
+    Disabled,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NotificationUrgency {
+    Low,
+    #[default]
+    Normal,
+    Critical,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationRequest {
+    pub title: String,
+    pub body: String,
+    pub urgency: NotificationUrgency,
+}
+
+impl NotificationRequest {
+    pub const MAX_TITLE_CHARS: usize = 256;
+    pub const MAX_BODY_CHARS: usize = 4096;
+
+    #[must_use]
+    pub fn new(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+            urgency: NotificationUrgency::Normal,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_urgency(mut self, urgency: NotificationUrgency) -> Self {
+        self.urgency = urgency;
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.title.trim().is_empty() {
+            return Err("notification title cannot be empty");
+        }
+        if self.title.chars().any(char::is_control) {
+            return Err("notification title cannot contain control characters");
+        }
+        if self
+            .body
+            .chars()
+            .any(|character| character.is_control() && character != '\n' && character != '\t')
+        {
+            return Err("notification body contains an unsupported control character");
+        }
+        if self.title.chars().count() > Self::MAX_TITLE_CHARS {
+            return Err("notification title exceeds the configured safety bound");
+        }
+        if self.body.chars().count() > Self::MAX_BODY_CHARS {
+            return Err("notification body exceeds the configured safety bound");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationDiagnostic {
+    pub backend: NotificationBackend,
+    pub availability: NotificationAvailability,
+    pub message: String,
+}
+
+/// Enqueues native notifications without exposing OS APIs to application code.
+/// Implementations must not block the render, input, or terminal-I/O paths.
+pub trait NotificationProvider {
+    fn notify(&mut self, request: NotificationRequest) -> Result<(), NotificationDiagnostic>;
+
+    fn diagnostic(&self) -> NotificationDiagnostic;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImeSupport {
     Unsupported,
     Basic,
@@ -445,6 +533,32 @@ mod tests {
                 charge_percent: Some(42),
             }
             .is_on_battery()
+        );
+    }
+
+    #[test]
+    fn notification_contract_rejects_unbounded_or_empty_requests() {
+        assert!(
+            NotificationRequest::new("Panea", "session exited")
+                .validate()
+                .is_ok()
+        );
+        assert_eq!(
+            NotificationRequest::new(" ", "body").validate(),
+            Err("notification title cannot be empty")
+        );
+        assert!(
+            NotificationRequest::new("Panea", "x".repeat(NotificationRequest::MAX_BODY_CHARS + 1))
+                .validate()
+                .is_err()
+        );
+        assert_eq!(
+            NotificationRequest::new("Panea\nspoofed", "body").validate(),
+            Err("notification title cannot contain control characters")
+        );
+        assert_eq!(
+            NotificationRequest::new("Panea", "body\0spoofed").validate(),
+            Err("notification body contains an unsupported control character")
         );
     }
 }

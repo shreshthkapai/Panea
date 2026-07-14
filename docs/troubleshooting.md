@@ -34,6 +34,6 @@ cargo xtask release-check
 Common current blockers:
 
 - macOS and Linux X11/Wayland smoke tests are not verified from this Windows host
-- packaged installers are not produced yet
-- Native OS keychain-backed secret storage is not wired into the app yet
-- remote OSC 52 clipboard confirmation UI is not wired
+- packaged artifacts outside Windows still require native-host reports
+- native keychain and notification providers still require macOS/Linux reports
+- remote OSC 52 confirmation still requires real local/SSH application smoke

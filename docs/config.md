@@ -108,7 +108,28 @@ confirm_remote_writes = true
 ```
 
 Remote OSC 52 clipboard writes are denied by default. Large OSC 52 writes are
-capped before they can touch the system clipboard.
+capped before they can touch the system clipboard. When `allow_remote = true`
+and `confirm_remote_writes = true`, Panea shows a renderer overlay containing
+the session, target, and payload size but never the clipboard contents. `Y`
+allows that one write; `N` or Escape denies it.
+
+## Notifications
+
+Native session notifications use one portable configuration on every desktop
+platform:
+
+```toml
+[notifications]
+enabled = true
+only_when_unfocused = true
+session_closed = true
+transport_errors = true
+```
+
+Delivery is queued outside the render, input, and PTY paths. The worker starts
+only when the first notification is needed. Windows uses toast notifications,
+macOS uses Notification Center, and Linux uses the freedesktop D-Bus protocol.
+Unavailable or permission-blocked providers report an explicit diagnostic.
 
 ## Shell Integration
 

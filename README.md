@@ -3,6 +3,11 @@
 Panea is a cross-platform terminal emulator built around the architecture in
 [architecture.md](architecture.md).
 
+Panea is currently an alpha candidate. The Windows installer and portable
+package have passed automated install, diagnostics, local-shell, and uninstall
+smoke checks on the development host. This is not yet a cross-OS verified
+daily-driver release; see [docs/alpha-scope.md](docs/alpha-scope.md).
+
 The implementation is organized as a Rust workspace with strict layer
 boundaries. The first goal is terminal correctness; rendering, configuration,
 semantics, SSH, multiplexing, and visual overlays are layered on top without
@@ -36,6 +41,12 @@ corrupting the raw terminal model.
 - `tools/conformance` - terminal conformance fixtures
 - `fuzz` - parser, grid, resize, Unicode, OSC, and shell marker fuzz targets
 
+## License
+
+Panea is available under either the Apache License 2.0 or the MIT License, at
+your option. See [LICENSE](LICENSE), [LICENSE-APACHE](LICENSE-APACHE), and
+[LICENSE-MIT](LICENSE-MIT).
+
 ## Development
 
 ```powershell
@@ -51,6 +62,7 @@ cargo xtask fuzz-smoke
 - [Getting started](docs/getting-started.md)
 - [Engineering rules](docs/engineering-rules.md)
 - [Current status](docs/status.md)
+- [Alpha scope](docs/alpha-scope.md)
 - [Capability matrix](docs/capability-matrix.md)
 - [Layer boundaries](docs/layer-boundaries.md)
 - [Fuzzing](docs/fuzzing.md)
@@ -58,6 +70,7 @@ cargo xtask fuzz-smoke
 - [Renderer device recovery](docs/renderer-device-recovery.md)
 - [App compatibility](docs/app-compatibility.md)
 - [Configuration](docs/config.md)
+- [Native notifications](docs/notifications.md)
 - [Themes](docs/themes.md)
 - [Cursor customization](docs/cursor-customization.md)
 - [Command blocks](docs/command-blocks.md)

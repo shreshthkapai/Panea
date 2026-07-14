@@ -3,8 +3,8 @@ name = "render-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Renderer-independent draw model, damage model, and visual primitives."
 
 [lints]
 workspace = true
-

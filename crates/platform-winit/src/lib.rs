@@ -3,19 +3,26 @@
 pub const LAYER: &str = "platform parity";
 
 use std::{
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        mpsc::{SyncSender, TrySendError, sync_channel},
+    },
+    thread,
     time::{Duration, Instant},
 };
 
 use arboard::Clipboard;
+use notify_rust::{Notification, Urgency};
 use platform_core::{
     ClipboardAvailability, ClipboardDiagnostic, ClipboardOperation, ClipboardProvider,
     CompositorInfo, DecorationMode, DecorationModeDiagnostic, DesktopPlatform, DpiBehavior,
     DpiInfo, ImeEvent, ImeSupport, InputEvent, KeyEvent, KeyModifiers, KeyState,
     LinuxWindowBackend, LinuxWindowBackendDiagnostic, MonitorInfo, MouseButton, MouseEvent,
-    MouseEventKind, PlatformCapabilities, PlatformFallback, PowerSource, PowerState,
-    PowerStateDiagnostic, PowerStateProvider, ShellEnvironmentInfo, UrlOpenDiagnostic, UrlOpener,
-    WindowAction, WindowMode, WindowModeDiagnostic,
+    MouseEventKind, NotificationAvailability, NotificationBackend, NotificationDiagnostic,
+    NotificationProvider, NotificationRequest, NotificationUrgency, PlatformCapabilities,
+    PlatformFallback, PowerSource, PowerState, PowerStateDiagnostic, PowerStateProvider,
+    ShellEnvironmentInfo, UrlOpenDiagnostic, UrlOpener, WindowAction, WindowMode,
+    WindowModeDiagnostic,
 };
 use starship_battery::units::ratio::percent;
 use starship_battery::{Manager as BatteryManager, State as BatteryState};
@@ -28,6 +35,201 @@ use winit::{
 };
 
 const POWER_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const NOTIFICATION_QUEUE_CAPACITY: usize = 16;
+
+#[derive(Debug)]
+pub struct DesktopNotificationProvider {
+    enabled: bool,
+    backend: NotificationBackend,
+    sender: Option<SyncSender<NotificationRequest>>,
+    diagnostic: Arc<Mutex<NotificationDiagnostic>>,
+}
+
+impl DesktopNotificationProvider {
+    #[must_use]
+    pub fn new(enabled: bool) -> Self {
+        let backend = notification_backend();
+        let (availability, message) = if !enabled {
+            (
+                NotificationAvailability::Disabled,
+                "native notifications are disabled by config".to_owned(),
+            )
+        } else if backend == NotificationBackend::Unsupported {
+            (
+                NotificationAvailability::Unavailable,
+                "this platform build has no native notification backend".to_owned(),
+            )
+        } else {
+            (
+                NotificationAvailability::Available,
+                format!(
+                    "{} notification backend ready; delivery worker starts on first use",
+                    notification_backend_name(backend)
+                ),
+            )
+        };
+        Self {
+            enabled,
+            backend,
+            sender: None,
+            diagnostic: Arc::new(Mutex::new(NotificationDiagnostic {
+                backend,
+                availability,
+                message,
+            })),
+        }
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if self.enabled == enabled {
+            return;
+        }
+        *self = Self::new(enabled);
+    }
+
+    fn ensure_worker(&mut self) -> Result<(), NotificationDiagnostic> {
+        if self.sender.is_some() {
+            return Ok(());
+        }
+        if !self.enabled || self.backend == NotificationBackend::Unsupported {
+            return Err(self.diagnostic());
+        }
+        let (sender, receiver) = sync_channel(NOTIFICATION_QUEUE_CAPACITY);
+        let backend = self.backend;
+        let diagnostic = Arc::clone(&self.diagnostic);
+        thread::Builder::new()
+            .name("panea-notifications".to_owned())
+            .spawn(move || {
+                while let Ok(request) = receiver.recv() {
+                    let result = deliver_native_notification(&request);
+                    let next = match result {
+                        Ok(()) => NotificationDiagnostic {
+                            backend,
+                            availability: NotificationAvailability::Available,
+                            message: format!(
+                                "{} notification delivered",
+                                notification_backend_name(backend)
+                            ),
+                        },
+                        Err(message) => NotificationDiagnostic {
+                            backend,
+                            availability: NotificationAvailability::Unavailable,
+                            message: format!(
+                                "{} notification delivery failed: {message}",
+                                notification_backend_name(backend)
+                            ),
+                        },
+                    };
+                    set_notification_diagnostic(&diagnostic, next);
+                }
+            })
+            .map_err(|error| {
+                let diagnostic = NotificationDiagnostic {
+                    backend,
+                    availability: NotificationAvailability::Unavailable,
+                    message: format!("failed to start notification worker: {error}"),
+                };
+                set_notification_diagnostic(&self.diagnostic, diagnostic.clone());
+                diagnostic
+            })?;
+        self.sender = Some(sender);
+        Ok(())
+    }
+}
+
+impl NotificationProvider for DesktopNotificationProvider {
+    fn notify(&mut self, request: NotificationRequest) -> Result<(), NotificationDiagnostic> {
+        if let Err(message) = request.validate() {
+            return Err(NotificationDiagnostic {
+                backend: self.backend,
+                availability: NotificationAvailability::Unavailable,
+                message: message.to_owned(),
+            });
+        }
+        self.ensure_worker()?;
+        let Some(sender) = self.sender.as_ref() else {
+            return Err(self.diagnostic());
+        };
+        sender.try_send(request).map_err(|error| {
+            let message = match error {
+                TrySendError::Full(_) => {
+                    "notification queue is full; newest notification was dropped".to_owned()
+                }
+                TrySendError::Disconnected(_) => {
+                    self.sender = None;
+                    "notification worker stopped unexpectedly".to_owned()
+                }
+            };
+            let diagnostic = NotificationDiagnostic {
+                backend: self.backend,
+                availability: NotificationAvailability::Unavailable,
+                message,
+            };
+            set_notification_diagnostic(&self.diagnostic, diagnostic.clone());
+            diagnostic
+        })
+    }
+
+    fn diagnostic(&self) -> NotificationDiagnostic {
+        self.diagnostic
+            .lock()
+            .map(|diagnostic| diagnostic.clone())
+            .unwrap_or_else(|_| NotificationDiagnostic {
+                backend: self.backend,
+                availability: NotificationAvailability::Unavailable,
+                message: "notification diagnostic lock was poisoned".to_owned(),
+            })
+    }
+}
+
+fn set_notification_diagnostic(
+    state: &Arc<Mutex<NotificationDiagnostic>>,
+    diagnostic: NotificationDiagnostic,
+) {
+    if let Ok(mut state) = state.lock() {
+        *state = diagnostic;
+    }
+}
+
+fn deliver_native_notification(request: &NotificationRequest) -> Result<(), String> {
+    let mut notification = Notification::new();
+    notification
+        .appname("Panea")
+        .summary(&request.title)
+        .body(&request.body)
+        .urgency(match request.urgency {
+            NotificationUrgency::Low => Urgency::Low,
+            NotificationUrgency::Normal => Urgency::Normal,
+            NotificationUrgency::Critical => Urgency::Critical,
+        });
+    #[cfg(windows)]
+    notification.app_id("Panea.Terminal");
+    notification
+        .show()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+const fn notification_backend() -> NotificationBackend {
+    if cfg!(windows) {
+        NotificationBackend::WindowsToast
+    } else if cfg!(target_os = "macos") {
+        NotificationBackend::MacOsNotificationCenter
+    } else if cfg!(target_os = "linux") {
+        NotificationBackend::Freedesktop
+    } else {
+        NotificationBackend::Unsupported
+    }
+}
+
+const fn notification_backend_name(backend: NotificationBackend) -> &'static str {
+    match backend {
+        NotificationBackend::WindowsToast => "Windows toast",
+        NotificationBackend::MacOsNotificationCenter => "macOS Notification Center",
+        NotificationBackend::Freedesktop => "freedesktop D-Bus",
+        NotificationBackend::Unsupported => "unsupported",
+    }
+}
 
 #[derive(Debug)]
 pub struct DesktopPowerMonitor {
@@ -973,6 +1175,33 @@ mod tests {
         assert!(!monitor.refresh_if_due());
         assert_eq!(monitor.next_refresh_after(), None);
         assert_eq!(monitor.power_state().state, PowerState::UNKNOWN);
+    }
+
+    #[test]
+    fn disabled_notification_provider_does_not_start_a_worker() {
+        let mut provider = DesktopNotificationProvider::new(false);
+
+        let diagnostic = provider
+            .notify(NotificationRequest::new("Panea", "session exited"))
+            .expect_err("disabled notifications must reject without queueing");
+        assert_eq!(diagnostic.availability, NotificationAvailability::Disabled);
+        assert!(provider.sender.is_none());
+    }
+
+    #[test]
+    fn notification_backend_is_explicit_for_supported_desktops() {
+        assert_eq!(
+            notification_backend(),
+            if cfg!(windows) {
+                NotificationBackend::WindowsToast
+            } else if cfg!(target_os = "macos") {
+                NotificationBackend::MacOsNotificationCenter
+            } else if cfg!(target_os = "linux") {
+                NotificationBackend::Freedesktop
+            } else {
+                NotificationBackend::Unsupported
+            }
+        );
     }
 
     #[test]
