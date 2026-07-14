@@ -7,4 +7,6 @@ by terminal, renderer, transport, platform, or config crates.
 
 Normal workspace builds embed an empty development payload. `cargo xtask
 package build` supplies the staged release payload and emits the distributable
-installer.
+installer. The installed Start menu shortcut targets the Windows GUI-subsystem
+`panea-gui.exe`; `panea.exe` remains available on `PATH` for diagnostics and
+other CLI commands.

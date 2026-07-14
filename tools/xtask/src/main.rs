@@ -3245,7 +3245,7 @@ fn build_package(options: &PackageOptions) -> ExitCode {
     }
 
     if !options.skip_cargo_build {
-        let code = build_desktop_binary(options.profile);
+        let code = build_desktop_binary(options.profile, options.target_platform);
         if code != ExitCode::SUCCESS {
             return code;
         }
@@ -3329,8 +3329,11 @@ fn smoke_package(options: &PackageOptions) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn build_desktop_binary(profile: PackageProfile) -> ExitCode {
+fn build_desktop_binary(profile: PackageProfile, target_platform: CompatPlatform) -> ExitCode {
     let mut args = vec!["build", "-p", "panea-desktop"];
+    if target_platform == CompatPlatform::Windows {
+        args.extend(["--features", "windows-gui"]);
+    }
     if profile == PackageProfile::Release {
         args.push("--release");
     }
@@ -3376,6 +3379,17 @@ fn stage_package(options: &PackageOptions) -> Result<PackageLayout, String> {
             layout.binary_path.display()
         )
     })?;
+    if options.target_platform == CompatPlatform::Windows {
+        let source = built_windows_gui_binary(options.profile);
+        let destination = windows_gui_binary_path(&layout.binary_path);
+        fs::copy(&source, &destination).map_err(|error| {
+            format!(
+                "failed to copy Windows GUI binary {} to {}: {error}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+    }
 
     write_package_resources(options, &layout)?;
     Ok(layout)
@@ -3489,6 +3503,7 @@ fn emit_windows_artifacts(
     layout: &PackageLayout,
 ) -> Result<Vec<DistributionArtifact>, String> {
     sign_windows_file(&layout.binary_path)?;
+    sign_windows_file(&windows_gui_binary_path(&layout.binary_path))?;
     let archive = options.out_dir.join(format!(
         "{}.zip",
         artifact_stem(options, "windows-portable")
@@ -4251,7 +4266,7 @@ fn write_linux_package_files(layout: &PackageLayout) -> Result<(), String> {
 fn write_windows_package_files(layout: &PackageLayout) -> Result<(), String> {
     write_file(
         &layout.resource_dir.join("WINDOWS.txt"),
-        "Panea Windows portable package.\n\nRun panea.exe from the package root. The release pipeline also emits a per-user installer that adds Start menu entries and the install directory to the user PATH.\n",
+        "Panea Windows portable package.\n\nRun panea-gui.exe for the normal desktop application without a console window. Use panea.exe for CLI diagnostics such as `panea doctor`. The release pipeline also emits a per-user installer that adds Start menu entries and the CLI binary directory to the user PATH.\n",
     )?;
     write_bytes(
         &layout.resource_dir.join("icons").join("panea.ico"),
@@ -4315,6 +4330,15 @@ fn verify_package_contents(
     for path in package_icon_paths(layout, target_platform) {
         if !path.exists() {
             return Err(format!("missing packaged icon {}", path.display()));
+        }
+    }
+    if target_platform == CompatPlatform::Windows {
+        let gui_binary = windows_gui_binary_path(&layout.binary_path);
+        if !gui_binary.exists() {
+            return Err(format!(
+                "missing packaged Windows GUI entrypoint {}",
+                gui_binary.display()
+            ));
         }
     }
     Ok(())
@@ -4565,7 +4589,8 @@ fn run_packaged_shell_smoke(binary_path: &Path, timeout: Duration) -> PackageSmo
 fn run_packaged_gui_smoke(binary_path: &Path, timeout: Duration) -> PackageSmokeResult {
     let started = Instant::now();
     let timeout_ms = timeout.as_millis().to_string();
-    let mut child = match Command::new(binary_path)
+    let gui_binary = packaged_gui_binary(binary_path);
+    let mut child = match Command::new(&gui_binary)
         .args(["gui-smoke", "--json", "--timeout-ms", timeout_ms.as_str()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -4579,7 +4604,7 @@ fn run_packaged_gui_smoke(binary_path: &Path, timeout: Duration) -> PackageSmoke
                 duration: started.elapsed(),
                 detail: format!(
                     "failed to spawn {} gui-smoke: {error}",
-                    binary_path.display()
+                    gui_binary.display()
                 ),
             };
         }
@@ -4594,7 +4619,7 @@ fn run_packaged_gui_smoke(binary_path: &Path, timeout: Duration) -> PackageSmoke
                     name: "gui-launch",
                     status: PackageSmokeStatus::TimedOut,
                     duration: started.elapsed(),
-                    detail: format!("{} gui-smoke exceeded timeout", binary_path.display()),
+                    detail: format!("{} gui-smoke exceeded timeout", gui_binary.display()),
                 };
             }
             Ok(None) => thread::sleep(Duration::from_millis(25)),
@@ -4619,7 +4644,7 @@ fn run_packaged_gui_smoke(binary_path: &Path, timeout: Duration) -> PackageSmoke
                 name: "gui-launch",
                 status: PackageSmokeStatus::Passed,
                 duration: started.elapsed(),
-                detail: format!("{} rendered its first session frame", binary_path.display()),
+                detail: format!("{} rendered its first session frame", gui_binary.display()),
             }
         }
         Ok(output) => PackageSmokeResult {
@@ -4749,6 +4774,25 @@ fn built_desktop_binary(profile: PackageProfile) -> PathBuf {
         .join(host_binary_name())
 }
 
+fn built_windows_gui_binary(profile: PackageProfile) -> PathBuf {
+    PathBuf::from("target")
+        .join(profile.target_dir())
+        .join("panea-gui.exe")
+}
+
+fn windows_gui_binary_path(binary_path: &Path) -> PathBuf {
+    binary_path.with_file_name("panea-gui.exe")
+}
+
+fn packaged_gui_binary(binary_path: &Path) -> PathBuf {
+    let candidate = windows_gui_binary_path(binary_path);
+    if candidate.is_file() {
+        candidate
+    } else {
+        binary_path.to_path_buf()
+    }
+}
+
 fn host_binary_name() -> &'static str {
     if cfg!(windows) { "panea.exe" } else { "panea" }
 }
@@ -4775,6 +4819,11 @@ fn package_platform_label(platform: CompatPlatform) -> &'static str {
 }
 
 fn render_package_manifest(options: &PackageOptions, layout: &PackageLayout) -> String {
+    let gui_binary = if options.target_platform == CompatPlatform::Windows {
+        windows_gui_binary_path(&layout.binary_path)
+    } else {
+        layout.binary_path.clone()
+    };
     format!(
         concat!(
             "{{\n",
@@ -4784,11 +4833,12 @@ fn render_package_manifest(options: &PackageOptions, layout: &PackageLayout) -> 
             "  \"artifact_kind\": \"{}\",\n",
             "  \"profile\": \"{}\",\n",
             "  \"binary\": \"{}\",\n",
+            "  \"gui_binary\": \"{}\",\n",
             "  \"resources\": \"{}\",\n",
             "  \"doctor_smoke\": \"panea doctor --json\",\n",
             "  \"shell_launch_smoke\": \"panea shell-smoke --json\",\n",
             "  \"gui_launch_smoke\": \"panea gui-smoke --json\",\n",
-            "  \"contains\": [\"binary\", \"application_icon\", \"default_config\", \"config_schema\", \"config_examples\", \"programmable_config_examples\", \"themes\", \"cursor_profiles\", \"cursor_vector_assets\", \"shell_integration_scripts\", \"doctor_command\", \"shell_smoke_command\", \"gui_smoke_command\", \"license\", \"readme\"]\n",
+            "  \"contains\": [\"binary\", \"gui_entrypoint\", \"application_icon\", \"default_config\", \"config_schema\", \"config_examples\", \"programmable_config_examples\", \"themes\", \"cursor_profiles\", \"cursor_vector_assets\", \"shell_integration_scripts\", \"doctor_command\", \"shell_smoke_command\", \"gui_smoke_command\", \"license\", \"readme\"]\n",
             "}}\n"
         ),
         env!("CARGO_PKG_VERSION"),
@@ -4800,6 +4850,7 @@ fn render_package_manifest(options: &PackageOptions, layout: &PackageLayout) -> 
             &layout.binary_path
         ))
         .as_str(),
+        json_escape(&relative_or_display(&layout.package_dir, &gui_binary)).as_str(),
         json_escape(&relative_or_display(
             &layout.package_dir,
             &layout.resource_dir
@@ -4812,7 +4863,7 @@ fn package_install_notes(options: &PackageOptions) -> String {
     let common = "Panea package artifact\n\nRun `panea doctor --json` first to verify diagnostics. Run `panea shell-smoke --json` to verify a bounded local PTY session, then `panea gui-smoke --json` to verify window, renderer, session, and first-frame startup.\n\n";
     match options.target_platform {
         CompatPlatform::Windows => format!(
-            "{common}Windows delivery:\n- Run `panea.exe` directly from the portable ZIP.\n- Or run the Panea installer EXE for a per-user install, Start menu shortcuts, and user PATH registration.\n- Uninstall from the Start menu shortcut or `panea-uninstall.exe uninstall`.\n"
+            "{common}Windows delivery:\n- Run `panea-gui.exe` from the portable ZIP for a console-free desktop launch.\n- Use `panea.exe` for CLI diagnostics and smoke commands.\n- Or run the Panea installer EXE for a per-user install, Start menu shortcuts, and user PATH registration.\n- Uninstall from the Start menu shortcut or `panea-uninstall.exe uninstall`.\n"
         ),
         CompatPlatform::Macos => format!(
             "{common}macOS delivery:\n- Open `Panea.app` or run `Panea.app/Contents/MacOS/panea doctor --json`.\n- Release builds emit ZIP and DMG artifacts. Signing and notarization require distribution credentials.\n"
@@ -6067,12 +6118,23 @@ mod tests {
         assert!(manifest.contains("\"doctor_command\""));
         assert!(manifest.contains("\"shell_smoke_command\""));
         assert!(manifest.contains("\"gui_smoke_command\""));
+        assert!(manifest.contains("\"gui_binary\": \"panea-gui.exe\""));
+        assert!(manifest.contains("\"gui_entrypoint\""));
         assert!(manifest.contains("\"cursor_vector_assets\""));
         assert!(manifest.contains("\"programmable_config_examples\""));
         assert!(manifest.contains("\"themes\""));
         assert!(manifest.contains("\"cursor_profiles\""));
         assert!(manifest.contains("\"license\""));
         assert!(manifest.contains("\"application_icon\""));
+    }
+
+    #[test]
+    fn windows_gui_entrypoint_is_sibling_of_console_binary() {
+        let binary = Path::new("package").join("panea.exe");
+        assert_eq!(
+            windows_gui_binary_path(&binary),
+            Path::new("package").join("panea-gui.exe")
+        );
     }
 
     #[test]

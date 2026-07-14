@@ -185,7 +185,7 @@ fn configure_windows_integration(options: &InstallOptions, install: bool) -> Res
     if !cfg!(windows) {
         return Ok(());
     }
-    let binary = options.install_dir.join("panea.exe");
+    let binary = options.install_dir.join("panea-gui.exe");
     let uninstall = options.install_dir.join("panea-uninstall.exe");
     let start_menu = env::var_os("APPDATA")
         .map(PathBuf::from)

@@ -4,10 +4,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+autobins = false
+
+[features]
+windows-gui = []
+
+[lib]
+path = "src/main.rs"
 
 [[bin]]
 name = "panea"
-path = "src/main.rs"
+path = "src/cli_main.rs"
+
+[[bin]]
+name = "panea-gui"
+path = "src/gui_main.rs"
+required-features = ["windows-gui"]
 
 [lints]
 workspace = true

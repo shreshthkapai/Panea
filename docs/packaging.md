@@ -15,7 +15,8 @@ same portable `AppConfig`
 macOS behavior: `Panea.app` bundle plus ZIP and DMG distribution artifacts
 Windows behavior: portable directory/ZIP plus a self-contained per-user
 installer with atomic upgrade, Start menu shortcuts, user PATH registration,
-and uninstall
+and uninstall; normal desktop launches use a GUI-subsystem entrypoint while
+the console entrypoint remains available for diagnostics
 Linux X11 behavior: portable directory/tarball, Debian package, AppImage, RPM,
 desktop file, and icon
 Linux Wayland behavior: same Linux package layout as X11; backend behavior is
@@ -76,6 +77,7 @@ Windows portable:
 ```text
 panea-<version>-windows-portable-<profile>/
   panea.exe
+  panea-gui.exe
   share/panea/
     config/default.toml
     config/schema.json
@@ -95,6 +97,13 @@ The Windows build also emits:
 panea-<version>-windows-portable-<arch>-<profile>.zip
 panea-<version>-windows-installer-<arch>-<profile>.exe
 ```
+
+`panea-gui.exe` and `panea.exe` execute the same desktop runtime. The GUI
+entrypoint is linked with the Windows GUI subsystem, so Start-menu and portable
+desktop launches do not create a console window. The console entrypoint keeps
+stdout/stderr available for `doctor`, shell integration, and smoke commands.
+The installer shortcut targets `panea-gui.exe`; the user `PATH` still exposes
+`panea.exe`.
 
 macOS app bundle:
 
@@ -167,7 +176,8 @@ PANEA_WINDOWS_SIGNTOOL=<optional-path-to-signtool.exe>
 PANEA_WINDOWS_TIMESTAMP_URL=<optional-RFC3161-url>
 ```
 
-The staged executable and installer are both Authenticode signed. macOS uses:
+Both staged Windows entrypoints and the installer are Authenticode signed.
+macOS uses:
 
 ```text
 PANEA_MACOS_SIGN_IDENTITY=<Developer ID Application identity>

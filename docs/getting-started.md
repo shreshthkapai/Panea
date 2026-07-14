@@ -37,6 +37,12 @@ Windows signing require release-owner credentials; tagged release CI fails if
 those credentials are absent. Panea is distributed under
 the dual `MIT OR Apache-2.0` license.
 
+On Windows, the installer creates a Start menu shortcut that launches
+`panea-gui.exe`, the GUI-subsystem entrypoint that does not create a second
+console window. `panea.exe` remains on the user `PATH` for commands such as
+`panea doctor`. Portable users should double-click `panea-gui.exe` and reserve
+`panea.exe` for CLI use.
+
 The app loads the default portable config when no user config exists. Generate a
 sample config with:
 

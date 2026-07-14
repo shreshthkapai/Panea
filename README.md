@@ -8,6 +8,10 @@ package have passed automated install, diagnostics, local-shell, and uninstall
 smoke checks on the development host. This is not yet a cross-OS verified
 daily-driver release; see [docs/alpha-scope.md](docs/alpha-scope.md).
 
+Windows packages provide `panea-gui.exe` for normal console-free desktop
+launches and `panea.exe` for CLI diagnostics. The installer creates a Start
+menu shortcut to the GUI entrypoint.
+
 The implementation is organized as a Rust workspace with strict layer
 boundaries. The first goal is terminal correctness; rendering, configuration,
 semantics, SSH, multiplexing, and visual overlays are layered on top without
