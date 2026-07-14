@@ -81,7 +81,7 @@ These areas are real foundations but must not be called complete:
 
 | Area | Status | Missing before completion |
 | --- | --- | --- |
-| Desktop app runtime | partial | Full app lifecycle polish and cross-OS manual validation remain; bounded GUI smokes verify window, GPU renderer, session creation, exactly one settled startup prompt without input, terminal input/output, first frame, and teardown. Initial launcher activation keys, orphan key repeats, and control-only IME commits are rejected at the platform-neutral input boundary. |
+| Desktop app runtime | partial | Full app lifecycle polish and cross-OS manual validation remain; bounded GUI smokes verify window, GPU renderer, session creation, exactly one settled startup prompt without input, terminal input/output, first frame, and teardown. Initial launcher activation keys, orphan key repeats, and control-only IME commits are rejected at the platform-neutral input boundary. PTY wakeups are processed immediately, pending output is applied before host input/resize events, and terminal protocol replies are ordered before user bytes so synchronous shell cursor queries cannot be overtaken. |
 | Platform windowing | partial | Native winit paths, explicit X11/Wayland builders, exclusive/borderless/frameless modes, decoration fallback reporting, DPI resize propagation, IME preedit overlays, clipboard providers, and native notification providers exist. Real macOS/Linux compositor/IME/DPI/notification validation remains. |
 | GPU renderer | tested | WGPU setup, persistent growable GPU batches, correctness-gated retained damage with event-driven full-frame presentation, incremental desktop damage projection, shaped-run/glyph/RGBA emoji atlas caching, lazy opt-in image-cursor GPU resources, row-scoped uploads, low-idle scheduling, benchmarks, device-loss backend recreation, screenshot infrastructure, and GPU timing plumbing exist; real sleep/wake/monitor-loss validation, macOS/Linux baselines, cross-OS render validation, and lower cold-start latency remain. |
 | Font and text rendering | tested | OpenType shaping, per-grapheme configured/system fallback, real regular/bold/italic/bold-italic face resolution, CJK/combining/ligature/emoji shaping, COLR/bitmap color glyph rasterization, RGBA atlas batching, run caching, and portable font diagnostics pass automated tests on Windows. |
@@ -165,6 +165,12 @@ slow font/GPU initialization from forwarding a Windows Search Enter/Space key
 to the PTY. PTY startup also precedes GPU device creation so shell startup and
 renderer initialization can overlap. Equivalent launcher behavior still needs
 real macOS and Linux desktop verification.
+
+Terminal output ordering is also explicit at the desktop boundary. A local PTY
+wakeup drains parser output immediately, non-redraw window events drain pending
+PTY output before input or resize handling, and generated DA/DSR replies are
+written before user input. The real PowerShell cursor/grid smoke now exercises
+dynamic terminal replies instead of a hard-coded cursor position.
 
 ## Immediate Next Slice
 

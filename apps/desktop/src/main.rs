@@ -1275,6 +1275,21 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                     }
                 }
                 _ => {
+                    // PTY output can contain synchronous terminal queries (for
+                    // example, CPR/DSR used by PowerShell's line editor). Apply
+                    // pending output and send terminal responses before a host
+                    // input or resize event is allowed to overtake it.
+                    if mux_runtime.poll_outputs(
+                        &mut clipboard,
+                        &osc52_policy,
+                        &clipboard_config,
+                        &mut notification_provider,
+                        &config.notifications,
+                        window_focused,
+                    ) {
+                        scheduler.terminal_content_changed();
+                        window.request_redraw();
+                    }
                     let platform_events = match catch_unwind(AssertUnwindSafe(|| {
                         input_translator.translate_window_event(&event)
                     })) {
@@ -1715,6 +1730,23 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                     }
                 }
             },
+            Event::UserEvent(()) => {
+                // Local PTY readers wake the event loop when bytes become
+                // available. Process that wake immediately instead of waiting
+                // for AboutToWait, where queued keyboard events could otherwise
+                // be handled first.
+                if mux_runtime.poll_outputs(
+                    &mut clipboard,
+                    &osc52_policy,
+                    &clipboard_config,
+                    &mut notification_provider,
+                    &config.notifications,
+                    window_focused,
+                ) {
+                    scheduler.terminal_content_changed();
+                    window.request_redraw();
+                }
+            }
             Event::AboutToWait => {
                 if gui_smoke_hold_until.is_some_and(|deadline| Instant::now() >= deadline) {
                     if let Some(completed) = &gui_smoke_completed {
@@ -3493,15 +3525,46 @@ fn shutdown_transport(transport: Option<&mut PaneTransport>) {
     }
 }
 
-fn flush_terminal_responses(terminal: &mut TerminalEmulator, transport: &mut PaneTransport) {
+trait TerminalInputSink {
+    fn write_terminal_bytes(&mut self, bytes: &[u8]) -> TransportResult<()>;
+}
+
+impl TerminalInputSink for PaneTransport {
+    fn write_terminal_bytes(&mut self, bytes: &[u8]) -> TransportResult<()> {
+        self.write_input(bytes)
+    }
+}
+
+#[cfg(test)]
+impl TerminalInputSink for LocalPtyTransport {
+    fn write_terminal_bytes(&mut self, bytes: &[u8]) -> TransportResult<()> {
+        self.write_input(bytes)
+    }
+}
+
+fn flush_terminal_responses<T>(terminal: &mut TerminalEmulator, transport: &mut T)
+where
+    T: TerminalInputSink + ?Sized,
+{
     let responses = terminal.state_mut().take_pending_output();
     if !responses.is_empty() {
         write_transport_input(transport, &responses);
     }
 }
 
-fn write_transport_input(transport: &mut PaneTransport, bytes: &[u8]) {
-    match catch_unwind(AssertUnwindSafe(|| transport.write_input(bytes))) {
+fn write_terminal_input<T>(terminal: &mut TerminalEmulator, transport: &mut T, bytes: &[u8])
+where
+    T: TerminalInputSink + ?Sized,
+{
+    flush_terminal_responses(terminal, transport);
+    write_transport_input(transport, bytes);
+}
+
+fn write_transport_input<T>(transport: &mut T, bytes: &[u8])
+where
+    T: TerminalInputSink + ?Sized,
+{
+    match catch_unwind(AssertUnwindSafe(|| transport.write_terminal_bytes(bytes))) {
         Ok(Ok(())) => {}
         Ok(Err(error)) => eprintln!("transport input error: {error}"),
         Err(panic) => eprintln!("transport input panic boundary: {}", panic_payload(panic)),
@@ -5785,7 +5848,7 @@ impl PaneRuntime {
             }
         }
         if let Some(transport) = self.transport.as_mut() {
-            write_transport_input(transport, bytes);
+            write_terminal_input(&mut self.terminal, transport, bytes);
         }
     }
 
@@ -8185,6 +8248,32 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingInputSink {
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl TerminalInputSink for RecordingInputSink {
+        fn write_terminal_bytes(&mut self, bytes: &[u8]) -> TransportResult<()> {
+            self.writes.push(bytes.to_vec());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn terminal_protocol_responses_are_written_before_user_input() {
+        let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(80, 24));
+        terminal
+            .apply_bytes(b"\x1b[4;8H\x1b[6n")
+            .expect("apply cursor-position query");
+        let mut sink = RecordingInputSink::default();
+
+        write_terminal_input(&mut terminal, &mut sink, b"typed");
+
+        assert_eq!(sink.writes, vec![b"\x1b[4;8R".to_vec(), b"typed".to_vec()]);
+        assert!(terminal.state().pending_output().is_empty());
+    }
+
     #[test]
     fn battery_policy_is_bounded_and_reversible() {
         let mut configured = PerformanceConfig::default();
@@ -9617,10 +9706,10 @@ mod tests {
         while Instant::now() < deadline {
             let output = transport.poll_output().expect("poll shell output");
             if !output.bytes.is_empty() {
-                answer_real_shell_terminal_queries(&mut transport, &output.bytes);
                 terminal
                     .apply_bytes(&output.bytes)
                     .expect("apply startup output");
+                flush_terminal_responses(&mut terminal, &mut transport);
                 raw.extend_from_slice(&output.bytes);
             }
             if !resized_after_prompt && raw.windows(3).any(|window| window == b"PS ") {
@@ -9678,10 +9767,10 @@ mod tests {
         while Instant::now() < startup_deadline {
             let output = transport.poll_output().expect("poll shell output");
             if !output.bytes.is_empty() {
-                answer_real_shell_terminal_queries(&mut transport, &output.bytes);
                 terminal
                     .apply_bytes(&output.bytes)
                     .expect("apply startup output");
+                flush_terminal_responses(&mut terminal, &mut transport);
             }
             if terminal_visible_lines(&terminal)
                 .iter()
@@ -9704,10 +9793,10 @@ mod tests {
         while Instant::now() < resize_deadline {
             let output = transport.poll_output().expect("poll resize output");
             if !output.bytes.is_empty() {
-                answer_real_shell_terminal_queries(&mut transport, &output.bytes);
                 terminal
                     .apply_bytes(&output.bytes)
                     .expect("apply resize output");
+                flush_terminal_responses(&mut terminal, &mut transport);
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -9724,6 +9813,7 @@ mod tests {
                 terminal
                     .apply_bytes(&output.bytes)
                     .expect("apply input echo");
+                flush_terminal_responses(&mut terminal, &mut transport);
             }
             if terminal_visible_lines(&terminal)
                 .iter()
@@ -9767,10 +9857,10 @@ mod tests {
         while Instant::now() < command_deadline {
             let output = transport.poll_output().expect("poll command output");
             if !output.bytes.is_empty() {
-                answer_real_shell_terminal_queries(&mut transport, &output.bytes);
                 terminal
                     .apply_bytes(&output.bytes)
                     .expect("apply command output");
+                flush_terminal_responses(&mut terminal, &mut transport);
             }
             let lines = terminal_visible_lines(&terminal);
             if lines
@@ -9823,7 +9913,9 @@ mod tests {
 
     fn run_interactive_shell_activation_smoke(profile: LocalShellProfile) {
         let marker = b"panea-runtime-integration-smoke";
-        let mut transport = LocalPtyTransport::spawn(profile, smoke_size()).expect("spawn shell");
+        let size = smoke_size();
+        let mut transport = LocalPtyTransport::spawn(profile, size).expect("spawn shell");
+        let mut query_terminal = TerminalEmulator::new(CoreTerminalSize::new(size.cols, size.rows));
         let mut parser = SemanticEscapeParser::new();
         let mut events = Vec::new();
         let mut bytes = Vec::new();
@@ -9833,7 +9925,10 @@ mod tests {
         while Instant::now() < deadline {
             let output = transport.poll_output().expect("poll shell output");
             if !output.bytes.is_empty() {
-                answer_real_shell_terminal_queries(&mut transport, &output.bytes);
+                query_terminal
+                    .apply_bytes(&output.bytes)
+                    .expect("apply shell output for terminal queries");
+                flush_terminal_responses(&mut query_terminal, &mut transport);
                 for event in parser.parse(&output.bytes, BufferPosition::new(0, 0)) {
                     events.push(event.event.kind());
                 }
@@ -9928,7 +10023,8 @@ mod tests {
 
     fn run_real_shell_semantic_smoke(shell: ShellKind, profile: LocalShellProfile) {
         let marker = b"panea-shell-integration-smoke";
-        let mut transport = match LocalPtyTransport::spawn(profile.clone(), smoke_size()) {
+        let size = smoke_size();
+        let mut transport = match LocalPtyTransport::spawn(profile.clone(), size) {
             Ok(transport) => transport,
             Err(error) => {
                 eprintln!(
@@ -9938,6 +10034,7 @@ mod tests {
                 return;
             }
         };
+        let mut query_terminal = TerminalEmulator::new(CoreTerminalSize::new(size.cols, size.rows));
         let mut parser = SemanticEscapeParser::new();
         let mut bytes = Vec::new();
         let mut events = Vec::new();
@@ -9946,7 +10043,10 @@ mod tests {
         while std::time::Instant::now() < deadline {
             let output = transport.poll_output().expect("poll shell output");
             if !output.bytes.is_empty() {
-                answer_real_shell_terminal_queries(&mut transport, &output.bytes);
+                query_terminal
+                    .apply_bytes(&output.bytes)
+                    .expect("apply shell output for terminal queries");
+                flush_terminal_responses(&mut query_terminal, &mut transport);
                 events.extend(
                     parser
                         .parse(&output.bytes, BufferPosition::new(0, 0))
@@ -9978,14 +10078,5 @@ mod tests {
             "real {shell:?} semantic smoke did not observe expected events; bytes={}, events={events:?}, diagnostics={diagnostics:?}",
             bytes.len()
         );
-    }
-
-    fn answer_real_shell_terminal_queries(transport: &mut LocalPtyTransport, bytes: &[u8]) {
-        if bytes
-            .windows(b"\x1b[6n".len())
-            .any(|window| window == b"\x1b[6n")
-        {
-            let _ = transport.write_input(b"\x1b[1;1R");
-        }
     }
 }
