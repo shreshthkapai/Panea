@@ -37,7 +37,7 @@ considered verified until that matrix has real X11 and Wayland host evidence.
 | shell integration | partial | partial | partial | partial | Semantic parsers, config modes, desktop runtime activation, and real PowerShell smoke exist; bash/zsh/fish, WSL, remote, macOS, and Linux validation remain open. |
 | tabs/panes | partial | partial | partial | partial | Local desktop tabs/splits are wired with per-pane terminal and PTY ownership; real cross-OS GUI smoke, startup layouts, and SSH panes remain open. |
 | command blocks | partial | partial | partial | partial | Semantic storage and basic overlays exist; real shell-driven UI verification remains open. |
-| cursor animations | partial | tested | partial | partial | Opt-in config, bounded cursor-region animation damage, desktop runtime wiring, and batched renderer quads exist; macOS/Linux visual smoke and full image cursor drawing remain open. |
+| cursor animations | partial | tested | partial | partial | Smooth/eased/effect animations and user GIF/PNG cursors use bounded local damage, off-thread decode, cached frames, and one GPU texture-array upload; macOS/Linux interactive visual smoke remains open. |
 | SSH | partial | partial | partial | partial | Secure transport backend, explicit trust/secret provider contracts, and `cargo xtask ssh-smoke` harness exist; native keychain UI/backend wiring and collected server reports remain open. |
 | config reload | partial | tested | partial | partial | Debounced TOML watcher and live applier exist; Windows unit/desktop tests pass, while macOS/Linux runtime validation remains open. |
 | notifications | not implemented yet | not implemented yet | not implemented yet | not implemented yet | Native notification surface has not been implemented. |

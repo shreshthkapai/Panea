@@ -4,7 +4,7 @@ use std::{
     error::Error,
     fs,
     panic::{AssertUnwindSafe, catch_unwind},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         mpsc::{self, Receiver, TryRecvError},
@@ -42,9 +42,9 @@ use render_core::{
     RenderScene, SelectionVisual,
 };
 use render_wgpu::{
-    AnimatedCursorImageCache, AnimatedCursorImageRequest, AnimatedCursorImageStatus,
-    CursorAnimationRuntime, CursorAnimationSettings, CursorBlinkRuntime, DamageTracker,
-    FrameDecision, FrameScheduler, GpuTerminalRenderer, PresentMode, RendererError,
+    AnimatedCursorImageCache, AnimatedCursorImageRequest, AnimatedCursorImageRuntime,
+    AnimatedCursorImageStatus, CursorAnimationRuntime, CursorAnimationSettings, CursorBlinkRuntime,
+    DamageTracker, FrameDecision, FrameScheduler, GpuTerminalRenderer, PresentMode, RendererError,
     RendererOptions,
 };
 use security::KeychainProvider;
@@ -437,6 +437,7 @@ struct LoadedDesktopConfig {
     config: AppConfig,
     diagnostics: Vec<ConfigDiagnostic>,
     source: String,
+    asset_base_dir: Option<PathBuf>,
     watcher: Option<DesktopConfigWatcher>,
 }
 
@@ -515,6 +516,7 @@ fn load_desktop_config() -> Result<LoadedDesktopConfig, Box<dyn Error>> {
                 config: loaded.config,
                 diagnostics: loaded.diagnostics,
                 source: format!("explicit:{}", path.display()),
+                asset_base_dir: path.parent().map(Path::to_path_buf),
                 watcher: Some(DesktopConfigWatcher::Programmable(
                     config_lua::ProgrammableConfigWatcher::new(path, platform),
                 )),
@@ -528,6 +530,9 @@ fn load_desktop_config() -> Result<LoadedDesktopConfig, Box<dyn Error>> {
         let loaded = config_toml::load(options.clone())?;
         return Ok(LoadedDesktopConfig {
             source: config_source_text(&loaded.source),
+            asset_base_dir: config_source_path(&loaded.source)
+                .and_then(Path::parent)
+                .map(Path::to_path_buf),
             config: loaded.config,
             diagnostics: loaded.diagnostics,
             watcher: Some(DesktopConfigWatcher::Toml(config_toml::ConfigWatcher::new(
@@ -547,6 +552,9 @@ fn load_desktop_config() -> Result<LoadedDesktopConfig, Box<dyn Error>> {
         let loaded = config_toml::load(options.clone())?;
         return Ok(LoadedDesktopConfig {
             source: config_source_text(&loaded.source),
+            asset_base_dir: config_source_path(&loaded.source)
+                .and_then(Path::parent)
+                .map(Path::to_path_buf),
             config: loaded.config,
             diagnostics: loaded.diagnostics,
             watcher: Some(DesktopConfigWatcher::Toml(config_toml::ConfigWatcher::new(
@@ -564,6 +572,7 @@ fn load_desktop_config() -> Result<LoadedDesktopConfig, Box<dyn Error>> {
             config: loaded.config,
             diagnostics: loaded.diagnostics,
             source: path.display().to_string(),
+            asset_base_dir: path.parent().map(Path::to_path_buf),
             watcher: Some(DesktopConfigWatcher::Programmable(
                 config_lua::ProgrammableConfigWatcher::new(path, platform),
             )),
@@ -577,6 +586,9 @@ fn load_desktop_config() -> Result<LoadedDesktopConfig, Box<dyn Error>> {
     let loaded = config_toml::load(options.clone())?;
     Ok(LoadedDesktopConfig {
         source: config_source_text(&loaded.source),
+        asset_base_dir: config_source_path(&loaded.source)
+            .and_then(Path::parent)
+            .map(Path::to_path_buf),
         config: loaded.config,
         diagnostics: loaded.diagnostics,
         watcher: Some(DesktopConfigWatcher::Toml(config_toml::ConfigWatcher::new(
@@ -621,6 +633,15 @@ fn config_source_text(source: &config_toml::ConfigSource) -> String {
         config_toml::ConfigSource::File(path) => path.display().to_string(),
         config_toml::ConfigSource::ExplicitFile(path) => {
             format!("explicit:{}", path.display())
+        }
+    }
+}
+
+fn config_source_path(source: &config_toml::ConfigSource) -> Option<&Path> {
+    match source {
+        config_toml::ConfigSource::Default => None,
+        config_toml::ConfigSource::File(path) | config_toml::ConfigSource::ExplicitFile(path) => {
+            Some(path)
         }
     }
 }
@@ -729,6 +750,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let loaded_config = load_desktop_config()?;
     log_config_diagnostics(&loaded_config.diagnostics);
     let mut config = loaded_config.config;
+    let cursor_asset_base_dir = loaded_config.asset_base_dir;
     let mut config_watcher = loaded_config.watcher;
     let _ssh_session_profiles: Vec<SshConnectionProfile> = config
         .ssh_profiles
@@ -770,8 +792,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut window_focused = true;
     let mut pointer_visible = true;
     let mut cursor_image_cache = AnimatedCursorImageCache::new();
+    let mut cursor_image_runtime = AnimatedCursorImageRuntime::new();
     let mut cursor_image_status_reported: Option<String> = None;
-    request_cursor_image_if_enabled(&mut cursor_image_cache, &config);
+    request_cursor_image_if_enabled(
+        &mut cursor_image_cache,
+        &config,
+        cursor_asset_base_dir.as_deref(),
+    );
     let mut surface_size = window.inner_size();
     let mut mux_runtime =
         MuxRuntime::new(&config, metrics, surface_size.width, surface_size.height);
@@ -790,6 +817,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         metrics,
                         &config,
                         Some(&mut cursor_animator),
+                        Some(&mut cursor_image_runtime),
                         CursorPresentation {
                             blink_visible: cursor_blink.visible(),
                             window_focused,
@@ -1229,6 +1257,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                                     request_cursor_image_if_enabled(
                                         &mut cursor_image_cache,
                                         &config,
+                                        cursor_asset_base_dir.as_deref(),
                                     );
                                     cursor_image_status_reported = None;
                                     if reloaded {
@@ -1268,6 +1297,10 @@ fn run() -> Result<(), Box<dyn Error>> {
 
                 match cursor_image_cache.poll() {
                     AnimatedCursorImageStatus::Ready(image) => {
+                        if cursor_image_runtime.set_image(&image) {
+                            scheduler.animation_changed();
+                            window.request_redraw();
+                        }
                         let key = format!("ready:{}", image.path.display());
                         if cursor_image_status_reported.as_deref() != Some(&key) {
                             for warning in image.warnings {
@@ -1277,14 +1310,23 @@ fn run() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     AnimatedCursorImageStatus::Failed { path, message } => {
+                        if cursor_image_runtime.clear() {
+                            scheduler.animation_changed();
+                            window.request_redraw();
+                        }
                         let key = format!("failed:{}:{message}", path.display());
                         if cursor_image_status_reported.as_deref() != Some(&key) {
                             eprintln!("cursor image {} failed: {message}", path.display());
                             cursor_image_status_reported = Some(key);
                         }
                     }
-                    AnimatedCursorImageStatus::Disabled
-                    | AnimatedCursorImageStatus::Loading { .. } => {}
+                    AnimatedCursorImageStatus::Disabled => {
+                        if cursor_image_runtime.clear() {
+                            scheduler.animation_changed();
+                            window.request_redraw();
+                        }
+                    }
+                    AnimatedCursorImageStatus::Loading { .. } => {}
                 }
 
                 let cursor_settings = cursor_animation_settings(&config);
@@ -1298,14 +1340,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                     scheduler.cursor_blink_changed();
                 }
                 let animation_delay = cursor_animator.next_frame_after(cursor_settings);
+                let cursor_image_delay = cursor_image_runtime.next_frame_after();
                 let blink_delay = cursor_blink.next_frame_after();
-                let next_delay = match (animation_delay, blink_delay) {
-                    (Some(animation), Some(blink)) => Some(animation.min(blink)),
-                    (Some(delay), None) | (None, Some(delay)) => Some(delay),
-                    (None, None) => None,
-                };
+                let next_delay = [animation_delay, cursor_image_delay, blink_delay]
+                    .into_iter()
+                    .flatten()
+                    .min();
                 if let Some(delay) = next_delay {
-                    if animation_delay.is_some() {
+                    if animation_delay.is_some() || cursor_image_delay.is_some() {
                         scheduler.animation_changed();
                     }
                     target.set_control_flow(ControlFlow::WaitUntil(Instant::now() + delay));
@@ -1461,22 +1503,57 @@ fn cursor_animation_settings(config: &AppConfig) -> CursorAnimationSettings {
         trail: config.cursor.trail,
         blink_easing: config.cursor.blink_easing,
         short_lived_glow: config.cursor.short_lived_glow,
+        shadow: config.cursor.shadow,
         fps,
+        max_active_animations: config.performance.max_active_animations,
+        max_animated_region_pixels: config.performance.max_animated_region_pixels,
     }
 }
 
-fn request_cursor_image_if_enabled(cache: &mut AnimatedCursorImageCache, config: &AppConfig) {
+fn request_cursor_image_if_enabled(
+    cache: &mut AnimatedCursorImageCache,
+    config: &AppConfig,
+    config_base_dir: Option<&Path>,
+) {
     if !config.cursor.image.enabled {
         cache.disable();
         return;
     }
 
+    let path = resolve_cursor_image_path(&config.cursor.image.path, config_base_dir);
     cache.request(AnimatedCursorImageRequest {
-        path: PathBuf::from(&config.cursor.image.path),
-        fps: config.cursor.image.fps,
+        path,
+        fps: config
+            .cursor
+            .image
+            .fps
+            .min(config.performance.max_animation_fps)
+            .max(1),
         max_size_kb: config.performance.max_cursor_asset_size_kb,
         warn_if_expensive: config.cursor.image.warn_if_expensive,
     });
+}
+
+fn resolve_cursor_image_path(configured: &str, config_base_dir: Option<&Path>) -> PathBuf {
+    let configured_path = expand_home_path(Path::new(configured));
+    if configured_path.is_relative() {
+        config_base_dir.map_or(configured_path.clone(), |base| base.join(&configured_path))
+    } else {
+        configured_path
+    }
+}
+
+fn expand_home_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let Some(relative) = text.strip_prefix("~/").or_else(|| text.strip_prefix("~\\")) else {
+        return path.to_path_buf();
+    };
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map_or_else(
+            || path.to_path_buf(),
+            |home| PathBuf::from(home).join(relative),
+        )
 }
 
 fn performance_budget(config: &AppConfig) -> PerformanceBudget {
@@ -4256,6 +4333,7 @@ fn scene_from_mux(
     metrics: Option<CellMetrics>,
     config: &AppConfig,
     cursor_animator: Option<&mut CursorAnimationRuntime>,
+    cursor_image_runtime: Option<&mut AnimatedCursorImageRuntime>,
     cursor: CursorPresentation,
 ) -> RenderScene {
     let mut scene = RenderScene {
@@ -4296,6 +4374,9 @@ fn scene_from_mux(
         append_pane_borders(&mut scene, runtime, tab_bar_rows, metrics, config);
         if let Some(cursor_animator) = cursor_animator {
             cursor_animator.populate_scene(&mut scene, metrics, cursor_animation_settings(config));
+        }
+        if let Some(cursor_image_runtime) = cursor_image_runtime {
+            cursor_image_runtime.populate_scene(&mut scene, metrics);
         }
     }
 
@@ -6742,6 +6823,20 @@ mod tests {
         assert_eq!(
             resolved_cursor_shape(&config, CursorShape::Block, &modes, false),
             RenderCursorShape::HollowBlock
+        );
+    }
+
+    #[test]
+    fn relative_cursor_assets_resolve_from_the_config_directory() {
+        let base = Path::new("portable-config");
+        assert_eq!(
+            resolve_cursor_image_path("assets/cursor.gif", Some(base)),
+            base.join("assets/cursor.gif")
+        );
+        let absolute = std::env::temp_dir().join("panea-cursor.png");
+        assert_eq!(
+            resolve_cursor_image_path(&absolute.to_string_lossy(), Some(base)),
+            absolute
         );
     }
 

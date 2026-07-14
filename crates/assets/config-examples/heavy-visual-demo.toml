@@ -19,6 +19,7 @@ typing_stretch = true
 trail = true
 blink_easing = true
 short_lived_glow = true
+shadow = true
 
 [cursor.image]
 enabled = false

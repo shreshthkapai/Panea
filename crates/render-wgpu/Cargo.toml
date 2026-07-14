@@ -11,6 +11,10 @@ workspace = true
 [dependencies]
 bytemuck.workspace = true
 font-system = { path = "../font-system" }
+image.workspace = true
 render-core = { path = "../render-core" }
 wgpu.workspace = true
 winit.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true

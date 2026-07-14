@@ -29,6 +29,10 @@ cargo xtask bench alternate-screen
 cargo xtask bench cursor-animation
 ```
 
+The cursor-animation benchmark also measures default and heavy decoded image
+cursor frame sets. Disabled mode allocates no image asset, creates no image
+quad, and schedules no animation frame.
+
 The harness reports elapsed time, byte throughput where applicable, frame
 timing, CPU render preparation time, glyph cache hits/misses, atlas uploads,
 damage region count, draw-call count, animated region count, idle wakeups, and

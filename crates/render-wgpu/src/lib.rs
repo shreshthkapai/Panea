@@ -6,6 +6,8 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     error::Error,
     fmt,
+    hash::{Hash, Hasher},
+    io::Cursor,
     path::PathBuf,
     sync::mpsc::{self, Receiver},
     sync::{Arc, Mutex},
@@ -18,12 +20,13 @@ use font_system::{
     CellMetrics, FontError, FontSystem, GlyphBitmap, GlyphBitmapFormat, GlyphCache, GlyphCacheKey,
     ShapedGlyph,
 };
+use image::{AnimationDecoder, ImageDecoder};
 use render_core::{
-    AnimationHandle, AnimationKind, CellPosition, CursorVisual, DamageRegion, FrameRequestReason,
-    GpuTimingStatus, OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle, RenderColor,
-    RenderCursorShape, RenderDecoration, RenderGrid, RenderInstrumentation, RenderRecoveryEvent,
-    RenderRecoveryReason, RenderRecoveryStatus, RenderRect, RenderScene, RenderSurfaceStatus,
-    SelectionVisual,
+    AnimationHandle, AnimationKind, CellPosition, CursorImageAsset, CursorImageFrame,
+    CursorImageVisual, CursorVisual, DamageRegion, FrameRequestReason, GpuTimingStatus,
+    OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle, RenderColor, RenderCursorShape,
+    RenderDecoration, RenderGrid, RenderInstrumentation, RenderRecoveryEvent, RenderRecoveryReason,
+    RenderRecoveryStatus, RenderRect, RenderScene, RenderSurfaceStatus, SelectionVisual,
 };
 use winit::window::Window;
 
@@ -256,6 +259,7 @@ impl GlyphAtlas {
 pub struct DamageTracker {
     previous_cells: HashMap<CellPosition, CellFingerprint>,
     previous_cursor: Option<CursorVisual>,
+    previous_cursor_image: Option<CursorImageVisual>,
     previous_size: Option<(u16, u16)>,
     previous_offset: render_core::RenderOffset,
     previous_visuals: Vec<DamageRegion>,
@@ -297,6 +301,7 @@ impl DamageTracker {
                 .map(|cell| (cell.position, CellFingerprint::from(cell)))
                 .collect();
             self.previous_cursor = scene.cursor;
+            self.previous_cursor_image = scene.cursor_image.clone();
             self.previous_visuals = visual_regions(scene, metrics);
             self.remember_visuals(scene);
             return vec![scene_grid_region(scene, metrics)];
@@ -363,6 +368,7 @@ impl DamageTracker {
             || self.previous_decorations != scene.decorations
             || self.previous_selections != scene.selections
             || self.previous_animations != scene.animations
+            || self.previous_cursor_image != scene.cursor_image
     }
 
     fn remember_visuals(&mut self, scene: &RenderScene) {
@@ -371,6 +377,7 @@ impl DamageTracker {
         self.previous_decorations = scene.decorations.clone();
         self.previous_selections = scene.selections.clone();
         self.previous_animations = scene.animations.clone();
+        self.previous_cursor_image = scene.cursor_image.clone();
     }
 }
 
@@ -393,6 +400,9 @@ fn visual_regions(scene: &RenderScene, metrics: CellMetrics) -> Vec<DamageRegion
                 .map(|animation| offset_region(animation.affected_region, scene.content_offset)),
         )
         .collect::<Vec<_>>();
+    if let Some(cursor_image) = &scene.cursor_image {
+        regions.push(offset_region(cursor_image.bounds, scene.content_offset));
+    }
     regions.extend(scene.selections.iter().flat_map(|selection| {
         selection
             .cells
@@ -636,7 +646,10 @@ pub struct CursorAnimationSettings {
     pub trail: bool,
     pub blink_easing: bool,
     pub short_lived_glow: bool,
+    pub shadow: bool,
     pub fps: u16,
+    pub max_active_animations: u16,
+    pub max_animated_region_pixels: u32,
 }
 
 impl Default for CursorAnimationSettings {
@@ -649,7 +662,10 @@ impl Default for CursorAnimationSettings {
             trail: false,
             blink_easing: false,
             short_lived_glow: false,
+            shadow: false,
             fps: 60,
+            max_active_animations: 8,
+            max_animated_region_pixels: 250_000,
         }
     }
 }
@@ -663,7 +679,10 @@ impl CursorAnimationSettings {
                 || self.typing_stretch
                 || self.trail
                 || self.blink_easing
-                || self.short_lived_glow)
+                || self.short_lived_glow
+                || self.shadow)
+            && self.max_active_animations > 0
+            && self.max_animated_region_pixels > 0
     }
 
     #[must_use]
@@ -680,6 +699,16 @@ pub struct CursorAnimationRuntime {
     next_id: u64,
     last_tick: Instant,
     typing_requested: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CursorAnimationSpec {
+    kind: AnimationKind,
+    affected_region: RenderRect,
+    start_region: RenderRect,
+    end_region: RenderRect,
+    color: RenderColor,
+    duration: Duration,
 }
 
 impl Default for CursorAnimationRuntime {
@@ -724,24 +753,36 @@ impl CursorAnimationRuntime {
 
         let current = scene.cursor;
         if let Some(cursor) = current {
-            let current_region = cursor_animation_region(cell_region(cursor.position, metrics));
+            let current_cell = cell_region(cursor.position, metrics);
+            let current_region = cursor_animation_region(current_cell);
             if let Some(previous) = self.previous_cursor
                 && previous.position != cursor.position
             {
-                let previous_region =
-                    cursor_animation_region(cell_region(previous.position, metrics));
+                let previous_cell = cell_region(previous.position, metrics);
                 if settings.smooth_movement {
                     self.push_animation(
-                        AnimationKind::CursorSmoothMovement,
-                        union_region(previous_region, current_region),
-                        Duration::from_millis(120),
+                        settings,
+                        CursorAnimationSpec {
+                            kind: AnimationKind::CursorSmoothMovement,
+                            affected_region: cursor_animation_region(previous_cell),
+                            start_region: previous_cell,
+                            end_region: current_cell,
+                            color: cursor.color,
+                            duration: Duration::from_millis(120),
+                        },
                     );
                 }
                 if settings.trail {
                     self.push_animation(
-                        AnimationKind::CursorTrail,
-                        union_region(previous_region, current_region),
-                        Duration::from_millis(180),
+                        settings,
+                        CursorAnimationSpec {
+                            kind: AnimationKind::CursorTrail,
+                            affected_region: cursor_animation_region(previous_cell),
+                            start_region: previous_cell,
+                            end_region: current_cell,
+                            color: cursor.color,
+                            duration: Duration::from_millis(180),
+                        },
                     );
                 }
             }
@@ -749,23 +790,54 @@ impl CursorAnimationRuntime {
             if self.typing_requested {
                 if settings.typing_pulse {
                     self.push_animation(
-                        AnimationKind::CursorTypingPulse,
-                        current_region,
-                        Duration::from_millis(140),
+                        settings,
+                        CursorAnimationSpec {
+                            kind: AnimationKind::CursorTypingPulse,
+                            affected_region: current_region,
+                            start_region: current_cell,
+                            end_region: current_cell,
+                            color: cursor.color,
+                            duration: Duration::from_millis(140),
+                        },
                     );
                 }
                 if settings.typing_stretch {
                     self.push_animation(
-                        AnimationKind::CursorTypingStretch,
-                        current_region,
-                        Duration::from_millis(100),
+                        settings,
+                        CursorAnimationSpec {
+                            kind: AnimationKind::CursorTypingStretch,
+                            affected_region: current_region,
+                            start_region: current_cell,
+                            end_region: current_cell,
+                            color: cursor.color,
+                            duration: Duration::from_millis(100),
+                        },
                     );
                 }
                 if settings.short_lived_glow {
                     self.push_animation(
-                        AnimationKind::CursorGlow,
-                        cursor_animation_region(current_region),
-                        Duration::from_millis(160),
+                        settings,
+                        CursorAnimationSpec {
+                            kind: AnimationKind::CursorGlow,
+                            affected_region: cursor_animation_region(current_region),
+                            start_region: current_cell,
+                            end_region: current_cell,
+                            color: cursor.color,
+                            duration: Duration::from_millis(160),
+                        },
+                    );
+                }
+                if settings.shadow {
+                    self.push_animation(
+                        settings,
+                        CursorAnimationSpec {
+                            kind: AnimationKind::CursorShadow,
+                            affected_region: cursor_animation_region(current_region),
+                            start_region: current_cell,
+                            end_region: current_cell,
+                            color: cursor.color,
+                            duration: Duration::from_millis(180),
+                        },
                     );
                 }
             }
@@ -776,9 +848,15 @@ impl CursorAnimationRuntime {
                     .is_some_and(|previous| previous.visible != cursor.visible)
             {
                 self.push_animation(
-                    AnimationKind::CursorBlinkEasing,
-                    current_region,
-                    settings.frame_interval().max(Duration::from_millis(16)),
+                    settings,
+                    CursorAnimationSpec {
+                        kind: AnimationKind::CursorBlinkEasing,
+                        affected_region: current_region,
+                        start_region: current_cell,
+                        end_region: current_cell,
+                        color: cursor.color,
+                        duration: Duration::from_millis(120),
+                    },
                 );
             }
         }
@@ -803,19 +881,35 @@ impl CursorAnimationRuntime {
         self.needs_frame().then(|| settings.frame_interval())
     }
 
-    fn push_animation(
-        &mut self,
-        kind: AnimationKind,
-        affected_region: RenderRect,
-        duration: Duration,
-    ) {
-        self.active.push(AnimationHandle {
+    fn push_animation(&mut self, settings: CursorAnimationSettings, spec: CursorAnimationSpec) {
+        let pixels = spec
+            .affected_region
+            .width
+            .saturating_mul(spec.affected_region.height);
+        if pixels > settings.max_animated_region_pixels {
+            return;
+        }
+        let animation = AnimationHandle {
             id: self.next_id,
-            kind,
-            affected_region,
+            kind: spec.kind,
+            affected_region: spec.affected_region,
+            start_region: spec.start_region,
+            end_region: spec.end_region,
+            color: spec.color,
             elapsed: Duration::ZERO,
-            remaining: Some(duration),
-        });
+            remaining: Some(spec.duration),
+        };
+        if let Some(existing) = self
+            .active
+            .iter_mut()
+            .find(|active| active.kind == spec.kind)
+        {
+            *existing = animation;
+        } else if self.active.len() < usize::from(settings.max_active_animations) {
+            self.active.push(animation);
+        } else {
+            return;
+        }
         self.next_id = self.next_id.saturating_add(1);
     }
 }
@@ -825,6 +919,17 @@ fn advance_animations(animations: &mut Vec<AnimationHandle>, elapsed: Duration) 
         animation.elapsed = animation.elapsed.saturating_add(elapsed);
         if let Some(remaining) = animation.remaining {
             animation.remaining = Some(remaining.checked_sub(elapsed).unwrap_or(Duration::ZERO));
+        }
+        if matches!(
+            animation.kind,
+            AnimationKind::CursorSmoothMovement | AnimationKind::CursorTrail
+        ) {
+            let progress = animation_progress(*animation);
+            animation.affected_region = cursor_animation_region(interpolate_region(
+                animation.start_region,
+                animation.end_region,
+                ease_out_cubic(progress),
+            ));
         }
     }
     animations.retain(|animation| animation.remaining != Some(Duration::ZERO));
@@ -874,6 +979,7 @@ pub struct DecodedCursorImage {
     pub fps: u16,
     pub size_kb: u32,
     pub warnings: Vec<String>,
+    pub asset: Arc<CursorImageAsset>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -950,7 +1056,130 @@ impl AnimatedCursorImageCache {
     }
 }
 
+#[derive(Debug)]
+pub struct AnimatedCursorImageRuntime {
+    image: Option<DecodedCursorImage>,
+    started_at: Instant,
+    visible_last_frame: bool,
+}
+
+impl Default for AnimatedCursorImageRuntime {
+    fn default() -> Self {
+        Self {
+            image: None,
+            started_at: Instant::now(),
+            visible_last_frame: false,
+        }
+    }
+}
+
+impl AnimatedCursorImageRuntime {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_image(&mut self, image: &DecodedCursorImage) -> bool {
+        if self
+            .image
+            .as_ref()
+            .is_some_and(|current| current.asset.id == image.asset.id && current.fps == image.fps)
+        {
+            return false;
+        }
+        self.image = Some(image.clone());
+        self.started_at = Instant::now();
+        true
+    }
+
+    pub fn clear(&mut self) -> bool {
+        let changed = self.image.take().is_some();
+        self.visible_last_frame = false;
+        changed
+    }
+
+    pub fn populate_scene(&mut self, scene: &mut RenderScene, metrics: CellMetrics) {
+        let (Some(image), Some(cursor)) = (&self.image, scene.cursor) else {
+            self.visible_last_frame = false;
+            scene.cursor_image = None;
+            return;
+        };
+        let blink = scene
+            .animations
+            .iter()
+            .find(|animation| animation.kind == AnimationKind::CursorBlinkEasing);
+        if !cursor.visible && blink.is_none() {
+            self.visible_last_frame = false;
+            scene.cursor_image = None;
+            return;
+        }
+
+        let elapsed = self.started_at.elapsed();
+        let frame_count = image.asset.frames.len().max(1);
+        let frame_index = if frame_count == 1 {
+            0
+        } else {
+            let frame_micros = 1_000_000u128 / u128::from(image.fps.max(1));
+            usize::try_from(elapsed.as_micros() / frame_micros).unwrap_or(usize::MAX) % frame_count
+        };
+        let cursor_region = scene
+            .animations
+            .iter()
+            .find(|animation| animation.kind == AnimationKind::CursorSmoothMovement)
+            .map_or_else(
+                || cell_region(cursor.position, metrics),
+                |animation| {
+                    interpolate_region(
+                        animation.start_region,
+                        animation.end_region,
+                        ease_out_cubic(animation_progress(*animation)),
+                    )
+                },
+            );
+        let opacity = blink.map_or(u8::MAX, |animation| {
+            let progress = animation_progress(*animation);
+            let alpha = if cursor.visible {
+                progress
+            } else {
+                1.0 - progress
+            };
+            (alpha.clamp(0.0, 1.0) * 255.0).round() as u8
+        });
+        scene.cursor_image = Some(CursorImageVisual {
+            asset: Arc::clone(&image.asset),
+            frame_index: u16::try_from(frame_index).unwrap_or(u16::MAX),
+            bounds: fit_cursor_image_bounds(cursor_region, image.width, image.height),
+            opacity,
+        });
+        self.visible_last_frame = true;
+    }
+
+    #[must_use]
+    pub fn next_frame_after(&self) -> Option<Duration> {
+        self.image.as_ref().and_then(|image| {
+            (self.visible_last_frame && image.asset.frames.len() > 1)
+                .then(|| Duration::from_micros(1_000_000 / u64::from(image.fps.max(1))))
+        })
+    }
+}
+
+fn fit_cursor_image_bounds(cell: RenderRect, image_width: u32, image_height: u32) -> RenderRect {
+    let scale = (cell.width as f32 / image_width.max(1) as f32)
+        .min(cell.height as f32 / image_height.max(1) as f32);
+    let width = (image_width as f32 * scale).round().max(1.0) as u32;
+    let height = (image_height as f32 * scale).round().max(1.0) as u32;
+    RenderRect {
+        x: cell.x + i32::try_from(cell.width.saturating_sub(width) / 2).unwrap_or(0),
+        y: cell.y + i32::try_from(cell.height.saturating_sub(height) / 2).unwrap_or(0),
+        width,
+        height,
+    }
+}
+
 fn decode_cursor_image_request(request: AnimatedCursorImageRequest) -> AnimatedCursorImageStatus {
+    const MAX_DIMENSION: u32 = 512;
+    const MAX_FRAMES: usize = 256;
+
     let path = request.path;
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -963,35 +1192,161 @@ fn decode_cursor_image_request(request: AnimatedCursorImageRequest) -> AnimatedC
     };
 
     let size_kb = u32::try_from(bytes.len().div_ceil(1024)).unwrap_or(u32::MAX);
-    let Some((width, height, frame_count)) = decode_cursor_image_header(&bytes) else {
+    if size_kb > request.max_size_kb {
         return AnimatedCursorImageStatus::Failed {
             path,
-            message: "cursor image must be GIF or PNG with a valid header".to_owned(),
+            message: format!(
+                "cursor image is {size_kb} KiB, above the configured {} KiB limit",
+                request.max_size_kb
+            ),
         };
+    }
+
+    let decoded_limit = usize::try_from(request.max_size_kb)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(1024)
+        .saturating_mul(16)
+        .clamp(4 * 1024 * 1024, 64 * 1024 * 1024);
+    let decoded = match decode_cursor_image_frames(&bytes, MAX_DIMENSION, MAX_FRAMES, decoded_limit)
+    {
+        Ok(decoded) => decoded,
+        Err(message) => return AnimatedCursorImageStatus::Failed { path, message },
     };
 
     let mut warnings = Vec::new();
-    if request.warn_if_expensive && size_kb > request.max_size_kb {
+    if request.warn_if_expensive
+        && size_kb > request.max_size_kb.saturating_mul(3).saturating_div(4)
+    {
         warnings.push(format!(
-            "cursor image {} KiB exceeds configured cap {} KiB",
+            "cursor image {} KiB is close to the configured {} KiB limit",
             size_kb, request.max_size_kb
         ));
     }
-    if request.warn_if_expensive && request.fps > 60 {
-        warnings.push(format!("cursor image FPS {} exceeds 60", request.fps));
+    if request.warn_if_expensive && request.fps > 30 {
+        warnings.push(format!(
+            "cursor image FPS {} exceeds the low-cost 30 FPS range",
+            request.fps
+        ));
     }
 
     AnimatedCursorImageStatus::Ready(DecodedCursorImage {
         path,
-        width,
-        height,
-        frame_count,
+        width: decoded.width,
+        height: decoded.height,
+        frame_count: u16::try_from(decoded.frames.len()).unwrap_or(u16::MAX),
         fps: request.fps,
         size_kb,
         warnings,
+        asset: Arc::new(CursorImageAsset {
+            id: cursor_image_asset_id(&bytes),
+            width: decoded.width,
+            height: decoded.height,
+            frames: decoded.frames.into(),
+        }),
     })
 }
 
+struct DecodedCursorFrames {
+    width: u32,
+    height: u32,
+    frames: Vec<CursorImageFrame>,
+}
+
+fn decode_cursor_image_frames(
+    bytes: &[u8],
+    max_dimension: u32,
+    max_frames: usize,
+    max_decoded_bytes: usize,
+) -> Result<DecodedCursorFrames, String> {
+    let format = image::guess_format(bytes)
+        .map_err(|_| "cursor image must be a valid GIF or PNG".to_owned())?;
+    match format {
+        image::ImageFormat::Gif => {
+            let decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))
+                .map_err(|error| format!("failed to decode GIF cursor: {error}"))?;
+            let (width, height) = decoder.dimensions();
+            validate_cursor_image_dimensions(width, height, max_dimension)?;
+            let mut frames = Vec::new();
+            let mut decoded_bytes = 0usize;
+            for frame in decoder.into_frames().take(max_frames.saturating_add(1)) {
+                if frames.len() == max_frames {
+                    return Err(format!("cursor GIF exceeds the {max_frames}-frame limit"));
+                }
+                let frame =
+                    frame.map_err(|error| format!("failed to decode GIF cursor frame: {error}"))?;
+                let buffer = frame.into_buffer();
+                if buffer.width() != width || buffer.height() != height {
+                    return Err("cursor GIF frames must use one canvas size".to_owned());
+                }
+                let pixels = buffer.into_raw();
+                decoded_bytes = decoded_bytes.saturating_add(pixels.len());
+                if decoded_bytes > max_decoded_bytes {
+                    return Err(format!(
+                        "decoded cursor frames exceed the {} KiB memory budget",
+                        max_decoded_bytes.div_ceil(1024)
+                    ));
+                }
+                frames.push(CursorImageFrame {
+                    pixels: pixels.into(),
+                });
+            }
+            if frames.is_empty() {
+                return Err("cursor GIF contains no frames".to_owned());
+            }
+            Ok(DecodedCursorFrames {
+                width,
+                height,
+                frames,
+            })
+        }
+        image::ImageFormat::Png => {
+            let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+                .map_err(|error| format!("failed to decode PNG cursor: {error}"))?
+                .to_rgba8();
+            let (width, height) = image.dimensions();
+            validate_cursor_image_dimensions(width, height, max_dimension)?;
+            let pixels = image.into_raw();
+            if pixels.len() > max_decoded_bytes {
+                return Err(format!(
+                    "decoded cursor image exceeds the {} KiB memory budget",
+                    max_decoded_bytes.div_ceil(1024)
+                ));
+            }
+            Ok(DecodedCursorFrames {
+                width,
+                height,
+                frames: vec![CursorImageFrame {
+                    pixels: pixels.into(),
+                }],
+            })
+        }
+        _ => Err("cursor image format is unsupported; use GIF or PNG".to_owned()),
+    }
+}
+
+fn validate_cursor_image_dimensions(
+    width: u32,
+    height: u32,
+    max_dimension: u32,
+) -> Result<(), String> {
+    if width == 0 || height == 0 {
+        return Err("cursor image dimensions must be non-zero".to_owned());
+    }
+    if width > max_dimension || height > max_dimension {
+        return Err(format!(
+            "cursor image dimensions {width}x{height} exceed the {max_dimension}px limit"
+        ));
+    }
+    Ok(())
+}
+
+fn cursor_image_asset_id(bytes: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[cfg(test)]
 fn decode_cursor_image_header(bytes: &[u8]) -> Option<(u32, u32, u16)> {
     if bytes.len() >= 10 && (&bytes[0..6] == b"GIF87a" || &bytes[0..6] == b"GIF89a") {
         let width = u16::from_le_bytes([bytes[6], bytes[7]]).into();
@@ -1089,6 +1444,8 @@ pub struct PreparedRenderBatches {
     pub decorations: QuadBatch,
     pub selections: QuadBatch,
     pub cursor: QuadBatch,
+    pub cursor_image: QuadBatch,
+    pub cursor_image_asset: Option<Arc<CursorImageAsset>>,
     pub atlas_uploads: Vec<AtlasUpload>,
     pub instrumentation: RenderInstrumentation,
 }
@@ -1103,6 +1460,7 @@ impl PreparedRenderBatches {
             !self.decorations.is_empty(),
             !self.selections.is_empty(),
             !self.cursor.is_empty(),
+            !self.cursor_image.is_empty(),
         ]
         .into_iter()
         .filter(|non_empty| *non_empty)
@@ -1185,6 +1543,7 @@ impl RenderBatchPlanner {
         let mut decorations = QuadBatch::new(QuadBatchKind::Decoration);
         let mut selections = QuadBatch::new(QuadBatchKind::Selection);
         let mut cursor = QuadBatch::new(QuadBatchKind::Cursor);
+        let mut cursor_image = QuadBatch::new(QuadBatchKind::Cursor);
         let mut atlas_uploads = Vec::new();
         let mut instrumentation = RenderInstrumentation {
             damage_region_count: damage_regions.len(),
@@ -1284,10 +1643,16 @@ impl RenderBatchPlanner {
             &scene.animations,
             &damage_regions,
             scene.content_offset,
+            scene.cursor_image.is_some(),
         );
 
         if let Some(cursor_visual) = scene.cursor
             && cursor_visual.visible
+            && scene.cursor_image.is_none()
+            && !scene
+                .animations
+                .iter()
+                .any(|animation| animation.kind == AnimationKind::CursorSmoothMovement)
         {
             push_cursor_quads(
                 &mut cursor,
@@ -1298,6 +1663,23 @@ impl RenderBatchPlanner {
             );
         }
 
+        let cursor_image_asset = scene.cursor_image.as_ref().and_then(|visual| {
+            let bounds = offset_region(visual.bounds, scene.content_offset);
+            if intersects_any(bounds, &damage_regions)
+                && usize::from(visual.frame_index) < visual.asset.frames.len()
+            {
+                push_cursor_image_quad(
+                    &mut cursor_image,
+                    bounds,
+                    visual.frame_index,
+                    visual.opacity,
+                );
+                Some(Arc::clone(&visual.asset))
+            } else {
+                None
+            }
+        });
+
         instrumentation.draw_call_count = count_non_empty_batches([
             !background.is_empty(),
             !glyphs.is_empty(),
@@ -1305,6 +1687,7 @@ impl RenderBatchPlanner {
             !decorations.is_empty(),
             !selections.is_empty(),
             !cursor.is_empty(),
+            !cursor_image.is_empty(),
         ]);
         instrumentation.glyphs.atlas_used_bytes = self.atlas.used_bytes();
         instrumentation.glyphs.atlas_capacity_bytes = self.atlas.capacity_bytes();
@@ -1321,6 +1704,8 @@ impl RenderBatchPlanner {
             decorations,
             selections,
             cursor,
+            cursor_image,
+            cursor_image_asset,
             atlas_uploads,
             instrumentation,
         })
@@ -1744,37 +2129,110 @@ fn push_animation_quads(
     animations: &[AnimationHandle],
     damage_regions: &[DamageRegion],
     offset: render_core::RenderOffset,
+    image_cursor_active: bool,
 ) {
     for animation in animations {
         let affected_region = offset_region(animation.affected_region, offset);
         if !intersects_any(affected_region, damage_regions) {
             continue;
         }
+        let start_region = offset_region(animation.start_region, offset);
+        let end_region = offset_region(animation.end_region, offset);
+        let progress = animation_progress(*animation);
         let color = animation_color(*animation);
         match animation.kind {
             AnimationKind::CursorTypingStretch => {
-                push_solid_quad(batch, stretch_region(affected_region), color);
+                push_rounded_quads(batch, stretch_region(end_region, progress), 2, color);
             }
-            AnimationKind::CursorTrail
-            | AnimationKind::CursorTypingPulse
-            | AnimationKind::CursorSmoothMovement
-            | AnimationKind::CursorBlinkEasing
-            | AnimationKind::CursorGlow
-            | AnimationKind::OverlayTransition => {
+            AnimationKind::CursorSmoothMovement => {
+                if !image_cursor_active {
+                    push_rounded_quads(
+                        batch,
+                        interpolate_region(start_region, end_region, ease_out_cubic(progress)),
+                        2,
+                        color,
+                    );
+                }
+            }
+            AnimationKind::CursorTrail => {
+                let trail = interpolate_region(start_region, end_region, progress * 0.75);
+                push_rounded_quads(batch, trail, 2, color);
+            }
+            AnimationKind::CursorTypingPulse => {
+                let expansion = ((1.0 - progress) * 4.0).round() as i32;
+                push_rounded_stroke_quads(batch, expand_region(end_region, expansion), 1, 3, color);
+            }
+            AnimationKind::CursorBlinkEasing => {
+                push_rounded_quads(batch, end_region, 2, color);
+            }
+            AnimationKind::CursorGlow => {
+                for expansion in [2, 4, 6] {
+                    let mut layer = color;
+                    layer.alpha /= expansion as u8;
+                    push_rounded_quads(batch, expand_region(end_region, expansion), 4, layer);
+                }
+            }
+            AnimationKind::CursorShadow => {
+                let mut shadow = end_region;
+                shadow.x = shadow.x.saturating_add(2);
+                shadow.y = shadow.y.saturating_add(2);
+                push_rounded_quads(batch, shadow, 2, color);
+            }
+            AnimationKind::OverlayTransition => {
                 push_solid_quad(batch, affected_region, color);
             }
         }
     }
 }
 
+fn push_cursor_image_quad(batch: &mut QuadBatch, rect: RenderRect, frame_index: u16, opacity: u8) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    let Ok(base) = u32::try_from(batch.vertices.len()) else {
+        return;
+    };
+    let x0 = rect.x as f32;
+    let y0 = rect.y as f32;
+    let x1 = rect.x as f32 + rect.width as f32;
+    let y1 = rect.y as f32 + rect.height as f32;
+    let metadata = [f32::from(frame_index), f32::from(opacity) / 255.0, 0.0, 0.0];
+    batch.vertices.extend([
+        BatchVertex {
+            position_px: [x0, y0],
+            uv: [0.0, 0.0],
+            color: metadata,
+        },
+        BatchVertex {
+            position_px: [x1, y0],
+            uv: [1.0, 0.0],
+            color: metadata,
+        },
+        BatchVertex {
+            position_px: [x1, y1],
+            uv: [1.0, 1.0],
+            color: metadata,
+        },
+        BatchVertex {
+            position_px: [x0, y1],
+            uv: [0.0, 1.0],
+            color: metadata,
+        },
+    ]);
+    batch
+        .indices
+        .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
 fn animation_color(animation: AnimationHandle) -> RenderColor {
     let base_alpha: u8 = match animation.kind {
-        AnimationKind::CursorSmoothMovement => 58,
-        AnimationKind::CursorTypingPulse => 78,
-        AnimationKind::CursorTypingStretch => 86,
-        AnimationKind::CursorTrail => 42,
-        AnimationKind::CursorBlinkEasing => 34,
-        AnimationKind::CursorGlow => 50,
+        AnimationKind::CursorSmoothMovement => 230,
+        AnimationKind::CursorTypingPulse => 120,
+        AnimationKind::CursorTypingStretch => 180,
+        AnimationKind::CursorTrail => 80,
+        AnimationKind::CursorBlinkEasing => 200,
+        AnimationKind::CursorGlow => 96,
+        AnimationKind::CursorShadow => 80,
         AnimationKind::OverlayTransition => 48,
     };
     let alpha = if let Some(remaining) = animation.remaining {
@@ -1788,19 +2246,52 @@ fn animation_color(animation: AnimationHandle) -> RenderColor {
     } else {
         base_alpha
     };
-    RenderColor {
-        red: 120,
-        green: 190,
-        blue: 255,
-        alpha,
+    let mut color = animation.color;
+    if animation.kind == AnimationKind::CursorShadow {
+        color.red = 0;
+        color.green = 0;
+        color.blue = 0;
+    }
+    color.alpha = ((u16::from(color.alpha) * u16::from(alpha)) / 255) as u8;
+    color
+}
+
+fn animation_progress(animation: AnimationHandle) -> f32 {
+    let Some(remaining) = animation.remaining else {
+        return 1.0;
+    };
+    let total = animation.elapsed.saturating_add(remaining).as_secs_f32();
+    if total <= f32::EPSILON {
+        1.0
+    } else {
+        (animation.elapsed.as_secs_f32() / total).clamp(0.0, 1.0)
     }
 }
 
-fn stretch_region(rect: RenderRect) -> RenderRect {
+fn ease_out_cubic(progress: f32) -> f32 {
+    1.0 - (1.0 - progress).powi(3)
+}
+
+fn interpolate_region(start: RenderRect, end: RenderRect, progress: f32) -> RenderRect {
+    let lerp = |a: f32, b: f32| a + ((b - a) * progress.clamp(0.0, 1.0));
     RenderRect {
-        x: rect.x - 2,
+        x: lerp(start.x as f32, end.x as f32).round() as i32,
+        y: lerp(start.y as f32, end.y as f32).round() as i32,
+        width: lerp(start.width as f32, end.width as f32).round().max(1.0) as u32,
+        height: lerp(start.height as f32, end.height as f32)
+            .round()
+            .max(1.0) as u32,
+    }
+}
+
+fn stretch_region(rect: RenderRect, progress: f32) -> RenderRect {
+    let expansion = ((1.0 - progress) * 4.0).round() as i32;
+    RenderRect {
+        x: rect.x - expansion,
         y: rect.y,
-        width: rect.width.saturating_add(4),
+        width: rect
+            .width
+            .saturating_add(u32::try_from(expansion.max(0) * 2).unwrap_or(0)),
         height: rect.height,
     }
 }
@@ -2084,6 +2575,7 @@ pub enum ScreenshotFixtureKind {
     CjkWide,
     Emoji,
     CursorStates,
+    CursorImage,
     SelectionStates,
     PromptDecorations,
     CommandBlocks,
@@ -2212,6 +2704,12 @@ pub fn screenshot_fixtures() -> Vec<ScreenshotFixture> {
             description: "block, beam, underline, hollow, and inactive cursor shapes",
             kind: ScreenshotFixtureKind::CursorStates,
             scene: cursor_states_scene(),
+        },
+        ScreenshotFixture {
+            name: "cursor-image",
+            description: "decoded custom image cursor composited as an overlay",
+            kind: ScreenshotFixtureKind::CursorImage,
+            scene: cursor_image_scene(),
         },
         ScreenshotFixture {
             name: "selection-states",
@@ -2538,6 +3036,41 @@ fn cursor_states_scene() -> RenderScene {
         cursor_decoration(2, 10, RenderCursorShape::Underline),
         cursor_decoration(3, 7, RenderCursorShape::HollowBlock),
     ];
+    scene
+}
+
+fn cursor_image_scene() -> RenderScene {
+    let mut scene = text_rows_scene(&[
+        "custom image cursor",
+        "RGBA overlay asset",
+        "raw cells unchanged",
+        "bounded GPU upload",
+    ]);
+    let pixels = [
+        255, 80, 90, 255, 255, 210, 80, 255, 70, 210, 255, 255, 255, 255, 255, 0, 255, 210, 80,
+        255, 70, 210, 255, 255, 255, 255, 255, 0, 255, 80, 90, 255, 70, 210, 255, 255, 255, 255,
+        255, 0, 255, 80, 90, 255, 255, 210, 80, 255, 255, 255, 255, 0, 255, 80, 90, 255, 255, 210,
+        80, 255, 70, 210, 255, 255,
+    ];
+    scene.cursor_image = Some(CursorImageVisual {
+        asset: Arc::new(CursorImageAsset {
+            id: 0xC0_55_0A,
+            width: 4,
+            height: 4,
+            frames: vec![CursorImageFrame {
+                pixels: pixels.to_vec().into(),
+            }]
+            .into(),
+        }),
+        frame_index: 0,
+        bounds: RenderRect {
+            x: 48,
+            y: 0,
+            width: 12,
+            height: 16,
+        },
+        opacity: 255,
+    });
     scene
 }
 
@@ -3013,7 +3546,9 @@ impl TerminalRasterizer {
             }
         }
 
-        if let Some(cursor) = scene.cursor {
+        if scene.cursor_image.is_none()
+            && let Some(cursor) = scene.cursor
+        {
             draw_cursor(&mut frame, cursor, metrics, scene.content_offset);
         }
 
@@ -3058,6 +3593,11 @@ impl TerminalRasterizer {
                 scene.content_offset,
                 &mut instrumentation,
             )?;
+        }
+
+        if let Some(cursor_image) = &scene.cursor_image {
+            draw_cursor_image(&mut frame, cursor_image, scene.content_offset);
+            instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
         }
 
         instrumentation.cpu_prepare_time = started.elapsed();
@@ -3320,6 +3860,7 @@ struct PersistentBatchBuffers {
     decorations: GpuBatchBuffers,
     selections: GpuBatchBuffers,
     cursor: GpuBatchBuffers,
+    cursor_image: GpuBatchBuffers,
 }
 
 fn fill_rect(frame: &mut CpuFrame, rect: RenderRect, color: RenderColor) {
@@ -3519,6 +4060,56 @@ fn blend_pixel(pixel: &mut [u8], color: RenderColor, alpha: u8) {
     pixel[3] = u8::MAX;
 }
 
+fn draw_cursor_image(
+    frame: &mut CpuFrame,
+    visual: &CursorImageVisual,
+    offset: render_core::RenderOffset,
+) {
+    let Some(source) = visual.asset.frames.get(usize::from(visual.frame_index)) else {
+        return;
+    };
+    let bounds = offset_region(visual.bounds, offset);
+    if bounds.width == 0 || bounds.height == 0 {
+        return;
+    }
+    for target_y in 0..bounds.height {
+        let source_y = target_y.saturating_mul(visual.asset.height) / bounds.height;
+        for target_x in 0..bounds.width {
+            let source_x = target_x.saturating_mul(visual.asset.width) / bounds.width;
+            let source_index = usize::try_from(
+                source_y
+                    .saturating_mul(visual.asset.width)
+                    .saturating_add(source_x)
+                    .saturating_mul(4),
+            )
+            .unwrap_or(usize::MAX);
+            let Some(pixel) = source
+                .pixels
+                .get(source_index..source_index.saturating_add(4))
+            else {
+                continue;
+            };
+            let x = bounds.x.saturating_add(target_x as i32);
+            let y = bounds.y.saturating_add(target_y as i32);
+            if x < 0 || y < 0 || x as u32 >= frame.width || y as u32 >= frame.height {
+                continue;
+            }
+            let target_index = ((y as u32 * frame.width + x as u32) * 4) as usize;
+            let alpha = ((u16::from(pixel[3]) * u16::from(visual.opacity)) / 255) as u8;
+            blend_pixel(
+                &mut frame.pixels[target_index..target_index + 4],
+                RenderColor {
+                    red: pixel[0],
+                    green: pixel[1],
+                    blue: pixel[2],
+                    alpha,
+                },
+                alpha,
+            );
+        }
+    }
+}
+
 fn draw_cursor(
     frame: &mut CpuFrame,
     cursor: CursorVisual,
@@ -3635,6 +4226,12 @@ struct GpuBackend {
     glyph_atlas_texture: Option<wgpu::Texture>,
     glyph_atlas_size: Option<(u32, u32)>,
     glyph_bind_group: Option<wgpu::BindGroup>,
+    cursor_image_pipeline: wgpu::RenderPipeline,
+    cursor_image_bind_group_layout: wgpu::BindGroupLayout,
+    cursor_image_sampler: wgpu::Sampler,
+    cursor_image_texture: Option<wgpu::Texture>,
+    cursor_image_asset_id: Option<u64>,
+    cursor_image_bind_group: Option<wgpu::BindGroup>,
     retained_frame: Option<wgpu::Texture>,
     retained_frame_size: Option<(u32, u32)>,
     retained_frame_initialized: bool,
@@ -3894,6 +4491,9 @@ impl GpuTerminalRenderer {
         batches.instrumentation.gpu_timing_status = backend.gpu_timing.timing_status();
         let gpu_started = Instant::now();
         backend.upload_atlas(&self.rasterizer, &batches);
+        if let Some(asset) = batches.cursor_image_asset.as_deref() {
+            backend.upload_cursor_image(asset);
+        }
         let result = backend.present_batches(&batches);
         batches.instrumentation.gpu_submit_time = Some(gpu_started.elapsed());
         batches.instrumentation.frame_time = frame_started.elapsed();
@@ -4182,6 +4782,50 @@ impl GpuBackend {
             min_filter: wgpu::FilterMode::Linear,
             ..wgpu::SamplerDescriptor::default()
         });
+        let cursor_image_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("panea-cursor-image-bind-group-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2Array,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let cursor_image_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("panea-cursor-image-pipeline-layout"),
+                bind_group_layouts: &[&cursor_image_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let cursor_image_pipeline = create_batch_pipeline(
+            &device,
+            &cursor_image_pipeline_layout,
+            &batch_shader,
+            format,
+            "panea-cursor-image-pipeline",
+            "fs_cursor_image",
+        );
+        let cursor_image_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("panea-cursor-image-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..wgpu::SamplerDescriptor::default()
+        });
         let gpu_timing = if options.gpu_timestamps {
             if gpu_timestamps_supported {
                 GpuTiming::enabled(&device, &queue)
@@ -4204,6 +4848,12 @@ impl GpuBackend {
             glyph_atlas_texture: None,
             glyph_atlas_size: None,
             glyph_bind_group: None,
+            cursor_image_pipeline,
+            cursor_image_bind_group_layout,
+            cursor_image_sampler,
+            cursor_image_texture: None,
+            cursor_image_asset_id: None,
+            cursor_image_bind_group: None,
             retained_frame: None,
             retained_frame_size: None,
             retained_frame_initialized: false,
@@ -4356,6 +5006,110 @@ impl GpuBackend {
         }
     }
 
+    fn upload_cursor_image(&mut self, asset: &CursorImageAsset) {
+        if self.cursor_image_asset_id == Some(asset.id) {
+            return;
+        }
+        let Ok(layer_count) = u32::try_from(asset.frames.len()) else {
+            return;
+        };
+        if asset.width == 0 || asset.height == 0 || layer_count == 0 {
+            return;
+        }
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("panea-cursor-image-array"),
+            size: wgpu::Extent3d {
+                width: asset.width,
+                height: asset.height,
+                depth_or_array_layers: layer_count,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let unpadded_row_bytes = asset.width.saturating_mul(4);
+        let padded_row_bytes = unpadded_row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        for (layer, frame) in asset.frames.iter().enumerate() {
+            let expected = usize::try_from(unpadded_row_bytes.saturating_mul(asset.height))
+                .unwrap_or(usize::MAX);
+            if frame.pixels.len() != expected {
+                return;
+            }
+            let mut upload = vec![
+                0;
+                usize::try_from(padded_row_bytes.saturating_mul(asset.height))
+                    .unwrap_or(0)
+            ];
+            for row in 0..asset.height {
+                let source_start =
+                    usize::try_from(row.saturating_mul(unpadded_row_bytes)).unwrap_or(usize::MAX);
+                let target_start =
+                    usize::try_from(row.saturating_mul(padded_row_bytes)).unwrap_or(usize::MAX);
+                let row_len = usize::try_from(unpadded_row_bytes).unwrap_or(0);
+                let (Some(source), Some(target)) = (
+                    frame
+                        .pixels
+                        .get(source_start..source_start.saturating_add(row_len)),
+                    upload.get_mut(target_start..target_start.saturating_add(row_len)),
+                ) else {
+                    return;
+                };
+                target.copy_from_slice(source);
+            }
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: u32::try_from(layer).unwrap_or(u32::MAX),
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &upload,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row_bytes),
+                    rows_per_image: Some(asset.height),
+                },
+                wgpu::Extent3d {
+                    width: asset.width,
+                    height: asset.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("panea-cursor-image-array-view"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            base_array_layer: 0,
+            array_layer_count: Some(layer_count),
+            ..wgpu::TextureViewDescriptor::default()
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("panea-cursor-image-bind-group"),
+            layout: &self.cursor_image_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.cursor_image_sampler),
+                },
+            ],
+        });
+        self.cursor_image_texture = Some(texture);
+        self.cursor_image_asset_id = Some(asset.id);
+        self.cursor_image_bind_group = Some(bind_group);
+    }
+
     fn present_batches(
         &mut self,
         batches: &PreparedRenderBatches,
@@ -4416,6 +5170,12 @@ impl GpuBackend {
             "cursor",
             &batches.cursor.vertices,
             &batches.cursor.indices,
+        );
+        self.batches.cursor_image.upload(
+            &upload_context,
+            "cursor-image",
+            &batches.cursor_image.vertices,
+            &batches.cursor_image.indices,
         );
         self.batches.glyphs.upload(
             &upload_context,
@@ -4484,6 +5244,14 @@ impl GpuBackend {
                 pass.set_pipeline(&self.glyph_pipeline);
                 pass.set_bind_group(0, glyph_bind_group, &[]);
                 draw_buffers(&mut pass, &self.batches.overlay_glyphs);
+            }
+            if self.cursor_image_asset_id
+                == batches.cursor_image_asset.as_ref().map(|asset| asset.id)
+                && let Some(cursor_image_bind_group) = &self.cursor_image_bind_group
+            {
+                pass.set_pipeline(&self.cursor_image_pipeline);
+                pass.set_bind_group(0, cursor_image_bind_group, &[]);
+                draw_buffers(&mut pass, &self.batches.cursor_image);
             }
         }
 
@@ -4638,6 +5406,16 @@ fn fs_glyph(in: VertexOut) -> @location(0) vec4<f32> {
     }
     return vec4<f32>(in.color.rgb, in.color.a * sample.a);
 }
+
+@group(0) @binding(2) var cursor_images: texture_2d_array<f32>;
+@group(0) @binding(3) var cursor_image_sampler: sampler;
+
+@fragment
+fn fs_cursor_image(in: VertexOut) -> @location(0) vec4<f32> {
+    let frame = i32(round(in.color.r));
+    let sample = textureSample(cursor_images, cursor_image_sampler, in.uv, frame);
+    return vec4<f32>(sample.rgb, sample.a * in.color.g);
+}
 "#;
 
 #[cfg(test)]
@@ -4660,6 +5438,75 @@ mod tests {
         assert_eq!(buffer_capacity(1), 256);
         assert_eq!(buffer_capacity(300), 512);
         assert_eq!(buffer_capacity(4096), 4096);
+    }
+
+    #[test]
+    fn cursor_image_shader_and_array_bindings_validate_on_available_adapter() {
+        let instance = wgpu::Instance::default();
+        let Some(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            }))
+        else {
+            return;
+        };
+        let Ok((device, _queue)) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("panea-cursor-image-test-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_defaults(),
+            },
+            None,
+        )) else {
+            return;
+        };
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("panea-cursor-image-test-shader"),
+            source: wgpu::ShaderSource::Wgsl(BATCH_SHADER.into()),
+        });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("panea-cursor-image-test-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("panea-cursor-image-test-pipeline-layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let _pipeline = create_batch_pipeline(
+            &device,
+            &layout,
+            &shader,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            "panea-cursor-image-test-pipeline",
+            "fs_cursor_image",
+        );
+        device.poll(wgpu::Maintain::Wait);
+        let error = pollster::block_on(device.pop_error_scope());
+        assert!(
+            error.is_none(),
+            "cursor image pipeline validation failed: {error:?}"
+        );
     }
 
     fn cell(row: i64, col: u16, text: &str) -> RenderCell {
@@ -5093,7 +5940,10 @@ mod tests {
             trail: true,
             blink_easing: false,
             short_lived_glow: true,
+            shadow: true,
             fps: 60,
+            max_active_animations: 8,
+            max_animated_region_pixels: 250_000,
         };
         let mut first = scene(vec![cell(0, 0, "a")]);
         runtime.populate_scene(&mut first, metrics(), settings);
@@ -5144,6 +5994,9 @@ mod tests {
             id: 1,
             kind: AnimationKind::CursorGlow,
             affected_region: region,
+            start_region: region,
+            end_region: region,
+            color: RenderColor::rgb(120, 190, 255),
             elapsed: Duration::from_millis(20),
             remaining: Some(Duration::from_millis(100)),
         }];
@@ -5173,6 +6026,181 @@ mod tests {
     }
 
     #[test]
+    fn animated_gif_frames_decode_to_cached_rgba_with_limits() {
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut encoded);
+            for color in [[255, 0, 0, 255], [0, 255, 0, 180]] {
+                let image = image::RgbaImage::from_pixel(2, 3, image::Rgba(color));
+                encoder
+                    .encode_frame(image::Frame::new(image))
+                    .expect("test GIF frame should encode");
+            }
+        }
+
+        let decoded =
+            decode_cursor_image_frames(&encoded, 32, 8, 4096).expect("test GIF should decode");
+        assert_eq!((decoded.width, decoded.height), (2, 3));
+        assert_eq!(decoded.frames.len(), 2);
+        assert_eq!(decoded.frames[0].pixels.len(), 24);
+        assert!(decode_cursor_image_frames(&encoded, 32, 1, 4096).is_err());
+        assert!(decode_cursor_image_frames(&encoded, 1, 8, 4096).is_err());
+    }
+
+    #[test]
+    fn static_png_cursor_decodes_as_one_frame() {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            3,
+            2,
+            image::Rgba([12, 34, 56, 200]),
+        ));
+        let mut encoded = Cursor::new(Vec::new());
+        image
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("test PNG should encode");
+
+        let decoded = decode_cursor_image_frames(encoded.get_ref(), 32, 8, 4096)
+            .expect("test PNG should decode");
+        assert_eq!((decoded.width, decoded.height), (3, 2));
+        assert_eq!(decoded.frames.len(), 1);
+        assert_eq!(decoded.frames[0].pixels[3], 200);
+    }
+
+    #[test]
+    fn image_cursor_is_one_batched_quad_and_suppresses_static_cursor() {
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let mut planner = RenderBatchPlanner::default();
+        let mut test_scene = scene(vec![cell(0, 0, "a")]);
+        let asset = test_cursor_image_asset(2);
+        test_scene.cursor_image = Some(CursorImageVisual {
+            asset: Arc::clone(&asset),
+            frame_index: 1,
+            bounds: RenderRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 16,
+            },
+            opacity: 220,
+        });
+
+        let batches = planner
+            .prepare_full(&test_scene, &mut fonts)
+            .expect("cursor image scene should prepare");
+        assert_eq!(batches.cursor.quad_count(), 0);
+        assert_eq!(batches.cursor_image.quad_count(), 1);
+        assert_eq!(
+            batches.cursor_image_asset.as_ref().map(|asset| asset.id),
+            Some(asset.id)
+        );
+    }
+
+    #[test]
+    fn image_cursor_frame_changes_damage_only_its_bounds() {
+        let asset = test_cursor_image_asset(2);
+        let bounds = RenderRect {
+            x: 8,
+            y: 16,
+            width: 8,
+            height: 16,
+        };
+        let mut first = scene(vec![cell(0, 0, "a")]);
+        first.cursor_image = Some(CursorImageVisual {
+            asset: Arc::clone(&asset),
+            frame_index: 0,
+            bounds,
+            opacity: 255,
+        });
+        let mut tracker = DamageTracker::new();
+        let _ = tracker.update(&first, metrics());
+
+        let mut second = first.clone();
+        second
+            .cursor_image
+            .as_mut()
+            .expect("cursor image")
+            .frame_index = 1;
+        let damage = tracker.update(&second, metrics());
+        assert_eq!(damage, vec![bounds]);
+    }
+
+    #[test]
+    fn image_cursor_runtime_schedules_only_visible_multiframe_assets() {
+        let asset = test_cursor_image_asset(2);
+        let image = DecodedCursorImage {
+            path: PathBuf::from("cursor.gif"),
+            width: 2,
+            height: 2,
+            frame_count: 2,
+            fps: 24,
+            size_kb: 1,
+            warnings: Vec::new(),
+            asset,
+        };
+        let mut runtime = AnimatedCursorImageRuntime::new();
+        runtime.set_image(&image);
+        let mut test_scene = scene(vec![cell(0, 0, "a")]);
+        runtime.populate_scene(&mut test_scene, metrics());
+        assert!(test_scene.cursor_image.is_some());
+        assert_eq!(
+            runtime.next_frame_after(),
+            Some(Duration::from_micros(1_000_000 / 24))
+        );
+
+        runtime.clear();
+        assert!(runtime.next_frame_after().is_none());
+    }
+
+    #[test]
+    fn cursor_animation_runtime_enforces_active_and_pixel_budgets() {
+        let mut runtime = CursorAnimationRuntime::new();
+        let settings = CursorAnimationSettings {
+            enabled: true,
+            smooth_movement: true,
+            typing_pulse: true,
+            typing_stretch: true,
+            max_active_animations: 1,
+            max_animated_region_pixels: 1024,
+            ..CursorAnimationSettings::default()
+        };
+        let mut first = scene(vec![cell(0, 0, "a")]);
+        runtime.populate_scene(&mut first, metrics(), settings);
+        let mut second = first.clone();
+        second.cursor.as_mut().expect("cursor").position = CellPosition { row: 1, col: 1 };
+        runtime.record_typing();
+        runtime.populate_scene(&mut second, metrics(), settings);
+        assert_eq!(second.animations.len(), 1);
+
+        let mut blocked = CursorAnimationRuntime::new();
+        let mut blocked_scene = scene(vec![cell(0, 0, "a")]);
+        blocked.record_typing();
+        blocked.populate_scene(
+            &mut blocked_scene,
+            metrics(),
+            CursorAnimationSettings {
+                max_animated_region_pixels: 1,
+                ..settings
+            },
+        );
+        assert!(blocked_scene.animations.is_empty());
+        assert!(blocked.next_frame_after(settings).is_none());
+    }
+
+    fn test_cursor_image_asset(frame_count: usize) -> Arc<CursorImageAsset> {
+        let frames = (0..frame_count)
+            .map(|index| CursorImageFrame {
+                pixels: [index as u8, 40, 80, 255].repeat(4).into(),
+            })
+            .collect::<Vec<_>>();
+        Arc::new(CursorImageAsset {
+            id: 42,
+            width: 2,
+            height: 2,
+            frames: frames.into(),
+        })
+    }
+
+    #[test]
     fn screenshot_fixtures_cover_required_categories() {
         let fixtures = screenshot_fixtures();
         let names = fixtures
@@ -5187,6 +6215,7 @@ mod tests {
             "cjk-wide",
             "emoji",
             "cursor-states",
+            "cursor-image",
             "selection-states",
             "prompt-decorations",
             "command-blocks",

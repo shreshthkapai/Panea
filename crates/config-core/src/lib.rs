@@ -281,6 +281,26 @@ impl AppConfig {
                 );
             }
         }
+        if self.cursor.animations_enabled {
+            let requested_effects = [
+                self.cursor.smooth_movement,
+                self.cursor.typing_pulse,
+                self.cursor.typing_stretch,
+                self.cursor.trail,
+                self.cursor.blink_easing,
+                self.cursor.short_lived_glow,
+                self.cursor.shadow,
+            ]
+            .into_iter()
+            .filter(|enabled| *enabled)
+            .count();
+            if requested_effects > usize::from(self.performance.max_active_animations) {
+                report.warning(
+                    "performance.max_active_animations",
+                    "cursor effect count exceeds the active animation budget; excess effects will be skipped",
+                );
+            }
+        }
 
         if self.scrollback.lines > 1_000_000 {
             report.warning(
@@ -799,10 +819,10 @@ impl AppConfig {
                 "animation FPS cap must be between 1 and 240",
             );
         }
-        if self.performance.max_cursor_asset_size_kb > 4096 {
+        if !(1..=4096).contains(&self.performance.max_cursor_asset_size_kb) {
             report.error(
                 "performance.max_cursor_asset_size_kb",
-                "cursor animation assets must be capped at 4096 KiB or less",
+                "cursor animation assets must be capped between 1 and 4096 KiB",
             );
         }
         if self.performance.max_active_animations > 256 {
@@ -1283,6 +1303,7 @@ pub struct CursorConfig {
     pub trail: bool,
     pub blink_easing: bool,
     pub short_lived_glow: bool,
+    pub shadow: bool,
     pub image: CursorImageConfig,
 }
 
@@ -1305,6 +1326,7 @@ impl Default for CursorConfig {
             trail: false,
             blink_easing: false,
             short_lived_glow: false,
+            shadow: false,
             image: CursorImageConfig::default(),
         }
     }
@@ -2320,6 +2342,7 @@ pub struct CursorConfigPatch {
     pub trail: Option<bool>,
     pub blink_easing: Option<bool>,
     pub short_lived_glow: Option<bool>,
+    pub shadow: Option<bool>,
     pub image: Option<CursorImageConfigPatch>,
 }
 
@@ -2345,6 +2368,7 @@ impl CursorConfigPatch {
         apply_opt(&mut config.trail, &self.trail);
         apply_opt(&mut config.blink_easing, &self.blink_easing);
         apply_opt(&mut config.short_lived_glow, &self.short_lived_glow);
+        apply_opt(&mut config.shadow, &self.shadow);
         if let Some(image) = &self.image {
             image.apply_to(&mut config.image);
         }
@@ -3009,6 +3033,49 @@ pub fn export_schema() -> ConfigSchema {
                         "cursor.animations_enabled",
                         "boolean",
                         default.cursor.animations_enabled,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "cursor.smooth_movement",
+                        "boolean",
+                        default.cursor.smooth_movement,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "cursor.typing_pulse",
+                        "boolean",
+                        default.cursor.typing_pulse,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "cursor.typing_stretch",
+                        "boolean",
+                        default.cursor.typing_stretch,
+                        true,
+                        false,
+                    ),
+                    field("cursor.trail", "boolean", default.cursor.trail, true, false),
+                    field(
+                        "cursor.blink_easing",
+                        "boolean",
+                        default.cursor.blink_easing,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "cursor.short_lived_glow",
+                        "boolean",
+                        default.cursor.short_lived_glow,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "cursor.shadow",
+                        "boolean",
+                        default.cursor.shadow,
                         true,
                         false,
                     ),
@@ -3709,6 +3776,13 @@ mod tests {
         assert!(report.diagnostics.iter().any(|diagnostic| {
             diagnostic.path == "cursor.image.fps"
                 && diagnostic.severity == ConfigDiagnosticSeverity::Warning
+        }));
+
+        config.performance.max_cursor_asset_size_kb = 0;
+        let report = config.validate();
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == "performance.max_cursor_asset_size_kb"
+                && diagnostic.severity == ConfigDiagnosticSeverity::Error
         }));
     }
 

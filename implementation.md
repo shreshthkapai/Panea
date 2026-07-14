@@ -363,8 +363,8 @@ to more visible features before the dependencies they rely on are hardened.
   block shapes with thickness, cell-relative rounded geometry, color, inactive
   styles, terminal-mode styles, terminal DECSCUSR requests, deterministic
   config-driven blink scheduling, and cursor-local retained-frame damage.
-  User-authored static geometry and full animated image frame rendering remain
-  explicitly deferred to the later custom/animated cursor pipeline.
+  User-authored vector geometry remains reserved; custom static PNG assets are
+  implemented through the image-cursor pipeline.
 - Phase 8 uses CPU-side timing plus WGPU submission wall-clock timing, and
   next-pass Phase 17 adds GPU timestamp status plumbing plus a developer
   in-window overlay. Real hardware timestamp validation, polished overlay UX,
@@ -393,12 +393,13 @@ to more visible features before the dependencies they rely on are hardened.
   renderer-only long-output collapse/expand. Projection is scrollback-aware,
   alternate-screen safe by default, damage-tracked, and batched. Real
   non-Windows shell-driven and cross-OS visual reports remain verification work.
-- Next-pass Phase 13 establishes opt-in cursor animation runtime wiring,
-  cursor-neighborhood damage regions, batched renderer animation quads,
-  `[cursor.image]` config, nonblocking GIF/PNG image metadata decode/cache, and
-  budget warnings. Full animated image pixel-frame decode/upload/draw,
-  polished visual tuning, and macOS/Linux X11/Linux Wayland visual smoke
-  verification remain deferred.
+- Steps 13 and 14 implement opt-in smooth movement, blink easing, typing
+  pulse/stretch, trail, glow, shadow, enforced animation budgets, static PNG
+  and animated GIF cursor assets, off-thread bounded RGBA decode, immutable
+  frame caching, one-time GPU texture-array upload, textured drawing, relative
+  config-path resolution, cursor-local damage, diagnostics, benchmarks, and
+  screenshot fixtures. macOS/Linux X11/Linux Wayland interactive visual smoke
+  remains verification work.
 - Next-pass Phase 14 adds `cargo xtask compat`, bounded real-process and
   real-PTY compatibility probes, fixture scripts, report generation under
   `target/compatibility`, and a manual app checklist. The required Windows

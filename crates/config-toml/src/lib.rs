@@ -780,6 +780,7 @@ fn known_paths() -> BTreeSet<&'static str> {
         "cursor.trail",
         "cursor.blink_easing",
         "cursor.short_lived_glow",
+        "cursor.shadow",
         "cursor.image",
         "cursor.image.enabled",
         "cursor.image.path",
@@ -1255,6 +1256,10 @@ mod tests {
                 "foundational-customization.toml",
                 include_str!("../../assets/config-examples/foundational-customization.toml"),
             ),
+            (
+                "custom-cursor.toml",
+                include_str!("../../assets/config-examples/custom-cursor.toml"),
+            ),
         ] {
             parse_str(contents, None, ConfigPlatform::Unknown)
                 .unwrap_or_else(|error| panic!("{name} should parse: {error}"));
@@ -1396,6 +1401,43 @@ mod tests {
         assert_eq!(loaded.config.window.title, "Recovered");
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn custom_cursor_animation_and_image_config_is_portable() {
+        let loaded = parse_str(
+            r#"
+            schema_version = 2
+
+            [cursor]
+            animations_enabled = true
+            smooth_movement = true
+            typing_pulse = true
+            typing_stretch = true
+            trail = true
+            blink_easing = true
+            short_lived_glow = true
+            shadow = true
+
+            [cursor.image]
+            enabled = true
+            path = "assets/cursor.gif"
+            fps = 24
+            warn_if_expensive = true
+            "#,
+            None,
+            ConfigPlatform::Windows,
+        )
+        .expect("portable cursor config should parse");
+
+        assert!(loaded.config.cursor.shadow);
+        assert!(loaded.config.cursor.image.enabled);
+        assert_eq!(loaded.config.cursor.image.path, "assets/cursor.gif");
+        assert!(
+            loaded.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            loaded.diagnostics
+        );
     }
 
     fn temp_config_path(name: &str) -> PathBuf {

@@ -2,7 +2,7 @@
 
 pub const LAYER: &str = "render performance";
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderColor {
@@ -76,6 +76,27 @@ pub struct CursorVisual {
 }
 
 pub type RenderCursor = CursorVisual;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorImageFrame {
+    pub pixels: Arc<[u8]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorImageAsset {
+    pub id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub frames: Arc<[CursorImageFrame]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorImageVisual {
+    pub asset: Arc<CursorImageAsset>,
+    pub frame_index: u16,
+    pub bounds: RenderRect,
+    pub opacity: u8,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderRect {
@@ -162,6 +183,7 @@ pub enum AnimationKind {
     CursorTrail,
     CursorBlinkEasing,
     CursorGlow,
+    CursorShadow,
     OverlayTransition,
 }
 
@@ -170,6 +192,9 @@ pub struct AnimationHandle {
     pub id: u64,
     pub kind: AnimationKind,
     pub affected_region: RenderRect,
+    pub start_region: RenderRect,
+    pub end_region: RenderRect,
+    pub color: RenderColor,
     pub elapsed: Duration,
     pub remaining: Option<Duration>,
 }
@@ -293,6 +318,7 @@ pub struct RenderScene {
     /// padding are resolved before reaching the renderer.
     pub content_offset: RenderOffset,
     pub cursor: Option<CursorVisual>,
+    pub cursor_image: Option<CursorImageVisual>,
     pub selections: Vec<SelectionVisual>,
     pub search_highlights: Vec<OverlayPrimitive>,
     pub semantic_overlays: Vec<OverlayPrimitive>,

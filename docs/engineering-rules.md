@@ -60,8 +60,7 @@ The remaining high-level work is:
   hardening remain.
 - Real non-Windows shell-driven command-block verification and cross-OS visual
   overlay smoke coverage. Collapse/expand and raw copy actions are implemented.
-- Full animated image cursor pixel-frame decode/upload/draw path and cross-OS
-  cursor animation visual smoke coverage.
+- Cross-OS cursor animation and image-cursor visual smoke coverage.
 - Desktop SSH trust/secret UI, native OS keychain backend wiring, and real
   provider verification.
 - Collected real SSH server smoke reports across Windows, macOS, Linux X11,

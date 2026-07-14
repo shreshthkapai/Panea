@@ -2,6 +2,7 @@ use std::{
     env,
     error::Error,
     process::ExitCode,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -11,9 +12,10 @@ use diagnostics::{
 };
 use font_system::{FontConfig, FontSystem};
 use render_core::{
-    AnimationHandle, AnimationKind, CellPosition, CursorVisual, FeatureCostSample, OptionalFeature,
-    OptionalFeatureCostMode, OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle,
-    RenderColor, RenderCursorShape, RenderGrid, RenderInstrumentation, RenderRect, RenderScene,
+    AnimationHandle, AnimationKind, CellPosition, CursorImageAsset, CursorImageFrame,
+    CursorImageVisual, CursorVisual, FeatureCostSample, OptionalFeature, OptionalFeatureCostMode,
+    OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle, RenderColor, RenderCursorShape,
+    RenderGrid, RenderInstrumentation, RenderRect, RenderScene,
 };
 use render_wgpu::TerminalRasterizer;
 use term_core::{
@@ -339,9 +341,67 @@ fn cursor_animation_cost() -> Result<(), Box<dyn Error>> {
             instrumentation.draw_call_count,
             report.passed
         );
+
+        let (frame_count, dimension) = match mode {
+            OptionalFeatureCostMode::EnabledDefault => (24, 16),
+            OptionalFeatureCostMode::EnabledHeavy => (120, 64),
+            OptionalFeatureCostMode::Disabled => unreachable!(),
+        };
+        let mut image_scene = generated_scene(DEFAULT_COLS, DEFAULT_ROWS, mode);
+        let asset = benchmark_cursor_image_asset(frame_count, dimension);
+        image_scene.cursor_image = Some(CursorImageVisual {
+            asset: Arc::clone(&asset),
+            frame_index: u16::try_from(frame_count - 1).unwrap_or(u16::MAX),
+            bounds: RenderRect {
+                x: 32,
+                y: 32,
+                width: 16,
+                height: 24,
+            },
+            opacity: 255,
+        });
+        image_scene.damage_regions = vec![RenderRect {
+            x: 32,
+            y: 32,
+            width: 16,
+            height: 24,
+        }];
+        let batches = rasterizer.prepare_batches(&image_scene, &mut fonts)?;
+        let decoded_bytes = asset
+            .frames
+            .iter()
+            .map(|frame| frame.pixels.len())
+            .sum::<usize>();
+        println!(
+            "feature=image-cursor mode={mode:?} frames={frame_count} decoded_bytes={decoded_bytes} quads={} draw_calls={}",
+            batches.cursor_image.quad_count(),
+            batches.draw_call_count()
+        );
     }
 
     Ok(())
+}
+
+fn benchmark_cursor_image_asset(frame_count: usize, dimension: u32) -> Arc<CursorImageAsset> {
+    let pixels_per_frame =
+        usize::try_from(dimension.saturating_mul(dimension).saturating_mul(4)).unwrap_or(0);
+    let frames = (0..frame_count)
+        .map(|index| {
+            let mut pixels = vec![0; pixels_per_frame];
+            for pixel in pixels.chunks_exact_mut(4) {
+                pixel.copy_from_slice(&[40, (index % 255) as u8, 220, 220]);
+            }
+            CursorImageFrame {
+                pixels: pixels.into(),
+            }
+        })
+        .collect::<Vec<_>>();
+    Arc::new(CursorImageAsset {
+        id: u64::try_from(frame_count).unwrap_or(u64::MAX),
+        width: dimension,
+        height: dimension,
+        frames: frames.into(),
+    })
 }
 
 fn render_many_panes() -> Result<(), Box<dyn Error>> {
@@ -523,15 +583,19 @@ fn unicode_scene(cols: u16, rows: u16, emoji_heavy: bool) -> RenderScene {
 }
 
 fn animation(id: u64, x: i32, y: i32) -> AnimationHandle {
+    let region = RenderRect {
+        x,
+        y,
+        width: 24,
+        height: 24,
+    };
     AnimationHandle {
         id,
         kind: AnimationKind::CursorTypingPulse,
-        affected_region: RenderRect {
-            x,
-            y,
-            width: 24,
-            height: 24,
-        },
+        affected_region: region,
+        start_region: region,
+        end_region: region,
+        color: RenderColor::rgb(120, 190, 255),
         elapsed: Duration::from_millis(16),
         remaining: Some(Duration::from_millis(120)),
     }

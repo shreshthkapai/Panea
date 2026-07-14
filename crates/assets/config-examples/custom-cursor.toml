@@ -1,0 +1,26 @@
+schema_version = 2
+
+[cursor]
+animations_enabled = true
+smooth_movement = true
+typing_pulse = true
+typing_stretch = false
+trail = true
+blink_easing = true
+short_lived_glow = true
+shadow = true
+
+# Relative paths resolve from the directory containing this config file.
+# Use a GIF for animation or a PNG for a custom static image cursor.
+[cursor.image]
+enabled = false
+path = "assets/my-cursor.gif"
+fps = 24
+warn_if_expensive = true
+
+[performance]
+max_animation_fps = 60
+max_cursor_asset_size_kb = 256
+max_active_animations = 8
+max_animated_region_pixels = 250000
+expensive_effect_warnings = true

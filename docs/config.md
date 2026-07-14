@@ -225,6 +225,7 @@ typing_stretch = false
 trail = false
 blink_easing = false
 short_lived_glow = false
+shadow = false
 
 [cursor.image]
 enabled = false
@@ -262,6 +263,12 @@ block_margin_px = 3
 block_padding_px = 6
 badge_gap_px = 4
 ```
+
+`cursor.image.path` accepts GIF animation or a static PNG. Relative paths are
+resolved from the config file directory; `~/...` uses the current platform home
+directory. Image cursors are opt-in, decoded off the render thread, and bounded
+by the performance cursor-asset and animation budgets. See
+`crates/assets/config-examples/custom-cursor.toml`.
 
 Command block styles are `traditional`, `subtle`, `card`, `split`,
 `minimal_header`, and `custom_theme`. `Ctrl+Shift+G` toggles collapse for the
