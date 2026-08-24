@@ -475,18 +475,44 @@ fn run_headless_shell_smoke(config: &AppConfig, timeout: Duration) -> ShellSmoke
     let deadline = Instant::now() + timeout;
     let mut output = Vec::new();
     let mut saw_marker = false;
+    let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(80, 24));
 
     while Instant::now() < deadline {
         match transport.poll_output() {
             Ok(poll) => {
-                if poll
-                    .bytes
-                    .windows(b"\x1b[6n".len())
-                    .any(|window| window == b"\x1b[6n")
+                output.extend_from_slice(&poll.bytes);
+                let responses = match terminal_responses_for_shell_smoke(&mut terminal, &poll.bytes)
                 {
-                    let _ = transport.write_input(b"\x1b[1;1R");
+                    Ok(responses) => responses,
+                    Err(error) => {
+                        let diagnostics = format_local_pty_diagnostics(&transport.diagnostics());
+                        let _ = transport.shutdown();
+                        return ShellSmokeResult {
+                            passed: false,
+                            duration: started.elapsed(),
+                            marker_observed: saw_marker,
+                            bytes_received: output.len(),
+                            preview: preview_smoke_bytes(&output),
+                            detail: format!("terminal parser failed: {error}"),
+                            diagnostics: vec![diagnostics],
+                        };
+                    }
+                };
+                if !responses.is_empty()
+                    && let Err(error) = transport.write_input(&responses)
+                {
+                    let diagnostics = format_local_pty_diagnostics(&transport.diagnostics());
+                    let _ = transport.shutdown();
+                    return ShellSmokeResult {
+                        passed: false,
+                        duration: started.elapsed(),
+                        marker_observed: saw_marker,
+                        bytes_received: output.len(),
+                        preview: preview_smoke_bytes(&output),
+                        detail: format!("failed to write terminal response: {error}"),
+                        diagnostics: vec![diagnostics],
+                    };
                 }
-                output.extend(poll.bytes);
                 saw_marker =
                     saw_marker || output.windows(marker.len()).any(|window| window == marker);
                 let closed =
@@ -542,6 +568,16 @@ fn run_headless_shell_smoke(config: &AppConfig, timeout: Duration) -> ShellSmoke
         },
         diagnostics,
     }
+}
+
+fn terminal_responses_for_shell_smoke(
+    terminal: &mut TerminalEmulator,
+    bytes: &[u8],
+) -> Result<Vec<u8>, String> {
+    terminal
+        .apply_bytes(bytes)
+        .map_err(|error| error.to_string())?;
+    Ok(terminal.state_mut().take_pending_output())
 }
 
 fn shell_smoke_profile(config: &AppConfig) -> LocalShellProfile {
@@ -9015,6 +9051,20 @@ mod tests {
 
         assert_eq!(sink.writes, vec![b"\x1b[4;8R".to_vec(), b"typed".to_vec()]);
         assert!(terminal.state().pending_output().is_empty());
+    }
+
+    #[test]
+    fn shell_smoke_parser_reassembles_split_terminal_queries() {
+        let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(80, 24));
+
+        assert_eq!(
+            terminal_responses_for_shell_smoke(&mut terminal, b"\x1b[").unwrap(),
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            terminal_responses_for_shell_smoke(&mut terminal, b"6n").unwrap(),
+            b"\x1b[1;1R"
+        );
     }
 
     #[test]
