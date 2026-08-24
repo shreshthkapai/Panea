@@ -1,7 +1,6 @@
 use std::time::{Duration, Instant};
 
 const MAX_PROGRESS: u16 = u16::MAX;
-const DOUBLE_CLICK_DISTANCE: f64 = 4.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChromePhase {
@@ -26,7 +25,6 @@ pub enum ChromeControl {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChromeIntent {
-    BeginDrag,
     Minimize,
     LeaveFullscreen,
     Close,
@@ -80,7 +78,6 @@ pub struct ChromeSettings {
     pub motion: ChromeMotion,
     pub transition_duration: Duration,
     pub hide_delay: Duration,
-    pub double_click_interval: Duration,
     pub frame_interval: Duration,
 }
 
@@ -90,12 +87,6 @@ struct Transition {
     from: u16,
     to: u16,
     next_frame: Instant,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Click {
-    point: ChromePoint,
-    at: Instant,
 }
 
 #[derive(Debug)]
@@ -109,7 +100,6 @@ pub struct FullscreenChromeController {
     hovered_control: Option<ChromeControl>,
     captured_control: Option<ChromeControl>,
     hide_deadline: Option<Instant>,
-    last_click: Option<Click>,
 }
 
 impl FullscreenChromeController {
@@ -125,7 +115,6 @@ impl FullscreenChromeController {
             hovered_control: None,
             captured_control: None,
             hide_deadline: None,
-            last_click: None,
         }
     }
 
@@ -255,27 +244,10 @@ impl FullscreenChromeController {
                 };
             }
             if self.contains_visible_chrome(input.point) {
-                let is_double_click = self.last_click.is_some_and(|last| {
-                    input.now.saturating_duration_since(last.at)
-                        <= self.settings.double_click_interval
-                        && points_are_near(last.point, input.point)
-                });
-                self.last_click = if is_double_click {
-                    None
-                } else {
-                    Some(Click {
-                        point: input.point,
-                        at: input.now,
-                    })
-                };
                 return ChromeUpdate {
                     consumed: true,
                     redraw: false,
-                    intent: Some(if is_double_click {
-                        ChromeIntent::LeaveFullscreen
-                    } else {
-                        ChromeIntent::BeginDrag
-                    }),
+                    intent: None,
                 };
             }
             return ChromeUpdate::idle();
@@ -376,7 +348,6 @@ impl FullscreenChromeController {
         self.progress = 0;
         self.transition = None;
         self.hide_deadline = None;
-        self.last_click = None;
         self.clear_interaction();
         ChromeUpdate {
             consumed: false,
@@ -479,11 +450,6 @@ impl FullscreenChromeController {
     }
 }
 
-fn points_are_near(left: ChromePoint, right: ChromePoint) -> bool {
-    (left.x - right.x).abs() <= DOUBLE_CLICK_DISTANCE
-        && (left.y - right.y).abs() <= DOUBLE_CLICK_DISTANCE
-}
-
 const fn intent_for_control(control: ChromeControl) -> ChromeIntent {
     match control {
         ChromeControl::Minimize => ChromeIntent::Minimize,
@@ -526,7 +492,6 @@ mod tests {
             motion,
             transition_duration: REVEAL_DURATION,
             hide_delay: HIDE_DELAY,
-            double_click_interval: Duration::from_millis(400),
             frame_interval: Duration::from_millis(8),
         })
     }
@@ -702,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_chrome_non_control_press_begins_drag() {
+    fn fullscreen_chrome_non_control_press_is_consumed_without_window_action() {
         let now = Instant::now();
         let mut chrome = controller(ChromeMotion::Instant);
         reveal(&mut chrome, now);
@@ -714,11 +679,11 @@ mod tests {
         });
 
         assert!(update.consumed);
-        assert_eq!(update.intent, Some(ChromeIntent::BeginDrag));
+        assert_eq!(update.intent, None);
     }
 
     #[test]
-    fn fullscreen_chrome_double_click_non_control_leaves_fullscreen() {
+    fn fullscreen_chrome_double_click_non_control_does_not_change_window_mode() {
         let now = Instant::now();
         let mut chrome = controller(ChromeMotion::Instant);
         reveal(&mut chrome, now);
@@ -739,8 +704,8 @@ mod tests {
             now: now + Duration::from_millis(200),
         });
 
-        assert_eq!(first.intent, Some(ChromeIntent::BeginDrag));
-        assert_eq!(second.intent, Some(ChromeIntent::LeaveFullscreen));
+        assert_eq!(first.intent, None);
+        assert_eq!(second.intent, None);
     }
 
     #[test]

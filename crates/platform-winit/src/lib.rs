@@ -1044,7 +1044,9 @@ pub fn apply_window_mode_with_decoration(
         }
         WindowMode::BorderlessFullscreen => {
             window.set_maximized(false);
-            window.set_decorations(false);
+            // Borderless fullscreen already suppresses native decorations.
+            // Preserve the windowed decoration state so leaving fullscreen is
+            // one mode transition instead of an intermediate frameless window.
             window.set_fullscreen(Some(Fullscreen::Borderless(window.current_monitor())));
         }
         WindowMode::FramelessWindowed => {

@@ -1797,6 +1797,21 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                     window.request_redraw();
                                 }
                                 if let Some(action) = chrome_route.action {
+                                    if matches!(action, WindowChromeAction::LeaveFullscreen) {
+                                        current_window_mode = apply_window_mode_logged(
+                                            &window,
+                                            WindowMode::Windowed,
+                                            decoration_mode,
+                                        );
+                                        let update = fullscreen_chrome.set_active(false);
+                                        fullscreen_chrome_instrumentation.set_active(false);
+                                        if update.redraw {
+                                            scheduler.animation_changed();
+                                            window.request_redraw();
+                                        }
+                                        continue;
+                                    }
+
                                     let diagnostic = apply_window_chrome_action(&window, action);
                                     if let Some(fallback) = diagnostic.fallback.as_ref() {
                                         eprintln!(
@@ -1809,25 +1824,13 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                     }
                                     if diagnostic.applied {
                                         match action {
-                                            WindowChromeAction::LeaveFullscreen => {
-                                                current_window_mode = apply_window_mode_logged(
-                                                    &window,
-                                                    WindowMode::Windowed,
-                                                    decoration_mode,
-                                                );
-                                                let update = fullscreen_chrome.set_active(false);
-                                                fullscreen_chrome_instrumentation.set_active(false);
-                                                if update.redraw {
-                                                    scheduler.animation_changed();
-                                                    window.request_redraw();
-                                                }
-                                            }
                                             WindowChromeAction::Close => {
                                                 mux_runtime.shutdown_all();
                                                 target.exit();
                                             }
                                             WindowChromeAction::BeginDrag
-                                            | WindowChromeAction::Minimize => {}
+                                            | WindowChromeAction::Minimize
+                                            | WindowChromeAction::LeaveFullscreen => {}
                                         }
                                     }
                                 }
@@ -2565,7 +2568,6 @@ fn route_fullscreen_chrome_mouse(
 
 const fn window_chrome_action_for_intent(intent: ChromeIntent) -> WindowChromeAction {
     match intent {
-        ChromeIntent::BeginDrag => WindowChromeAction::BeginDrag,
         ChromeIntent::Minimize => WindowChromeAction::Minimize,
         ChromeIntent::LeaveFullscreen => WindowChromeAction::LeaveFullscreen,
         ChromeIntent::Close => WindowChromeAction::Close,
@@ -2621,7 +2623,6 @@ fn fullscreen_chrome_settings(
         motion,
         transition_duration: Duration::from_millis(u64::from(configured.animation_duration_ms)),
         hide_delay: Duration::from_millis(u64::from(configured.hide_delay_ms)),
-        double_click_interval: Duration::from_millis(500),
         frame_interval: Duration::from_nanos(1_000_000_000u64 / u64::from(fps)),
     }
 }
@@ -11050,7 +11051,6 @@ mod tests {
             motion,
             transition_duration: Duration::from_millis(120),
             hide_delay: Duration::from_millis(120),
-            double_click_interval: Duration::from_millis(400),
             frame_interval: Duration::from_millis(16),
         })
     }
