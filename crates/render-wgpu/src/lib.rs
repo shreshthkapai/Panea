@@ -32,16 +32,41 @@ use render_core::{
 use serde::Deserialize;
 use winit::window::Window;
 
-// Retained damage is correctness-gated. The current texture-retention path can
-// present stale or displaced glyphs across interactive frames on WGPU/DX12.
-// Keep production rendering full-frame and batched until a GPU frame-sequence
-// test proves retention on every supported backend.
-const RETAINED_DAMAGE_PRESENTATION_ENABLED: bool = false;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresentMode {
     Vsync,
     Immediate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetainedDamageStatus {
+    Enabled,
+    DisabledByConfig,
+    Unsupported { reason: String },
+    Unverified { reason: String },
+}
+
+impl fmt::Display for RetainedDamageStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Enabled => formatter.write_str("enabled"),
+            Self::DisabledByConfig => formatter.write_str("disabled by configuration"),
+            Self::Unsupported { reason } => write!(formatter, "unsupported: {reason}"),
+            Self::Unverified { reason } => write!(formatter, "unverified: {reason}"),
+        }
+    }
+}
+
+fn retained_damage_status(requested: bool, surface_copy_supported: bool) -> RetainedDamageStatus {
+    if !requested {
+        RetainedDamageStatus::DisabledByConfig
+    } else if surface_copy_supported {
+        RetainedDamageStatus::Enabled
+    } else {
+        RetainedDamageStatus::Unsupported {
+            reason: "the active WGPU surface cannot receive the retained frame texture".to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4307,6 +4332,7 @@ fn buffer_capacity(required: u64) -> u64 {
 
 #[derive(Debug, Default)]
 struct PersistentBatchBuffers {
+    damage_clear: GpuBatchBuffers,
     background: GpuBatchBuffers,
     glyphs: GpuBatchBuffers,
     overlay_glyphs: GpuBatchBuffers,
@@ -4314,6 +4340,14 @@ struct PersistentBatchBuffers {
     selections: GpuBatchBuffers,
     cursor: GpuBatchBuffers,
     cursor_image: GpuBatchBuffers,
+}
+
+fn prepare_damage_clear_batch(damage_regions: &[DamageRegion], color: RenderColor) -> QuadBatch {
+    let mut batch = QuadBatch::new(QuadBatchKind::Background);
+    for region in damage_regions {
+        push_solid_quad(&mut batch, *region, color);
+    }
+    batch
 }
 
 fn fill_rect(frame: &mut CpuFrame, rect: RenderRect, color: RenderColor) {
@@ -4672,6 +4706,7 @@ struct GpuBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    clear_pipeline: wgpu::RenderPipeline,
     quad_pipeline: wgpu::RenderPipeline,
     glyph_pipeline: wgpu::RenderPipeline,
     glyph_bind_group_layout: wgpu::BindGroupLayout,
@@ -4683,15 +4718,28 @@ struct GpuBackend {
     cursor_image_texture: Option<wgpu::Texture>,
     cursor_image_asset_id: Option<u64>,
     cursor_image_bind_group: Option<wgpu::BindGroup>,
-    retained_frame: Option<wgpu::Texture>,
-    retained_frame_size: Option<(u32, u32)>,
-    retained_frame_initialized: bool,
+    retained_frame: RetainedFrameState,
     surface_copy_supported: bool,
     batches: PersistentBatchBuffers,
     device_loss_signal: Arc<Mutex<Option<DeviceLossSignal>>>,
     gpu_timing: GpuTiming,
     transparent: bool,
     background: RenderColor,
+}
+
+#[derive(Default)]
+struct RetainedFrameState {
+    texture: Option<wgpu::Texture>,
+    size: Option<(u32, u32)>,
+    initialized: bool,
+}
+
+impl RetainedFrameState {
+    fn invalidate(&mut self) {
+        self.texture = None;
+        self.size = None;
+        self.initialized = false;
+    }
 }
 
 struct CursorImageGpuResources {
@@ -4970,11 +5018,26 @@ impl GpuTerminalRenderer {
 
     #[must_use]
     pub fn damage_tracking_active(&self) -> bool {
-        self.options.damage_tracking
-            && self
-                .backend
-                .as_ref()
-                .is_some_and(GpuBackend::supports_retained_damage)
+        self.retained_damage_status() == RetainedDamageStatus::Enabled
+    }
+
+    #[must_use]
+    pub fn retained_damage_status(&self) -> RetainedDamageStatus {
+        if !self.options.damage_tracking {
+            return RetainedDamageStatus::DisabledByConfig;
+        }
+        self.backend.as_ref().map_or_else(
+            || RetainedDamageStatus::Unverified {
+                reason: "the GPU backend is unavailable while renderer recovery is pending"
+                    .to_owned(),
+            },
+            |backend| {
+                retained_damage_status(
+                    self.options.damage_tracking,
+                    backend.supports_retained_damage(),
+                )
+            },
+        )
     }
 
     pub fn render_scene(
@@ -5006,7 +5069,7 @@ impl GpuTerminalRenderer {
             backend.supports_retained_damage(),
         );
         if prepare_full_frame {
-            backend.retained_frame_initialized = false;
+            backend.retained_frame.initialized = false;
         }
         let mut batches = if prepare_full_frame {
             self.rasterizer.prepare_full_batches(scene, fonts)?
@@ -5020,11 +5083,14 @@ impl GpuTerminalRenderer {
         if let Some(asset) = batches.cursor_image_asset.as_deref() {
             backend.upload_cursor_image(asset);
         }
-        let result = backend.present_batches(
-            &batches,
-            retained_damage_enabled,
-            should_load_retained_frame(retained_damage_enabled, prepare_full_frame),
-        );
+        let load_retained_frame =
+            should_load_retained_frame(retained_damage_enabled, prepare_full_frame);
+        batches.instrumentation.draw_call_count =
+            batches.instrumentation.draw_call_count.saturating_add(
+                retained_damage_extra_draw_calls(load_retained_frame, batches.damage_regions.len()),
+            );
+        let result =
+            backend.present_batches(&batches, retained_damage_enabled, load_retained_frame);
         batches.instrumentation.gpu_submit_time = Some(gpu_started.elapsed());
         batches.instrumentation.frame_time = frame_started.elapsed();
         self.last_instrumentation = batches.instrumentation;
@@ -5040,7 +5106,7 @@ impl GpuTerminalRenderer {
                 self.retry_present_after_surface_reconfigure(
                     &batches,
                     retained_damage_enabled,
-                    should_load_retained_frame(retained_damage_enabled, prepare_full_frame),
+                    load_retained_frame,
                 )
             }
             Err(error @ RendererError::DeviceLost { .. }) => {
@@ -5176,6 +5242,10 @@ fn should_load_retained_frame(retained_damage_enabled: bool, prepare_full_frame:
     retained_damage_enabled && !prepare_full_frame
 }
 
+fn retained_damage_extra_draw_calls(load_previous: bool, damage_region_count: usize) -> u32 {
+    u32::from(load_previous && damage_region_count > 0)
+}
+
 impl GpuBackend {
     async fn new(window: Arc<Window>, options: RendererOptions) -> Result<Self, RendererError> {
         let size = window.inner_size();
@@ -5254,8 +5324,7 @@ impl GpuBackend {
         } else {
             caps.alpha_modes[0]
         };
-        let surface_copy_supported = RETAINED_DAMAGE_PRESENTATION_ENABLED
-            && caps.usages.contains(wgpu::TextureUsages::COPY_DST);
+        let surface_copy_supported = caps.usages.contains(wgpu::TextureUsages::COPY_DST);
         let config = wgpu::SurfaceConfiguration {
             usage: if surface_copy_supported {
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST
@@ -5287,6 +5356,18 @@ impl GpuBackend {
             &batch_shader,
             format,
             "panea-quad-pipeline",
+            if format.is_srgb() {
+                "fs_color_srgb_target"
+            } else {
+                "fs_color_unorm_target"
+            },
+        );
+        let clear_pipeline = create_replacement_pipeline(
+            &device,
+            &quad_pipeline_layout,
+            &batch_shader,
+            format,
+            "panea-damage-clear-pipeline",
             if format.is_srgb() {
                 "fs_color_srgb_target"
             } else {
@@ -5354,6 +5435,7 @@ impl GpuBackend {
             device,
             queue,
             config,
+            clear_pipeline,
             quad_pipeline,
             glyph_pipeline,
             glyph_bind_group_layout,
@@ -5365,9 +5447,7 @@ impl GpuBackend {
             cursor_image_texture: None,
             cursor_image_asset_id: None,
             cursor_image_bind_group: None,
-            retained_frame: None,
-            retained_frame_size: None,
-            retained_frame_initialized: false,
+            retained_frame: RetainedFrameState::default(),
             surface_copy_supported,
             batches: PersistentBatchBuffers::default(),
             device_loss_signal,
@@ -5385,9 +5465,7 @@ impl GpuBackend {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
-        self.retained_frame = None;
-        self.retained_frame_size = None;
-        self.retained_frame_initialized = false;
+        self.retained_frame.invalidate();
     }
 
     fn supports_retained_damage(&self) -> bool {
@@ -5396,11 +5474,11 @@ impl GpuBackend {
 
     fn ensure_retained_frame(&mut self) {
         if !self.surface_copy_supported
-            || self.retained_frame_size == Some((self.config.width, self.config.height))
+            || self.retained_frame.size == Some((self.config.width, self.config.height))
         {
             return;
         }
-        self.retained_frame = Some(self.device.create_texture(&wgpu::TextureDescriptor {
+        self.retained_frame.texture = Some(self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("panea-retained-frame"),
             size: wgpu::Extent3d {
                 width: self.config.width,
@@ -5414,8 +5492,8 @@ impl GpuBackend {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         }));
-        self.retained_frame_size = Some((self.config.width, self.config.height));
-        self.retained_frame_initialized = false;
+        self.retained_frame.size = Some((self.config.width, self.config.height));
+        self.retained_frame.initialized = false;
     }
 
     fn take_device_loss_signal(&self) -> Option<DeviceLossSignal> {
@@ -5703,9 +5781,7 @@ impl GpuBackend {
         if retained_damage_enabled {
             self.ensure_retained_frame();
         } else {
-            self.retained_frame = None;
-            self.retained_frame_size = None;
-            self.retained_frame_initialized = false;
+            self.retained_frame.invalidate();
         }
         let output = match self.surface.get_current_texture() {
             Ok(output) => output,
@@ -5739,6 +5815,32 @@ impl GpuBackend {
             width: self.config.width,
             height: self.config.height,
         };
+        let load_previous = load_retained_frame
+            && self.retained_frame.texture.is_some()
+            && self.retained_frame.initialized;
+        let damage_clear = prepare_damage_clear_batch(
+            if load_previous {
+                &batches.damage_regions
+            } else {
+                &[]
+            },
+            if self.transparent {
+                RenderColor {
+                    red: 0,
+                    green: 0,
+                    blue: 0,
+                    alpha: 0,
+                }
+            } else {
+                self.background
+            },
+        );
+        self.batches.damage_clear.upload(
+            &upload_context,
+            "damage-clear",
+            &damage_clear.vertices,
+            &damage_clear.indices,
+        );
         self.batches.background.upload(
             &upload_context,
             "background",
@@ -5783,19 +5885,10 @@ impl GpuBackend {
         );
         let retained_view = self
             .retained_frame
+            .texture
             .as_ref()
             .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
         let target_view = retained_view.as_ref().unwrap_or(&view);
-        let load =
-            if load_retained_frame && retained_view.is_some() && self.retained_frame_initialized {
-                wgpu::LoadOp::Load
-            } else {
-                wgpu::LoadOp::Clear(if self.transparent {
-                    wgpu::Color::TRANSPARENT
-                } else {
-                    surface_clear_color(self.background, self.config.format)
-                })
-            };
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -5803,53 +5896,33 @@ impl GpuBackend {
             });
         let timestamp_written = self.gpu_timing.can_write_this_frame();
         let timestamp_writes = self.gpu_timing.render_pass_writes();
+        encode_retained_frame(
+            &mut encoder,
+            target_view,
+            load_previous,
+            if self.transparent {
+                wgpu::Color::TRANSPARENT
+            } else {
+                surface_clear_color(self.background, self.config.format)
+            },
+            GpuFrameDraw {
+                clear_pipeline: &self.clear_pipeline,
+                quad_pipeline: &self.quad_pipeline,
+                glyph_pipeline: &self.glyph_pipeline,
+                glyph_bind_group: self.glyph_bind_group.as_ref(),
+                cursor_image_pipeline: self
+                    .cursor_image_resources
+                    .as_ref()
+                    .map(|resources| &resources.pipeline),
+                cursor_image_bind_group: self.cursor_image_bind_group.as_ref(),
+                batches: &self.batches,
+                cursor_image_active: self.cursor_image_asset_id
+                    == batches.cursor_image_asset.as_ref().map(|asset| asset.id),
+            },
+            timestamp_writes,
+        );
 
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("panea-batch-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes,
-            });
-
-            pass.set_pipeline(&self.quad_pipeline);
-            draw_buffers(&mut pass, &self.batches.background);
-            draw_buffers(&mut pass, &self.batches.selections);
-            draw_buffers(&mut pass, &self.batches.cursor);
-
-            if let Some(glyph_bind_group) = &self.glyph_bind_group {
-                pass.set_pipeline(&self.glyph_pipeline);
-                pass.set_bind_group(0, glyph_bind_group, &[]);
-                draw_buffers(&mut pass, &self.batches.glyphs);
-            }
-
-            pass.set_pipeline(&self.quad_pipeline);
-            draw_buffers(&mut pass, &self.batches.decorations);
-            if let Some(glyph_bind_group) = &self.glyph_bind_group {
-                pass.set_pipeline(&self.glyph_pipeline);
-                pass.set_bind_group(0, glyph_bind_group, &[]);
-                draw_buffers(&mut pass, &self.batches.overlay_glyphs);
-            }
-            if self.cursor_image_asset_id
-                == batches.cursor_image_asset.as_ref().map(|asset| asset.id)
-                && let Some(cursor_image_resources) = &self.cursor_image_resources
-                && let Some(cursor_image_bind_group) = &self.cursor_image_bind_group
-            {
-                pass.set_pipeline(&cursor_image_resources.pipeline);
-                pass.set_bind_group(0, cursor_image_bind_group, &[]);
-                draw_buffers(&mut pass, &self.batches.cursor_image);
-            }
-        }
-
-        if let Some(retained_frame) = self.retained_frame.as_ref() {
+        if let Some(retained_frame) = self.retained_frame.texture.as_ref() {
             encoder.copy_texture_to_texture(
                 wgpu::ImageCopyTexture {
                     texture: retained_frame,
@@ -5869,7 +5942,7 @@ impl GpuBackend {
                     depth_or_array_layers: 1,
                 },
             );
-            self.retained_frame_initialized = true;
+            self.retained_frame.initialized = true;
         }
 
         if timestamp_written {
@@ -5980,6 +6053,77 @@ fn map_device_lost_reason(reason: wgpu::DeviceLostReason) -> Option<RenderRecove
     }
 }
 
+struct GpuFrameDraw<'a> {
+    clear_pipeline: &'a wgpu::RenderPipeline,
+    quad_pipeline: &'a wgpu::RenderPipeline,
+    glyph_pipeline: &'a wgpu::RenderPipeline,
+    glyph_bind_group: Option<&'a wgpu::BindGroup>,
+    cursor_image_pipeline: Option<&'a wgpu::RenderPipeline>,
+    cursor_image_bind_group: Option<&'a wgpu::BindGroup>,
+    batches: &'a PersistentBatchBuffers,
+    cursor_image_active: bool,
+}
+
+fn encode_retained_frame<'a>(
+    encoder: &'a mut wgpu::CommandEncoder,
+    retained: &'a wgpu::TextureView,
+    load_previous: bool,
+    clear_color: wgpu::Color,
+    draw: GpuFrameDraw<'a>,
+    timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'a>>,
+) -> bool {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("panea-batch-pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: retained,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: if load_previous {
+                    wgpu::LoadOp::Load
+                } else {
+                    wgpu::LoadOp::Clear(clear_color)
+                },
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        occlusion_query_set: None,
+        timestamp_writes,
+    });
+
+    pass.set_pipeline(draw.clear_pipeline);
+    draw_buffers(&mut pass, &draw.batches.damage_clear);
+
+    pass.set_pipeline(draw.quad_pipeline);
+    draw_buffers(&mut pass, &draw.batches.background);
+    draw_buffers(&mut pass, &draw.batches.selections);
+    draw_buffers(&mut pass, &draw.batches.cursor);
+
+    if let Some(glyph_bind_group) = draw.glyph_bind_group {
+        pass.set_pipeline(draw.glyph_pipeline);
+        pass.set_bind_group(0, glyph_bind_group, &[]);
+        draw_buffers(&mut pass, &draw.batches.glyphs);
+    }
+
+    pass.set_pipeline(draw.quad_pipeline);
+    draw_buffers(&mut pass, &draw.batches.decorations);
+    if let Some(glyph_bind_group) = draw.glyph_bind_group {
+        pass.set_pipeline(draw.glyph_pipeline);
+        pass.set_bind_group(0, glyph_bind_group, &[]);
+        draw_buffers(&mut pass, &draw.batches.overlay_glyphs);
+    }
+    if draw.cursor_image_active
+        && let Some(cursor_image_pipeline) = draw.cursor_image_pipeline
+        && let Some(cursor_image_bind_group) = draw.cursor_image_bind_group
+    {
+        pass.set_pipeline(cursor_image_pipeline);
+        pass.set_bind_group(0, cursor_image_bind_group, &[]);
+        draw_buffers(&mut pass, &draw.batches.cursor_image);
+    }
+
+    load_previous
+}
+
 fn draw_buffers<'a>(pass: &mut wgpu::RenderPass<'a>, buffers: &'a GpuBatchBuffers) {
     let (Some(vertices), Some(indices)) = (&buffers.vertices, &buffers.indices) else {
         return;
@@ -6014,6 +6158,37 @@ fn create_batch_pipeline(
     label: &'static str,
     fragment_entry: &'static str,
 ) -> wgpu::RenderPipeline {
+    create_batch_pipeline_with_blend(
+        device,
+        layout,
+        shader,
+        format,
+        label,
+        fragment_entry,
+        Some(wgpu::BlendState::ALPHA_BLENDING),
+    )
+}
+
+fn create_replacement_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat,
+    label: &'static str,
+    fragment_entry: &'static str,
+) -> wgpu::RenderPipeline {
+    create_batch_pipeline_with_blend(device, layout, shader, format, label, fragment_entry, None)
+}
+
+fn create_batch_pipeline_with_blend(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat,
+    label: &'static str,
+    fragment_entry: &'static str,
+    blend: Option<wgpu::BlendState>,
+) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(label),
         layout: Some(layout),
@@ -6028,7 +6203,7 @@ fn create_batch_pipeline(
             entry_point: fragment_entry,
             targets: &[Some(wgpu::ColorTargetState {
                 format,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                blend,
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -6156,6 +6331,368 @@ fn fs_cursor_image_unorm_target(in: VertexOut) -> @location(0) vec4<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const RED: RenderColor = RenderColor::rgb(255, 0, 0);
+    const GREEN: RenderColor = RenderColor::rgb(0, 255, 0);
+    const BLUE: RenderColor = RenderColor::rgb(0, 0, 255);
+    const WHITE: RenderColor = RenderColor::rgb(255, 255, 255);
+    const YELLOW: RenderColor = RenderColor::rgb(255, 255, 0);
+
+    struct TestFrame {
+        clears: Vec<(RenderRect, RenderColor)>,
+        quads: Vec<(RenderRect, RenderColor)>,
+    }
+
+    impl TestFrame {
+        fn quadrants(colors: [RenderColor; 4]) -> Self {
+            Self {
+                clears: Vec::new(),
+                quads: vec![
+                    (
+                        RenderRect {
+                            x: 0,
+                            y: 0,
+                            width: 8,
+                            height: 8,
+                        },
+                        colors[0],
+                    ),
+                    (
+                        RenderRect {
+                            x: 8,
+                            y: 0,
+                            width: 8,
+                            height: 8,
+                        },
+                        colors[1],
+                    ),
+                    (
+                        RenderRect {
+                            x: 0,
+                            y: 8,
+                            width: 8,
+                            height: 8,
+                        },
+                        colors[2],
+                    ),
+                    (
+                        RenderRect {
+                            x: 8,
+                            y: 8,
+                            width: 8,
+                            height: 8,
+                        },
+                        colors[3],
+                    ),
+                ],
+            }
+        }
+
+        fn damage(bounds: RenderRect, color: RenderColor) -> Self {
+            Self {
+                clears: vec![(bounds, color)],
+                quads: Vec::new(),
+            }
+        }
+    }
+
+    struct TestPixels {
+        width: u32,
+        pixels: Vec<u8>,
+    }
+
+    impl TestPixels {
+        fn at(&self, x: u32, y: u32) -> [u8; 4] {
+            let index = usize::try_from((y * self.width + x) * 4).expect("pixel index");
+            self.pixels[index..index + 4]
+                .try_into()
+                .expect("RGBA pixel")
+        }
+    }
+
+    fn render_retained_sequence(
+        first: TestFrame,
+        second: TestFrame,
+    ) -> Result<Option<TestPixels>, String> {
+        const WIDTH: u32 = 16;
+        const HEIGHT: u32 = 16;
+
+        let instance = wgpu::Instance::default();
+        let Some(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            }))
+        else {
+            eprintln!("retained-frame test skipped: no WGPU adapter is available");
+            return Ok(None);
+        };
+        let adapter_info = adapter.get_info();
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("panea-retained-frame-test-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_defaults(),
+            },
+            None,
+        ))
+        .map_err(|error| {
+            format!(
+                "failed to create retained-frame test device for {} ({:?}): {error}",
+                adapter_info.name, adapter_info.backend
+            )
+        })?;
+        eprintln!(
+            "retained-frame test adapter={} backend={:?}",
+            adapter_info.name, adapter_info.backend
+        );
+
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let retained = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("panea-retained-frame-test-target"),
+            size: wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let retained_view = retained.create_view(&wgpu::TextureViewDescriptor::default());
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("panea-retained-frame-test-shader"),
+            source: wgpu::ShaderSource::Wgsl(BATCH_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("panea-retained-frame-test-layout"),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
+        });
+        let pipeline = create_batch_pipeline(
+            &device,
+            &layout,
+            &shader,
+            format,
+            "panea-retained-frame-test-pipeline",
+            "fs_color_unorm_target",
+        );
+        let clear_pipeline = create_replacement_pipeline(
+            &device,
+            &layout,
+            &shader,
+            format,
+            "panea-retained-frame-test-clear-pipeline",
+            "fs_color_unorm_target",
+        );
+        let upload_context = GpuUploadContext {
+            device: &device,
+            queue: &queue,
+            width: WIDTH,
+            height: HEIGHT,
+        };
+        let mut gpu_batches = PersistentBatchBuffers::default();
+
+        let encode_test_frame = |frame: TestFrame,
+                                 load_previous: bool,
+                                 gpu_batches: &mut PersistentBatchBuffers|
+         -> wgpu::CommandBuffer {
+            let mut batch = QuadBatch::new(QuadBatchKind::Background);
+            for (bounds, color) in frame.quads {
+                push_solid_quad(&mut batch, bounds, color);
+            }
+            let mut clears = QuadBatch::new(QuadBatchKind::Background);
+            for (bounds, color) in frame.clears {
+                push_solid_quad(&mut clears, bounds, color);
+            }
+            gpu_batches.damage_clear.upload(
+                &upload_context,
+                "retained-frame-test-clear",
+                &clears.vertices,
+                &clears.indices,
+            );
+            gpu_batches.background.upload(
+                &upload_context,
+                "retained-frame-test-background",
+                &batch.vertices,
+                &batch.indices,
+            );
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("panea-retained-frame-test-encoder"),
+            });
+            encode_retained_frame(
+                &mut encoder,
+                &retained_view,
+                load_previous,
+                wgpu::Color::TRANSPARENT,
+                GpuFrameDraw {
+                    clear_pipeline: &clear_pipeline,
+                    quad_pipeline: &pipeline,
+                    glyph_pipeline: &pipeline,
+                    glyph_bind_group: None,
+                    cursor_image_pipeline: None,
+                    cursor_image_bind_group: None,
+                    batches: gpu_batches,
+                    cursor_image_active: false,
+                },
+                None,
+            );
+            encoder.finish()
+        };
+
+        queue.submit(Some(encode_test_frame(first, false, &mut gpu_batches)));
+        queue.submit(Some(encode_test_frame(second, true, &mut gpu_batches)));
+
+        let unpadded_row_bytes = WIDTH * 4;
+        let padded_row_bytes = unpadded_row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("panea-retained-frame-test-readback"),
+            size: u64::from(padded_row_bytes * HEIGHT),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("panea-retained-frame-test-readback-encoder"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &retained,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &readback,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row_bytes),
+                    rows_per_image: Some(HEIGHT),
+                },
+            },
+            wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+
+        let (sender, receiver) = mpsc::channel();
+        readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result.map_err(|error| error.to_string()));
+            });
+        device.poll(wgpu::Maintain::Wait);
+        receiver.recv().map_err(|error| error.to_string())??;
+
+        let mapped = readback.slice(..).get_mapped_range();
+        let mut pixels = Vec::with_capacity(usize::try_from(WIDTH * HEIGHT * 4).unwrap_or(0));
+        for row in mapped.chunks_exact(usize::try_from(padded_row_bytes).unwrap_or(0)) {
+            pixels.extend_from_slice(&row[..usize::try_from(unpadded_row_bytes).unwrap_or(0)]);
+        }
+        drop(mapped);
+        readback.unmap();
+
+        Ok(Some(TestPixels {
+            width: WIDTH,
+            pixels,
+        }))
+    }
+
+    #[test]
+    fn retained_frame_preserves_unchanged_pixels_and_replaces_damage() {
+        let first = TestFrame::quadrants([RED, GREEN, BLUE, WHITE]);
+        let second = TestFrame::damage(
+            RenderRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            },
+            YELLOW,
+        );
+        let Some(pixels) = render_retained_sequence(first, second).expect("GPU sequence") else {
+            return;
+        };
+
+        assert_eq!(pixels.at(2, 2), [255, 255, 0, 255]);
+        assert_eq!(pixels.at(12, 2), [0, 255, 0, 255]);
+        assert_eq!(pixels.at(2, 12), [0, 0, 255, 255]);
+        assert_eq!(pixels.at(12, 12), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn retained_damage_status_is_explicit() {
+        assert_eq!(
+            retained_damage_status(false, true),
+            RetainedDamageStatus::DisabledByConfig
+        );
+        assert!(matches!(
+            retained_damage_status(true, false),
+            RetainedDamageStatus::Unsupported { .. }
+        ));
+        assert_eq!(
+            retained_damage_status(true, true),
+            RetainedDamageStatus::Enabled
+        );
+        assert!(
+            retained_damage_status(true, false)
+                .to_string()
+                .contains("cannot receive")
+        );
+    }
+
+    #[test]
+    fn retained_frame_invalidation_forces_fresh_full_frame() {
+        let mut retained = RetainedFrameState {
+            texture: None,
+            size: Some((80, 24)),
+            initialized: true,
+        };
+
+        retained.invalidate();
+
+        assert_eq!(retained.size, None);
+        assert!(!retained.initialized);
+        assert!(!should_load_retained_frame(true, true));
+    }
+
+    #[test]
+    fn retained_damage_clear_covers_removed_content_regions() {
+        let regions = vec![
+            RenderRect {
+                x: 8,
+                y: 16,
+                width: 8,
+                height: 16,
+            },
+            RenderRect {
+                x: 32,
+                y: 48,
+                width: 24,
+                height: 16,
+            },
+        ];
+
+        let batch = prepare_damage_clear_batch(&regions, RenderColor::rgb(12, 12, 12));
+
+        assert_eq!(batch.quad_count(), 2);
+        assert_eq!(batch.vertices[0].position_px, [8.0, 16.0]);
+        assert_eq!(batch.vertices[4].position_px, [32.0, 48.0]);
+    }
+
+    #[test]
+    fn retained_damage_clear_draw_call_is_instrumented_only_when_used() {
+        assert_eq!(retained_damage_extra_draw_calls(false, 2), 0);
+        assert_eq!(retained_damage_extra_draw_calls(true, 0), 0);
+        assert_eq!(retained_damage_extra_draw_calls(true, 2), 1);
+    }
 
     fn metrics() -> CellMetrics {
         CellMetrics {

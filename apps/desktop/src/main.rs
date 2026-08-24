@@ -50,7 +50,7 @@ use render_wgpu::{
     AnimatedCursorImageStatus, CursorAnimationRuntime, CursorAnimationSettings, CursorBlinkRuntime,
     CursorVectorCache, CursorVectorRequest, CursorVectorRuntime, CursorVectorStatus, DamageTracker,
     FrameDecision, FrameScheduler, GpuTerminalRenderer, PresentMode, RendererError,
-    RendererOptions,
+    RendererOptions, RetainedDamageStatus,
 };
 use security::{
     HostKeyTrustAction, HostKeyTrustReason, HostKeyTrustRequest, HostTrustProvider,
@@ -1099,10 +1099,13 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
             "renderer startup background fallback: {error}; revealing the window for normal first-frame rendering"
         );
     }
-    if config.renderer.damage_tracking && !renderer.damage_tracking_active() {
-        eprintln!(
-            "renderer fallback: retained damage presentation is disabled because cross-frame correctness is not verified; using event-driven full-frame GPU batches"
-        );
+    if config.renderer.damage_tracking {
+        let retained_status = renderer.retained_damage_status();
+        if retained_status != RetainedDamageStatus::Enabled {
+            eprintln!(
+                "renderer fallback: retained damage presentation is {retained_status}; using event-driven full-frame GPU batches"
+            );
+        }
     }
     if gui_smoke.is_some() {
         eprintln!(
