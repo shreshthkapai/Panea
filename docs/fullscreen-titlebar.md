@@ -2,56 +2,19 @@
 
 Feature name: Auto-hidden fullscreen titlebar
 
-Layer: platform parity, config portability
+Layer: platform parity, render performance, config portability, diagnostics
 
-User-facing behavior: In borderless or frameless fullscreen, moving the pointer
-into a configurable strip at the top edge temporarily reveals the platform's
-native decorated, maximized window. The operating system owns the caption,
-application icon, system menu, and window controls. Moving back into the client
-area returns Panea to borderless fullscreen. Panea does not draw a titlebar or
-imitate native controls in the terminal renderer.
+User-facing behavior: In `borderless_fullscreen` or `frameless_fullscreen`,
+moving the pointer into the configured top-edge strip reveals Panea-owned
+chrome over the terminal. The native window remains fullscreen throughout the
+reveal and hide cycle. The overlay does not reserve terminal rows, resize the
+PTY, or mutate terminal cells.
 
-Config keys: `window.fullscreen_titlebar.enabled`, `height`, `reveal_height`,
-and `show_window_controls`.
-
-macOS behavior: Uses winit's native decorated/maximized window and returns to
-borderless fullscreen. Native visual verification remains required.
-
-Windows behavior: Uses the real Windows non-client titlebar and caption buttons
-while revealed. The installed release has been visually verified for startup,
-reveal, and return to borderless fullscreen. The native frame is retained after
-its first reveal so later hover cycles do not rebuild the non-client style.
-Transient caption geometry is excluded from terminal and PTY resizing, so a
-hover cannot reflow terminal content.
-
-Linux X11 behavior: Requests the WM's native decorated/maximized window, then
-returns to fullscreen. The active WM remains authoritative and compositor-matrix
-verification is required.
-
-Linux Wayland behavior: Uses compositor-negotiated native decorations and
-fullscreen transitions. Mutter, KWin, Sway/wlroots, and Hyprland verification
-remains required.
-
-Fallback behavior: The feature is dormant in windowed, maximized, and exclusive
-fullscreen modes. If borderless fullscreen itself is unavailable or altered by
-the platform, existing requested/effective window-mode diagnostics apply. The
-emergency `restore_window_decorations` binding remains available independently.
-
-Diagnostics: `panea doctor window` reports whether the bar is enabled, its
-logical dimensions, whether controls are enabled, and whether the configured
-window mode can activate it.
-
-Performance cost when disabled: A single predictable branch for pointer events;
-no render work, allocation, timer, wakeup, or redraw.
-
-Performance cost when enabled: No per-frame work or animation. Only entering or
-leaving the top-edge state requests a native window-mode transition. A short
-input guard rejects queued pointer motion while the OS applies the caption.
-Terminal and PTY geometry remains unchanged during the transient reveal.
-
-Tests: Config defaults, validation, TOML, programmable config, platform
-overrides, live reload classification, and native reveal/hide state transitions.
-Manual visual verification remains required on every target window system.
+The titlebar provides minimize, restore-to-windowed, and close controls. Its
+background consumes pointer presses but does not initiate a native drag or
+change window mode. To move the window, restore it first and use the native
+decorated titlebar. This explicit fallback avoids platform-specific fullscreen
+drag behavior and unstable native frame reconstruction.
 
 ## Configuration
 
@@ -64,9 +27,77 @@ enabled = true
 height = 36
 reveal_height = 3
 show_window_controls = true
+animation = "smooth"
+animation_duration_ms = 120
+hide_delay_ms = 120
 ```
 
-`reveal_height` is expressed in logical pixels and scales with the active
-monitor. `height` and `show_window_controls` remain accepted for config
-compatibility; native titlebar dimensions and controls are owned by the OS.
-The feature is opt-in and defaults to disabled.
+The feature is opt-in and defaults to disabled. `height` and `reveal_height`
+are logical pixels and scale with the active monitor. `animation = "instant"`
+provides the reduced-motion path. `panea doctor window` reports the configured
+and effective animation, retained-damage status, metrics, and fallback reason.
+
+## Platform Contract
+
+- **Windows:** Panea chrome uses Windows-oriented right-side controls. Window
+  actions are executed by `platform-winit`; the Windows non-client frame is
+  never created or removed during hover.
+- **macOS:** The same overlay and actions are implemented. Exact traffic-light
+  fidelity is not claimed; native-host visual verification remains required.
+- **Linux X11:** The same overlay is used. The window manager remains
+  authoritative for minimize, restore, and close behavior; rejected actions
+  must produce diagnostics.
+- **Linux Wayland:** The same overlay is used. The compositor remains
+  authoritative; unsupported operations use an explicit diagnostic fallback.
+
+If retained presentation is unavailable, smooth motion resolves to an instant
+overlay transition. Fullscreen remains stable if an action is rejected.
+Emergency restore keybindings remain available independently of the overlay.
+
+## Performance Contract
+
+Disabled cost is one predictable event-loop branch with no timer, allocation,
+overlay batch, GPU upload, or frame. Hidden steady state schedules no wakeups.
+An active transition is bounded by `animation_duration_ms`, reuses cached logo
+and glyph resources, and damages only the old and new chrome bounds. Input,
+PTY output, terminal layout, and renderer recovery never wait on the animation.
+
+## Automated Fixtures
+
+The screenshot runner captures these deterministic states:
+
+```text
+fullscreen-chrome-hidden
+fullscreen-chrome-half
+fullscreen-chrome-visible
+fullscreen-chrome-close-hover
+fullscreen-chrome-no-controls
+```
+
+The hidden and visible fixtures use identical terminal cells and content
+offsets. Automated tests also require every rendered pixel below the 36 px
+chrome band to remain identical.
+
+## Native Verification Checklist
+
+Run this checklist on Windows, macOS, Linux X11, and Linux Wayland. Record the
+OS version, window backend/compositor, DPI scale, monitor setup, GPU backend,
+commit, package hash, and result in the platform verification report.
+
+- Launch windowed by default; enter fullscreen only through the configured
+  action.
+- Reveal from the top-edge strip with no native fullscreen transition.
+- Confirm prompt, cursor, selection, pane geometry, terminal rows/columns, and
+  PTY size do not change during reveal or hide.
+- Confirm re-entry cancels a pending hide and focus loss cancels interaction.
+- Confirm minimize, restore-to-windowed, and close controls invoke one native
+  action each; background press does not drag or leave fullscreen.
+- Repeat after window resize, fullscreen/windowed cycles, DPI change, and
+  monitor change.
+- Verify `animation = "instant"`, `show_window_controls = false`, and live
+  configuration reload.
+- Leave the terminal idle while hidden and confirm no chrome animation wakeups.
+- Verify `panea doctor window` explains any animation or platform fallback.
+
+Deterministic screenshots verify renderer geometry, not compositor behavior.
+A platform is not marked verified until its packaged native checklist passes.

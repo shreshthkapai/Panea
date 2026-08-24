@@ -27,6 +27,7 @@ considered verified until that matrix has real X11 and Wayland host evidence.
 | window modes | partial | partial | partial | partial | Windowed, maximized, exclusive/borderless fullscreen, and frameless runtime paths exist; native-host validation remains open. |
 | frameless modes | partial | partial | fallback | fallback | Implemented through winit decorations; unsupported strategies report requested/effective fallback and Linux still requires compositor tests. |
 | fullscreen modes | partial | partial | partial | partial | Exclusive mode selects a monitor video mode and explicitly falls back to borderless when unavailable. |
+| auto-hidden fullscreen titlebar | partial | partial | partial | partial | Client-owned overlay keeps the native window fullscreen and does not reflow terminal content. Deterministic fixtures exist; packaged native checklists remain required on every platform. |
 | clipboard | partial | partial | partial | partial | System clipboard bridge, pane-aware mouse/keyboard selection, portable Ctrl/Super copy/paste, Linux Primary selection provider, paste protection, and OSC 52 policy exist; real cross-OS and Linux compositor smoke remain. |
 | IME | partial | partial | partial | partial | Enabled/preedit/commit/disabled events are wired; preedit is an overlay and only commit reaches the PTY. Real language/input-method validation remains. |
 | DPI/fractional scaling | partial | partial | partial | partial | Per-monitor scale events resize renderer, mux viewports, terminal grids, and PTYs; native-host fractional behavior needs verification. |
@@ -56,6 +57,8 @@ considered verified until that matrix has real X11 and Wayland host evidence.
 | Shell integration real-session smoke | PowerShell verified on current host | Unverified | Unverified | Unverified |
 | Native mux runtime smoke | Unit-tested only | Unverified | Unverified | Unverified |
 | App compatibility required smoke | Verified on current host | Unverified | Unverified | Unverified |
+| Fullscreen chrome screenshots | Verified on current host | Unverified | Unverified | Unverified |
+| Packaged fullscreen chrome interaction | Previously exercised on current host; final artifact checklist pending | Unverified | Unverified | Unverified |
 
 ## macOS Polish Checklist
 

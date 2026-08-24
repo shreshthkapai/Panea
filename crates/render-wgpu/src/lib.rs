@@ -3351,6 +3351,7 @@ pub enum ScreenshotFixtureKind {
     CommandBlocks,
     MultiplePanes,
     TransparencyOpacity,
+    FullscreenChrome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3510,6 +3511,36 @@ pub fn screenshot_fixtures() -> Vec<ScreenshotFixture> {
             description: "semi-transparent overlays blended over terminal cells",
             kind: ScreenshotFixtureKind::TransparencyOpacity,
             scene: transparency_scene(),
+        },
+        ScreenshotFixture {
+            name: "fullscreen-chrome-hidden",
+            description: "fullscreen terminal with client chrome fully hidden",
+            kind: ScreenshotFixtureKind::FullscreenChrome,
+            scene: fullscreen_chrome_scene(0, false, true),
+        },
+        ScreenshotFixture {
+            name: "fullscreen-chrome-half",
+            description: "fullscreen terminal with client chrome half revealed",
+            kind: ScreenshotFixtureKind::FullscreenChrome,
+            scene: fullscreen_chrome_scene(u16::MAX / 2, false, true),
+        },
+        ScreenshotFixture {
+            name: "fullscreen-chrome-visible",
+            description: "fullscreen terminal with client chrome fully revealed",
+            kind: ScreenshotFixtureKind::FullscreenChrome,
+            scene: fullscreen_chrome_scene(u16::MAX, false, true),
+        },
+        ScreenshotFixture {
+            name: "fullscreen-chrome-close-hover",
+            description: "fullscreen terminal with close control hovered",
+            kind: ScreenshotFixtureKind::FullscreenChrome,
+            scene: fullscreen_chrome_scene(u16::MAX, true, true),
+        },
+        ScreenshotFixture {
+            name: "fullscreen-chrome-no-controls",
+            description: "fullscreen terminal chrome without window controls",
+            kind: ScreenshotFixtureKind::FullscreenChrome,
+            scene: fullscreen_chrome_scene(u16::MAX, false, false),
         },
     ]
 }
@@ -3995,6 +4026,66 @@ fn transparency_scene() -> RenderScene {
             label_color: None,
         },
     ];
+    scene
+}
+
+fn fullscreen_chrome_scene(
+    progress: u16,
+    close_hovered: bool,
+    show_window_controls: bool,
+) -> RenderScene {
+    const SURFACE_WIDTH: u32 = 192;
+    const CHROME_HEIGHT: u32 = 36;
+    const CONTROL_WIDTH: u32 = 48;
+
+    let mut scene = text_rows_scene(&[
+        "PS C:\\Users\\panea>",
+        "cargo test -q",
+        "running 42 tests",
+        "test result: ok",
+    ]);
+    scene.cursor = Some(cursor(1, 13, RenderCursorShape::Beam, false));
+    if progress == 0 {
+        return scene;
+    }
+
+    let visible_height =
+        (u64::from(CHROME_HEIGHT) * u64::from(progress)).div_ceil(u64::from(u16::MAX)) as u32;
+    let y = visible_height as i32 - CHROME_HEIGHT as i32;
+    let controls = if show_window_controls {
+        [
+            (WindowChromeControlKind::Minimize, 3_u32),
+            (WindowChromeControlKind::LeaveFullscreen, 2_u32),
+            (WindowChromeControlKind::Close, 1_u32),
+        ]
+        .into_iter()
+        .map(|(kind, slot)| WindowChromeControlVisual {
+            kind,
+            bounds: RenderRect {
+                x: SURFACE_WIDTH.saturating_sub(CONTROL_WIDTH * slot) as i32,
+                y,
+                width: CONTROL_WIDTH,
+                height: CHROME_HEIGHT,
+            },
+            hovered: close_hovered && kind == WindowChromeControlKind::Close,
+            pressed: false,
+        })
+        .collect()
+    } else {
+        Vec::new()
+    };
+    scene.window_chrome = Some(WindowChromeVisual {
+        bounds: RenderRect {
+            x: 0,
+            y,
+            width: SURFACE_WIDTH,
+            height: CHROME_HEIGHT,
+        },
+        opacity: progress,
+        title: "Panea".to_owned(),
+        show_logo: true,
+        controls,
+    });
     scene
 }
 
@@ -8245,9 +8336,43 @@ mod tests {
             "command-blocks",
             "multiple-panes",
             "transparency-opacity",
+            "fullscreen-chrome-hidden",
+            "fullscreen-chrome-half",
+            "fullscreen-chrome-visible",
+            "fullscreen-chrome-close-hover",
+            "fullscreen-chrome-no-controls",
         ] {
             assert!(names.contains(expected), "missing fixture {expected}");
         }
+    }
+
+    #[test]
+    fn fullscreen_chrome_fixtures_preserve_terminal_layout_below_chrome() {
+        let fixtures = screenshot_fixtures();
+        let hidden = fixtures
+            .iter()
+            .find(|fixture| fixture.name == "fullscreen-chrome-hidden")
+            .expect("hidden fullscreen chrome fixture");
+        let visible = fixtures
+            .iter()
+            .find(|fixture| fixture.name == "fullscreen-chrome-visible")
+            .expect("visible fullscreen chrome fixture");
+
+        assert_eq!(hidden.scene.grid, visible.scene.grid);
+        assert_eq!(hidden.scene.content_offset, visible.scene.content_offset);
+
+        let hidden = capture_screenshot_fixture(hidden.name).expect("hidden fixture capture");
+        let visible = capture_screenshot_fixture(visible.name).expect("visible fixture capture");
+        assert_eq!(hidden.frame.width, visible.frame.width);
+        assert_eq!(hidden.frame.height, visible.frame.height);
+
+        let chrome_height = 36_u32.min(hidden.frame.height);
+        let first_unchanged_byte = (chrome_height * hidden.frame.width * u32::from(4_u8)) as usize;
+        assert_eq!(
+            &hidden.frame.pixels[first_unchanged_byte..],
+            &visible.frame.pixels[first_unchanged_byte..],
+            "fullscreen chrome must not reflow or alter terminal pixels outside its overlay bounds"
+        );
     }
 
     #[test]
