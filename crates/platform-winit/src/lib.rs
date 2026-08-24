@@ -22,8 +22,9 @@ use platform_core::{
     MouseEventKind, NotificationAvailability, NotificationBackend, NotificationDiagnostic,
     NotificationProvider, NotificationRequest, NotificationUrgency, PlatformCapabilities,
     PlatformFallback, PowerSource, PowerState, PowerStateDiagnostic, PowerStateProvider,
-    ShellEnvironmentInfo, UrlOpenDiagnostic, UrlOpener, WindowAction, WindowMode,
-    WindowModeDiagnostic,
+    ShellEnvironmentInfo, UrlOpenDiagnostic, UrlOpener, WindowAction, WindowChromeAction,
+    WindowChromeActionDiagnostic, WindowChromeActionExecutor, WindowMode, WindowModeDiagnostic,
+    execute_window_chrome_action,
 };
 use starship_battery::units::ratio::percent;
 use starship_battery::{Manager as BatteryManager, State as BatteryState};
@@ -942,6 +943,70 @@ pub fn apply_window_mode(window: &Window, requested: WindowMode) -> WindowModeDi
     apply_window_mode_with_decoration(window, requested, DecorationMode::Native)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WinitWindowChromeOperation {
+    DragWindow,
+    Minimize,
+    LeaveFullscreen,
+    RequestDesktopClose,
+}
+
+const fn window_chrome_operation(action: WindowChromeAction) -> WinitWindowChromeOperation {
+    match action {
+        WindowChromeAction::BeginDrag => WinitWindowChromeOperation::DragWindow,
+        WindowChromeAction::Minimize => WinitWindowChromeOperation::Minimize,
+        WindowChromeAction::LeaveFullscreen => WinitWindowChromeOperation::LeaveFullscreen,
+        WindowChromeAction::Close => WinitWindowChromeOperation::RequestDesktopClose,
+    }
+}
+
+struct WinitWindowChromeExecutor<'window> {
+    window: &'window Window,
+}
+
+impl WindowChromeActionExecutor for WinitWindowChromeExecutor<'_> {
+    fn try_apply_window_chrome_action(
+        &mut self,
+        action: WindowChromeAction,
+    ) -> Result<(), PlatformFallback> {
+        match window_chrome_operation(action) {
+            WinitWindowChromeOperation::DragWindow => self
+                .window
+                .drag_window()
+                .map_err(|error| window_chrome_action_fallback(action, &error.to_string())),
+            WinitWindowChromeOperation::Minimize => {
+                self.window.set_minimized(true);
+                Ok(())
+            }
+            WinitWindowChromeOperation::LeaveFullscreen => {
+                self.window.set_fullscreen(None);
+                Ok(())
+            }
+            WinitWindowChromeOperation::RequestDesktopClose => Ok(()),
+        }
+    }
+}
+
+/// Applies a client-chrome action without exposing winit to the app's controller.
+/// A successful `Close` diagnostic is an exit intent that the desktop event loop
+/// must honor; this function never terminates the process itself.
+#[must_use]
+pub fn apply_window_chrome_action(
+    window: &Window,
+    action: WindowChromeAction,
+) -> WindowChromeActionDiagnostic {
+    execute_window_chrome_action(&mut WinitWindowChromeExecutor { window }, action)
+}
+
+fn window_chrome_action_fallback(action: WindowChromeAction, reason: &str) -> PlatformFallback {
+    PlatformFallback {
+        feature: "window_chrome_action".to_owned(),
+        requested: action.as_str().to_owned(),
+        effective: "unchanged".to_owned(),
+        reason: reason.to_owned(),
+    }
+}
+
 pub fn apply_window_mode_with_decoration(
     window: &Window,
     requested: WindowMode,
@@ -1087,6 +1152,7 @@ pub fn platform_capabilities(
             WindowMode::FramelessWindowed,
             WindowMode::FramelessFullscreen,
         ],
+        window_chrome_actions_supported: window_chrome_actions_for(detected_platform()),
         decoration_modes_supported: vec![
             DecorationMode::Auto,
             DecorationMode::Native,
@@ -1101,6 +1167,19 @@ pub fn platform_capabilities(
         compositor_info: compositor_info(),
         shell_environment_info: shell_environment_info(),
         fallbacks: Vec::new(),
+    }
+}
+
+fn window_chrome_actions_for(platform: DesktopPlatform) -> Vec<WindowChromeAction> {
+    if matches!(platform, DesktopPlatform::Unknown) {
+        vec![WindowChromeAction::Close]
+    } else {
+        vec![
+            WindowChromeAction::BeginDrag,
+            WindowChromeAction::Minimize,
+            WindowChromeAction::LeaveFullscreen,
+            WindowChromeAction::Close,
+        ]
     }
 }
 
@@ -1542,5 +1621,60 @@ mod tests {
                 .reason
                 .contains("compositor")
         );
+    }
+
+    #[test]
+    fn window_chrome_action_mapping_is_total_and_close_stays_app_owned() {
+        assert_eq!(
+            window_chrome_operation(WindowChromeAction::BeginDrag),
+            WinitWindowChromeOperation::DragWindow
+        );
+        assert_eq!(
+            window_chrome_operation(WindowChromeAction::Minimize),
+            WinitWindowChromeOperation::Minimize
+        );
+        assert_eq!(
+            window_chrome_operation(WindowChromeAction::LeaveFullscreen),
+            WinitWindowChromeOperation::LeaveFullscreen
+        );
+        assert_eq!(
+            window_chrome_operation(WindowChromeAction::Close),
+            WinitWindowChromeOperation::RequestDesktopClose
+        );
+    }
+
+    #[test]
+    fn window_chrome_action_capabilities_cover_every_desktop_backend() {
+        let all_actions = vec![
+            WindowChromeAction::BeginDrag,
+            WindowChromeAction::Minimize,
+            WindowChromeAction::LeaveFullscreen,
+            WindowChromeAction::Close,
+        ];
+        for platform in [
+            DesktopPlatform::Windows,
+            DesktopPlatform::MacOs,
+            DesktopPlatform::LinuxX11,
+            DesktopPlatform::LinuxWayland,
+        ] {
+            assert_eq!(window_chrome_actions_for(platform), all_actions);
+        }
+        assert_eq!(
+            window_chrome_actions_for(DesktopPlatform::Unknown),
+            vec![WindowChromeAction::Close]
+        );
+    }
+
+    #[test]
+    fn rejected_window_chrome_action_names_the_backend_failure() {
+        let fallback = window_chrome_action_fallback(
+            WindowChromeAction::BeginDrag,
+            "the compositor rejected interactive movement",
+        );
+
+        assert_eq!(fallback.feature, "window_chrome_action");
+        assert_eq!(fallback.requested, "begin_drag");
+        assert_eq!(fallback.effective, "unchanged");
+        assert!(fallback.reason.contains("compositor"));
     }
 }

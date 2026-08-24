@@ -49,6 +49,26 @@ pub enum WindowAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowChromeAction {
+    BeginDrag,
+    Minimize,
+    LeaveFullscreen,
+    Close,
+}
+
+impl WindowChromeAction {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BeginDrag => "begin_drag",
+            Self::Minimize => "minimize",
+            Self::LeaveFullscreen => "leave_fullscreen",
+            Self::Close => "close",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipboardCapability {
     System,
     PrimarySelection,
@@ -351,6 +371,40 @@ pub struct WindowModeDiagnostic {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowChromeActionDiagnostic {
+    pub action: WindowChromeAction,
+    pub applied: bool,
+    pub fallback: Option<PlatformFallback>,
+}
+
+/// Executes window-chrome intent without exposing a concrete window backend.
+pub trait WindowChromeActionExecutor {
+    fn try_apply_window_chrome_action(
+        &mut self,
+        action: WindowChromeAction,
+    ) -> Result<(), PlatformFallback>;
+}
+
+#[must_use]
+pub fn execute_window_chrome_action(
+    executor: &mut impl WindowChromeActionExecutor,
+    action: WindowChromeAction,
+) -> WindowChromeActionDiagnostic {
+    match executor.try_apply_window_chrome_action(action) {
+        Ok(()) => WindowChromeActionDiagnostic {
+            action,
+            applied: true,
+            fallback: None,
+        },
+        Err(fallback) => WindowChromeActionDiagnostic {
+            action,
+            applied: false,
+            fallback: Some(fallback),
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecorationModeDiagnostic {
     pub requested: DecorationMode,
     pub effective: DecorationMode,
@@ -371,6 +425,7 @@ pub struct LinuxWindowBackendDiagnostic {
 pub struct PlatformCapabilities {
     pub platform: DesktopPlatform,
     pub window_modes_supported: Vec<WindowMode>,
+    pub window_chrome_actions_supported: Vec<WindowChromeAction>,
     pub decoration_modes_supported: Vec<DecorationMode>,
     pub clipboard_capabilities: Vec<ClipboardCapability>,
     pub gpu_backends_available: Vec<GpuBackend>,
@@ -560,5 +615,65 @@ mod tests {
             NotificationRequest::new("Panea", "body\0spoofed").validate(),
             Err("notification body contains an unsupported control character")
         );
+    }
+
+    #[derive(Debug)]
+    struct FakeWindowChromeExecutor {
+        rejected: Option<WindowChromeAction>,
+    }
+
+    impl WindowChromeActionExecutor for FakeWindowChromeExecutor {
+        fn try_apply_window_chrome_action(
+            &mut self,
+            action: WindowChromeAction,
+        ) -> Result<(), PlatformFallback> {
+            if self.rejected == Some(action) {
+                Err(PlatformFallback {
+                    feature: "window_chrome_action".to_owned(),
+                    requested: action.as_str().to_owned(),
+                    effective: "unchanged".to_owned(),
+                    reason: "fake backend rejected the action".to_owned(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn window_chrome_action_contract_never_silently_reports_failure() {
+        let actions = [
+            WindowChromeAction::BeginDrag,
+            WindowChromeAction::Minimize,
+            WindowChromeAction::LeaveFullscreen,
+            WindowChromeAction::Close,
+        ];
+
+        for rejected in actions {
+            let mut executor = FakeWindowChromeExecutor {
+                rejected: Some(rejected),
+            };
+            for action in actions {
+                let diagnostic = execute_window_chrome_action(&mut executor, action);
+                assert_eq!(diagnostic.action, action);
+                assert_ne!(
+                    diagnostic.applied,
+                    diagnostic.fallback.is_some(),
+                    "{action:?} must be applied or carry an explicit fallback"
+                );
+                if action == rejected {
+                    assert!(!diagnostic.applied);
+                    assert_eq!(
+                        diagnostic
+                            .fallback
+                            .as_ref()
+                            .map(|value| value.requested.as_str()),
+                        Some(action.as_str())
+                    );
+                } else {
+                    assert!(diagnostic.applied);
+                }
+            }
+        }
     }
 }
