@@ -1,7 +1,7 @@
 use std::{
     env, fs,
     io::{self, Cursor, Read},
-    path::{Component, Path, PathBuf},
+    path::PathBuf,
     process::{Command, ExitCode},
 };
 
@@ -295,15 +295,18 @@ fn parse_payload(payload: &[u8]) -> Result<Vec<PayloadEntry<'_>>, String> {
 }
 
 fn safe_relative_path(value: &str) -> Result<PathBuf, String> {
-    let path = Path::new(value);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_)))
-    {
+    if value.is_empty() || value.contains(['\0', '\\', ':']) {
         return Err(format!("unsafe installer path: {value}"));
     }
-    Ok(path.to_path_buf())
+
+    let mut path = PathBuf::new();
+    for component in value.split('/') {
+        if component.is_empty() || matches!(component, "." | "..") {
+            return Err(format!("unsafe installer path: {value}"));
+        }
+        path.push(component);
+    }
+    Ok(path)
 }
 
 fn read_u32(cursor: &mut Cursor<&[u8]>) -> Result<u32, String> {
@@ -332,6 +335,12 @@ mod tests {
         assert!(safe_relative_path("share/panea/config/default.toml").is_ok());
         assert!(safe_relative_path("../outside").is_err());
         assert!(safe_relative_path("C:/outside").is_err());
+        assert!(safe_relative_path(r"C:\outside").is_err());
+        assert!(safe_relative_path(r"share\panea.exe").is_err());
+        assert!(safe_relative_path("/outside").is_err());
+        assert!(safe_relative_path("//server/share").is_err());
+        assert!(safe_relative_path("share/../outside").is_err());
+        assert!(safe_relative_path("panea.exe:stream").is_err());
     }
 
     #[test]
