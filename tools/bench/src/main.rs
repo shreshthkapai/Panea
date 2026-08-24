@@ -15,9 +15,10 @@ use render_core::{
     AnimationHandle, AnimationKind, CellPosition, CursorImageAsset, CursorImageFrame,
     CursorImageVisual, CursorVisual, FeatureCostSample, OptionalFeature, OptionalFeatureCostMode,
     OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle, RenderColor, RenderCursorShape,
-    RenderGrid, RenderInstrumentation, RenderRect, RenderScene,
+    RenderGrid, RenderInstrumentation, RenderRect, RenderScene, WindowChromeControlKind,
+    WindowChromeControlVisual, WindowChromeVisual,
 };
-use render_wgpu::TerminalRasterizer;
+use render_wgpu::{DamageTracker, TerminalRasterizer};
 use term_core::{
     CellAttributes, Color, CursorShape, TerminalCore, TerminalSize as CoreTerminalSize,
 };
@@ -25,6 +26,11 @@ use term_parser::TerminalEmulator;
 
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 36;
+const FULLSCREEN_CHROME_SURFACE_WIDTH: u32 = 1_920;
+const FULLSCREEN_CHROME_SURFACE_HEIGHT: u32 = 1_080;
+const FULLSCREEN_CHROME_HEIGHT: u32 = 36;
+const FULLSCREEN_CHROME_TRANSITION: Duration = Duration::from_millis(120);
+const FULLSCREEN_CHROME_FPS: u64 = 60;
 
 fn main() -> ExitCode {
     match run() {
@@ -92,13 +98,14 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         "cursor-animation" => cursor_animation_cost(),
         "command-blocks" => render_command_blocks(),
+        "fullscreen-chrome" => fullscreen_chrome_benchmark(),
         other => Err(format!("unknown benchmark '{other}'").into()),
     }
 }
 
 fn print_help() {
     println!(
-        "usage: cargo xtask bench <all|profiles|render-grid|render-full-ascii|render-mixed-unicode|render-emoji-heavy|render-fast-scrolling|render-large-scrollback-viewport|render-many-panes|render-cursor-animation|render-command-blocks|cat-large-file|color-heavy|scrollback|resize|input-latency|unicode|alternate-screen|cursor-animation|command-blocks>"
+        "usage: cargo xtask bench <all|profiles|render-grid|render-full-ascii|render-mixed-unicode|render-emoji-heavy|render-fast-scrolling|render-large-scrollback-viewport|render-many-panes|render-cursor-animation|render-command-blocks|cat-large-file|color-heavy|scrollback|resize|input-latency|unicode|alternate-screen|cursor-animation|command-blocks|fullscreen-chrome>"
     );
 }
 
@@ -134,7 +141,216 @@ fn run_all() -> Result<(), Box<dyn Error>> {
     cursor_animation_cost()?;
     render_many_panes()?;
     render_command_blocks()?;
+    fullscreen_chrome_benchmark()?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullscreenChromeBenchMode {
+    Disabled,
+    Instant,
+    Smooth,
+}
+
+impl FullscreenChromeBenchMode {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Instant => "instant",
+            Self::Smooth => "smooth",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FullscreenChromeBenchmarkResult {
+    mode: FullscreenChromeBenchMode,
+    cpu_prepare: Duration,
+    frames: u64,
+    frame_budget: u64,
+    dirty_pixels: u64,
+    draw_calls: u64,
+    max_damage_height: u32,
+}
+
+fn fullscreen_chrome_benchmark() -> Result<(), Box<dyn Error>> {
+    let results = fullscreen_chrome_benchmark_results()?;
+    print!("{}", fullscreen_chrome_benchmark_report(&results));
+    Ok(())
+}
+
+fn fullscreen_chrome_benchmark_results()
+-> Result<Vec<FullscreenChromeBenchmarkResult>, Box<dyn Error>> {
+    [
+        FullscreenChromeBenchMode::Disabled,
+        FullscreenChromeBenchMode::Instant,
+        FullscreenChromeBenchMode::Smooth,
+    ]
+    .into_iter()
+    .map(fullscreen_chrome_benchmark_case)
+    .collect()
+}
+
+fn fullscreen_chrome_benchmark_case(
+    mode: FullscreenChromeBenchMode,
+) -> Result<FullscreenChromeBenchmarkResult, Box<dyn Error>> {
+    let frame_budget = fullscreen_chrome_frame_budget();
+    if mode == FullscreenChromeBenchMode::Disabled {
+        return Ok(FullscreenChromeBenchmarkResult {
+            mode,
+            cpu_prepare: Duration::ZERO,
+            frames: 0,
+            frame_budget,
+            dirty_pixels: 0,
+            draw_calls: 0,
+            max_damage_height: 0,
+        });
+    }
+
+    let mut fonts = FontSystem::new(FontConfig::default());
+    let metrics = fonts.cell_metrics()?;
+    let mut rasterizer = TerminalRasterizer::default();
+    let mut damage_tracker = DamageTracker::new();
+    let hidden = fullscreen_chrome_scene(None);
+    let _ = damage_tracker.update(&hidden, metrics);
+    let frame_count = if mode == FullscreenChromeBenchMode::Instant {
+        1
+    } else {
+        frame_budget
+    };
+    let mut result = FullscreenChromeBenchmarkResult {
+        mode,
+        cpu_prepare: Duration::ZERO,
+        frames: 0,
+        frame_budget,
+        dirty_pixels: 0,
+        draw_calls: 0,
+        max_damage_height: 0,
+    };
+
+    for frame in 1..=frame_count {
+        let progress = if mode == FullscreenChromeBenchMode::Instant {
+            u16::MAX
+        } else {
+            ((u64::from(u16::MAX) * frame) / frame_count).min(u64::from(u16::MAX)) as u16
+        };
+        let mut scene = fullscreen_chrome_scene(Some(progress));
+        scene.damage_regions = damage_tracker
+            .update(&scene, metrics)
+            .into_iter()
+            .filter_map(clip_fullscreen_chrome_damage)
+            .collect();
+        for damage in &scene.damage_regions {
+            result.dirty_pixels = result
+                .dirty_pixels
+                .saturating_add(u64::from(damage.width) * u64::from(damage.height));
+            result.max_damage_height = result.max_damage_height.max(damage.height);
+        }
+        let batches = rasterizer.prepare_batches(&scene, &mut fonts)?;
+        result.cpu_prepare = result
+            .cpu_prepare
+            .saturating_add(batches.instrumentation.cpu_prepare_time);
+        result.draw_calls = result
+            .draw_calls
+            .saturating_add(u64::from(batches.draw_call_count()));
+        result.frames = result.frames.saturating_add(1);
+    }
+
+    Ok(result)
+}
+
+fn fullscreen_chrome_frame_budget() -> u64 {
+    let transition_nanos = FULLSCREEN_CHROME_TRANSITION.as_nanos();
+    let frames = transition_nanos
+        .saturating_mul(u128::from(FULLSCREEN_CHROME_FPS))
+        .div_ceil(1_000_000_000);
+    u64::try_from(frames).unwrap_or(u64::MAX).saturating_add(1)
+}
+
+fn fullscreen_chrome_scene(progress: Option<u16>) -> RenderScene {
+    let mut scene = RenderScene {
+        grid: RenderGrid {
+            columns: 1,
+            rows: 1,
+            cells: Vec::new(),
+        },
+        ..RenderScene::default()
+    };
+    let Some(progress) = progress else {
+        return scene;
+    };
+    let visible_height = (u64::from(FULLSCREEN_CHROME_HEIGHT) * u64::from(progress))
+        .div_ceil(u64::from(u16::MAX))
+        .min(u64::from(FULLSCREEN_CHROME_HEIGHT)) as u32;
+    let y = visible_height as i32 - FULLSCREEN_CHROME_HEIGHT as i32;
+    let control_width = FULLSCREEN_CHROME_HEIGHT;
+    let controls = [
+        (WindowChromeControlKind::Minimize, 3u32),
+        (WindowChromeControlKind::LeaveFullscreen, 2u32),
+        (WindowChromeControlKind::Close, 1u32),
+    ]
+    .into_iter()
+    .map(|(kind, slot)| WindowChromeControlVisual {
+        kind,
+        bounds: RenderRect {
+            x: FULLSCREEN_CHROME_SURFACE_WIDTH.saturating_sub(control_width.saturating_mul(slot))
+                as i32,
+            y,
+            width: control_width,
+            height: FULLSCREEN_CHROME_HEIGHT,
+        },
+        hovered: false,
+        pressed: false,
+    })
+    .collect();
+    scene.window_chrome = Some(WindowChromeVisual {
+        bounds: RenderRect {
+            x: 0,
+            y,
+            width: FULLSCREEN_CHROME_SURFACE_WIDTH,
+            height: FULLSCREEN_CHROME_HEIGHT,
+        },
+        opacity: progress,
+        title: "Panea".to_owned(),
+        show_logo: true,
+        controls,
+    });
+    scene
+}
+
+fn clip_fullscreen_chrome_damage(region: RenderRect) -> Option<RenderRect> {
+    let left = i64::from(region.x).max(0);
+    let top = i64::from(region.y).max(0);
+    let right = (i64::from(region.x) + i64::from(region.width))
+        .min(i64::from(FULLSCREEN_CHROME_SURFACE_WIDTH));
+    let bottom = (i64::from(region.y) + i64::from(region.height))
+        .min(i64::from(FULLSCREEN_CHROME_SURFACE_HEIGHT))
+        .min(i64::from(FULLSCREEN_CHROME_HEIGHT));
+    (right > left && bottom > top).then(|| RenderRect {
+        x: left as i32,
+        y: top as i32,
+        width: u32::try_from(right - left).unwrap_or(u32::MAX),
+        height: u32::try_from(bottom - top).unwrap_or(u32::MAX),
+    })
+}
+
+fn fullscreen_chrome_benchmark_report(results: &[FullscreenChromeBenchmarkResult]) -> String {
+    results
+        .iter()
+        .map(|result| {
+            format!(
+                "bench=fullscreen-chrome mode={} surface={}x{} transition_ms={} cpu_prepare={:?} frames={} dirty_pixels={} draw_calls={}\n",
+                result.mode.name(),
+                FULLSCREEN_CHROME_SURFACE_WIDTH,
+                FULLSCREEN_CHROME_SURFACE_HEIGHT,
+                FULLSCREEN_CHROME_TRANSITION.as_millis(),
+                result.cpu_prepare,
+                result.frames,
+                result.dirty_pixels,
+                result.draw_calls,
+            )
+        })
+        .collect()
 }
 
 fn print_profiles() {
@@ -879,5 +1095,44 @@ mod tests {
             scheduler.next_frame(),
             FrameDecision::FrameNeeded(_)
         ));
+    }
+
+    #[test]
+    fn fullscreen_chrome_benchmark_has_disabled_instant_and_smooth_cases() {
+        let results = fullscreen_chrome_benchmark_results().expect("fullscreen chrome benchmark");
+
+        assert_eq!(
+            results.iter().map(|result| result.mode).collect::<Vec<_>>(),
+            vec![
+                FullscreenChromeBenchMode::Disabled,
+                FullscreenChromeBenchMode::Instant,
+                FullscreenChromeBenchMode::Smooth,
+            ]
+        );
+        let disabled = &results[0];
+        assert_eq!(disabled.frames, 0);
+        assert_eq!(disabled.dirty_pixels, 0);
+        assert_eq!(disabled.draw_calls, 0);
+
+        let smooth = &results[2];
+        assert!(smooth.frames <= smooth.frame_budget);
+        assert!(smooth.max_damage_height <= FULLSCREEN_CHROME_HEIGHT);
+        assert!(smooth.dirty_pixels > 0);
+        assert!(smooth.draw_calls > 0);
+    }
+
+    #[test]
+    fn fullscreen_chrome_benchmark_report_exposes_required_metrics() {
+        let results = fullscreen_chrome_benchmark_results().expect("fullscreen chrome benchmark");
+        let report = fullscreen_chrome_benchmark_report(&results);
+
+        for mode in ["disabled", "instant", "smooth"] {
+            assert!(report.contains(&format!("mode={mode}")));
+        }
+        for field in ["cpu_prepare=", "frames=", "dirty_pixels=", "draw_calls="] {
+            assert!(report.contains(field));
+        }
+        assert!(report.contains("surface=1920x1080"));
+        assert!(report.contains("transition_ms=120"));
     }
 }

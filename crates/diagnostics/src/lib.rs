@@ -6,11 +6,12 @@ use std::{collections::VecDeque, fmt, time::Duration};
 
 use config_core::{
     AppConfig, ConfigDiagnostic, ConfigDiagnosticSeverity, ConfigPlatform,
-    DecorationStrategyConfig, SshAuthMethod, SshKnownHostsPolicy, WindowModeConfig,
+    DecorationStrategyConfig, FullscreenChromeAnimation, SshAuthMethod, SshKnownHostsPolicy,
+    WindowModeConfig,
 };
 use platform_core::{DesktopPlatform, DpiBehavior};
 use render_core::{
-    FeatureCostSample, GpuTimingStatus, OptionalFeatureCostMode, RenderInstrumentation,
+    FeatureCostSample, GpuTimingStatus, OptionalFeatureCostMode, RenderInstrumentation, RenderRect,
 };
 use semantics::{CommandBlockConfidence, IntegrationMode, SemanticDiagnostics, SemanticEventKind};
 
@@ -662,6 +663,74 @@ pub struct DoctorInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FullscreenChromeRetainedDamage {
+    Enabled,
+    Disabled,
+    Unsupported,
+    Unverified,
+}
+
+impl fmt::Display for FullscreenChromeRetainedDamage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+            Self::Unsupported => "unsupported",
+            Self::Unverified => "unverified",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullscreenChromeRuntimeSnapshot {
+    pub effective_animation: Option<FullscreenChromeAnimation>,
+    pub retained_damage: FullscreenChromeRetainedDamage,
+    pub fallback: Option<String>,
+    pub metrics: Option<FullscreenChromePerformanceMetrics>,
+}
+
+impl Default for FullscreenChromeRuntimeSnapshot {
+    fn default() -> Self {
+        Self {
+            effective_animation: None,
+            retained_damage: FullscreenChromeRetainedDamage::Unverified,
+            fallback: None,
+            metrics: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FullscreenChromePerformanceMetrics {
+    pub animation_frames: u64,
+    pub dirty_pixels: u64,
+    pub draw_calls: u64,
+    pub cpu_prepare_time: Duration,
+}
+
+impl FullscreenChromePerformanceMetrics {
+    pub fn record_frame(
+        &mut self,
+        damage_regions: &[RenderRect],
+        instrumentation: RenderInstrumentation,
+    ) {
+        self.animation_frames = self.animation_frames.saturating_add(1);
+        self.dirty_pixels = self.dirty_pixels.saturating_add(
+            damage_regions
+                .iter()
+                .map(|region| u64::from(region.width) * u64::from(region.height))
+                .fold(0u64, u64::saturating_add),
+        );
+        self.draw_calls = self
+            .draw_calls
+            .saturating_add(u64::from(instrumentation.draw_call_count));
+        self.cpu_prepare_time = self
+            .cpu_prepare_time
+            .saturating_add(instrumentation.cpu_prepare_time);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DoctorRuntimeSnapshot {
     pub renderer_backend: String,
     pub gpu_adapter: Option<String>,
@@ -678,6 +747,7 @@ pub struct DoctorRuntimeSnapshot {
     pub keychain_provider: String,
     pub pty_backend: String,
     pub ssh_provider_status: String,
+    pub fullscreen_chrome: FullscreenChromeRuntimeSnapshot,
 }
 
 impl Default for DoctorRuntimeSnapshot {
@@ -698,6 +768,7 @@ impl Default for DoctorRuntimeSnapshot {
             keychain_provider: "not probed".to_owned(),
             pty_backend: "not probed".to_owned(),
             ssh_provider_status: "not probed".to_owned(),
+            fullscreen_chrome: FullscreenChromeRuntimeSnapshot::default(),
         }
     }
 }
@@ -904,6 +975,13 @@ fn append_platform_report(input: &DoctorInput, report: &mut DoctorReport) {
 }
 
 fn append_window_report(input: &DoctorInput, report: &mut DoctorReport) {
+    let configured_animation =
+        fullscreen_chrome_animation_name(input.config.window.fullscreen_titlebar.animation);
+    let effective_animation = input
+        .runtime
+        .fullscreen_chrome
+        .effective_animation
+        .map_or("unverified", fullscreen_chrome_animation_name);
     report.lines.extend([
         "window:".to_owned(),
         format!(
@@ -927,6 +1005,22 @@ fn append_window_report(input: &DoctorInput, report: &mut DoctorReport) {
             input.config.window.fullscreen_titlebar.show_window_controls
         ),
         format!(
+            "  fullscreen_chrome configured={configured_animation} effective={effective_animation}"
+        ),
+        format!(
+            "  fullscreen_chrome retained_damage={}",
+            input.runtime.fullscreen_chrome.retained_damage
+        ),
+        format!(
+            "  fullscreen_chrome fallback={}",
+            input
+                .runtime
+                .fullscreen_chrome
+                .fallback
+                .as_deref()
+                .unwrap_or("none")
+        ),
+        format!(
             "  provider_backend={}",
             input
                 .runtime
@@ -935,6 +1029,16 @@ fn append_window_report(input: &DoctorInput, report: &mut DoctorReport) {
                 .unwrap_or("not initialized by doctor")
         ),
     ]);
+
+    if let Some(metrics) = input.runtime.fullscreen_chrome.metrics {
+        report.lines.push(format!(
+            "  fullscreen_chrome frames={} dirty_pixels={} draw_calls={} cpu_prepare={:?}",
+            metrics.animation_frames,
+            metrics.dirty_pixels,
+            metrics.draw_calls,
+            metrics.cpu_prepare_time
+        ));
+    }
 
     if matches!(
         input.config.window.mode,
@@ -980,6 +1084,13 @@ fn append_window_report(input: &DoctorInput, report: &mut DoctorReport) {
             message: "auto-hidden fullscreen titlebar is configured but activates only in borderless_fullscreen or frameless_fullscreen mode"
                 .to_owned(),
         });
+    }
+}
+
+const fn fullscreen_chrome_animation_name(animation: FullscreenChromeAnimation) -> &'static str {
+    match animation {
+        FullscreenChromeAnimation::Instant => "instant",
+        FullscreenChromeAnimation::Smooth => "smooth",
     }
 }
 
@@ -2594,6 +2705,61 @@ mod tests {
         let text = report.render_text();
         assert!(text.contains("fullscreen_titlebar enabled=true"));
         assert!(text.contains("activates only in borderless_fullscreen"));
+    }
+
+    #[test]
+    fn fullscreen_chrome_doctor_reports_effective_runtime_contract() {
+        let mut config = AppConfig::default();
+        config.window.mode = WindowModeConfig::BorderlessFullscreen;
+        config.window.fullscreen_titlebar.enabled = true;
+        config.window.fullscreen_titlebar.animation =
+            config_core::FullscreenChromeAnimation::Smooth;
+        let input = DoctorInput {
+            app_version: "0.1.0".to_owned(),
+            config_source: "test".to_owned(),
+            config,
+            config_diagnostics: Vec::new(),
+            platform: PlatformSnapshot::detect(),
+            runtime: DoctorRuntimeSnapshot {
+                fullscreen_chrome: FullscreenChromeRuntimeSnapshot {
+                    effective_animation: Some(config_core::FullscreenChromeAnimation::Smooth),
+                    retained_damage: FullscreenChromeRetainedDamage::Enabled,
+                    fallback: None,
+                    metrics: None,
+                },
+                ..DoctorRuntimeSnapshot::default()
+            },
+            recent_errors: Vec::new(),
+        };
+
+        let text = doctor_report(&input, DoctorTopic::Window).render_text();
+
+        assert!(text.contains("fullscreen_chrome configured=smooth effective=smooth"));
+        assert!(text.contains("fullscreen_chrome retained_damage=enabled"));
+        assert!(text.contains("fullscreen_chrome fallback=none"));
+    }
+
+    #[test]
+    fn fullscreen_chrome_metrics_accumulate_bounded_frame_cost() {
+        let mut metrics = FullscreenChromePerformanceMetrics::default();
+        metrics.record_frame(
+            &[render_core::RenderRect {
+                x: 0,
+                y: 0,
+                width: 1_920,
+                height: 36,
+            }],
+            RenderInstrumentation {
+                cpu_prepare_time: Duration::from_micros(250),
+                draw_call_count: 2,
+                ..RenderInstrumentation::default()
+            },
+        );
+
+        assert_eq!(metrics.animation_frames, 1);
+        assert_eq!(metrics.dirty_pixels, 1_920 * 36);
+        assert_eq!(metrics.draw_calls, 2);
+        assert_eq!(metrics.cpu_prepare_time, Duration::from_micros(250));
     }
 
     #[test]

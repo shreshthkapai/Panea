@@ -911,6 +911,42 @@ fn doctor_runtime_snapshot(
             "ssh2 transport; interactive host trust and credential prompts enabled; native keychain available={}",
             keychain_capability.available
         ),
+        fullscreen_chrome: doctor_fullscreen_chrome_snapshot(config),
+    }
+}
+
+fn doctor_fullscreen_chrome_snapshot(
+    config: &AppConfig,
+) -> diagnostics::FullscreenChromeRuntimeSnapshot {
+    let configured = &config.window.fullscreen_titlebar;
+    let retained_damage = if config.renderer.damage_tracking {
+        diagnostics::FullscreenChromeRetainedDamage::Unverified
+    } else {
+        diagnostics::FullscreenChromeRetainedDamage::Disabled
+    };
+    let (effective_animation, fallback) = if !configured.enabled {
+        (Some(configured.animation), None)
+    } else if matches!(configured.animation, FullscreenChromeAnimation::Instant)
+        || configured.animation_duration_ms == 0
+    {
+        (Some(FullscreenChromeAnimation::Instant), None)
+    } else if !config.renderer.damage_tracking {
+        (
+            Some(FullscreenChromeAnimation::Instant),
+            Some("smooth animation requires retained damage tracking".to_owned()),
+        )
+    } else {
+        (
+            None,
+            Some("effective animation is resolved by the active window renderer".to_owned()),
+        )
+    };
+
+    diagnostics::FullscreenChromeRuntimeSnapshot {
+        effective_animation,
+        retained_damage,
+        fallback,
+        metrics: None,
     }
 }
 
@@ -1133,6 +1169,10 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
         renderer.retained_damage_status() == RetainedDamageStatus::Enabled,
     ));
     let _ = fullscreen_chrome.set_active(fullscreen_chrome_mode_active(current_window_mode));
+    let mut fullscreen_chrome_instrumentation = FullscreenChromeInstrumentation::new(
+        config.window.fullscreen_titlebar.enabled
+            && fullscreen_chrome_mode_active(current_window_mode),
+    );
     let mut scheduler = FrameScheduler::new();
     let mut damage_tracker = DamageTracker::new();
     let mut performance_overlay_ui = PerformanceOverlayUiState::new(&config.diagnostics);
@@ -1246,6 +1286,10 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                         Ok(Ok(())) => {
                             let mut instrumentation = renderer.last_instrumentation();
                             instrumentation.idle_wakeups = idle_wakeups;
+                            fullscreen_chrome_instrumentation.record_presented_frame(
+                                &scene.damage_regions,
+                                instrumentation,
+                            );
                             if performance_overlay.is_enabled() {
                                 mux_runtime.populate_performance_sample(&mut instrumentation);
                             }
@@ -1296,6 +1340,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                         eprintln!("render recovery: {}", event.message);
                                         let chrome_update = sync_fullscreen_chrome(
                                             &mut fullscreen_chrome,
+                                            &mut fullscreen_chrome_instrumentation,
                                             &config,
                                             current_window_mode,
                                             surface_size.width,
@@ -1303,9 +1348,11 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                             renderer.retained_damage_status()
                                                 == RetainedDamageStatus::Enabled,
                                         );
-                                        if chrome_update.redraw {
-                                            scheduler.animation_changed();
-                                        }
+                                        request_fullscreen_chrome_frame(
+                                            chrome_update.redraw,
+                                            &mut fullscreen_chrome_instrumentation,
+                                            &mut scheduler,
+                                        );
                                         damage_tracker.request_full_redraw();
                                         scheduler.terminal_content_changed();
                                         window.request_redraw();
@@ -1373,6 +1420,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                 pending_terminal_resize.queue(resized);
                                 let chrome_update = sync_fullscreen_chrome(
                                     &mut fullscreen_chrome,
+                                    &mut fullscreen_chrome_instrumentation,
                                     &config,
                                     current_window_mode,
                                     surface_size.width,
@@ -1380,9 +1428,11 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                     renderer.retained_damage_status()
                                         == RetainedDamageStatus::Enabled,
                                 );
-                                if chrome_update.redraw {
-                                    scheduler.animation_changed();
-                                }
+                                request_fullscreen_chrome_frame(
+                                    chrome_update.redraw,
+                                    &mut fullscreen_chrome_instrumentation,
+                                    &mut scheduler,
+                                );
                                 scheduler.window_resized();
                                 window.request_redraw();
                             }
@@ -1399,6 +1449,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                 pending_terminal_resize.queue(surface_size);
                                 let chrome_update = sync_fullscreen_chrome(
                                     &mut fullscreen_chrome,
+                                    &mut fullscreen_chrome_instrumentation,
                                     &config,
                                     current_window_mode,
                                     surface_size.width,
@@ -1406,9 +1457,11 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                     renderer.retained_damage_status()
                                         == RetainedDamageStatus::Enabled,
                                 );
-                                if chrome_update.redraw {
-                                    scheduler.animation_changed();
-                                }
+                                request_fullscreen_chrome_frame(
+                                    chrome_update.redraw,
+                                    &mut fullscreen_chrome_instrumentation,
+                                    &mut scheduler,
+                                );
                                 if matches!(config.diagnostics.log_level, LogLevel::Debug | LogLevel::Trace) {
                                     eprintln!("DPI scale changed to {scale_factor:.3}");
                                 }
@@ -1609,6 +1662,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                             );
                                             let chrome_update = sync_fullscreen_chrome(
                                                 &mut fullscreen_chrome,
+                                                &mut fullscreen_chrome_instrumentation,
                                                 &config,
                                                 current_window_mode,
                                                 surface_size.width,
@@ -1616,9 +1670,11 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                                 renderer.retained_damage_status()
                                                     == RetainedDamageStatus::Enabled,
                                             );
-                                            if chrome_update.redraw {
-                                                scheduler.animation_changed();
-                                            }
+                                            request_fullscreen_chrome_frame(
+                                                chrome_update.redraw,
+                                                &mut fullscreen_chrome_instrumentation,
+                                                &mut scheduler,
+                                            );
                                             scheduler.window_resized();
                                             window.request_redraw();
                                         }
@@ -1631,6 +1687,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                             );
                                             let chrome_update = sync_fullscreen_chrome(
                                                 &mut fullscreen_chrome,
+                                                &mut fullscreen_chrome_instrumentation,
                                                 &config,
                                                 current_window_mode,
                                                 surface_size.width,
@@ -1638,9 +1695,11 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                                 renderer.retained_damage_status()
                                                     == RetainedDamageStatus::Enabled,
                                             );
-                                            if chrome_update.redraw {
-                                                scheduler.animation_changed();
-                                            }
+                                            request_fullscreen_chrome_frame(
+                                                chrome_update.redraw,
+                                                &mut fullscreen_chrome_instrumentation,
+                                                &mut scheduler,
+                                            );
                                             scheduler.window_resized();
                                             window.request_redraw();
                                         }
@@ -1660,6 +1719,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                             );
                                             let chrome_update = sync_fullscreen_chrome(
                                                 &mut fullscreen_chrome,
+                                                &mut fullscreen_chrome_instrumentation,
                                                 &config,
                                                 current_window_mode,
                                                 surface_size.width,
@@ -1667,9 +1727,11 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                                 renderer.retained_damage_status()
                                                     == RetainedDamageStatus::Enabled,
                                             );
-                                            if chrome_update.redraw {
-                                                scheduler.animation_changed();
-                                            }
+                                            request_fullscreen_chrome_frame(
+                                                chrome_update.redraw,
+                                                &mut fullscreen_chrome_instrumentation,
+                                                &mut scheduler,
+                                            );
                                             scheduler.window_resized();
                                             window.request_redraw();
                                         }
@@ -1726,8 +1788,12 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                     mouse,
                                     Instant::now(),
                                 );
+                                request_fullscreen_chrome_frame(
+                                    chrome_route.redraw,
+                                    &mut fullscreen_chrome_instrumentation,
+                                    &mut scheduler,
+                                );
                                 if chrome_route.redraw {
-                                    scheduler.animation_changed();
                                     window.request_redraw();
                                 }
                                 if let Some(action) = chrome_route.action {
@@ -1750,6 +1816,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                                     decoration_mode,
                                                 );
                                                 let update = fullscreen_chrome.set_active(false);
+                                                fullscreen_chrome_instrumentation.set_active(false);
                                                 if update.redraw {
                                                     scheduler.animation_changed();
                                                     window.request_redraw();
@@ -1835,9 +1902,11 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                 window_focused = focused;
                                 let chrome_update =
                                     fullscreen_chrome.focus_changed(focused, Instant::now());
-                                if chrome_update.redraw {
-                                    scheduler.animation_changed();
-                                }
+                                request_fullscreen_chrome_frame(
+                                    chrome_update.redraw,
+                                    &mut fullscreen_chrome_instrumentation,
+                                    &mut scheduler,
+                                );
                                 if cursor_blink.record_activity() {
                                     scheduler.cursor_blink_changed();
                                 }
@@ -1860,6 +1929,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                     );
                                     let chrome_update = sync_fullscreen_chrome(
                                         &mut fullscreen_chrome,
+                                        &mut fullscreen_chrome_instrumentation,
                                         &config,
                                         current_window_mode,
                                         surface_size.width,
@@ -1867,9 +1937,11 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                         renderer.retained_damage_status()
                                             == RetainedDamageStatus::Enabled,
                                     );
-                                    if chrome_update.redraw {
-                                        scheduler.animation_changed();
-                                    }
+                                    request_fullscreen_chrome_frame(
+                                        chrome_update.redraw,
+                                        &mut fullscreen_chrome_instrumentation,
+                                        &mut scheduler,
+                                    );
                                     scheduler.window_resized();
                                     window.request_redraw();
                                 }
@@ -1882,6 +1954,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                     );
                                     let chrome_update = sync_fullscreen_chrome(
                                         &mut fullscreen_chrome,
+                                        &mut fullscreen_chrome_instrumentation,
                                         &config,
                                         current_window_mode,
                                         surface_size.width,
@@ -1889,9 +1962,11 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                         renderer.retained_damage_status()
                                             == RetainedDamageStatus::Enabled,
                                     );
-                                    if chrome_update.redraw {
-                                        scheduler.animation_changed();
-                                    }
+                                    request_fullscreen_chrome_frame(
+                                        chrome_update.redraw,
+                                        &mut fullscreen_chrome_instrumentation,
+                                        &mut scheduler,
+                                    );
                                     scheduler.window_resized();
                                     window.request_redraw();
                                 }
@@ -1911,6 +1986,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                     );
                                     let chrome_update = sync_fullscreen_chrome(
                                         &mut fullscreen_chrome,
+                                        &mut fullscreen_chrome_instrumentation,
                                         &config,
                                         current_window_mode,
                                         surface_size.width,
@@ -1918,9 +1994,11 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                         renderer.retained_damage_status()
                                             == RetainedDamageStatus::Enabled,
                                     );
-                                    if chrome_update.redraw {
-                                        scheduler.animation_changed();
-                                    }
+                                    request_fullscreen_chrome_frame(
+                                        chrome_update.redraw,
+                                        &mut fullscreen_chrome_instrumentation,
+                                        &mut scheduler,
+                                    );
                                     scheduler.window_resized();
                                     window.request_redraw();
                                 }
@@ -1958,8 +2036,12 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
             Event::AboutToWait => {
                 let now = Instant::now();
                 let chrome_update = fullscreen_chrome.tick(now);
+                request_fullscreen_chrome_frame(
+                    chrome_update.redraw,
+                    &mut fullscreen_chrome_instrumentation,
+                    &mut scheduler,
+                );
                 if chrome_update.redraw {
-                    scheduler.animation_changed();
                     window.request_redraw();
                 }
                 if let Some(size) = pending_terminal_resize.take_due(now)
@@ -2083,6 +2165,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                         }
                                         let chrome_update = sync_fullscreen_chrome(
                                             &mut fullscreen_chrome,
+                                            &mut fullscreen_chrome_instrumentation,
                                             &config,
                                             current_window_mode,
                                             surface_size.width,
@@ -2090,9 +2173,11 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                             renderer.retained_damage_status()
                                                 == RetainedDamageStatus::Enabled,
                                         );
-                                        if chrome_update.redraw {
-                                            scheduler.animation_changed();
-                                        }
+                                        request_fullscreen_chrome_frame(
+                                            chrome_update.redraw,
+                                            &mut fullscreen_chrome_instrumentation,
+                                            &mut scheduler,
+                                        );
                                         scheduler.terminal_content_changed();
                                         window.request_redraw();
                                     }
@@ -2143,15 +2228,18 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                     );
                     let chrome_update = sync_fullscreen_chrome(
                         &mut fullscreen_chrome,
+                        &mut fullscreen_chrome_instrumentation,
                         &config,
                         current_window_mode,
                         surface_size.width,
                         dpi_scale_factor,
                         renderer.retained_damage_status() == RetainedDamageStatus::Enabled,
                     );
-                    if chrome_update.redraw {
-                        scheduler.animation_changed();
-                    }
+                    request_fullscreen_chrome_frame(
+                        chrome_update.redraw,
+                        &mut fullscreen_chrome_instrumentation,
+                        &mut scheduler,
+                    );
                     log_power_policy(&config.performance, &power_state);
                     scheduler.animation_changed();
                     window.request_redraw();
@@ -2371,6 +2459,67 @@ struct FullscreenChromeRoute {
     action: Option<WindowChromeAction>,
 }
 
+#[derive(Debug, Default)]
+struct FullscreenChromeInstrumentation {
+    metrics: Option<diagnostics::FullscreenChromePerformanceMetrics>,
+    frame_pending: bool,
+}
+
+impl FullscreenChromeInstrumentation {
+    fn new(active: bool) -> Self {
+        Self {
+            metrics: active.then(diagnostics::FullscreenChromePerformanceMetrics::default),
+            frame_pending: false,
+        }
+    }
+
+    fn set_active(&mut self, active: bool) {
+        if active {
+            if self.metrics.is_none() {
+                self.metrics = Some(diagnostics::FullscreenChromePerformanceMetrics::default());
+            }
+        } else {
+            self.metrics = None;
+            self.frame_pending = false;
+        }
+    }
+
+    fn mark_frame(&mut self) {
+        if self.metrics.is_some() {
+            self.frame_pending = true;
+        }
+    }
+
+    fn record_presented_frame(
+        &mut self,
+        damage_regions: &[RenderRect],
+        instrumentation: RenderInstrumentation,
+    ) {
+        if !std::mem::take(&mut self.frame_pending) {
+            return;
+        }
+        if let Some(metrics) = self.metrics.as_mut() {
+            metrics.record_frame(damage_regions, instrumentation);
+        }
+    }
+
+    #[cfg(test)]
+    const fn metrics(&self) -> Option<&diagnostics::FullscreenChromePerformanceMetrics> {
+        self.metrics.as_ref()
+    }
+}
+
+fn request_fullscreen_chrome_frame(
+    redraw: bool,
+    instrumentation: &mut FullscreenChromeInstrumentation,
+    scheduler: &mut FrameScheduler,
+) {
+    if redraw {
+        instrumentation.mark_frame();
+        scheduler.animation_changed();
+    }
+}
+
 impl FullscreenChromeRoute {
     #[cfg(test)]
     const fn terminal() -> Self {
@@ -2485,6 +2634,7 @@ fn logical_to_physical_pixels(logical: u16, scale_factor: f64) -> u32 {
 
 fn sync_fullscreen_chrome(
     chrome: &mut FullscreenChromeController,
+    instrumentation: &mut FullscreenChromeInstrumentation,
     config: &AppConfig,
     mode: WindowMode,
     surface_width: u32,
@@ -2498,6 +2648,9 @@ fn sync_fullscreen_chrome(
         retained_damage_available,
     ));
     let active_update = chrome.set_active(fullscreen_chrome_mode_active(mode));
+    instrumentation.set_active(
+        config.window.fullscreen_titlebar.enabled && fullscreen_chrome_mode_active(mode),
+    );
     ChromeUpdate {
         consumed: settings_update.consumed || active_update.consumed,
         redraw: settings_update.redraw || active_update.redraw,
@@ -10840,6 +10993,48 @@ mod tests {
 
         assert!(!reload_requires_terminal_resize(&chrome_only));
         assert!(reload_requires_terminal_resize(&font_reload));
+    }
+
+    #[test]
+    fn fullscreen_chrome_instrumentation_allocates_metrics_only_when_active() {
+        let mut instrumentation = FullscreenChromeInstrumentation::new(false);
+        instrumentation.mark_frame();
+        instrumentation.record_presented_frame(
+            &[RenderRect {
+                x: 0,
+                y: 0,
+                width: 1_920,
+                height: 36,
+            }],
+            RenderInstrumentation {
+                draw_call_count: 2,
+                ..RenderInstrumentation::default()
+            },
+        );
+        assert!(instrumentation.metrics().is_none());
+
+        instrumentation.set_active(true);
+        instrumentation.mark_frame();
+        instrumentation.record_presented_frame(
+            &[RenderRect {
+                x: 0,
+                y: 0,
+                width: 1_920,
+                height: 36,
+            }],
+            RenderInstrumentation {
+                draw_call_count: 2,
+                ..RenderInstrumentation::default()
+            },
+        );
+
+        assert_eq!(
+            instrumentation
+                .metrics()
+                .expect("active chrome metrics")
+                .animation_frames,
+            1
+        );
     }
 
     fn test_fullscreen_chrome(

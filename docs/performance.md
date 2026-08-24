@@ -27,11 +27,19 @@ cargo xtask bench input-latency
 cargo xtask bench unicode
 cargo xtask bench alternate-screen
 cargo xtask bench cursor-animation
+cargo xtask bench fullscreen-chrome
 ```
 
 The cursor-animation benchmark also measures default and heavy decoded image
 cursor frame sets. Disabled mode allocates no image asset, creates no image
 quad, and schedules no animation frame.
+
+The fullscreen-chrome benchmark uses a fixed `1920x1080` surface and a
+`120 ms` transition. It reports disabled, instant, and smooth cases with CPU
+preparation time, frame count, dirty pixels, and draw calls. Disabled mode
+performs no render preparation; animated damage is clipped to the configured
+chrome height. Runtime chrome metrics are allocated only while the feature is
+enabled in a supported fullscreen mode.
 
 The harness reports elapsed time, byte throughput where applicable, frame
 timing, CPU render preparation time, glyph cache hits/misses, atlas uploads,
