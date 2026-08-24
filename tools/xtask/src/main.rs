@@ -1379,17 +1379,44 @@ fn run_pty_compat(
     let mut lifecycle = Vec::new();
     let mut saw_marker = false;
     let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(80, 24));
+    let mut pending_terminal_responses = Vec::new();
+    let mut terminal_response_pending_since = None;
 
     while Instant::now() < deadline {
         match transport.poll_output() {
             Ok(poll) => {
-                answer_terminal_queries(&mut transport, &mut terminal, &poll.bytes)?;
+                let output_idle = poll.bytes.is_empty();
+                let responses = terminal_responses_for(&mut terminal, &poll.bytes)
+                    .map_err(CompatRunError::failed)?;
+                if !responses.is_empty() {
+                    terminal_response_pending_since.get_or_insert_with(Instant::now);
+                    pending_terminal_responses.extend(responses);
+                }
                 lifecycle.extend(poll.lifecycle);
                 output.extend(poll.bytes);
                 saw_marker =
                     saw_marker || output.windows(marker.len()).any(|window| window == marker);
                 let closed =
                     poll.closed || matches!(transport.state(), TransportState::Closed { .. });
+                let pending_age = terminal_response_pending_since
+                    .map_or(Duration::ZERO, |queued_at| queued_at.elapsed());
+                if !closed
+                    && should_flush_terminal_responses(
+                        !pending_terminal_responses.is_empty(),
+                        output_idle,
+                        pending_age,
+                    )
+                {
+                    transport
+                        .write_input(&pending_terminal_responses)
+                        .map_err(|error| {
+                            CompatRunError::failed(format!(
+                                "failed to write terminal query response: {error}"
+                            ))
+                        })?;
+                    pending_terminal_responses.clear();
+                    terminal_response_pending_since = None;
+                }
                 if closed {
                     break;
                 }
@@ -1479,19 +1506,13 @@ fn pty_runtime_unavailable(output: &[u8]) -> bool {
         || output.contains("there are no distributions installed")
 }
 
-fn answer_terminal_queries(
-    transport: &mut LocalPtyTransport,
-    terminal: &mut TerminalEmulator,
-    bytes: &[u8],
-) -> Result<(), CompatRunError> {
-    let responses = terminal_responses_for(terminal, bytes).map_err(CompatRunError::failed)?;
-    if !responses.is_empty() {
-        transport.write_input(&responses).map_err(|error| {
-            CompatRunError::failed(format!("failed to write terminal query response: {error}"))
-        })?;
-    }
-
-    Ok(())
+fn should_flush_terminal_responses(
+    has_pending_responses: bool,
+    output_idle: bool,
+    pending_age: Duration,
+) -> bool {
+    const MAX_COALESCE_DELAY: Duration = Duration::from_millis(20);
+    has_pending_responses && (output_idle || pending_age >= MAX_COALESCE_DELAY)
 }
 
 fn terminal_responses_for(
@@ -5974,6 +5995,26 @@ mod tests {
             terminal_responses_for(&mut terminal, b"6n").unwrap(),
             b"\x1b[1;1R"
         );
+    }
+
+    #[test]
+    fn terminal_query_responses_wait_for_idle_output_with_a_bounded_delay() {
+        assert!(!should_flush_terminal_responses(
+            true,
+            false,
+            Duration::from_millis(5)
+        ));
+        assert!(should_flush_terminal_responses(true, true, Duration::ZERO));
+        assert!(should_flush_terminal_responses(
+            true,
+            false,
+            Duration::from_millis(20)
+        ));
+        assert!(!should_flush_terminal_responses(
+            false,
+            true,
+            Duration::from_millis(20)
+        ));
     }
 
     #[test]
