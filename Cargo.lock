@@ -4678,6 +4678,8 @@ dependencies = [
  "security",
  "sha2",
  "shell-integration",
+ "term-core",
+ "term-parser",
  "transport-core",
  "transport-pty",
  "transport-ssh",

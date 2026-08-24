@@ -20,6 +20,8 @@ use security::{
     SecretProvider, SecretRequest, SecretString, evaluate_osc52_clipboard_write,
 };
 use shell_integration::{ShellKind, script_for_shell};
+use term_core::{TerminalCore, TerminalSize as CoreTerminalSize};
+use term_parser::TerminalEmulator;
 use transport_core::{TerminalSize, TerminalTransport, TransportLifecycleEvent, TransportState};
 use transport_pty::{LocalPtyDiagnostics, LocalPtyTransport, LocalShellProfile};
 use transport_ssh::{SshConnectionProfile, SshTransport};
@@ -1376,11 +1378,12 @@ fn run_pty_compat(
     let mut output = Vec::new();
     let mut lifecycle = Vec::new();
     let mut saw_marker = false;
+    let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(80, 24));
 
     while Instant::now() < deadline {
         match transport.poll_output() {
             Ok(poll) => {
-                answer_terminal_queries(&mut transport, &poll.bytes)?;
+                answer_terminal_queries(&mut transport, &mut terminal, &poll.bytes)?;
                 lifecycle.extend(poll.lifecycle);
                 output.extend(poll.bytes);
                 saw_marker =
@@ -1478,18 +1481,27 @@ fn pty_runtime_unavailable(output: &[u8]) -> bool {
 
 fn answer_terminal_queries(
     transport: &mut LocalPtyTransport,
+    terminal: &mut TerminalEmulator,
     bytes: &[u8],
 ) -> Result<(), CompatRunError> {
-    if bytes
-        .windows(b"\x1b[6n".len())
-        .any(|window| window == b"\x1b[6n")
-    {
-        transport.write_input(b"\x1b[1;1R").map_err(|error| {
-            CompatRunError::failed(format!("failed to answer CPR query: {error}"))
+    let responses = terminal_responses_for(terminal, bytes).map_err(CompatRunError::failed)?;
+    if !responses.is_empty() {
+        transport.write_input(&responses).map_err(|error| {
+            CompatRunError::failed(format!("failed to write terminal query response: {error}"))
         })?;
     }
 
     Ok(())
+}
+
+fn terminal_responses_for(
+    terminal: &mut TerminalEmulator,
+    bytes: &[u8],
+) -> Result<Vec<u8>, String> {
+    terminal
+        .apply_bytes(bytes)
+        .map_err(|error| format!("failed to parse PTY output: {error}"))?;
+    Ok(terminal.state_mut().take_pending_output())
 }
 
 fn command_label(program: &str, args: &[String]) -> String {
@@ -5701,6 +5713,8 @@ fn dependency_rules() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
                 "render-wgpu",
                 "security",
                 "shell-integration",
+                "term-core",
+                "term-parser",
                 "transport-core",
                 "transport-pty",
                 "transport-ssh",
@@ -5926,6 +5940,21 @@ mod tests {
         assert!(cases.iter().any(|case| case.key == "mux-tmux"
             && !case.required
             && case.category == CompatCategory::Multiplexers));
+    }
+
+    #[test]
+    fn compatibility_terminal_probe_answers_queries_split_across_reads() {
+        let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(80, 24));
+
+        assert!(
+            terminal_responses_for(&mut terminal, b"\x1b[")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            terminal_responses_for(&mut terminal, b"6n").unwrap(),
+            b"\x1b[1;1R"
+        );
     }
 
     #[test]
