@@ -1,4 +1,5 @@
 /target/
+/.worktrees/
 /fuzz/target/
 /.idea/
 /.vscode/
