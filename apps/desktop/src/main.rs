@@ -575,9 +575,8 @@ fn terminal_responses_for_shell_smoke(
     bytes: &[u8],
 ) -> Result<Vec<u8>, String> {
     terminal
-        .apply_bytes(bytes)
-        .map_err(|error| error.to_string())?;
-    Ok(terminal.state_mut().take_pending_output())
+        .apply_bytes_and_take_pending_output(bytes)
+        .map_err(|error| error.to_string())
 }
 
 fn shell_smoke_profile(config: &AppConfig) -> LocalShellProfile {
@@ -609,6 +608,7 @@ fn shell_smoke_profile(config: &AppConfig) -> LocalShellProfile {
             profile.args = vec![
                 "-NoLogo".to_owned(),
                 "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
                 "-Command".to_owned(),
                 "Write-Output panea-package-shell-smoke".to_owned(),
             ];
@@ -624,6 +624,7 @@ fn shell_smoke_profile(config: &AppConfig) -> LocalShellProfile {
                 profile.args = vec![
                     "-NoLogo".to_owned(),
                     "-NoProfile".to_owned(),
+                    "-NonInteractive".to_owned(),
                     "-Command".to_owned(),
                     "Write-Output panea-package-shell-smoke".to_owned(),
                 ];

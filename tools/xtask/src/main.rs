@@ -20,7 +20,7 @@ use security::{
     SecretProvider, SecretRequest, SecretString, evaluate_osc52_clipboard_write,
 };
 use shell_integration::{ShellKind, script_for_shell};
-use term_core::{TerminalCore, TerminalSize as CoreTerminalSize};
+use term_core::TerminalSize as CoreTerminalSize;
 use term_parser::TerminalEmulator;
 use transport_core::{TerminalSize, TerminalTransport, TransportLifecycleEvent, TransportState};
 use transport_pty::{LocalPtyDiagnostics, LocalPtyTransport, LocalShellProfile};
@@ -1499,9 +1499,8 @@ fn terminal_responses_for(
     bytes: &[u8],
 ) -> Result<Vec<u8>, String> {
     terminal
-        .apply_bytes(bytes)
-        .map_err(|error| format!("failed to parse PTY output: {error}"))?;
-    Ok(terminal.state_mut().take_pending_output())
+        .apply_bytes_and_take_pending_output(bytes)
+        .map_err(|error| format!("failed to parse PTY output: {error}"))
 }
 
 fn command_label(program: &str, args: &[String]) -> String {
@@ -2024,6 +2023,8 @@ fn verify_os_steps(options: &VerifyOsOptions) -> Vec<VerifyStep> {
                 "compat",
                 "run",
                 "--required-only",
+                "--timeout-ms",
+                "10000",
                 "--report-dir",
                 "target/cross-os/compatibility",
             ],
@@ -2680,6 +2681,7 @@ fn shell_compat_cases() -> Vec<CompatCase> {
             LocalShellProfile::powershell().with_args([
                 "-NoLogo",
                 "-NoProfile",
+                "-NonInteractive",
                 "-Command",
                 "Write-Output panea-compat-powershell",
             ]),
@@ -2703,6 +2705,7 @@ fn shell_compat_cases() -> Vec<CompatCase> {
             LocalShellProfile::custom("pwsh", "pwsh").with_args([
                 "-NoLogo",
                 "-NoProfile",
+                "-NonInteractive",
                 "-Command",
                 "Write-Output panea-compat-pwsh",
             ]),
@@ -2775,6 +2778,7 @@ fn protocol_compat_cases() -> Vec<CompatCase> {
             LocalShellProfile::powershell().with_args([
                 "-NoLogo",
                 "-NoProfile",
+                "-NonInteractive",
                 "-Command",
                 "$e=[char]27; $b=[char]7; Write-Output \"$e[38;2;255;0;0mpanea-compat-truecolor$e[0m\"; Write-Output \"$e]0;panea-title$b\"",
             ]),
@@ -4436,7 +4440,7 @@ fn run_packaged_doctor(binary_path: &Path, timeout: Duration) -> PackageSmokeRes
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() >= timeout => {
+            Ok(None) if started.elapsed() >= package_process_supervisor_timeout(timeout) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return PackageSmokeResult {
@@ -4527,7 +4531,7 @@ fn run_packaged_shell_smoke(binary_path: &Path, timeout: Duration) -> PackageSmo
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() >= timeout => {
+            Ok(None) if started.elapsed() >= package_process_supervisor_timeout(timeout) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return PackageSmokeResult {
@@ -4599,6 +4603,12 @@ fn run_packaged_shell_smoke(binary_path: &Path, timeout: Duration) -> PackageSmo
     }
 }
 
+fn package_process_supervisor_timeout(timeout: Duration) -> Duration {
+    timeout
+        .saturating_add(Duration::from_secs(2))
+        .max(Duration::from_secs(30))
+}
+
 fn run_packaged_gui_smoke(binary_path: &Path, timeout: Duration) -> PackageSmokeResult {
     let started = Instant::now();
     let startup = run_packaged_gui_smoke_mode(binary_path, timeout, "--startup");
@@ -4656,7 +4666,7 @@ fn run_packaged_gui_smoke_mode(
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() >= timeout.saturating_add(Duration::from_secs(2)) => {
+            Ok(None) if started.elapsed() >= package_process_supervisor_timeout(timeout) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return PackageSmokeResult {
@@ -4736,7 +4746,7 @@ fn run_windows_installer_smoke(options: &PackageOptions) -> PackageSmokeResult {
             .args(["install", "--install-dir"])
             .arg(&install_dir)
             .args(["--no-shortcuts", "--no-path", "--no-register"]),
-        options.timeout,
+        package_process_supervisor_timeout(options.timeout),
     );
     if let Err(error) = install {
         return PackageSmokeResult {
@@ -4756,7 +4766,7 @@ fn run_windows_installer_smoke(options: &PackageOptions) -> PackageSmokeResult {
             .args(["uninstall", "--install-dir"])
             .arg(&install_dir)
             .args(["--no-shortcuts", "--no-path", "--no-register"]),
-        options.timeout,
+        package_process_supervisor_timeout(options.timeout),
     );
 
     let passed = doctor.status == PackageSmokeStatus::Passed
@@ -5940,6 +5950,15 @@ mod tests {
         assert!(cases.iter().any(|case| case.key == "mux-tmux"
             && !case.required
             && case.category == CompatCategory::Multiplexers));
+
+        let powershell = cases
+            .iter()
+            .find(|case| case.key == "shell-powershell")
+            .expect("PowerShell compatibility case");
+        let CompatCaseKind::Pty { profile, .. } = &powershell.kind else {
+            panic!("PowerShell compatibility case must use a PTY");
+        };
+        assert!(profile.args.iter().any(|arg| arg == "-NonInteractive"));
     }
 
     #[test]
@@ -6069,6 +6088,17 @@ mod tests {
                 && step.required
                 && matches!(step.kind, VerifyStepKind::Command { .. })
         }));
+        let compatibility = steps
+            .iter()
+            .find(|step| step.key == "compat-required")
+            .expect("compatibility verification step");
+        let VerifyStepKind::Command { args, .. } = &compatibility.kind else {
+            panic!("compatibility verification must run a command");
+        };
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--timeout-ms", "10000"])
+        );
     }
 
     #[test]
@@ -6099,6 +6129,8 @@ mod tests {
         assert!(workflow.contains("CARGO_INCREMENTAL: \"0\""));
         assert!(workflow.contains("CARGO_PROFILE_DEV_DEBUG: \"0\""));
         assert!(workflow.contains("CARGO_PROFILE_TEST_DEBUG: \"0\""));
+        assert!(workflow.contains("target/cross-os/compatibility/"));
+        assert!(workflow.contains("target/cross-os/screenshots/"));
         assert!(
             workflow.contains("a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0")
         );
@@ -6154,6 +6186,18 @@ mod tests {
         assert_eq!(options.out_dir, PathBuf::from("target/custom-packages"));
         assert!(options.skip_cargo_build);
         assert_eq!(options.timeout, Duration::from_millis(750));
+    }
+
+    #[test]
+    fn package_process_supervisor_allows_cold_launch_and_diagnostic_grace() {
+        assert_eq!(
+            package_process_supervisor_timeout(Duration::from_secs(10)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            package_process_supervisor_timeout(Duration::from_secs(60)),
+            Duration::from_secs(62)
+        );
     }
 
     #[test]

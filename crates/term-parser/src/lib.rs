@@ -36,6 +36,11 @@ impl TerminalEmulator {
         &mut self.state
     }
 
+    pub fn apply_bytes_and_take_pending_output(&mut self, bytes: &[u8]) -> TerminalResult<Vec<u8>> {
+        self.apply_bytes(bytes)?;
+        Ok(self.state.take_pending_output())
+    }
+
     #[must_use]
     pub fn into_state(self) -> TerminalState {
         self.state
@@ -1036,6 +1041,22 @@ mod tests {
         assert_eq!(
             String::from_utf8(terminal.state_mut().take_pending_output()).unwrap(),
             "\x1b[1;5R"
+        );
+    }
+
+    #[test]
+    fn incremental_apply_returns_split_terminal_query_responses() {
+        let mut terminal = TerminalEmulator::new(TerminalSize::new(80, 24));
+
+        assert_eq!(
+            terminal
+                .apply_bytes_and_take_pending_output(b"\x1b[")
+                .unwrap(),
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            terminal.apply_bytes_and_take_pending_output(b"6n").unwrap(),
+            b"\x1b[1;1R"
         );
     }
 
