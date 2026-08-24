@@ -35,7 +35,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y rpm xvfb
+          sudo apt-get install -y rpm xvfb xauth libxkbcommon-x11-0
           curl -L --fail --retry 3 -o "$RUNNER_TEMP/appimagetool" https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           echo "a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0  $RUNNER_TEMP/appimagetool" | sha256sum --check
           chmod +x "$RUNNER_TEMP/appimagetool"

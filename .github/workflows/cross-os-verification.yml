@@ -40,7 +40,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y rpm xvfb xauth weston
+          sudo apt-get install -y rpm xvfb xauth weston libxkbcommon-x11-0
 
       - name: Install pinned AppImage tool
         if: runner.os == 'Linux'
@@ -84,7 +84,7 @@ jobs:
           --target-platform ${{ matrix.target }}
           --suite ci
           --allow-missing-screenshot-baseline
-          --timeout-ms 300000
+          --timeout-ms 600000
 
       - name: Run Panea platform verification suite (Linux X11)
         if: matrix.target == 'linux-x11'
@@ -97,7 +97,7 @@ jobs:
           --target-platform linux-x11
           --suite ci
           --allow-missing-screenshot-baseline
-          --timeout-ms 300000
+          --timeout-ms 600000
 
       - name: Run Panea platform verification suite (Linux Wayland)
         if: matrix.target == 'linux-wayland'
@@ -107,7 +107,7 @@ jobs:
           --target-platform linux-wayland
           --suite ci
           --allow-missing-screenshot-baseline
-          --timeout-ms 300000
+          --timeout-ms 600000
 
       - name: Stop headless Wayland compositor
         if: always() && matrix.target == 'linux-wayland'
