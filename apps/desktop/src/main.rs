@@ -91,6 +91,8 @@ use winit::{
     event_loop::ControlFlow,
 };
 
+pub mod fullscreen_chrome;
+
 pub fn main_entry() {
     if std::env::args().nth(1).as_deref() == Some("gui-smoke") {
         std::process::exit(run_gui_smoke_cli());
