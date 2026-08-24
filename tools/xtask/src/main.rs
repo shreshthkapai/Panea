@@ -6135,6 +6135,12 @@ mod tests {
             workflow.contains("a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0")
         );
         assert!(release_workflow.contains("libxkbcommon-x11-0"));
+        assert!(release_workflow.contains("libegl1"));
+        assert!(release_workflow.contains("libgl1-mesa-dri"));
+        assert!(release_workflow.contains("mesa-vulkan-drivers"));
+        assert!(release_workflow.contains("WINIT_UNIX_BACKEND: x11"));
+        assert!(release_workflow.contains("XDG_SESSION_TYPE: x11"));
+        assert!(release_workflow.contains("LIBGL_ALWAYS_SOFTWARE: \"1\""));
     }
 
     #[test]
