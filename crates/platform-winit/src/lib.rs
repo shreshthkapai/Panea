@@ -33,9 +33,9 @@ use starship_battery::{Manager as BatteryManager, State as BatteryState};
 use winit::{
     dpi::LogicalSize,
     event::{ElementState, Ime, MouseScrollDelta, WindowEvent},
-    event_loop::{EventLoop, EventLoopBuilder, EventLoopWindowTarget},
+    event_loop::EventLoop,
     keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey},
-    window::{Fullscreen, Icon, Window, WindowBuilder},
+    window::{Fullscreen, Icon, Window},
 };
 
 const POWER_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -463,7 +463,7 @@ pub struct DesktopWindow {
 
 impl DesktopWindow {
     pub fn create(
-        event_loop: &EventLoopWindowTarget<()>,
+        event_loop: &EventLoop<()>,
         settings: &WindowSettings,
     ) -> Result<Self, winit::error::OsError> {
         let decoration = resolve_decoration_mode(settings.decoration_mode, detected_platform());
@@ -472,7 +472,7 @@ impl DesktopWindow {
             WindowMode::FramelessWindowed | WindowMode::FramelessFullscreen
         ) && !matches!(decoration.effective, DecorationMode::None);
 
-        let window = WindowBuilder::new()
+        let attributes = Window::default_attributes()
             .with_title(settings.title.clone())
             .with_window_icon(settings.icon.as_ref().and_then(WindowIcon::to_winit))
             .with_inner_size(LogicalSize::new(
@@ -482,15 +482,16 @@ impl DesktopWindow {
             .with_visible(settings.visible_on_create)
             .with_decorations(decorations)
             .with_transparent(settings.opacity < 1.0)
-            .with_maximized(matches!(settings.mode, WindowMode::Maximized))
-            .build(event_loop)?;
+            .with_maximized(matches!(settings.mode, WindowMode::Maximized));
+        #[allow(deprecated)]
+        let window = event_loop.create_window(attributes)?;
 
         let window = Arc::new(window);
         window.set_ime_allowed(true);
         let window_mode =
             apply_window_mode_with_decoration(&window, settings.mode, decoration.effective);
         let linux = linux_backend_diagnostic(settings, &decoration);
-        let monitors = monitor_infos(event_loop);
+        let monitors = monitor_infos(&window);
         let dpi = window_dpi_info(&window);
 
         Ok(Self {
@@ -1078,7 +1079,7 @@ pub fn apply_window_mode_with_decoration(
     }
 }
 
-fn preferred_video_mode(window: &Window) -> Option<winit::monitor::VideoMode> {
+fn preferred_video_mode(window: &Window) -> Option<winit::monitor::VideoModeHandle> {
     let size = window.inner_size();
     window.current_monitor()?.video_modes().max_by_key(|mode| {
         let mode_size = mode.size();
@@ -1131,7 +1132,7 @@ fn resolve_decoration_mode(
 pub fn create_event_loop(
     requested: LinuxWindowBackend,
 ) -> Result<EventLoop<()>, winit::error::EventLoopError> {
-    let mut builder = EventLoopBuilder::new();
+    let mut builder = EventLoop::builder();
     #[cfg(target_os = "linux")]
     match requested {
         LinuxWindowBackend::Auto => {}
@@ -1150,10 +1151,7 @@ pub fn create_event_loop(
 }
 
 #[must_use]
-pub fn platform_capabilities(
-    event_loop: &EventLoopWindowTarget<()>,
-    _window: &Window,
-) -> PlatformCapabilities {
+pub fn platform_capabilities(_event_loop: &EventLoop<()>, window: &Window) -> PlatformCapabilities {
     PlatformCapabilities {
         platform: detected_platform(),
         window_modes_supported: vec![
@@ -1175,7 +1173,7 @@ pub fn platform_capabilities(
         gpu_backends_available: Vec::new(),
         ime_supported: ImeSupport::Basic,
         dpi_behavior: dpi_behavior_for_platform(),
-        monitors: monitor_infos(event_loop),
+        monitors: monitor_infos(window),
         compositor_info: compositor_info(),
         shell_environment_info: shell_environment_info(),
         fallbacks: Vec::new(),
@@ -1265,8 +1263,8 @@ fn wheel_delta(delta: MouseScrollDelta) -> (f64, f64) {
     }
 }
 
-fn monitor_infos(event_loop: &EventLoopWindowTarget<()>) -> Vec<MonitorInfo> {
-    event_loop.available_monitors().map(monitor_info).collect()
+fn monitor_infos(window: &Window) -> Vec<MonitorInfo> {
+    window.available_monitors().map(monitor_info).collect()
 }
 
 fn monitor_info(monitor: winit::monitor::MonitorHandle) -> MonitorInfo {

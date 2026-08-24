@@ -1225,6 +1225,9 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
     let mut gui_smoke_success_presented = false;
     let mut gui_smoke_hold_until = None;
 
+    // Winit 0.30 keeps the closure API as a migration bridge; moving this large state machine to
+    // ApplicationHandler is a separate architectural change from the macOS compatibility update.
+    #[allow(deprecated)]
     event_loop.run(move |event, target| {
         target.set_control_flow(ControlFlow::Wait);
 
