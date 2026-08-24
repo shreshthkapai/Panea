@@ -693,6 +693,9 @@ fn known_paths() -> BTreeSet<&'static str> {
         "window.fullscreen_titlebar.height",
         "window.fullscreen_titlebar.reveal_height",
         "window.fullscreen_titlebar.show_window_controls",
+        "window.fullscreen_titlebar.animation",
+        "window.fullscreen_titlebar.animation_duration_ms",
+        "window.fullscreen_titlebar.hide_delay_ms",
         "renderer",
         "renderer.backend",
         "renderer.vsync",
@@ -1556,6 +1559,9 @@ mod tests {
             height = 38
             reveal_height = 4
             show_window_controls = true
+            animation = "smooth"
+            animation_duration_ms = 140
+            hide_delay_ms = 80
             "#,
             None,
             ConfigPlatform::Windows,
@@ -1564,6 +1570,48 @@ mod tests {
 
         assert!(loaded.config.window.fullscreen_titlebar.enabled);
         assert_eq!(loaded.config.window.fullscreen_titlebar.height, 38);
+        assert_eq!(
+            loaded.config.window.fullscreen_titlebar.animation,
+            config_core::FullscreenChromeAnimation::Smooth
+        );
+        assert_eq!(
+            loaded
+                .config
+                .window
+                .fullscreen_titlebar
+                .animation_duration_ms,
+            140
+        );
+        assert_eq!(loaded.config.window.fullscreen_titlebar.hide_delay_ms, 80);
+        assert!(loaded.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn fullscreen_titlebar_legacy_toml_uses_portable_motion_defaults() {
+        let loaded = parse_str(
+            r#"
+            schema_version = 2
+            [window.fullscreen_titlebar]
+            enabled = true
+            "#,
+            None,
+            ConfigPlatform::LinuxWayland,
+        )
+        .expect("legacy titlebar config should parse");
+
+        assert_eq!(
+            loaded.config.window.fullscreen_titlebar.animation,
+            config_core::FullscreenChromeAnimation::Smooth
+        );
+        assert_eq!(
+            loaded
+                .config
+                .window
+                .fullscreen_titlebar
+                .animation_duration_ms,
+            120
+        );
+        assert_eq!(loaded.config.window.fullscreen_titlebar.hide_delay_ms, 120);
         assert!(loaded.diagnostics.is_empty());
     }
 

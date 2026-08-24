@@ -233,10 +233,17 @@ enabled = true
 height = 36          # logical pixels
 reveal_height = 3    # logical pixels at the top edge
 show_window_controls = true
+animation = "smooth" # smooth or instant
+animation_duration_ms = 120
+hide_delay_ms = 120
 ```
 
 The bar is an overlay and does not change terminal contents, selection, PTY
-dimensions, or mouse coordinates while hidden. See
+dimensions, or mouse coordinates while hidden. `smooth` resolves to `instant`
+without changing the stored config when reduced motion is requested, retained
+GPU damage is unavailable, or the active animation budget cannot admit it.
+The same keys and defaults apply on Windows, macOS, Linux X11, and Linux
+Wayland; platform overrides refine them only when explicitly configured. See
 [Auto-Hidden Fullscreen Titlebar](fullscreen-titlebar.md).
 
 Renderer diagnostics can optionally request GPU timestamp queries:

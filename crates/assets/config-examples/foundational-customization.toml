@@ -11,6 +11,15 @@ margin_y = 2
 opacity = 0.96
 mode = "windowed"
 
+[window.fullscreen_titlebar]
+enabled = false
+height = 36
+reveal_height = 3
+show_window_controls = true
+animation = "smooth"
+animation_duration_ms = 120
+hide_delay_ms = 120
+
 [font]
 family = "Cascadia Mono"
 fallback_families = ["Noto Sans Mono CJK JP", "Segoe UI Emoji", "Noto Color Emoji"]

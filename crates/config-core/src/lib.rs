@@ -200,6 +200,18 @@ impl AppConfig {
                 "fullscreen titlebar reveal height must be greater than zero and no larger than the titlebar height",
             );
         }
+        if self.window.fullscreen_titlebar.animation_duration_ms > 500 {
+            report.error(
+                "window.fullscreen_titlebar.animation_duration_ms",
+                "fullscreen titlebar animation duration must be between 0 and 500 milliseconds",
+            );
+        }
+        if self.window.fullscreen_titlebar.hide_delay_ms > 1000 {
+            report.error(
+                "window.fullscreen_titlebar.hide_delay_ms",
+                "fullscreen titlebar hide delay must be between 0 and 1000 milliseconds",
+            );
+        }
         if matches!(
             self.window.mode,
             WindowModeConfig::FramelessFullscreen | WindowModeConfig::FramelessWindowed
@@ -1015,6 +1027,9 @@ pub struct FullscreenTitlebarConfig {
     /// Top-edge hover strip in logical pixels.
     pub reveal_height: u16,
     pub show_window_controls: bool,
+    pub animation: FullscreenChromeAnimation,
+    pub animation_duration_ms: u16,
+    pub hide_delay_ms: u16,
 }
 
 impl Default for FullscreenTitlebarConfig {
@@ -1024,8 +1039,40 @@ impl Default for FullscreenTitlebarConfig {
             height: 36,
             reveal_height: 3,
             show_window_controls: true,
+            animation: FullscreenChromeAnimation::Smooth,
+            animation_duration_ms: 120,
+            hide_delay_ms: 120,
         }
     }
+}
+
+impl FullscreenTitlebarConfig {
+    #[must_use]
+    pub const fn effective_animation(
+        &self,
+        reduced_motion: bool,
+        retained_damage_available: bool,
+        animation_budget_available: bool,
+    ) -> FullscreenChromeAnimation {
+        if matches!(self.animation, FullscreenChromeAnimation::Smooth)
+            && !reduced_motion
+            && retained_damage_available
+            && animation_budget_available
+            && self.animation_duration_ms > 0
+        {
+            FullscreenChromeAnimation::Smooth
+        } else {
+            FullscreenChromeAnimation::Instant
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FullscreenChromeAnimation {
+    Instant,
+    #[default]
+    Smooth,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2318,6 +2365,9 @@ pub struct FullscreenTitlebarConfigPatch {
     pub height: Option<u16>,
     pub reveal_height: Option<u16>,
     pub show_window_controls: Option<bool>,
+    pub animation: Option<FullscreenChromeAnimation>,
+    pub animation_duration_ms: Option<u16>,
+    pub hide_delay_ms: Option<u16>,
 }
 
 impl FullscreenTitlebarConfigPatch {
@@ -2326,6 +2376,12 @@ impl FullscreenTitlebarConfigPatch {
         apply_opt(&mut config.height, &self.height);
         apply_opt(&mut config.reveal_height, &self.reveal_height);
         apply_opt(&mut config.show_window_controls, &self.show_window_controls);
+        apply_opt(&mut config.animation, &self.animation);
+        apply_opt(
+            &mut config.animation_duration_ms,
+            &self.animation_duration_ms,
+        );
+        apply_opt(&mut config.hide_delay_ms, &self.hide_delay_ms);
     }
 }
 
@@ -3102,6 +3158,27 @@ pub fn export_schema() -> ConfigSchema {
                         "window.fullscreen_titlebar.show_window_controls",
                         "boolean",
                         default.window.fullscreen_titlebar.show_window_controls,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "window.fullscreen_titlebar.animation",
+                        "fullscreen_chrome_animation",
+                        format!("{:?}", default.window.fullscreen_titlebar.animation),
+                        true,
+                        false,
+                    ),
+                    field(
+                        "window.fullscreen_titlebar.animation_duration_ms",
+                        "integer",
+                        default.window.fullscreen_titlebar.animation_duration_ms,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "window.fullscreen_titlebar.hide_delay_ms",
+                        "integer",
+                        default.window.fullscreen_titlebar.hide_delay_ms,
                         true,
                         false,
                     ),
@@ -4598,6 +4675,12 @@ mod tests {
     fn fullscreen_titlebar_is_opt_in_validated_and_live_reloadable() {
         let config = AppConfig::default();
         assert!(!config.window.fullscreen_titlebar.enabled);
+        assert_eq!(
+            config.window.fullscreen_titlebar.animation,
+            FullscreenChromeAnimation::Smooth
+        );
+        assert_eq!(config.window.fullscreen_titlebar.animation_duration_ms, 120);
+        assert_eq!(config.window.fullscreen_titlebar.hide_delay_ms, 120);
         assert!(!config.validate().has_errors());
 
         let mut next = config.clone();
@@ -4615,6 +4698,82 @@ mod tests {
                 diagnostic.path == "window.fullscreen_titlebar.reveal_height"
             })
         );
+
+        next.window.fullscreen_titlebar.reveal_height = 3;
+        next.window.fullscreen_titlebar.height = 23;
+        next.window.fullscreen_titlebar.animation_duration_ms = 501;
+        next.window.fullscreen_titlebar.hide_delay_ms = 1001;
+        let paths = next
+            .validate()
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.path)
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"window.fullscreen_titlebar.height".to_owned()));
+        assert!(paths.contains(&"window.fullscreen_titlebar.animation_duration_ms".to_owned()));
+        assert!(paths.contains(&"window.fullscreen_titlebar.hide_delay_ms".to_owned()));
+    }
+
+    #[test]
+    fn fullscreen_titlebar_effective_animation_obeys_runtime_gates() {
+        let config = FullscreenTitlebarConfig::default();
+        assert_eq!(
+            config.effective_animation(false, true, true),
+            FullscreenChromeAnimation::Smooth
+        );
+        assert_eq!(
+            config.effective_animation(true, true, true),
+            FullscreenChromeAnimation::Instant
+        );
+        assert_eq!(
+            config.effective_animation(false, false, true),
+            FullscreenChromeAnimation::Instant
+        );
+        assert_eq!(
+            config.effective_animation(false, true, false),
+            FullscreenChromeAnimation::Instant
+        );
+        assert_eq!(config.animation, FullscreenChromeAnimation::Smooth);
+
+        let mut zero_duration = config;
+        zero_duration.animation_duration_ms = 0;
+        assert_eq!(
+            zero_duration.effective_animation(false, true, true),
+            FullscreenChromeAnimation::Instant
+        );
+    }
+
+    #[test]
+    fn fullscreen_titlebar_old_config_and_schema_remain_compatible() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            [window.fullscreen_titlebar]
+            enabled = true
+            height = 40
+            "#,
+        )
+        .expect("old fullscreen titlebar config should retain defaults");
+        assert_eq!(config.schema_version, CURRENT_CONFIG_SCHEMA_VERSION);
+        assert_eq!(
+            config.window.fullscreen_titlebar.animation,
+            FullscreenChromeAnimation::Smooth
+        );
+        assert_eq!(config.window.fullscreen_titlebar.animation_duration_ms, 120);
+        assert_eq!(config.window.fullscreen_titlebar.hide_delay_ms, 120);
+
+        let schema = export_schema();
+        let window = schema
+            .sections
+            .iter()
+            .find(|section| section.name == "window")
+            .expect("window schema");
+        for path in [
+            "window.fullscreen_titlebar.animation",
+            "window.fullscreen_titlebar.animation_duration_ms",
+            "window.fullscreen_titlebar.hide_delay_ms",
+        ] {
+            assert!(window.fields.iter().any(|field| field.path == path));
+        }
     }
 
     #[test]
@@ -4624,9 +4783,14 @@ mod tests {
             [window.fullscreen_titlebar]
             enabled = true
             height = 36
+            animation = "smooth"
+            animation_duration_ms = 150
+            hide_delay_ms = 90
 
             [platform.windows.window.fullscreen_titlebar]
             height = 42
+            animation = "instant"
+            animation_duration_ms = 0
             "#,
         )
         .expect("fullscreen titlebar override should parse");
@@ -4635,6 +4799,17 @@ mod tests {
         let linux = config.resolved_for_platform(ConfigPlatform::LinuxWayland);
         assert!(windows.window.fullscreen_titlebar.enabled);
         assert_eq!(windows.window.fullscreen_titlebar.height, 42);
+        assert_eq!(
+            windows.window.fullscreen_titlebar.animation,
+            FullscreenChromeAnimation::Instant
+        );
+        assert_eq!(windows.window.fullscreen_titlebar.animation_duration_ms, 0);
+        assert_eq!(windows.window.fullscreen_titlebar.hide_delay_ms, 90);
         assert_eq!(linux.window.fullscreen_titlebar.height, 36);
+        assert_eq!(
+            linux.window.fullscreen_titlebar.animation,
+            FullscreenChromeAnimation::Smooth
+        );
+        assert_eq!(linux.window.fullscreen_titlebar.animation_duration_ms, 150);
     }
 }

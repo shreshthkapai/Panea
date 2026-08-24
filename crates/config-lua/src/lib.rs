@@ -19,14 +19,14 @@ use config_core::{
     AppConfig, ClipboardConfigPatch, ColorConfigPatch, CommandBlockStyle, CommandBlocksConfigPatch,
     ConfigDiagnostic, ConfigDiagnosticSeverity, ConfigPlatform, ConfigProvider,
     ConfigProviderError, CursorConfigPatch, CursorShape, DecorationStrategyConfig,
-    DiagnosticsConfigPatch, FontConfigPatch, FullscreenTitlebarConfigPatch,
-    InputOutputGroupingStyle, KeyBinding, LinuxBackendConfig, LoadedAppConfig, LogLevel,
-    MouseBinding, NotificationConfigPatch, Osc52ClipboardConfigPatch, PerformanceConfigPatch,
-    PerformanceOverlayDetail, PerformanceOverlayPosition, PerformanceProfile, PlatformOverride,
-    PlatformOverrides, PresentModePreference, PromptDecorationStyle, PromptDecorationsConfigPatch,
-    RendererBackendPreference, RendererConfigPatch, RgbaColor, ShellIntegrationActivationConfig,
-    ShellIntegrationConfigPatch, ShellProfile, ShellProfileKind, SshProfile, WindowConfigPatch,
-    WindowModeConfig,
+    DiagnosticsConfigPatch, FontConfigPatch, FullscreenChromeAnimation,
+    FullscreenTitlebarConfigPatch, InputOutputGroupingStyle, KeyBinding, LinuxBackendConfig,
+    LoadedAppConfig, LogLevel, MouseBinding, NotificationConfigPatch, Osc52ClipboardConfigPatch,
+    PerformanceConfigPatch, PerformanceOverlayDetail, PerformanceOverlayPosition,
+    PerformanceProfile, PlatformOverride, PlatformOverrides, PresentModePreference,
+    PromptDecorationStyle, PromptDecorationsConfigPatch, RendererBackendPreference,
+    RendererConfigPatch, RgbaColor, ShellIntegrationActivationConfig, ShellIntegrationConfigPatch,
+    ShellProfile, ShellProfileKind, SshProfile, WindowConfigPatch, WindowModeConfig,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -874,6 +874,16 @@ fn set_config_value(config: &mut AppConfig, path: &str, value: &ConfigValue) -> 
         "window.fullscreen_titlebar.show_window_controls" => {
             config.window.fullscreen_titlebar.show_window_controls = value_as_bool(value)?;
         }
+        "window.fullscreen_titlebar.animation" => {
+            config.window.fullscreen_titlebar.animation =
+                parse_fullscreen_chrome_animation(value_as_string_ref(value)?)?;
+        }
+        "window.fullscreen_titlebar.animation_duration_ms" => {
+            config.window.fullscreen_titlebar.animation_duration_ms = value_as_u16(value)?;
+        }
+        "window.fullscreen_titlebar.hide_delay_ms" => {
+            config.window.fullscreen_titlebar.hide_delay_ms = value_as_u16(value)?;
+        }
         "renderer.backend" => {
             config.renderer.backend = parse_renderer_backend(value_as_string_ref(value)?)?;
         }
@@ -1184,6 +1194,32 @@ fn set_platform_override_value(
                 .get_or_insert_with(FullscreenTitlebarConfigPatch::default)
                 .show_window_controls = Some(value_as_bool(value)?);
         }
+        "window.fullscreen_titlebar.animation" => {
+            entry
+                .window
+                .get_or_insert_with(WindowConfigPatch::default)
+                .fullscreen_titlebar
+                .get_or_insert_with(FullscreenTitlebarConfigPatch::default)
+                .animation = Some(parse_fullscreen_chrome_animation(value_as_string_ref(
+                value,
+            )?)?);
+        }
+        "window.fullscreen_titlebar.animation_duration_ms" => {
+            entry
+                .window
+                .get_or_insert_with(WindowConfigPatch::default)
+                .fullscreen_titlebar
+                .get_or_insert_with(FullscreenTitlebarConfigPatch::default)
+                .animation_duration_ms = Some(value_as_u16(value)?);
+        }
+        "window.fullscreen_titlebar.hide_delay_ms" => {
+            entry
+                .window
+                .get_or_insert_with(WindowConfigPatch::default)
+                .fullscreen_titlebar
+                .get_or_insert_with(FullscreenTitlebarConfigPatch::default)
+                .hide_delay_ms = Some(value_as_u16(value)?);
+        }
         "renderer.backend" => {
             entry
                 .renderer
@@ -1403,6 +1439,14 @@ fn parse_window_mode(value: &str) -> Result<WindowModeConfig, String> {
         "frameless_windowed" => Ok(WindowModeConfig::FramelessWindowed),
         "frameless_fullscreen" => Ok(WindowModeConfig::FramelessFullscreen),
         other => Err(format!("unknown window mode '{other}'")),
+    }
+}
+
+fn parse_fullscreen_chrome_animation(value: &str) -> Result<FullscreenChromeAnimation, String> {
+    match value {
+        "instant" => Ok(FullscreenChromeAnimation::Instant),
+        "smooth" => Ok(FullscreenChromeAnimation::Smooth),
+        _ => Err(format!("unsupported fullscreen chrome animation '{value}'")),
     }
 }
 
@@ -1862,7 +1906,11 @@ mod tests {
             r#"
             panea.set("window.fullscreen_titlebar.enabled", true)
             panea.set("window.fullscreen_titlebar.height", 40)
+            panea.set("window.fullscreen_titlebar.animation", "smooth")
+            panea.set("window.fullscreen_titlebar.animation_duration_ms", 140)
+            panea.set("window.fullscreen_titlebar.hide_delay_ms", 80)
             panea.platform_set("windows", "window.fullscreen_titlebar.reveal_height", 5)
+            panea.platform_set("windows", "window.fullscreen_titlebar.animation", "instant")
             "#,
             None,
             ConfigPlatform::Windows,
@@ -1872,5 +1920,18 @@ mod tests {
         assert!(loaded.config.window.fullscreen_titlebar.enabled);
         assert_eq!(loaded.config.window.fullscreen_titlebar.height, 40);
         assert_eq!(loaded.config.window.fullscreen_titlebar.reveal_height, 5);
+        assert_eq!(
+            loaded.config.window.fullscreen_titlebar.animation,
+            config_core::FullscreenChromeAnimation::Instant
+        );
+        assert_eq!(
+            loaded
+                .config
+                .window
+                .fullscreen_titlebar
+                .animation_duration_ms,
+            140
+        );
+        assert_eq!(loaded.config.window.fullscreen_titlebar.hide_delay_ms, 80);
     }
 }
