@@ -6,7 +6,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError},
     },
@@ -1066,9 +1066,11 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
     let settings = window_settings(&config);
     let event_loop = create_event_loop(settings.linux_backend)?;
     let transport_waker = TransportWakeHandle::new({
-        let event_loop_proxy = event_loop.create_proxy();
+        let event_loop_proxy = Mutex::new(event_loop.create_proxy());
         move || {
-            let _ = event_loop_proxy.send_event(());
+            if let Ok(event_loop_proxy) = event_loop_proxy.lock() {
+                let _ = event_loop_proxy.send_event(());
+            }
         }
     });
     let desktop_window = DesktopWindow::create(&event_loop, &settings)?;
