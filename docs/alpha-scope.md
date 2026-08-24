@@ -24,8 +24,10 @@ multiplexer, shell-integration, visual, and SSH paths with informed users.
 ## Explicit Limits
 
 - Windows is the only platform with current-host package and real local-shell
-  evidence. macOS, Linux X11, and Linux Wayland implementations are not called
-  verified until their native reports pass.
+  evidence. Its deterministic fullscreen chrome fixtures and package lifecycle
+  smoke pass; final exact-artifact interaction sign-off is still manual. macOS,
+  Linux X11, and Linux Wayland implementations are not called verified until
+  their native reports pass.
 - Editors, TUIs, tmux/screen/zellij, WSL, SSH servers, IME, clipboard, GPU
   device-loss, and compositor behavior still require broader interactive and
   real-host evidence.
@@ -44,6 +46,12 @@ bounded, deny unsafe clipboard and SSH actions by default, and pass its packaged
 doctor, local-shell, no-input single-prompt startup, and terminal-I/O GUI smoke
 commands. A platform is listed as verified only
 after those checks and the platform-specific manual checklist run on that OS.
+
+For the current Windows artifact, automated acceptance gates pass. Alpha
+publication remains blocked on the exact-artifact fullscreen interaction
+checklist, release-owner signing decision/evidence, and any broader platform
+claims the release intends to make. A Windows-only unsigned development alpha
+must be labeled as such.
 
 Alpha bug reports should include `panea doctor --json` output. Diagnostic
 exports exclude terminal contents, command output, environment variables,
