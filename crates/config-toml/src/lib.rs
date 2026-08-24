@@ -1160,11 +1160,11 @@ mod tests {
             env.get(key).map(std::ffi::OsString::from)
         });
 
-        assert!(
-            windows_paths
-                .iter()
-                .any(|path| path.ends_with("Panea\\config.toml"))
-        );
+        assert!(windows_paths.iter().any(|path| {
+            path.to_string_lossy()
+                .replace('/', "\\")
+                .ends_with("Panea\\config.toml")
+        }));
 
         let mut env = BTreeMap::new();
         env.insert("XDG_CONFIG_HOME", "/home/me/.config");

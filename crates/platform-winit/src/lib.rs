@@ -13,7 +13,9 @@ use std::{
 };
 
 use arboard::Clipboard;
-use notify_rust::{Notification, Urgency};
+use notify_rust::Notification;
+#[cfg(not(target_os = "macos"))]
+use notify_rust::Urgency;
 use platform_core::{
     ClipboardAvailability, ClipboardDiagnostic, ClipboardOperation, ClipboardProvider,
     CompositorInfo, DecorationMode, DecorationModeDiagnostic, DesktopPlatform, DpiBehavior,
@@ -233,12 +235,8 @@ fn deliver_native_notification(request: &NotificationRequest) -> Result<(), Stri
     notification
         .appname("Panea")
         .summary(&request.title)
-        .body(&request.body)
-        .urgency(match request.urgency {
-            NotificationUrgency::Low => Urgency::Low,
-            NotificationUrgency::Normal => Urgency::Normal,
-            NotificationUrgency::Critical => Urgency::Critical,
-        });
+        .body(&request.body);
+    apply_notification_urgency(&mut notification, request.urgency);
     #[cfg(windows)]
     notification.app_id("Panea.Terminal");
     notification
@@ -246,6 +244,18 @@ fn deliver_native_notification(request: &NotificationRequest) -> Result<(), Stri
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
+
+#[cfg(not(target_os = "macos"))]
+fn apply_notification_urgency(notification: &mut Notification, urgency: NotificationUrgency) {
+    notification.urgency(match urgency {
+        NotificationUrgency::Low => Urgency::Low,
+        NotificationUrgency::Normal => Urgency::Normal,
+        NotificationUrgency::Critical => Urgency::Critical,
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn apply_notification_urgency(_notification: &mut Notification, _urgency: NotificationUrgency) {}
 
 const fn notification_backend() -> NotificationBackend {
     if cfg!(windows) {

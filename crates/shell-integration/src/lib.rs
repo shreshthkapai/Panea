@@ -4,7 +4,6 @@ pub const LAYER: &str = "semantic meaning";
 
 use std::{
     collections::BTreeMap,
-    path::Path,
     time::{Duration, Instant},
 };
 
@@ -330,17 +329,20 @@ impl ShellKind {
 
 #[must_use]
 pub fn detect_shell_kind(program_or_name: &str) -> ShellKind {
-    let path = Path::new(program_or_name);
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(program_or_name);
+    let file_name = portable_executable_name(program_or_name);
     let without_extension = file_name
         .strip_suffix(".exe")
         .or_else(|| file_name.strip_suffix(".EXE"))
         .unwrap_or(file_name);
 
     ShellKind::parse(without_extension)
+}
+
+fn portable_executable_name(program_or_name: &str) -> &str {
+    program_or_name
+        .rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(program_or_name)
 }
 
 #[must_use]
@@ -1250,6 +1252,16 @@ mod tests {
             ShellKind::Pwsh
         );
         assert_eq!(detect_shell_kind("unknown-shell"), ShellKind::Unknown);
+    }
+
+    #[test]
+    fn executable_name_parsing_is_independent_of_host_path_rules() {
+        assert_eq!(
+            portable_executable_name("C:\\Program Files\\PowerShell\\7\\pwsh.exe"),
+            "pwsh.exe"
+        );
+        assert_eq!(portable_executable_name("/usr/local/bin/fish"), "fish");
+        assert_eq!(portable_executable_name("pwsh.exe"), "pwsh.exe");
     }
 
     #[test]

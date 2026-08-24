@@ -34,13 +34,88 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Run Panea platform verification suite
+
+      - name: Install Linux verification dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm xvfb xauth weston
+
+      - name: Install pinned AppImage tool
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          tool="$RUNNER_TEMP/appimagetool"
+          curl -L --fail --retry 3 \
+            -o "$tool" \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          echo "a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0  $tool" | sha256sum --check
+          chmod +x "$tool"
+          echo "PANEA_APPIMAGETOOL=$tool" >> "$GITHUB_ENV"
+          echo "APPIMAGE_EXTRACT_AND_RUN=1" >> "$GITHUB_ENV"
+
+      - name: Start headless Wayland compositor
+        if: matrix.target == 'linux-wayland'
+        shell: bash
+        run: |
+          runtime="$RUNNER_TEMP/panea-wayland-runtime"
+          mkdir -p "$runtime"
+          chmod 700 "$runtime"
+          XDG_RUNTIME_DIR="$runtime" weston \
+            --backend=headless-backend.so \
+            --socket=panea-wayland \
+            --idle-time=0 \
+            --log="$RUNNER_TEMP/weston.log" &
+          echo $! > "$RUNNER_TEMP/weston.pid"
+          for attempt in $(seq 1 50); do
+            test -S "$runtime/panea-wayland" && break
+            sleep 0.1
+          done
+          test -S "$runtime/panea-wayland"
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+          echo "WAYLAND_DISPLAY=panea-wayland" >> "$GITHUB_ENV"
+          echo "WINIT_UNIX_BACKEND=wayland" >> "$GITHUB_ENV"
+
+      - name: Run Panea platform verification suite (Windows/macOS)
+        if: runner.os != 'Linux'
         run: >
           cargo run -p xtask -- verify-os run
           --target-platform ${{ matrix.target }}
           --suite ci
           --allow-missing-screenshot-baseline
           --timeout-ms 300000
+
+      - name: Run Panea platform verification suite (Linux X11)
+        if: matrix.target == 'linux-x11'
+        shell: bash
+        env:
+          WINIT_UNIX_BACKEND: x11
+        run: >
+          xvfb-run -a -s "-screen 0 1920x1080x24"
+          cargo run -p xtask -- verify-os run
+          --target-platform linux-x11
+          --suite ci
+          --allow-missing-screenshot-baseline
+          --timeout-ms 300000
+
+      - name: Run Panea platform verification suite (Linux Wayland)
+        if: matrix.target == 'linux-wayland'
+        shell: bash
+        run: >
+          cargo run -p xtask -- verify-os run
+          --target-platform linux-wayland
+          --suite ci
+          --allow-missing-screenshot-baseline
+          --timeout-ms 300000
+
+      - name: Stop headless Wayland compositor
+        if: always() && matrix.target == 'linux-wayland'
+        shell: bash
+        run: |
+          test ! -f "$RUNNER_TEMP/weston.pid" || kill "$(cat "$RUNNER_TEMP/weston.pid")" || true
+          test ! -f "$RUNNER_TEMP/weston.log" || cat "$RUNNER_TEMP/weston.log"
+
       - name: Upload verification report
         if: always()
         uses: actions/upload-artifact@v4

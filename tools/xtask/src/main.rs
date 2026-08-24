@@ -6056,6 +6056,20 @@ mod tests {
     }
 
     #[test]
+    fn cross_os_workflow_provisions_real_linux_sessions_and_packaging_tools() {
+        let workflow = include_str!("../../../.github/workflows/cross-os-verification.yml");
+
+        assert!(workflow.contains("xvfb-run -a"));
+        assert!(workflow.contains("--backend=headless-backend.so"));
+        assert!(workflow.contains("WAYLAND_DISPLAY"));
+        assert!(workflow.contains("PANEA_APPIMAGETOOL"));
+        assert!(workflow.contains("APPIMAGE_EXTRACT_AND_RUN"));
+        assert!(
+            workflow.contains("a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0")
+        );
+    }
+
+    #[test]
     fn verify_os_report_json_escapes_step_notes() {
         let report = VerifyOsReport {
             target_platform: CompatPlatform::Windows,
