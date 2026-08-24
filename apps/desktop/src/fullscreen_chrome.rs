@@ -81,6 +81,7 @@ pub struct ChromeSettings {
     pub transition_duration: Duration,
     pub hide_delay: Duration,
     pub double_click_interval: Duration,
+    pub frame_interval: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -112,8 +113,6 @@ pub struct FullscreenChromeController {
 }
 
 impl FullscreenChromeController {
-    const FRAME_INTERVAL: Duration = Duration::from_millis(8);
-
     #[must_use]
     pub const fn new(settings: ChromeSettings) -> Self {
         Self {
@@ -133,6 +132,11 @@ impl FullscreenChromeController {
     #[must_use]
     pub const fn phase(&self) -> ChromePhase {
         self.phase
+    }
+
+    #[must_use]
+    pub const fn settings(&self) -> ChromeSettings {
+        self.settings
     }
 
     #[must_use]
@@ -181,13 +185,21 @@ impl FullscreenChromeController {
         }
     }
 
+    pub fn update_settings(&mut self, settings: ChromeSettings) -> ChromeUpdate {
+        if self.settings == settings {
+            return ChromeUpdate::idle();
+        }
+        self.settings = settings;
+        self.reset()
+    }
+
     pub fn pointer_moved(&mut self, point: ChromePoint, now: Instant) -> ChromeUpdate {
         if !self.operational() {
             return ChromeUpdate::idle();
         }
 
         let was_hovered = self.hovered_control;
-        let inside_chrome = self.contains_chrome(point);
+        let inside_chrome = self.contains_visible_chrome(point);
         self.pointer_inside = inside_chrome;
         self.hovered_control = inside_chrome.then(|| self.hit_control(point)).flatten();
 
@@ -228,7 +240,7 @@ impl FullscreenChromeController {
         }
 
         let hit = self
-            .contains_chrome(input.point)
+            .contains_visible_chrome(input.point)
             .then(|| self.hit_control(input.point))
             .flatten();
 
@@ -242,7 +254,7 @@ impl FullscreenChromeController {
                     intent: None,
                 };
             }
-            if self.contains_chrome(input.point) {
+            if self.contains_visible_chrome(input.point) {
                 let is_double_click = self.last_click.is_some_and(|last| {
                     input.now.saturating_duration_since(last.at)
                         <= self.settings.double_click_interval
@@ -278,7 +290,7 @@ impl FullscreenChromeController {
         }
 
         ChromeUpdate {
-            consumed: self.contains_chrome(input.point),
+            consumed: self.contains_visible_chrome(input.point),
             redraw: false,
             intent: None,
         }
@@ -345,7 +357,7 @@ impl FullscreenChromeController {
         let next_progress = interpolate(transition.from, transition.to, eased);
         let redraw = next_progress != self.progress;
         self.progress = next_progress;
-        transition.next_frame = now + Self::FRAME_INTERVAL;
+        transition.next_frame = now + self.settings.frame_interval;
         self.transition = Some(transition);
 
         ChromeUpdate {
@@ -426,10 +438,20 @@ impl FullscreenChromeController {
             && point.y < f64::from(self.settings.reveal_height)
     }
 
-    fn contains_chrome(&self, point: ChromePoint) -> bool {
+    fn contains_visible_chrome(&self, point: ChromePoint) -> bool {
         self.contains_x(point.x)
             && point.y >= 0.0
-            && point.y < f64::from(self.settings.chrome_height)
+            && point.y < f64::from(self.visible_chrome_height())
+    }
+
+    fn visible_chrome_height(&self) -> u32 {
+        if self.progress == 0 {
+            return 0;
+        }
+        let scaled = u64::from(self.settings.chrome_height) * u64::from(self.progress);
+        scaled
+            .div_ceil(u64::from(MAX_PROGRESS))
+            .min(u64::from(u32::MAX)) as u32
     }
 
     fn contains_x(&self, x: f64) -> bool {
@@ -437,7 +459,7 @@ impl FullscreenChromeController {
     }
 
     fn hit_control(&self, point: ChromePoint) -> Option<ChromeControl> {
-        if self.settings.control_width == 0 || !self.contains_chrome(point) {
+        if self.settings.control_width == 0 || !self.contains_visible_chrome(point) {
             return None;
         }
         let distance_from_right = f64::from(self.settings.surface_width) - point.x;
@@ -505,6 +527,7 @@ mod tests {
             transition_duration: REVEAL_DURATION,
             hide_delay: HIDE_DELAY,
             double_click_interval: Duration::from_millis(400),
+            frame_interval: Duration::from_millis(8),
         })
     }
 
@@ -752,5 +775,63 @@ mod tests {
         }
         assert_eq!(chrome.next_deadline(), None);
         assert_eq!(chrome.presentation(), None);
+    }
+
+    #[test]
+    fn fullscreen_chrome_partial_reveal_only_captures_visible_pixels() {
+        let now = Instant::now();
+        let mut chrome = controller(ChromeMotion::Smooth);
+
+        chrome.pointer_moved(point(20.0, 1.0), now);
+
+        assert!(
+            chrome
+                .pointer_moved(point(20.0, 0.0), now + Duration::from_millis(1))
+                .consumed
+        );
+        assert!(
+            !chrome
+                .pointer_moved(point(20.0, 20.0), now + Duration::from_millis(2))
+                .consumed
+        );
+    }
+
+    #[test]
+    fn fullscreen_chrome_settings_update_resets_stale_interaction() {
+        let now = Instant::now();
+        let mut chrome = controller(ChromeMotion::Instant);
+        reveal(&mut chrome, now);
+        chrome.pointer_button(ChromePointerButton {
+            point: point(980.0, 20.0),
+            pressed: true,
+            now,
+        });
+        let mut settings = chrome.settings();
+        settings.surface_width = 2_000;
+
+        let update = chrome.update_settings(settings);
+
+        assert!(update.redraw);
+        assert_eq!(chrome.phase(), ChromePhase::Hidden);
+        assert_eq!(chrome.settings().surface_width, 2_000);
+        assert_eq!(chrome.presentation(), None);
+        assert_eq!(chrome.next_deadline(), None);
+    }
+
+    #[test]
+    fn fullscreen_chrome_uses_configured_frame_interval() {
+        let now = Instant::now();
+        let mut chrome = controller(ChromeMotion::Smooth);
+        let mut settings = chrome.settings();
+        settings.frame_interval = Duration::from_millis(20);
+        chrome.update_settings(settings);
+
+        chrome.pointer_moved(point(20.0, 1.0), now);
+        chrome.tick(now);
+
+        assert_eq!(
+            chrome.next_deadline(),
+            Some(now + Duration::from_millis(20))
+        );
     }
 }
