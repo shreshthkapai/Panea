@@ -22,7 +22,8 @@ desktop file, and icon
 Linux Wayland behavior: same Linux package layout as X11; backend behavior is
 selected and diagnosed at runtime
 Fallback behavior: portable archives remain available for local unsigned
-development builds; tagged release jobs require signing credentials, and Linux
+development builds; tagged release jobs require signing credentials unless the
+repository explicitly enables its temporary unsigned-release policy, and Linux
 format builders fail clearly when their release tools are unavailable
 Diagnostics: packaged `panea doctor --json`, `panea shell-smoke --json`, and
 `panea gui-smoke --startup --json` and
@@ -171,8 +172,17 @@ recomputes every listed digest before launching packaged binaries.
 ## Signing And Notarization
 
 Local package builds remain unsigned unless credentials are supplied. Tagged
-release CI sets `PANEA_REQUIRE_SIGNING=1`, which converts missing credentials
-into a hard failure instead of silently publishing unsigned artifacts.
+release CI sets `PANEA_REQUIRE_SIGNING=1` by default, which converts missing
+credentials into a hard failure instead of silently publishing unsigned
+artifacts.
+
+Maintainers can explicitly set the repository variable
+`PANEA_ALLOW_UNSIGNED_RELEASES=true` while release certificates are not yet
+available. That temporary policy permits unsigned Windows and macOS artifacts,
+adds a prominent warning to the GitHub Release, and does not bypass native
+package smoke tests, checksums, or provenance attestations. Remove the variable
+or set it to `false` once signing credentials are configured; absence is the
+secure, signing-required default.
 
 Windows hooks:
 
@@ -183,7 +193,8 @@ PANEA_WINDOWS_SIGNTOOL=<optional-path-to-signtool.exe>
 PANEA_WINDOWS_TIMESTAMP_URL=<optional-RFC3161-url>
 ```
 
-Both staged Windows entrypoints and the installer are Authenticode signed.
+When the Windows signing variables are configured, both staged Windows
+entrypoints and the installer are Authenticode signed.
 macOS uses:
 
 ```text
@@ -191,19 +202,21 @@ PANEA_MACOS_SIGN_IDENTITY=<Developer ID Application identity>
 PANEA_MACOS_NOTARY_PROFILE=<notarytool keychain profile>
 ```
 
-The app is hardened-runtime signed and verified before archive creation; the
-DMG is submitted with `notarytool --wait` and stapled. Secrets stay in CI secret
-storage and are never written to package manifests or logs by Panea tooling.
+When the macOS signing variables are configured, the app is hardened-runtime
+signed and verified before archive creation; the DMG is submitted with
+`notarytool --wait` and stapled. Secrets stay in CI secret storage and are never
+written to package manifests or logs by Panea tooling.
 
 Linux builders require `dpkg-deb`, `rpmbuild`, and `appimagetool` (or
 `PANEA_APPIMAGETOOL`). Release CI installs/pins those tools before packaging.
 
 ## TERM/Terminfo Decision
 
-Panea deliberately ships no custom terminfo entry for the alpha. It advertises
-`xterm-256color`, which matches the current compatibility contract and works on
-remote hosts without installation. A Panea-specific TERM will only be added
-after stable, distinct capabilities and a remote fallback strategy exist.
+Panea deliberately ships no custom terminfo entry for the current compatibility
+baseline. It advertises `xterm-256color`, which matches the current compatibility
+contract and works on remote hosts without installation. A Panea-specific TERM
+will only be added after stable, distinct capabilities and a remote fallback
+strategy exist.
 
 ## Release Boundaries
 
@@ -215,11 +228,12 @@ after stable, distinct capabilities and a remote fallback strategy exist.
 - Windows installer and portable artifacts are implemented and passed the
   current-host development package smoke. Authenticode hooks are implemented;
   a release certificate is still an external release credential.
-- macOS ZIP/DMG generation is implemented but must run and be validated on a
-  macOS host. Signing/notarization pipeline hooks are implemented; Apple
-  credentials and final host verification remain external release evidence.
-- Linux tarball, deb, AppImage, and RPM generation are implemented but still
-  require collected Linux-host release reports.
+- macOS ZIP/DMG generation and native-runner package smoke are implemented.
+  Signing/notarization pipeline hooks are implemented; Apple credentials remain
+  external release credentials.
+- Linux tarball, deb, AppImage, and RPM generation and the X11 software-GPU
+  package smoke are implemented. Broader compositor validation remains tracked
+  separately.
 - Automated terminal-I/O GUI launch exists; broader interaction remains manual on
   every target OS.
 - Source and packaged artifacts carry the dual `MIT OR Apache-2.0` license.

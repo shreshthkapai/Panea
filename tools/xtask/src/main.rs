@@ -6182,6 +6182,17 @@ mod tests {
         assert!(release_workflow.contains("WINIT_UNIX_BACKEND: x11"));
         assert!(release_workflow.contains("XDG_SESSION_TYPE: x11"));
         assert!(release_workflow.contains("LIBGL_ALWAYS_SOFTWARE: \"1\""));
+        assert!(release_workflow.contains("vars.PANEA_ALLOW_UNSIGNED_RELEASES"));
+        assert!(release_workflow.contains("publish-release:"));
+        assert!(release_workflow.contains("needs: [package, performance-contract]"));
+        assert!(release_workflow.contains("actions/download-artifact@v4"));
+        assert!(release_workflow.contains("actions/attest-build-provenance@v2"));
+        assert!(release_workflow.contains("gh release create"));
+        assert!(release_workflow.contains("--verify-tag"));
+        assert!(release_workflow.contains("Windows and macOS artifacts are unsigned"));
+        assert!(!release_workflow.contains("merge-multiple: true"));
+        assert!(release_workflow.contains("expected_version=\"${GITHUB_REF_NAME#v}\""));
+        assert!(release_workflow.contains("duplicate release filename"));
     }
 
     #[test]

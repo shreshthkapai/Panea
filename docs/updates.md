@@ -1,12 +1,31 @@
 # Downloads and Updates
 
 Panea publishes immutable, versioned artifacts through GitHub Releases. The
-release tag, Cargo workspace version, binary version, package metadata, update
-manifest, and changelog entry must agree exactly.
+release tag, Cargo workspace version, binary version, and package metadata must
+agree exactly.
 
-Panea uses normal semantic versions such as `v0.1.0` and `v0.1.1`. The initial
-update implementation has one `stable` channel. Additional release channels
-are intentionally deferred until there is a demonstrated need for them.
+Panea uses normal semantic versions such as `v0.1.0` and `v0.1.1`. The planned
+update implementation has one `stable` channel. Additional release channels are
+intentionally deferred until there is a demonstrated need for them.
+
+## Current Implementation Status
+
+GitHub Release publication, native platform packages, SHA-256 manifests, and
+GitHub provenance attestations are implemented. Panea does not yet implement
+background update checks, the `panea update` command family, automatic install,
+or `panea-update-v1.json`. Users currently update explicitly by downloading a
+newer immutable release and running the platform installer or replacing their
+portable installation.
+
+The `v0.1.0` Windows and macOS artifacts are intentionally unsigned while the
+project has no release certificates. GitHub Release notes identify that state;
+SmartScreen and Gatekeeper warnings are expected. Checksums and attestations
+provide integrity and build provenance, but they are not substitutes for an
+operating-system publisher signature. The release workflow requires signing by
+default after the temporary repository policy is removed.
+
+The remaining sections define the updater's future security and UX contract;
+they must not be read as claiming that the updater is currently available.
 
 ## User Contract
 
@@ -52,15 +71,15 @@ Every release contains the formats supported by its native release runners:
 
 ```text
 Windows: installer executable and portable ZIP
-macOS: signed/notarized DMG and application ZIP
+macOS: DMG and application ZIP
 Linux: AppImage, portable tarball, DEB, and RPM
 ```
 
-The release also contains `SHA256SUMS.txt`, `panea-update-v1.json`, release
-notes, license files where the package format requires them, and GitHub artifact
-attestations. A release is not accepted merely because upload succeeded: a
-post-release workflow downloads the public assets and verifies their checksums,
-embedded versions, contents, and bounded launch smokes.
+The release also contains `SHA256SUMS.txt`, release notes, license files where
+the package format requires them, and GitHub artifact attestations. Native
+package jobs verify checksums, embedded versions, contents, and bounded launch
+smokes before publication. Until an automated public-asset verifier is added,
+the maintainer downloads and checks the published asset set after release.
 
 ## Update Manifest
 
@@ -162,8 +181,9 @@ not change artifact selection or trust policy.
 
 ## Security and Trust
 
-- Stable release jobs fail when required Windows or macOS signing credentials
-  are unavailable.
+- Tagged release jobs fail when required Windows or macOS signing credentials
+  are unavailable unless maintainers explicitly set the temporary repository
+  policy `PANEA_ALLOW_UNSIGNED_RELEASES=true`.
 - Assets are downloaded only over HTTPS from the configured official release
   origin.
 - SHA-256 verification is mandatory before installer handoff.
@@ -221,13 +241,12 @@ or silently replace an asset. A correction receives a new semantic version.
 
 A release can be published only when:
 
-1. the changelog, Cargo version, tag, binary version, package metadata, and
-   update manifest agree;
+1. the Cargo version, tag, binary version, and package metadata agree;
 2. native package jobs build and pass their required tests and package smokes;
 3. release artifacts satisfy signing policy;
 4. checksums and attestations are generated;
 5. public assets are downloaded and independently re-verified after
-   publication.
+   publication, manually until the post-release verifier is automated.
 
 The release workflow reports unsupported or unverified platforms honestly. It
 does not turn a Windows-only result into a cross-platform claim.
