@@ -3,6 +3,9 @@
 pub const LAYER: &str = "visual overlay";
 
 pub const PANEA_ICON_PNG_512: &[u8] = include_bytes!("../branding/generated/panea-icon-512.png");
+pub const PANEA_ICON_PNG_32: &[u8] = include_bytes!("../branding/generated/panea-icon-32.png");
+pub const PANEA_ICON_PNG_32_DIMENSIONS: (u32, u32) = (32, 32);
+pub const MAX_RENDERER_BRANDING_BYTES: usize = 32 * 1024;
 pub const PANEA_ICON_ICO: &[u8] = include_bytes!("../branding/generated/panea.ico");
 pub const PANEA_ICON_ICNS: &[u8] = include_bytes!("../branding/generated/Panea.icns");
 
@@ -106,5 +109,12 @@ mod tests {
         assert_eq!(&PANEA_ICON_PNG_512[..8], b"\x89PNG\r\n\x1a\n");
         assert_eq!(&PANEA_ICON_ICO[..4], &[0, 0, 1, 0]);
         assert_eq!(&PANEA_ICON_ICNS[..4], b"icns");
+    }
+
+    #[test]
+    fn branding_icon_for_renderer_is_a_bounded_32_pixel_png() {
+        assert_eq!(&PANEA_ICON_PNG_32[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(PANEA_ICON_PNG_32_DIMENSIONS, (32, 32));
+        assert!(PANEA_ICON_PNG_32.len() <= MAX_RENDERER_BRANDING_BYTES);
     }
 }

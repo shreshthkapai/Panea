@@ -10,7 +10,7 @@ use std::{
     io::Cursor,
     path::PathBuf,
     sync::mpsc::{self, Receiver},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     thread,
     time::Duration,
     time::Instant,
@@ -27,7 +27,8 @@ use render_core::{
     DamageRegion, FrameRequestReason, GpuTimingStatus, OverlayKind, OverlayPrimitive, RenderCell,
     RenderCellStyle, RenderColor, RenderCursorShape, RenderDecoration, RenderGrid,
     RenderInstrumentation, RenderRecoveryEvent, RenderRecoveryReason, RenderRecoveryStatus,
-    RenderRect, RenderScene, RenderSurfaceStatus, SelectionVisual,
+    RenderRect, RenderScene, RenderSurfaceStatus, SelectionVisual, WindowChromeControlKind,
+    WindowChromeControlVisual, WindowChromeVisual,
 };
 use serde::Deserialize;
 use winit::window::Window;
@@ -144,6 +145,7 @@ pub enum RendererError {
     DeviceUnavailable(String),
     RecoveryFailed(String),
     Font(String),
+    Asset(String),
     EmptySurface,
 }
 
@@ -162,6 +164,7 @@ impl fmt::Display for RendererError {
             Self::DeviceUnavailable(message) => write!(f, "GPU device unavailable: {message}"),
             Self::RecoveryFailed(message) => write!(f, "GPU recovery failed: {message}"),
             Self::Font(message) => write!(f, "font error: {message}"),
+            Self::Asset(message) => write!(f, "renderer asset error: {message}"),
             Self::EmptySurface => f.write_str("surface has zero width or height"),
         }
     }
@@ -183,6 +186,18 @@ pub struct AtlasEntry {
     pub height: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AtlasCacheKey {
+    Glyph(GlyphCacheKey),
+    PaneaLogo,
+}
+
+impl From<GlyphCacheKey> for AtlasCacheKey {
+    fn from(value: GlyphCacheKey) -> Self {
+        Self::Glyph(value)
+    }
+}
+
 #[derive(Debug)]
 pub struct GlyphAtlas {
     width: u32,
@@ -190,8 +205,8 @@ pub struct GlyphAtlas {
     cursor_x: u32,
     cursor_y: u32,
     row_height: u32,
-    entries: HashMap<GlyphCacheKey, AtlasEntry>,
-    lru: VecDeque<GlyphCacheKey>,
+    entries: HashMap<AtlasCacheKey, AtlasEntry>,
+    lru: VecDeque<AtlasCacheKey>,
 }
 
 impl GlyphAtlas {
@@ -208,7 +223,12 @@ impl GlyphAtlas {
         }
     }
 
-    pub fn allocate(&mut self, key: GlyphCacheKey, bitmap: &GlyphBitmap) -> Option<AtlasEntry> {
+    pub fn allocate(
+        &mut self,
+        key: impl Into<AtlasCacheKey>,
+        bitmap: &GlyphBitmap,
+    ) -> Option<AtlasEntry> {
+        let key = key.into();
         if let Some(entry) = self.entries.get(&key).copied() {
             self.touch(key);
             return Some(entry);
@@ -244,8 +264,8 @@ impl GlyphAtlas {
     }
 
     #[must_use]
-    pub fn entry(&self, key: GlyphCacheKey) -> Option<AtlasEntry> {
-        self.entries.get(&key).copied()
+    pub fn entry(&self, key: impl Into<AtlasCacheKey>) -> Option<AtlasEntry> {
+        self.entries.get(&key.into()).copied()
     }
 
     #[must_use]
@@ -284,7 +304,7 @@ impl GlyphAtlas {
         self.lru.clear();
     }
 
-    fn touch(&mut self, key: GlyphCacheKey) {
+    fn touch(&mut self, key: AtlasCacheKey) {
         self.lru.retain(|entry| *entry != key);
         self.lru.push_back(key);
     }
@@ -302,6 +322,7 @@ pub struct DamageTracker {
     previous_search_highlights: Vec<OverlayPrimitive>,
     previous_semantic_overlays: Vec<OverlayPrimitive>,
     previous_surface_overlays: Vec<OverlayPrimitive>,
+    previous_window_chrome: Option<WindowChromeVisual>,
     previous_decorations: Vec<RenderDecoration>,
     previous_selections: Vec<SelectionVisual>,
     previous_animations: Vec<AnimationHandle>,
@@ -416,6 +437,7 @@ impl DamageTracker {
         self.previous_search_highlights != scene.search_highlights
             || self.previous_semantic_overlays != scene.semantic_overlays
             || self.previous_surface_overlays != scene.surface_overlays
+            || self.previous_window_chrome != scene.window_chrome
             || self.previous_decorations != scene.decorations
             || self.previous_selections != scene.selections
             || self.previous_animations != scene.animations
@@ -427,6 +449,7 @@ impl DamageTracker {
         self.previous_search_highlights = scene.search_highlights.clone();
         self.previous_semantic_overlays = scene.semantic_overlays.clone();
         self.previous_surface_overlays = scene.surface_overlays.clone();
+        self.previous_window_chrome = scene.window_chrome.clone();
         self.previous_decorations = scene.decorations.clone();
         self.previous_selections = scene.selections.clone();
         self.previous_animations = scene.animations.clone();
@@ -460,6 +483,9 @@ fn visual_regions(scene: &RenderScene, metrics: CellMetrics) -> Vec<DamageRegion
     }
     if let Some(cursor_vector) = &scene.cursor_vector {
         regions.push(offset_region(cursor_vector.bounds, scene.content_offset));
+    }
+    if let Some(window_chrome) = &scene.window_chrome {
+        regions.push(window_chrome.bounds);
     }
     regions.extend(scene.selections.iter().flat_map(|selection| {
         selection
@@ -531,6 +557,24 @@ fn scene_grid_region(scene: &RenderScene, metrics: CellMetrics) -> DamageRegion 
                 .max(0)
                 .unsigned_abs()
                 .saturating_add(overlay.bounds.height),
+        );
+    }
+    if let Some(window_chrome) = &scene.window_chrome {
+        region.width = region.width.max(
+            window_chrome
+                .bounds
+                .x
+                .max(0)
+                .unsigned_abs()
+                .saturating_add(window_chrome.bounds.width),
+        );
+        region.height = region.height.max(
+            window_chrome
+                .bounds
+                .y
+                .max(0)
+                .unsigned_abs()
+                .saturating_add(window_chrome.bounds.height),
         );
     }
     region
@@ -1804,7 +1848,7 @@ impl GlyphBatch {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AtlasUpload {
-    pub key: GlyphCacheKey,
+    pub key: AtlasCacheKey,
     pub entry: AtlasEntry,
     pub pixels: Vec<u8>,
     pub format: GlyphBitmapFormat,
@@ -1819,6 +1863,7 @@ pub struct PreparedRenderBatches {
     pub glyphs: GlyphBatch,
     pub overlay_glyphs: GlyphBatch,
     pub decorations: QuadBatch,
+    pub window_chrome: QuadBatch,
     pub selections: QuadBatch,
     pub cursor: QuadBatch,
     pub cursor_image: QuadBatch,
@@ -1835,6 +1880,7 @@ impl PreparedRenderBatches {
             !self.glyphs.is_empty(),
             !self.overlay_glyphs.is_empty(),
             !self.decorations.is_empty(),
+            !self.window_chrome.is_empty(),
             !self.selections.is_empty(),
             !self.cursor.is_empty(),
             !self.cursor_image.is_empty(),
@@ -1896,14 +1942,32 @@ impl RenderBatchPlanner {
     ) -> Result<PreparedRenderBatches, RendererError> {
         let started = Instant::now();
         let metrics = fonts.cell_metrics()?;
-        let frame_width = ((f32::from(scene.grid.columns) * metrics.cell_width)
+        let mut frame_width = ((f32::from(scene.grid.columns) * metrics.cell_width)
             .ceil()
             .max(1.0) as u32)
             .saturating_add(scene.content_offset.x.max(0) as u32 * 2);
-        let frame_height = ((f32::from(scene.grid.rows) * metrics.cell_height)
+        let mut frame_height = ((f32::from(scene.grid.rows) * metrics.cell_height)
             .ceil()
             .max(1.0) as u32)
             .saturating_add(scene.content_offset.y.max(0) as u32 * 2);
+        if let Some(window_chrome) = &scene.window_chrome {
+            frame_width = frame_width.max(
+                window_chrome
+                    .bounds
+                    .x
+                    .max(0)
+                    .unsigned_abs()
+                    .saturating_add(window_chrome.bounds.width),
+            );
+            frame_height = frame_height.max(
+                window_chrome
+                    .bounds
+                    .y
+                    .max(0)
+                    .unsigned_abs()
+                    .saturating_add(window_chrome.bounds.height),
+            );
+        }
         let damage_regions = effective_damage_regions(scene, metrics);
 
         let mut background = QuadBatch::new(QuadBatchKind::Background);
@@ -1918,6 +1982,7 @@ impl RenderBatchPlanner {
             glyph_count: 0,
         };
         let mut decorations = QuadBatch::new(QuadBatchKind::Decoration);
+        let mut window_chrome = QuadBatch::new(QuadBatchKind::Decoration);
         let mut selections = QuadBatch::new(QuadBatchKind::Selection);
         let mut cursor = QuadBatch::new(QuadBatchKind::Cursor);
         let mut cursor_image = QuadBatch::new(QuadBatchKind::Cursor);
@@ -2071,11 +2136,29 @@ impl RenderBatchPlanner {
             push_cursor_vector_quads(&mut cursor, vector, &damage_regions, scene.content_offset);
         }
 
+        if let Some(visual) = &scene.window_chrome
+            && intersects_any(visual.bounds, &damage_regions)
+        {
+            self.push_window_chrome(
+                &mut window_chrome,
+                &mut overlay_glyphs,
+                visual,
+                &mut GlyphBatchContext {
+                    atlas_uploads: &mut atlas_uploads,
+                    instrumentation: &mut instrumentation,
+                    fonts,
+                    metrics,
+                    rect: visual.bounds,
+                },
+            )?;
+        }
+
         instrumentation.draw_call_count = count_non_empty_batches([
             !background.is_empty(),
             !glyphs.is_empty(),
             !overlay_glyphs.is_empty(),
             !decorations.is_empty(),
+            !window_chrome.is_empty(),
             !selections.is_empty(),
             !cursor.is_empty(),
             !cursor_image.is_empty(),
@@ -2093,6 +2176,7 @@ impl RenderBatchPlanner {
             glyphs,
             overlay_glyphs,
             decorations,
+            window_chrome,
             selections,
             cursor,
             cursor_image,
@@ -2199,7 +2283,7 @@ impl RenderBatchPlanner {
                         .atlas_uploads
                         .saturating_add(1);
                     context.atlas_uploads.push(AtlasUpload {
-                        key,
+                        key: key.into(),
                         entry,
                         pixels: bitmap.pixels.clone(),
                         format: bitmap.format,
@@ -2255,6 +2339,158 @@ impl RenderBatchPlanner {
         };
         self.push_glyphs(glyphs, &cell, context)
     }
+
+    fn push_window_chrome(
+        &mut self,
+        geometry: &mut QuadBatch,
+        glyphs: &mut GlyphBatch,
+        visual: &WindowChromeVisual,
+        context: &mut GlyphBatchContext<'_>,
+    ) -> Result<(), RendererError> {
+        if visual.opacity == 0 || visual.bounds.width == 0 || visual.bounds.height == 0 {
+            return Ok(());
+        }
+
+        push_solid_quad(
+            geometry,
+            visual.bounds,
+            with_fixed_opacity(RenderColor::rgb(18, 18, 18), visual.opacity),
+        );
+        for control in &visual.controls {
+            push_window_chrome_control(geometry, control, visual.opacity);
+        }
+
+        let mut title_x = visual.bounds.x.saturating_add(8);
+        if visual.show_logo {
+            let bitmap = panea_logo_bitmap()?;
+            let key = AtlasCacheKey::PaneaLogo;
+            let atlas_hit = self.atlas.entry(key).is_some();
+            if let Some(entry) = self.atlas.allocate(key, bitmap) {
+                if !atlas_hit {
+                    context.instrumentation.glyphs.atlas_uploads = context
+                        .instrumentation
+                        .glyphs
+                        .atlas_uploads
+                        .saturating_add(1);
+                    context.atlas_uploads.push(AtlasUpload {
+                        key,
+                        entry,
+                        pixels: bitmap.pixels.clone(),
+                        format: GlyphBitmapFormat::Rgba,
+                    });
+                }
+                let logo_bounds = window_chrome_logo_bounds(visual, title_x);
+                push_glyph_quad(
+                    glyphs,
+                    logo_bounds,
+                    entry,
+                    self.atlas.dimensions(),
+                    with_fixed_opacity(RenderColor::rgb(255, 255, 255), visual.opacity),
+                    true,
+                );
+                title_x = title_x.saturating_add(logo_bounds.width as i32 + 8);
+            }
+        }
+
+        if let Some(overlay) = window_chrome_title_overlay(visual, title_x) {
+            context.rect = overlay_label_rect(&overlay, context.metrics);
+            self.push_overlay_label_glyphs(glyphs, &overlay, context)?;
+        }
+
+        Ok(())
+    }
+}
+
+static PANEA_LOGO_BITMAP: OnceLock<Result<GlyphBitmap, String>> = OnceLock::new();
+
+fn panea_logo_bitmap() -> Result<&'static GlyphBitmap, RendererError> {
+    PANEA_LOGO_BITMAP
+        .get_or_init(|| {
+            let image = image::load_from_memory_with_format(
+                assets::PANEA_ICON_PNG_32,
+                image::ImageFormat::Png,
+            )
+            .map_err(|error| format!("failed to decode built-in Panea logo: {error}"))?
+            .to_rgba8();
+            let dimensions = (image.width(), image.height());
+            if dimensions != assets::PANEA_ICON_PNG_32_DIMENSIONS {
+                return Err(format!(
+                    "built-in Panea logo is {dimensions:?}; expected {:?}",
+                    assets::PANEA_ICON_PNG_32_DIMENSIONS
+                ));
+            }
+            let expected_bytes = usize::try_from(image.width())
+                .unwrap_or(usize::MAX)
+                .saturating_mul(usize::try_from(image.height()).unwrap_or(usize::MAX))
+                .saturating_mul(4);
+            if expected_bytes > assets::MAX_RENDERER_BRANDING_BYTES {
+                return Err(format!(
+                    "decoded Panea logo requires {expected_bytes} bytes; limit is {}",
+                    assets::MAX_RENDERER_BRANDING_BYTES
+                ));
+            }
+            Ok(GlyphBitmap {
+                width: image.width(),
+                height: image.height(),
+                offset_x: 0,
+                offset_y: 0,
+                advance_width: image.width() as f32,
+                pixels: image.into_raw(),
+                format: GlyphBitmapFormat::Rgba,
+            })
+        })
+        .as_ref()
+        .map_err(|message| RendererError::Asset(message.clone()))
+}
+
+fn window_chrome_logo_bounds(visual: &WindowChromeVisual, x: i32) -> RenderRect {
+    let size = visual.bounds.height.saturating_sub(12).clamp(1, 24);
+    RenderRect {
+        x,
+        y: visual.bounds.y + visual.bounds.height.saturating_sub(size) as i32 / 2,
+        width: size,
+        height: size,
+    }
+}
+
+fn window_chrome_title_overlay(
+    visual: &WindowChromeVisual,
+    title_x: i32,
+) -> Option<OverlayPrimitive> {
+    if visual.title.trim().is_empty() {
+        return None;
+    }
+    let controls_x = visual
+        .controls
+        .iter()
+        .map(|control| control.bounds.x)
+        .min()
+        .unwrap_or_else(|| visual.bounds.x.saturating_add(visual.bounds.width as i32));
+    let title_width = controls_x.saturating_sub(title_x).saturating_sub(8).max(0) as u32;
+    (title_width > 0).then(|| OverlayPrimitive {
+        kind: OverlayKind::WindowChrome,
+        bounds: RenderRect {
+            x: title_x.saturating_sub(4),
+            y: visual.bounds.y,
+            width: title_width.saturating_add(8),
+            height: visual.bounds.height,
+        },
+        color: RenderColor {
+            red: 0,
+            green: 0,
+            blue: 0,
+            alpha: 0,
+        },
+        border_color: None,
+        border_width_px: 0,
+        corner_radius_px: 0,
+        z_index: i16::MAX,
+        label: Some(visual.title.clone()),
+        label_color: Some(with_fixed_opacity(
+            RenderColor::rgb(232, 232, 232),
+            visual.opacity,
+        )),
+    })
 }
 
 fn terminal_text_runs(cells: &[RenderCell]) -> Vec<RenderCell> {
@@ -2391,6 +2627,87 @@ fn push_solid_quad(batch: &mut QuadBatch, rect: RenderRect, color: RenderColor) 
         [[0.0, 0.0]; 4],
         color,
     );
+}
+
+fn with_fixed_opacity(mut color: RenderColor, opacity: u16) -> RenderColor {
+    color.alpha = ((u32::from(color.alpha) * u32::from(opacity)) / u32::from(u16::MAX)) as u8;
+    color
+}
+
+fn push_window_chrome_control(
+    batch: &mut QuadBatch,
+    control: &WindowChromeControlVisual,
+    opacity: u16,
+) {
+    if control.bounds.width == 0 || control.bounds.height == 0 {
+        return;
+    }
+
+    let background = match (control.kind, control.hovered, control.pressed) {
+        (WindowChromeControlKind::Close, _, true) => Some(RenderColor::rgb(176, 20, 30)),
+        (WindowChromeControlKind::Close, true, false) => Some(RenderColor::rgb(220, 38, 48)),
+        (_, _, true) => Some(RenderColor::rgb(62, 62, 62)),
+        (_, true, false) => Some(RenderColor::rgb(46, 46, 46)),
+        (_, false, false) => None,
+    };
+    if let Some(background) = background {
+        push_solid_quad(
+            batch,
+            control.bounds,
+            with_fixed_opacity(background, opacity),
+        );
+    }
+
+    let symbol = with_fixed_opacity(RenderColor::rgb(232, 232, 232), opacity);
+    let center_x = control.bounds.x + (control.bounds.width / 2) as i32;
+    let center_y = control.bounds.y + (control.bounds.height / 2) as i32;
+    match control.kind {
+        WindowChromeControlKind::Minimize => push_solid_quad(
+            batch,
+            RenderRect {
+                x: center_x - 5,
+                y: center_y + 3,
+                width: 10,
+                height: 1,
+            },
+            symbol,
+        ),
+        WindowChromeControlKind::LeaveFullscreen => push_stroke_quads(
+            batch,
+            RenderRect {
+                x: center_x - 5,
+                y: center_y - 4,
+                width: 10,
+                height: 8,
+            },
+            1,
+            symbol,
+        ),
+        WindowChromeControlKind::Close => {
+            for offset in -4_i32..=4 {
+                push_solid_quad(
+                    batch,
+                    RenderRect {
+                        x: center_x + offset,
+                        y: center_y + offset,
+                        width: 1,
+                        height: 1,
+                    },
+                    symbol,
+                );
+                push_solid_quad(
+                    batch,
+                    RenderRect {
+                        x: center_x + offset,
+                        y: center_y - offset,
+                        width: 1,
+                        height: 1,
+                    },
+                    symbol,
+                );
+            }
+        }
+    }
 }
 
 fn push_glyph_quad(
@@ -3953,6 +4270,24 @@ impl TerminalRasterizer {
                     .saturating_add(overlay.bounds.height),
             );
         }
+        if let Some(window_chrome) = &scene.window_chrome {
+            width = width.max(
+                window_chrome
+                    .bounds
+                    .x
+                    .max(0)
+                    .unsigned_abs()
+                    .saturating_add(window_chrome.bounds.width),
+            );
+            height = height.max(
+                window_chrome
+                    .bounds
+                    .y
+                    .max(0)
+                    .unsigned_abs()
+                    .saturating_add(window_chrome.bounds.height),
+            );
+        }
         let mut frame = CpuFrame {
             width,
             height,
@@ -4076,6 +4411,16 @@ impl TerminalRasterizer {
         if let Some(cursor_image) = &scene.cursor_image {
             draw_cursor_image(&mut frame, cursor_image, scene.content_offset);
             instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
+        }
+
+        if let Some(window_chrome) = &scene.window_chrome {
+            self.draw_window_chrome(
+                &mut frame,
+                window_chrome,
+                fonts,
+                metrics,
+                &mut instrumentation,
+            )?;
         }
 
         instrumentation.cpu_prepare_time = started.elapsed();
@@ -4203,6 +4548,58 @@ impl TerminalRasterizer {
             }
         }
         instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
+        Ok(())
+    }
+
+    fn draw_window_chrome(
+        &mut self,
+        frame: &mut CpuFrame,
+        visual: &WindowChromeVisual,
+        fonts: &mut FontSystem,
+        metrics: CellMetrics,
+        instrumentation: &mut RenderInstrumentation,
+    ) -> Result<(), RendererError> {
+        if visual.opacity == 0 || visual.bounds.width == 0 || visual.bounds.height == 0 {
+            return Ok(());
+        }
+
+        let mut geometry = QuadBatch::new(QuadBatchKind::Decoration);
+        push_solid_quad(
+            &mut geometry,
+            visual.bounds,
+            with_fixed_opacity(RenderColor::rgb(18, 18, 18), visual.opacity),
+        );
+        for control in &visual.controls {
+            push_window_chrome_control(&mut geometry, control, visual.opacity);
+        }
+        draw_quad_batch_cpu(frame, &geometry);
+        instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
+
+        let mut title_x = visual.bounds.x.saturating_add(8);
+        if visual.show_logo {
+            let bitmap = panea_logo_bitmap()?;
+            let logo_bounds = window_chrome_logo_bounds(visual, title_x);
+            draw_rgba_bitmap(
+                frame,
+                logo_bounds,
+                bitmap.width,
+                bitmap.height,
+                &bitmap.pixels,
+                ((u32::from(visual.opacity) * 255) / u32::from(u16::MAX)) as u8,
+            );
+            instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
+            title_x = title_x.saturating_add(logo_bounds.width as i32 + 8);
+        }
+        if let Some(overlay) = window_chrome_title_overlay(visual, title_x) {
+            self.draw_overlay_label(
+                frame,
+                &overlay,
+                fonts,
+                metrics,
+                render_core::RenderOffset::default(),
+                instrumentation,
+            )?;
+        }
         Ok(())
     }
 }
@@ -4337,6 +4734,7 @@ struct PersistentBatchBuffers {
     glyphs: GpuBatchBuffers,
     overlay_glyphs: GpuBatchBuffers,
     decorations: GpuBatchBuffers,
+    window_chrome: GpuBatchBuffers,
     selections: GpuBatchBuffers,
     cursor: GpuBatchBuffers,
     cursor_image: GpuBatchBuffers,
@@ -4377,6 +4775,93 @@ fn blend_rect(frame: &mut CpuFrame, rect: RenderRect, color: RenderColor) {
         for x in x0..x1 {
             let index = ((y * frame.width + x) * 4) as usize;
             blend_pixel(&mut frame.pixels[index..index + 4], color, color.alpha);
+        }
+    }
+}
+
+fn draw_quad_batch_cpu(frame: &mut CpuFrame, batch: &QuadBatch) {
+    for quad in batch.vertices.chunks_exact(4) {
+        let x0 = quad
+            .iter()
+            .map(|vertex| vertex.position_px[0])
+            .fold(f32::INFINITY, f32::min)
+            .round() as i32;
+        let y0 = quad
+            .iter()
+            .map(|vertex| vertex.position_px[1])
+            .fold(f32::INFINITY, f32::min)
+            .round() as i32;
+        let x1 = quad
+            .iter()
+            .map(|vertex| vertex.position_px[0])
+            .fold(f32::NEG_INFINITY, f32::max)
+            .round() as i32;
+        let y1 = quad
+            .iter()
+            .map(|vertex| vertex.position_px[1])
+            .fold(f32::NEG_INFINITY, f32::max)
+            .round() as i32;
+        let color = quad[0].color;
+        blend_rect(
+            frame,
+            RenderRect {
+                x: x0,
+                y: y0,
+                width: x1.saturating_sub(x0) as u32,
+                height: y1.saturating_sub(y0) as u32,
+            },
+            RenderColor {
+                red: (color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                green: (color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                blue: (color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                alpha: (color[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+            },
+        );
+    }
+}
+
+fn draw_rgba_bitmap(
+    frame: &mut CpuFrame,
+    bounds: RenderRect,
+    source_width: u32,
+    source_height: u32,
+    pixels: &[u8],
+    opacity: u8,
+) {
+    if bounds.width == 0 || bounds.height == 0 || source_width == 0 || source_height == 0 {
+        return;
+    }
+    for target_y in 0..bounds.height {
+        let source_y = target_y.saturating_mul(source_height) / bounds.height;
+        for target_x in 0..bounds.width {
+            let source_x = target_x.saturating_mul(source_width) / bounds.width;
+            let source_index = usize::try_from(
+                source_y
+                    .saturating_mul(source_width)
+                    .saturating_add(source_x)
+                    .saturating_mul(4),
+            )
+            .unwrap_or(usize::MAX);
+            let Some(pixel) = pixels.get(source_index..source_index.saturating_add(4)) else {
+                continue;
+            };
+            let x = bounds.x.saturating_add(target_x as i32);
+            let y = bounds.y.saturating_add(target_y as i32);
+            if x < 0 || y < 0 || x as u32 >= frame.width || y as u32 >= frame.height {
+                continue;
+            }
+            let target_index = ((y as u32 * frame.width + x as u32) * 4) as usize;
+            let alpha = ((u16::from(pixel[3]) * u16::from(opacity)) / 255) as u8;
+            blend_pixel(
+                &mut frame.pixels[target_index..target_index + 4],
+                RenderColor {
+                    red: pixel[0],
+                    green: pixel[1],
+                    blue: pixel[2],
+                    alpha,
+                },
+                alpha,
+            );
         }
     }
 }
@@ -5853,6 +6338,12 @@ impl GpuBackend {
             &batches.decorations.vertices,
             &batches.decorations.indices,
         );
+        self.batches.window_chrome.upload(
+            &upload_context,
+            "window-chrome",
+            &batches.window_chrome.vertices,
+            &batches.window_chrome.indices,
+        );
         self.batches.selections.upload(
             &upload_context,
             "selections",
@@ -6107,6 +6598,7 @@ fn encode_retained_frame<'a>(
 
     pass.set_pipeline(draw.quad_pipeline);
     draw_buffers(&mut pass, &draw.batches.decorations);
+    draw_buffers(&mut pass, &draw.batches.window_chrome);
     if let Some(glyph_bind_group) = draw.glyph_bind_group {
         pass.set_pipeline(draw.glyph_pipeline);
         pass.set_bind_group(0, glyph_bind_group, &[]);
@@ -7832,5 +8324,181 @@ mod tests {
         assert!(damage.iter().any(|region| {
             region.x == 0 && region.y == 0 && region.width >= 800 && region.height >= 36
         }));
+    }
+
+    fn window_chrome_visual() -> render_core::WindowChromeVisual {
+        use render_core::{WindowChromeControlKind, WindowChromeControlVisual};
+
+        render_core::WindowChromeVisual {
+            bounds: RenderRect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 36,
+            },
+            opacity: u16::MAX,
+            title: "Panea".to_owned(),
+            show_logo: true,
+            controls: vec![
+                WindowChromeControlVisual {
+                    kind: WindowChromeControlKind::Minimize,
+                    bounds: RenderRect {
+                        x: 656,
+                        y: 0,
+                        width: 48,
+                        height: 36,
+                    },
+                    hovered: false,
+                    pressed: false,
+                },
+                WindowChromeControlVisual {
+                    kind: WindowChromeControlKind::LeaveFullscreen,
+                    bounds: RenderRect {
+                        x: 704,
+                        y: 0,
+                        width: 48,
+                        height: 36,
+                    },
+                    hovered: false,
+                    pressed: false,
+                },
+                WindowChromeControlVisual {
+                    kind: WindowChromeControlKind::Close,
+                    bounds: RenderRect {
+                        x: 752,
+                        y: 0,
+                        width: 48,
+                        height: 36,
+                    },
+                    hovered: true,
+                    pressed: false,
+                },
+            ],
+        }
+    }
+
+    fn has_vertex_strictly_inside(batch: &QuadBatch, bounds: RenderRect) -> bool {
+        let x0 = bounds.x as f32;
+        let y0 = bounds.y as f32;
+        let x1 = x0 + bounds.width as f32;
+        let y1 = y0 + bounds.height as f32;
+        batch.vertices.iter().any(|vertex| {
+            vertex.position_px[0] > x0
+                && vertex.position_px[0] < x1
+                && vertex.position_px[1] > y0
+                && vertex.position_px[1] < y1
+        })
+    }
+
+    #[test]
+    fn window_chrome_is_one_batched_overlay_with_logo_title_and_controls() {
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let mut planner = RenderBatchPlanner::default();
+        let visual = window_chrome_visual();
+        let mut test_scene = scene_without_cursor(Vec::new());
+        test_scene.window_chrome = Some(visual.clone());
+        test_scene.damage_regions = vec![visual.bounds];
+
+        let first = planner
+            .prepare(&test_scene, &mut fonts)
+            .expect("window chrome should prepare");
+        let second = planner
+            .prepare(&test_scene, &mut fonts)
+            .expect("unchanged window chrome should prepare");
+
+        assert_eq!(first.window_chrome.kind, QuadBatchKind::Decoration);
+        assert!(!first.window_chrome.is_empty());
+        assert!(first.overlay_glyphs.glyph_count > 0, "title must be shaped");
+        assert_eq!(
+            first
+                .atlas_uploads
+                .iter()
+                .filter(|upload| upload.key == AtlasCacheKey::PaneaLogo)
+                .count(),
+            1,
+            "the built-in logo must be uploaded once"
+        );
+        assert_eq!(
+            second
+                .atlas_uploads
+                .iter()
+                .filter(|upload| upload.key == AtlasCacheKey::PaneaLogo)
+                .count(),
+            0,
+            "the cached logo must not be uploaded again"
+        );
+        assert_eq!(first.overlay_glyphs, second.overlay_glyphs);
+        for control in &visual.controls {
+            assert!(
+                has_vertex_strictly_inside(&first.window_chrome, control.bounds),
+                "{:?} control must contribute batched geometry",
+                control.kind
+            );
+        }
+        assert!(first.window_chrome.vertices.iter().any(|vertex| {
+            vertex.color[0] > 0.7 && vertex.color[1] < 0.3 && vertex.color[2] < 0.3
+        }));
+    }
+
+    #[test]
+    fn absent_window_chrome_has_zero_batch_and_upload_cost() {
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let mut planner = RenderBatchPlanner::default();
+        let test_scene = scene_without_cursor(Vec::new());
+
+        let batches = planner
+            .prepare(&test_scene, &mut fonts)
+            .expect("empty scene should prepare");
+
+        assert!(batches.window_chrome.is_empty());
+        assert!(
+            !batches
+                .atlas_uploads
+                .iter()
+                .any(|upload| upload.key == AtlasCacheKey::PaneaLogo)
+        );
+    }
+
+    #[test]
+    fn window_chrome_is_present_in_renderer_independent_cpu_snapshots() {
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let mut rasterizer = TerminalRasterizer::default();
+        let mut test_scene = scene_without_cursor(Vec::new());
+        let visual = window_chrome_visual();
+        test_scene.window_chrome = Some(visual.clone());
+
+        let frame = rasterizer
+            .rasterize(&test_scene, &mut fonts)
+            .expect("window chrome snapshot should render");
+
+        assert!(frame.width >= visual.bounds.width);
+        assert!(frame.height >= visual.bounds.height);
+        let index = ((2 * frame.width + 2) * 4) as usize;
+        assert_ne!(&frame.pixels[index..index + 4], &[12, 12, 12, 255]);
+    }
+
+    #[test]
+    fn window_chrome_changes_damage_old_and_new_surface_bounds() {
+        let mut tracker = DamageTracker::new();
+        let mut first = scene_without_cursor(Vec::new());
+        first.window_chrome = Some(window_chrome_visual());
+        let _ = tracker.update(&first, metrics());
+
+        let mut second = first.clone();
+        let chrome = second.window_chrome.as_mut().expect("chrome visual");
+        chrome.bounds.y = 12;
+        chrome.opacity = u16::MAX / 2;
+        let damage = tracker.update(&second, metrics());
+
+        assert!(
+            damage
+                .iter()
+                .any(|region| region.y == 0 && region.height >= 36)
+        );
+        assert!(
+            damage
+                .iter()
+                .any(|region| region.y <= 12 && region.height >= 36)
+        );
     }
 }

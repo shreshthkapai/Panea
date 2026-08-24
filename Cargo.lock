@@ -2700,6 +2700,7 @@ version = "0.1.0"
 name = "render-wgpu"
 version = "0.1.0"
 dependencies = [
+ "assets",
  "bytemuck",
  "font-system",
  "image",

@@ -207,6 +207,31 @@ pub struct RenderDecoration {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowChromeControlKind {
+    Minimize,
+    LeaveFullscreen,
+    Close,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowChromeControlVisual {
+    pub kind: WindowChromeControlKind,
+    pub bounds: RenderRect,
+    pub hovered: bool,
+    pub pressed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowChromeVisual {
+    pub bounds: RenderRect,
+    /// Fixed-point opacity in the inclusive range `0..=u16::MAX`.
+    pub opacity: u16,
+    pub title: String,
+    pub show_logo: bool,
+    pub controls: Vec<WindowChromeControlVisual>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnimationKind {
     CursorSmoothMovement,
     CursorTypingPulse,
@@ -356,6 +381,8 @@ pub struct RenderScene {
     pub semantic_overlays: Vec<OverlayPrimitive>,
     /// App chrome positioned in physical surface pixels rather than terminal-content pixels.
     pub surface_overlays: Vec<OverlayPrimitive>,
+    /// Fullscreen app chrome in physical surface pixels. This is presentation-only state.
+    pub window_chrome: Option<WindowChromeVisual>,
     pub decorations: Vec<RenderDecoration>,
     pub animations: Vec<AnimationHandle>,
     pub damage_regions: Vec<DamageRegion>,

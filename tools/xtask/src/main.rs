@@ -5679,7 +5679,10 @@ fn dependency_rules() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         ("platform-core", allowed([])),
         ("platform-winit", allowed(["platform-core"])),
         ("render-core", allowed([])),
-        ("render-wgpu", allowed(["font-system", "render-core"])),
+        (
+            "render-wgpu",
+            allowed(["assets", "font-system", "render-core"]),
+        ),
         ("security", allowed([])),
         ("semantics", allowed(["term-core"])),
         ("shell-integration", allowed(["semantics"])),

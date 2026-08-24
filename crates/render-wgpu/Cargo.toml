@@ -10,6 +10,7 @@ description = "GPU renderer implementation, glyph atlas, batches, and frame sche
 workspace = true
 
 [dependencies]
+assets = { path = "../assets" }
 bytemuck.workspace = true
 font-system = { path = "../font-system" }
 image.workspace = true

@@ -32,7 +32,7 @@ Lower layers must not import higher or runtime-specific layers.
 | `term-parser` | ANSI/VT parsing into terminal-core actions | `term-core` |
 | `semantics` | prompt, input, output, command region meaning | `term-core` only when terminal positions are needed |
 | `render-core` | renderer-independent scene, damage, overlays, cursor visuals | none |
-| `render-wgpu` | WGPU backend, glyph atlas, batching, frame scheduler | `render-core`, `font-system` |
+| `render-wgpu` | WGPU backend, glyph atlas, batching, frame scheduler | `render-core`, `font-system`, immutable built-in `assets` |
 | `font-system` | font discovery, fallback, metrics, glyph rasterization policy | none |
 | `transport-core` | byte I/O, resize, lifecycle contracts | none |
 | `transport-pty` | local PTY and pseudoconsole backend | `transport-core` |
@@ -52,6 +52,8 @@ Lower layers must not import higher or runtime-specific layers.
 `render-wgpu` currently uses `winit` as an external window-handle bridge for
 surface creation. That dependency must stay backend-local and must not become a
 dependency on `platform-winit`, transports, shells, SSH, or app runtime code.
+Its `assets` dependency is limited to immutable, bounded built-in renderer
+resources; asset discovery and user-controlled decoding remain outside the hot path.
 
 ## Provider Interfaces
 
