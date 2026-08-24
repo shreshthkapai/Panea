@@ -6096,6 +6096,9 @@ mod tests {
         assert!(workflow.contains("PANEA_APPIMAGETOOL"));
         assert!(workflow.contains("APPIMAGE_EXTRACT_AND_RUN"));
         assert!(workflow.contains("--timeout-ms 600000"));
+        assert!(workflow.contains("CARGO_INCREMENTAL: \"0\""));
+        assert!(workflow.contains("CARGO_PROFILE_DEV_DEBUG: \"0\""));
+        assert!(workflow.contains("CARGO_PROFILE_TEST_DEBUG: \"0\""));
         assert!(
             workflow.contains("a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0")
         );
