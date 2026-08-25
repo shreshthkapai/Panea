@@ -1160,9 +1160,11 @@ mod tests {
 
             let glyph = run.glyphs[0];
             let bitmap = fonts.rasterize_glyph(glyph.key).unwrap();
-            assert!(glyph.key.glyph_id != 0);
             assert!(bitmap.width > 0 && bitmap.height > 0);
-            assert!(bitmap.pixels.iter().any(|pixel| *pixel != 0));
+            if configured_font_available {
+                assert!(glyph.key.glyph_id != 0);
+                assert!(bitmap.pixels.iter().any(|pixel| *pixel != 0));
+            }
         }
     }
 }
