@@ -3,6 +3,14 @@
 All notable changes to Panea are documented here. Panea follows Semantic
 Versioning and publishes immutable release tags.
 
+## [0.1.9] - 2026-08-25
+
+### Added
+
+- Add bounded, platform-neutral `send_bytes:<hex>` keybinding actions.
+- Bind `Ctrl+Backspace` to Ctrl+W by default for backward-word deletion in
+  PowerShell and readline-style shells without OS-specific input handling.
+
 ## [0.1.2] - 2026-08-25
 
 ### Fixed
@@ -32,6 +40,7 @@ the Windows package smoke exposed the output-supervisor deadlock fixed in
 
 - Initial public Panea release.
 
+[0.1.9]: https://github.com/shreshthkapai/Panea/compare/v0.1.8...v0.1.9
 [0.1.2]: https://github.com/shreshthkapai/Panea/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/shreshthkapai/Panea/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/shreshthkapai/Panea/releases/tag/v0.1.0

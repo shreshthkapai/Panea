@@ -479,6 +479,11 @@ Named keybinding actions can open a specific profile, for example
 `new_workspace:name`, `switch_workspace:name`, and `rename_workspace:name`.
 `reconnect_session` reconnects the active SSH pane while preserving its local
 scrollback; the default binding is `Ctrl+Alt+R`.
+`send_bytes:<hex>` writes an explicit bounded byte sequence to the active
+terminal transport. Panea's default `Ctrl+Backspace` binding uses
+`send_bytes:17` so readline-style shells and PowerShell delete the previous
+word without introducing shell logic into the terminal core. Hex payloads must
+contain complete byte pairs and are capped at 4096 bytes.
 Restoration recreates layouts and starts fresh transports; it does not claim
 process resurrection.
 

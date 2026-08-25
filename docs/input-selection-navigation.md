@@ -47,6 +47,7 @@ hosts.
 ```text
 Ctrl+Shift+C / Super+C       copy selection
 Ctrl+Shift+V / Super+V       paste
+Ctrl+Backspace               delete previous shell word (sends Ctrl+W)
 Shift+PageUp/PageDown        scroll one viewport
 Ctrl+Shift+Home/End          oldest scrollback / live bottom
 Ctrl+Shift+S                 interactive scrollback search

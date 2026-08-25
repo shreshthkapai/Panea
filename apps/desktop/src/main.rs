@@ -1801,6 +1801,23 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                                 "command palette action is reserved for a later phase"
                                             );
                                         }
+                                        action if action.starts_with("send_bytes:") => {
+                                            match parse_send_bytes_action(action) {
+                                                Ok(Some(bytes)) => {
+                                                    cursor_animator.record_typing();
+                                                    if cursor_blink.record_activity() {
+                                                        scheduler.cursor_blink_changed();
+                                                    }
+                                                    mux_runtime.write_active(&bytes);
+                                                }
+                                                Err(error) => {
+                                                    eprintln!(
+                                                        "invalid keybinding action '{action}': {error}"
+                                                    );
+                                                }
+                                                Ok(None) => {}
+                                            }
+                                        }
                                         _ => {
                                             if mux_runtime.handle_profile_mux_action(
                                                 &action,
@@ -3867,6 +3884,42 @@ fn keybinding_action(event: &KeyEvent, config: &AppConfig) -> Option<String> {
         .iter()
         .find(|binding| canonical_key_spec(&binding.keys) == event_key)
         .map(|binding| binding.action.clone())
+}
+
+fn parse_send_bytes_action(action: &str) -> Result<Option<Vec<u8>>, String> {
+    const PREFIX: &str = "send_bytes:";
+    const MAX_BYTES: usize = 4096;
+
+    let Some(payload) = action.strip_prefix(PREFIX) else {
+        return Ok(None);
+    };
+    if !payload.is_ascii() {
+        return Err("hex payload must contain only ASCII characters".to_owned());
+    }
+
+    let compact = payload
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    if compact.is_empty() {
+        return Err("hex payload cannot be empty".to_owned());
+    }
+    if compact.len() % 2 != 0 {
+        return Err("hex payload must contain complete byte pairs".to_owned());
+    }
+    if compact.len() / 2 > MAX_BYTES {
+        return Err(format!("hex payload exceeds the {MAX_BYTES}-byte limit"));
+    }
+
+    let mut bytes = Vec::with_capacity(compact.len() / 2);
+    for pair in compact.chunks_exact(2) {
+        let pair = std::str::from_utf8(pair)
+            .map_err(|_| "hex payload must contain only ASCII characters".to_owned())?;
+        let byte = u8::from_str_radix(pair, 16)
+            .map_err(|_| format!("invalid hexadecimal byte '{pair}'"))?;
+        bytes.push(byte);
+    }
+    Ok(Some(bytes))
 }
 
 fn mousebinding_action(event: &MouseEvent, config: &config_core::MouseConfig) -> Option<String> {
@@ -9455,6 +9508,38 @@ mod tests {
             canonical_key_spec("Shift+Ctrl+T"),
             canonical_key_event(&event)
         );
+
+        let backspace = key_event(
+            "Backspace",
+            KeyModifiers {
+                ctrl: true,
+                ..KeyModifiers::default()
+            },
+        );
+        assert_eq!(
+            keybinding_action(&backspace, &config).as_deref(),
+            Some("send_bytes:17")
+        );
+    }
+
+    #[test]
+    fn send_bytes_keybinding_decodes_hex_payload() {
+        assert_eq!(
+            parse_send_bytes_action("send_bytes:17"),
+            Ok(Some(vec![0x17]))
+        );
+        assert_eq!(
+            parse_send_bytes_action("send_bytes:1b5b41"),
+            Ok(Some(b"\x1b[A".to_vec()))
+        );
+        assert_eq!(parse_send_bytes_action("new_tab"), Ok(None));
+    }
+
+    #[test]
+    fn send_bytes_keybinding_rejects_malformed_payload() {
+        assert!(parse_send_bytes_action("send_bytes:").is_err());
+        assert!(parse_send_bytes_action("send_bytes:1").is_err());
+        assert!(parse_send_bytes_action("send_bytes:zz").is_err());
     }
 
     #[test]

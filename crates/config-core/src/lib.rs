@@ -1614,6 +1614,7 @@ impl Default for KeyboardConfig {
             keybindings: vec![
                 KeyBinding::new("Ctrl+Shift+C", "copy"),
                 KeyBinding::new("Ctrl+Shift+V", "paste"),
+                KeyBinding::new("Ctrl+Backspace", "send_bytes:17"),
                 KeyBinding::new("Super+C", "copy"),
                 KeyBinding::new("Super+V", "paste"),
                 KeyBinding::new("Ctrl+Shift+F", "toggle_fullscreen"),
