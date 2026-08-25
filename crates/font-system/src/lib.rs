@@ -1141,17 +1141,21 @@ mod tests {
             family: "CaskaydiaCove NF".to_owned(),
             ..FontConfig::default()
         });
+        let configured_font_available =
+            fonts.resolve_fallback_chain().primary.source != FontSource::Unresolved;
         let metrics = fonts.cell_metrics().expect("configured font metrics");
         for sample in ["\u{e0b6}", "\u{e62a}", "\u{e0b4}", "\u{e725}"] {
             let run = fonts
                 .shape_text(sample, false, false)
                 .expect("shape powerline glyph");
             assert_eq!(run.glyphs.len(), 1);
-            assert!(
-                run.families_used
-                    .iter()
-                    .any(|family| family == "CaskaydiaCove NF")
-            );
+            if configured_font_available {
+                assert!(
+                    run.families_used
+                        .iter()
+                        .any(|family| family == "CaskaydiaCove NF")
+                );
+            }
             assert!((run.advance_width - metrics.cell_width).abs() < 0.01);
 
             let glyph = run.glyphs[0];
