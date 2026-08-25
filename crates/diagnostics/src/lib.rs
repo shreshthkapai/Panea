@@ -1167,6 +1167,14 @@ fn append_fonts_report(input: &DoctorInput, report: &mut DoctorReport) {
                 .to_owned(),
         });
     }
+    if input.runtime.font_discovery.contains("style fallback") {
+        report.findings.push(DoctorFinding {
+            severity: DoctorSeverity::Warning,
+            area: "fonts",
+            message: "one or more requested bold/italic faces are unavailable; the regular face will be used"
+                .to_owned(),
+        });
+    }
 }
 
 fn append_config_report(input: &DoctorInput, report: &mut DoctorReport) {
@@ -2790,7 +2798,9 @@ mod tests {
             config_diagnostics: Vec::new(),
             platform: PlatformSnapshot::detect(),
             runtime: DoctorRuntimeSnapshot {
-                font_discovery: "primary:monospace=unresolved".to_owned(),
+                font_discovery:
+                    "primary:monospace=unresolved; bold-face:monospace=file:regular.ttf (style fallback)"
+                        .to_owned(),
                 clipboard_provider: "system unavailable".to_owned(),
                 ..DoctorRuntimeSnapshot::default()
             },
@@ -2802,6 +2812,7 @@ mod tests {
 
         assert!(fonts.contains("discovery=primary:monospace=unresolved"));
         assert!(fonts.contains("could not be resolved"));
+        assert!(fonts.contains("regular face will be used"));
         assert!(clipboard.contains("provider=system unavailable"));
     }
 

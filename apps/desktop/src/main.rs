@@ -1064,15 +1064,30 @@ fn font_discovery_label(config: &AppConfig) -> String {
         .diagnostics()
         .into_iter()
         .map(|diagnostic| {
-            let source = match &diagnostic.source {
-                FontSource::File(path) => format!("file:{}", path.display()),
-                FontSource::Memory => "memory".to_owned(),
-                FontSource::Unresolved => "unresolved".to_owned(),
-            };
-            format!("{}:{}={source}", diagnostic.role, diagnostic.family)
+            format_font_diagnostic(
+                diagnostic.role,
+                &diagnostic.family,
+                diagnostic.resolved,
+                &diagnostic.source,
+            )
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+fn format_font_diagnostic(role: &str, family: &str, resolved: bool, source: &FontSource) -> String {
+    let unresolved = matches!(source, FontSource::Unresolved);
+    let source = match source {
+        FontSource::File(path) => format!("file:{}", path.display()),
+        FontSource::Memory => "memory".to_owned(),
+        FontSource::Unresolved => "unresolved".to_owned(),
+    };
+    let fallback = if resolved || unresolved {
+        ""
+    } else {
+        " (style fallback)"
+    };
+    format!("{role}:{family}={source}{fallback}")
 }
 
 fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
@@ -9950,7 +9965,26 @@ mod tests {
             ascent: 11.0,
             descent: -3.0,
             line_gap: 1.0,
+            baseline: 12.0,
+            underline_position: 14.0,
+            strikethrough_position: 7.0,
+            decoration_thickness: 1.0,
         }
+    }
+
+    #[test]
+    fn font_diagnostics_label_unmatched_style_faces_explicitly() {
+        let label = format_font_diagnostic(
+            "bold-face",
+            "Panea Test Font",
+            false,
+            &FontSource::File(PathBuf::from("PaneaTest-Regular.ttf")),
+        );
+
+        assert_eq!(
+            label,
+            "bold-face:Panea Test Font=file:PaneaTest-Regular.ttf (style fallback)"
+        );
     }
 
     fn test_semantic_viewport(origin_row: i64) -> SemanticOverlayViewport {

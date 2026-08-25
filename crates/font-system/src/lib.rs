@@ -69,6 +69,13 @@ pub struct CellMetrics {
     pub ascent: f32,
     pub descent: f32,
     pub line_gap: f32,
+    /// Primary-font baseline measured down from the top of a terminal cell.
+    pub baseline: f32,
+    /// Underline top edge measured down from the top of a terminal cell.
+    pub underline_position: f32,
+    /// Strikeout top edge measured down from the top of a terminal cell.
+    pub strikethrough_position: f32,
+    pub decoration_thickness: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -685,12 +692,10 @@ impl LoadedFont {
                 reason: "OpenType shaping face could not be created".to_owned(),
             });
         };
-        // `ab_glyph::PxScale` defines `size` against the font's unscaled
-        // vertical height, not units-per-em. Cell metrics and rasterization use
-        // that contract, so shaping must use the same scale or glyph advances
-        // visibly drift away from terminal cells and the cursor.
-        let unscaled_height = self.font.height_unscaled().max(1.0);
-        let scale = size / unscaled_height;
+        // `size` is pixels per em. Rustybuzz reports positions in font design
+        // units, so converting by units-per-em keeps shaping, Swash
+        // rasterization, and typographic point sizes on one scale.
+        let scale = self.design_unit_scale(size);
         let mut buffer = rustybuzz::UnicodeBuffer::new();
         buffer.push_str(text);
         buffer.guess_segment_properties();
@@ -721,7 +726,7 @@ impl LoadedFont {
 
     #[must_use]
     pub fn metrics(&self, size: f32, line_height: f32) -> CellMetrics {
-        let scaled = self.font.as_scaled(PxScale::from(size));
+        let scaled = self.font.as_scaled(self.ab_glyph_scale(size));
         let ascent = scaled.ascent();
         let descent = scaled.descent();
         let line_gap = scaled.line_gap();
@@ -729,6 +734,12 @@ impl LoadedFont {
             .ceil()
             .max(1.0);
         let zero_width = scaled.h_advance(self.font.glyph_id('0')).max(1.0);
+        let baseline = ((cell_height - (ascent - descent)) * 0.5 + ascent).clamp(0.0, cell_height);
+        let (underline_offset, strikeout_offset, stroke_size) = self.decoration_metrics(size);
+        let decoration_thickness = stroke_size.abs().max(1.0).min(cell_height);
+        let maximum_decoration_y = (cell_height - decoration_thickness).max(0.0);
+        let underline_position = (baseline - underline_offset).clamp(0.0, maximum_decoration_y);
+        let strikethrough_position = (baseline - strikeout_offset).clamp(0.0, maximum_decoration_y);
 
         CellMetrics {
             font_size: size,
@@ -737,12 +748,16 @@ impl LoadedFont {
             ascent,
             descent,
             line_gap,
+            baseline,
+            underline_position,
+            strikethrough_position,
+            decoration_thickness,
         }
     }
 
     #[must_use]
     pub fn rasterize(&self, glyph_id: u16, size: f32) -> GlyphBitmap {
-        let scaled = self.font.as_scaled(PxScale::from(size));
+        let scaled = self.font.as_scaled(self.ab_glyph_scale(size));
         let glyph_id = GlyphId(glyph_id);
         let advance_width = scaled.h_advance(glyph_id).max(0.0);
         let ascent = scaled.ascent();
@@ -780,7 +795,7 @@ impl LoadedFont {
                     width: image.placement.width,
                     height: image.placement.height,
                     offset_x: image.placement.left,
-                    offset_y: (ascent.round() as i32).saturating_sub(image.placement.top),
+                    offset_y: -image.placement.top,
                     advance_width,
                     pixels,
                     format,
@@ -791,12 +806,12 @@ impl LoadedFont {
         if let Some(image) = self
             .font
             .glyph_raster_image2(glyph_id, size.round().clamp(1.0, u16::MAX as f32) as u16)
-            && let Some(bitmap) = raster_image_to_bitmap(&image, advance_width, size)
+            && let Some(bitmap) = raster_image_to_bitmap(&image, advance_width, size, ascent)
         {
             return bitmap;
         }
 
-        let glyph = glyph_id.with_scale_and_position(PxScale::from(size), point(0.0, ascent));
+        let glyph = glyph_id.with_scale_and_position(self.ab_glyph_scale(size), point(0.0, 0.0));
 
         let Some(outlined) = self.font.outline_glyph(glyph) else {
             if glyph_id != GlyphId(0) {
@@ -804,13 +819,16 @@ impl LoadedFont {
                     width: 1,
                     height: 1,
                     offset_x: 0,
-                    offset_y: 0,
+                    offset_y: -ascent.round() as i32,
                     advance_width,
                     pixels: vec![0],
                     format: GlyphBitmapFormat::Alpha,
                 };
             }
-            return GlyphBitmap::missing(advance_width, (ascent - scaled.descent()).ceil() as u32);
+            let mut missing =
+                GlyphBitmap::missing(advance_width, (ascent - scaled.descent()).ceil() as u32);
+            missing.offset_y = -ascent.round() as i32;
+            return missing;
         };
 
         let bounds = outlined.px_bounds();
@@ -833,6 +851,57 @@ impl LoadedFont {
             format: GlyphBitmapFormat::Alpha,
         }
     }
+
+    fn ab_glyph_scale(&self, pixels_per_em: f32) -> PxScale {
+        let units_per_em = self
+            .font
+            .units_per_em()
+            .unwrap_or_else(|| self.font.height_unscaled())
+            .max(1.0);
+        PxScale::from(pixels_per_em * self.font.height_unscaled().max(1.0) / units_per_em)
+    }
+
+    fn design_unit_scale(&self, pixels_per_em: f32) -> f32 {
+        pixels_per_em
+            / self
+                .font
+                .units_per_em()
+                .unwrap_or_else(|| self.font.height_unscaled())
+                .max(1.0)
+    }
+
+    fn decoration_metrics(&self, pixels_per_em: f32) -> (f32, f32, f32) {
+        let fallback_stroke = (pixels_per_em / 14.0).max(1.0);
+        let fallback_underline = -fallback_stroke;
+        let fallback_strikeout = self
+            .font
+            .as_scaled(self.ab_glyph_scale(pixels_per_em))
+            .ascent()
+            * 0.35;
+        let Some(font) = SwashFontRef::from_index(&self.bytes, self.face_index as usize) else {
+            return (fallback_underline, fallback_strikeout, fallback_stroke);
+        };
+        let metrics = font
+            .metrics(&[])
+            .linear_scale(self.design_unit_scale(pixels_per_em));
+        (
+            if metrics.underline_offset == 0.0 {
+                fallback_underline
+            } else {
+                metrics.underline_offset
+            },
+            if metrics.strikeout_offset == 0.0 {
+                fallback_strikeout
+            } else {
+                metrics.strikeout_offset
+            },
+            if metrics.stroke_size == 0.0 {
+                fallback_stroke
+            } else {
+                metrics.stroke_size
+            },
+        )
+    }
 }
 
 fn is_default_ignorable(ch: char) -> bool {
@@ -844,13 +913,14 @@ fn raster_image_to_bitmap(
     image: &ab_glyph::v2::GlyphImage<'_>,
     advance_width: f32,
     requested_size: f32,
+    ascent: f32,
 ) -> Option<GlyphBitmap> {
+    let strike_scale = requested_size / f32::from(image.pixels_per_em.max(1));
     let (width, height, pixels) = match &image.format {
         GlyphImageFormat::Png => {
             let decoded = image::load_from_memory(image.data).ok()?.to_rgba8();
-            let scale = requested_size / f32::from(image.pixels_per_em.max(1));
-            let width = (decoded.width() as f32 * scale).round().max(1.0) as u32;
-            let height = (decoded.height() as f32 * scale).round().max(1.0) as u32;
+            let width = (decoded.width() as f32 * strike_scale).round().max(1.0) as u32;
+            let height = (decoded.height() as f32 * strike_scale).round().max(1.0) as u32;
             let resized = if decoded.width() == width && decoded.height() == height {
                 decoded
             } else {
@@ -872,8 +942,8 @@ fn raster_image_to_bitmap(
     Some(GlyphBitmap {
         width,
         height,
-        offset_x: image.origin.x.round() as i32,
-        offset_y: image.origin.y.round() as i32,
+        offset_x: (image.origin.x * strike_scale).round() as i32,
+        offset_y: (image.origin.y * strike_scale - ascent).round() as i32,
         advance_width,
         pixels,
         format: GlyphBitmapFormat::Rgba,
@@ -998,6 +1068,71 @@ mod tests {
     }
 
     #[test]
+    fn typographic_size_uses_pixels_per_em_for_font_metrics() {
+        let mut fonts = FontSystem::new(FontConfig {
+            size: 13.0,
+            line_height: 1.0,
+            ..FontConfig::default()
+        });
+        let pixels_per_em = fonts.physical_font_size();
+        let expected_ascent = {
+            let font = fonts.primary_font().expect("primary font");
+            let units_per_em = font.font.units_per_em().expect("units per em");
+            let scale = PxScale::from(pixels_per_em * font.font.height_unscaled() / units_per_em);
+            font.font.as_scaled(scale).ascent()
+        };
+        let metrics = fonts.cell_metrics().expect("cell metrics");
+
+        assert!(
+            (metrics.ascent - expected_ascent).abs() <= f32::EPSILON,
+            "font metrics must interpret configured points as pixels per em: actual={}, expected={expected_ascent}",
+            metrics.ascent
+        );
+    }
+
+    #[test]
+    fn line_height_centers_primary_font_box_around_the_baseline() {
+        for scale_factor in [1.0, 1.25, 1.5] {
+            for line_height in [1.0, 1.2, 1.5] {
+                let mut fonts = FontSystem::new_with_scale_factor(
+                    FontConfig {
+                        line_height,
+                        ..FontConfig::default()
+                    },
+                    scale_factor,
+                );
+                let Ok(metrics) = fonts.cell_metrics() else {
+                    return;
+                };
+                let leading_above = metrics.baseline - metrics.ascent;
+                let leading_below = metrics.cell_height - (metrics.baseline - metrics.descent);
+
+                assert!(
+                    (leading_above - leading_below).abs() <= 0.51,
+                    "line-height leading must be centered: scale={scale_factor}, line_height={line_height}, above={leading_above}, below={leading_below}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rasterized_glyph_offsets_are_relative_to_a_shared_baseline() {
+        let mut fonts = FontSystem::new(FontConfig::default());
+        let Ok(run) = fonts.shape_text("A", false, false) else {
+            return;
+        };
+        let bitmap = fonts
+            .rasterize_glyph(run.glyphs[0].key)
+            .expect("rasterized glyph");
+
+        assert!(
+            bitmap.offset_y < 0,
+            "an ordinary glyph top must be above the shared baseline, got {}",
+            bitmap.offset_y
+        );
+    }
+
+    #[test]
     fn point_sizes_scale_to_physical_pixels() {
         let config = FontConfig {
             size: 12.0,
@@ -1091,6 +1226,38 @@ mod tests {
         };
         assert!(!run.glyphs.is_empty());
         assert!(run.glyphs.iter().all(|glyph| glyph.key.font_id != 0));
+    }
+
+    #[test]
+    fn fallback_glyph_bitmaps_use_the_primary_cell_baseline_contract() {
+        let mut fonts = FontSystem::new(FontConfig {
+            fallback_families: vec![
+                "Segoe UI Emoji".to_owned(),
+                "Apple Color Emoji".to_owned(),
+                "Noto Color Emoji".to_owned(),
+                "Noto Sans CJK JP".to_owned(),
+            ],
+            ..FontConfig::default()
+        });
+        let Ok(metrics) = fonts.cell_metrics() else {
+            return;
+        };
+        let Ok(run) = fonts.shape_text("A\u{754c}\u{1f600}", false, false) else {
+            return;
+        };
+
+        for glyph in run.glyphs {
+            let bitmap = fonts
+                .rasterize_glyph(glyph.key)
+                .expect("rasterized fallback glyph");
+            let top = metrics.baseline + bitmap.offset_y as f32;
+            let bottom = top + bitmap.height as f32;
+            assert!(
+                top < metrics.cell_height && bottom > 0.0,
+                "fallback glyph must intersect the primary terminal row: top={top}, bottom={bottom}, cell_height={}",
+                metrics.cell_height
+            );
+        }
     }
 
     #[test]

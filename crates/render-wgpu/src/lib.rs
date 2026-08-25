@@ -2306,17 +2306,15 @@ impl RenderBatchPlanner {
         };
 
         let mut pen_x = context.rect.x as f32;
-        let mut pen_y = context.rect.y as f32;
+        let mut pen_y = glyph_baseline_y(context.rect, context.metrics);
         for item in run {
             let key = item.key;
             let cache_hit = self.glyph_cache.contains_key(key);
             let bitmap = self.glyph_cache.get_or_insert_with(key, || {
-                context.fonts.rasterize_glyph(key).unwrap_or_else(|_| {
-                    GlyphBitmap::missing(
-                        context.metrics.cell_width,
-                        context.metrics.cell_height as u32,
-                    )
-                })
+                context
+                    .fonts
+                    .rasterize_glyph(key)
+                    .unwrap_or_else(|_| missing_glyph_bitmap(context.metrics))
             });
             if cache_hit {
                 context.instrumentation.glyphs.cache_hits =
@@ -2955,17 +2953,13 @@ fn push_stroke_quads(batch: &mut QuadBatch, rect: RenderRect, width: u32, color:
 fn push_text_decorations(
     decorations: &mut QuadBatch,
     cell: &RenderCell,
-    _metrics: CellMetrics,
+    metrics: CellMetrics,
     rect: RenderRect,
 ) {
     if cell.style.underline {
         push_solid_quad(
             decorations,
-            RenderRect {
-                y: rect.y + rect.height as i32 - 2,
-                height: 1,
-                ..rect
-            },
+            metric_decoration_rect(rect, metrics, metrics.underline_position),
             cell.foreground,
         );
     }
@@ -2973,14 +2967,42 @@ fn push_text_decorations(
     if cell.style.strikethrough {
         push_solid_quad(
             decorations,
-            RenderRect {
-                y: rect.y + (rect.height / 2) as i32,
-                height: 1,
-                ..rect
-            },
+            metric_decoration_rect(rect, metrics, metrics.strikethrough_position),
             cell.foreground,
         );
     }
+}
+
+fn glyph_baseline_y(rect: RenderRect, metrics: CellMetrics) -> f32 {
+    rect.y as f32 + vertical_metric_offset(rect, metrics) + metrics.baseline
+}
+
+fn vertical_metric_offset(rect: RenderRect, metrics: CellMetrics) -> f32 {
+    (rect.height as f32 - metrics.cell_height) * 0.5
+}
+
+fn metric_decoration_rect(rect: RenderRect, metrics: CellMetrics, position: f32) -> RenderRect {
+    let height = metrics
+        .decoration_thickness
+        .round()
+        .max(1.0)
+        .min(rect.height.max(1) as f32) as u32;
+    let requested_y =
+        (rect.y as f32 + vertical_metric_offset(rect, metrics) + position).round() as i32;
+    let maximum_y = rect
+        .y
+        .saturating_add(rect.height.saturating_sub(height) as i32);
+    RenderRect {
+        y: requested_y.clamp(rect.y, maximum_y),
+        height,
+        ..rect
+    }
+}
+
+fn missing_glyph_bitmap(metrics: CellMetrics) -> GlyphBitmap {
+    let mut bitmap = GlyphBitmap::missing(metrics.cell_width, metrics.cell_height.ceil() as u32);
+    bitmap.offset_y = -metrics.baseline.round() as i32;
+    bitmap
 }
 
 fn push_animation_quads(
@@ -4335,6 +4357,10 @@ fn cursor_decoration(row: i64, col: u16, shape: RenderCursorShape) -> RenderDeco
         ascent: 11.0,
         descent: -3.0,
         line_gap: 1.0,
+        baseline: 12.0,
+        underline_position: 14.0,
+        strikethrough_position: 7.0,
+        decoration_thickness: 1.0,
     };
     let mut batch = QuadBatch::new(QuadBatchKind::Cursor);
     push_cursor_quads(
@@ -4664,14 +4690,14 @@ impl TerminalRasterizer {
         }
 
         let mut pen_x = rect.x as f32;
-        let mut pen_y = rect.y as f32;
+        let mut pen_y = glyph_baseline_y(rect, metrics);
         let shaped = fonts.shape_text(&cell.text, cell.style.bold, cell.style.italic)?;
         for glyph in shaped.glyphs {
             let key = glyph.key;
             let bitmap = self.batch_planner.glyph_cache.get_or_insert_with(key, || {
-                fonts.rasterize_glyph(key).unwrap_or_else(|_| {
-                    GlyphBitmap::missing(metrics.cell_width, metrics.cell_height as u32)
-                })
+                fonts
+                    .rasterize_glyph(key)
+                    .unwrap_or_else(|_| missing_glyph_bitmap(metrics))
             });
             draw_glyph(
                 frame,
@@ -4685,27 +4711,17 @@ impl TerminalRasterizer {
         }
 
         if cell.style.underline {
-            let y = rect.y + rect.height as i32 - 2;
             fill_rect(
                 frame,
-                RenderRect {
-                    y,
-                    height: 1,
-                    ..rect
-                },
+                metric_decoration_rect(rect, metrics, metrics.underline_position),
                 cell.foreground,
             );
         }
 
         if cell.style.strikethrough {
-            let y = rect.y + (rect.height / 2) as i32;
             fill_rect(
                 frame,
-                RenderRect {
-                    y,
-                    height: 1,
-                    ..rect
-                },
+                metric_decoration_rect(rect, metrics, metrics.strikethrough_position),
                 cell.foreground,
             );
         }
@@ -4745,14 +4761,14 @@ impl TerminalRasterizer {
         };
         let rect = offset_region(overlay_label_rect(overlay, metrics), offset);
         let mut pen_x = rect.x as f32;
-        let mut pen_y = rect.y as f32;
+        let mut pen_y = glyph_baseline_y(rect, metrics);
         let shaped = fonts.shape_text(&cell.text, false, false)?;
         for glyph in shaped.glyphs {
             let key = glyph.key;
             let bitmap = self.batch_planner.glyph_cache.get_or_insert_with(key, || {
-                fonts.rasterize_glyph(key).unwrap_or_else(|_| {
-                    GlyphBitmap::missing(metrics.cell_width, metrics.cell_height as u32)
-                })
+                fonts
+                    .rasterize_glyph(key)
+                    .unwrap_or_else(|_| missing_glyph_bitmap(metrics))
             });
             draw_glyph(
                 frame,
@@ -7591,7 +7607,51 @@ mod tests {
             ascent: 11.0,
             descent: -3.0,
             line_gap: 1.0,
+            baseline: 12.0,
+            underline_position: 14.0,
+            strikethrough_position: 7.0,
+            decoration_thickness: 1.0,
         }
+    }
+
+    #[test]
+    fn text_decorations_follow_font_metrics() {
+        let mut batch = QuadBatch::new(QuadBatchKind::Decoration);
+        let mut styled = cell(0, 0, "x");
+        styled.style.underline = true;
+        styled.style.strikethrough = true;
+        let metrics = CellMetrics {
+            underline_position: 12.0,
+            strikethrough_position: 5.0,
+            decoration_thickness: 2.0,
+            ..metrics()
+        };
+
+        push_text_decorations(
+            &mut batch,
+            &styled,
+            metrics,
+            RenderRect {
+                x: 0,
+                y: 20,
+                width: 8,
+                height: 16,
+            },
+        );
+
+        let mut y_values = batch
+            .vertices
+            .chunks_exact(4)
+            .map(|quad| quad[0].position_px[1] as i32)
+            .collect::<Vec<_>>();
+        y_values.sort_unstable();
+        assert_eq!(y_values, [25, 32]);
+        assert!(
+            batch
+                .vertices
+                .chunks_exact(4)
+                .all(|quad| (quad[2].position_px[1] - quad[0].position_px[1]) == 2.0)
+        );
     }
 
     #[test]
@@ -8148,6 +8208,31 @@ mod tests {
             "text geometry escaped its terminal cells: text_right={text_right}, cursor_left={cursor_left}, cell_width={}",
             metrics.cell_width
         );
+    }
+
+    #[test]
+    fn prepared_terminal_glyph_uses_the_centered_cell_baseline() {
+        let mut fonts = FontSystem::new(font_system::FontConfig {
+            line_height: 1.5,
+            ..font_system::FontConfig::default()
+        });
+        let metrics = fonts.cell_metrics().expect("cell metrics");
+        let shaped = fonts.shape_text("H", false, false).expect("shape glyph");
+        let glyph = shaped.glyphs[0];
+        let bitmap = fonts.rasterize_glyph(glyph.key).expect("rasterize glyph");
+        let expected_top = (metrics.baseline - glyph.y_offset).round() + bitmap.offset_y as f32;
+        let mut planner = RenderBatchPlanner::default();
+        let batches = planner
+            .prepare_full(&scene_without_cursor(vec![cell(0, 0, "H")]), &mut fonts)
+            .expect("prepare terminal glyph");
+        let actual_top = batches
+            .glyphs
+            .vertices
+            .iter()
+            .map(|vertex| vertex.position_px[1])
+            .fold(f32::INFINITY, f32::min);
+
+        assert_eq!(actual_top, expected_top);
     }
 
     #[test]

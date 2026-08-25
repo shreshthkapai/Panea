@@ -48,16 +48,31 @@ Can diagnostics show its cost? Glyph cache hits/misses and atlas uploads/occupan
 - The generic `monospace` family resolves through Panea's portable modern
   fallback order before the host's legacy generic alias.
 - Rustybuzz shapes OpenType runs and preserves cluster offsets.
-- Rustybuzz positions are converted with the same `ab_glyph::PxScale`
-  factor used by cell metrics and rasterization (`font.size_px /
-  font.height_unscaled()`). Units-per-em must not be used as a substitute:
-  mixing those scales makes text advances diverge from cell and cursor
-  coordinates.
+- `font.size` is converted to physical pixels per em. Rustybuzz and Swash use
+  `pixels_per_em / units_per_em`; `ab_glyph::PxScale` is derived from that same
+  value using the face's unscaled height. Mixing pixels-per-em with
+  `ab_glyph::PxScale` directly makes shaped advances, rasterized glyphs, and
+  terminal cells disagree.
+- The primary face defines one baseline per terminal row. Configured line-height
+  leading is split above and below the primary ascent/descent box, and every
+  fallback glyph stores a baseline-relative vertical bearing. CJK, emoji, Nerd
+  Font icons, and ordinary text therefore share a baseline even when their face
+  metrics differ.
+- Underline and strikethrough geometry comes from the primary font's metrics,
+  with bounded metric-derived fallbacks for fonts that omit those values.
 - Fallback selection occurs per Unicode grapheme, including combining marks,
   variation selectors, emoji modifiers, and ZWJ sequences.
 - Swash rasterizes monochrome outlines, COLR/CPAL color outlines, and embedded
   color bitmaps. The GPU atlas stores RGBA data so color emoji are not tinted by
   the terminal foreground color.
+- Monochrome glyphs use grayscale alpha masks. LCD subpixel masks are not used
+  without a known display pixel geometry and an opaque composition path, because
+  applying them to transparent surfaces or incompatible monitor layouts creates
+  colored fringes. Any future subpixel mode must be capability-reported and use
+  the same portable fallback.
+- Baseline correction is part of the renderer contract, not a per-platform
+  `glyph_offset_y` workaround. A future user offset may be added for deliberate
+  typography customization, but it must apply after the correct shared baseline.
 - Compatible adjacent ASCII cells are shaped as one run, allowing configured
   font ligatures while terminal selection and cursor positions remain cell-based.
 - CJK and emoji cells remain independently owned terminal graphemes; wide-cell
@@ -65,8 +80,10 @@ Can diagnostics show its cost? Glyph cache hits/misses and atlas uploads/occupan
 - Shaped glyph advances remain floating point until final pixel placement so
   fractional advances cannot accumulate one rounding error per glyph.
 - Tests require a primary monospace run's shaped advance to match its terminal
-  cell span and require prepared glyph geometry to remain aligned with the
-  following cursor cell.
+  cell span, line-height leading to remain vertically balanced across DPI
+  scales, fallback glyphs to intersect the shared row, decorations to honor font
+  metrics, and prepared glyph geometry to remain aligned with the following
+  cursor cell.
 
 ## Verification Boundary
 

@@ -877,6 +877,10 @@ mod tests {
             ascent: 10.0,
             descent: -3.0,
             line_gap: 2.0,
+            baseline: 11.5,
+            underline_position: 14.0,
+            strikethrough_position: 7.0,
+            decoration_thickness: 1.0,
         });
 
         assert_eq!(size.cols, 48);
