@@ -209,6 +209,8 @@ pub struct GlyphAtlas {
     lru: VecDeque<AtlasCacheKey>,
 }
 
+const GLYPH_ATLAS_PADDING: u32 = 1;
+
 impl GlyphAtlas {
     #[must_use]
     pub fn new(width: u32, height: u32) -> Self {
@@ -236,28 +238,30 @@ impl GlyphAtlas {
 
         let width = bitmap.width.max(1);
         let height = bitmap.height.max(1);
-        if width > self.width || height > self.height {
+        let allocation_width = width.saturating_add(GLYPH_ATLAS_PADDING * 2);
+        let allocation_height = height.saturating_add(GLYPH_ATLAS_PADDING * 2);
+        if allocation_width > self.width || allocation_height > self.height {
             return None;
         }
 
-        if self.cursor_x + width > self.width {
+        if self.cursor_x.saturating_add(allocation_width) > self.width {
             self.cursor_x = 0;
             self.cursor_y += self.row_height;
             self.row_height = 0;
         }
 
-        if self.cursor_y + height > self.height {
+        if self.cursor_y.saturating_add(allocation_height) > self.height {
             self.clear();
         }
 
         let entry = AtlasEntry {
-            x: self.cursor_x,
-            y: self.cursor_y,
+            x: self.cursor_x + GLYPH_ATLAS_PADDING,
+            y: self.cursor_y + GLYPH_ATLAS_PADDING,
             width,
             height,
         };
-        self.cursor_x += width;
-        self.row_height = self.row_height.max(height);
+        self.cursor_x += allocation_width;
+        self.row_height = self.row_height.max(allocation_height);
         self.entries.insert(key, entry);
         self.lru.push_back(key);
         Some(entry)
@@ -2718,19 +2722,13 @@ fn push_glyph_quad(
     color: RenderColor,
     color_bitmap: bool,
 ) {
-    let (atlas_width, atlas_height) = atlas_dimensions;
-    let atlas_width = atlas_width.max(1) as f32;
-    let atlas_height = atlas_height.max(1) as f32;
-    let x0 = atlas_entry.x as f32 / atlas_width;
-    let y0 = atlas_entry.y as f32 / atlas_height;
-    let x1 = atlas_entry.x.saturating_add(atlas_entry.width) as f32 / atlas_width;
-    let y1 = atlas_entry.y.saturating_add(atlas_entry.height) as f32 / atlas_height;
+    let uv = atlas_uv_bounds(atlas_entry, atlas_dimensions);
 
     push_quad(
         &mut batch.vertices,
         &mut batch.indices,
         rect,
-        [[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
+        [[uv.0, uv.1], [uv.2, uv.1], [uv.2, uv.3], [uv.0, uv.3]],
         color,
     );
     if color_bitmap {
@@ -2739,6 +2737,16 @@ fn push_glyph_quad(
         }
     }
     batch.glyph_count = batch.glyph_count.saturating_add(1);
+}
+
+fn atlas_uv_bounds(entry: AtlasEntry, atlas_dimensions: (u32, u32)) -> (f32, f32, f32, f32) {
+    let atlas_width = atlas_dimensions.0.max(1) as f32;
+    let atlas_height = atlas_dimensions.1.max(1) as f32;
+    let x0 = entry.x as f32 / atlas_width;
+    let y0 = entry.y as f32 / atlas_height;
+    let x1 = entry.x.saturating_add(entry.width) as f32 / atlas_width;
+    let y1 = entry.y.saturating_add(entry.height) as f32 / atlas_height;
+    (x0, y0, x1, y1)
 }
 
 fn push_quad(
@@ -6153,47 +6161,89 @@ impl GpuBackend {
             if upload.entry.width == 0 || upload.entry.height == 0 {
                 continue;
             }
-            for row in 0..upload.entry.height {
-                let source_channels = match upload.format {
-                    GlyphBitmapFormat::Alpha => 1,
-                    GlyphBitmapFormat::Rgba => 4,
-                };
-                let start = (row * upload.entry.width * source_channels) as usize;
-                let end = start + (upload.entry.width * source_channels) as usize;
-                if end > upload.pixels.len() {
-                    break;
-                }
-                let row_pixels = match upload.format {
-                    GlyphBitmapFormat::Alpha => upload.pixels[start..end]
-                        .iter()
-                        .flat_map(|alpha| [255, 255, 255, *alpha])
-                        .collect::<Vec<_>>(),
-                    GlyphBitmapFormat::Rgba => upload.pixels[start..end].to_vec(),
-                };
-                self.queue.write_texture(
-                    wgpu::ImageCopyTexture {
-                        texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d {
-                            x: upload.entry.x,
-                            y: upload.entry.y + row,
-                            z: 0,
-                        },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    &row_pixels,
-                    wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: None,
-                        rows_per_image: None,
-                    },
-                    wgpu::Extent3d {
-                        width: upload.entry.width,
-                        height: 1,
-                        depth_or_array_layers: 1,
-                    },
-                );
+            if upload.entry.x < GLYPH_ATLAS_PADDING || upload.entry.y < GLYPH_ATLAS_PADDING {
+                continue;
             }
+
+            let padded_width = upload.entry.width + GLYPH_ATLAS_PADDING * 2;
+            let padded_height = upload.entry.height + GLYPH_ATLAS_PADDING * 2;
+            let padded_len = usize::try_from(padded_width)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(usize::try_from(padded_height).unwrap_or(usize::MAX))
+                .saturating_mul(4);
+            let mut padded_pixels = vec![0_u8; padded_len];
+            for y in 0..padded_height {
+                let source_y = y
+                    .saturating_sub(GLYPH_ATLAS_PADDING)
+                    .min(upload.entry.height.saturating_sub(1));
+                for x in 0..padded_width {
+                    let source_x = x
+                        .saturating_sub(GLYPH_ATLAS_PADDING)
+                        .min(upload.entry.width.saturating_sub(1));
+                    let target_index = usize::try_from(
+                        y.saturating_mul(padded_width)
+                            .saturating_add(x)
+                            .saturating_mul(4),
+                    )
+                    .unwrap_or(usize::MAX);
+                    let Some(target) = padded_pixels.get_mut(target_index..target_index + 4) else {
+                        continue;
+                    };
+                    match upload.format {
+                        GlyphBitmapFormat::Alpha => {
+                            let source_index = usize::try_from(
+                                source_y
+                                    .saturating_mul(upload.entry.width)
+                                    .saturating_add(source_x),
+                            )
+                            .unwrap_or(usize::MAX);
+                            target.copy_from_slice(&[
+                                255,
+                                255,
+                                255,
+                                upload.pixels.get(source_index).copied().unwrap_or(0),
+                            ]);
+                        }
+                        GlyphBitmapFormat::Rgba => {
+                            let source_index = usize::try_from(
+                                source_y
+                                    .saturating_mul(upload.entry.width)
+                                    .saturating_add(source_x)
+                                    .saturating_mul(4),
+                            )
+                            .unwrap_or(usize::MAX);
+                            if let Some(source) = upload.pixels.get(source_index..source_index + 4)
+                            {
+                                target.copy_from_slice(source);
+                            }
+                        }
+                    }
+                }
+            }
+
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: upload.entry.x - GLYPH_ATLAS_PADDING,
+                        y: upload.entry.y - GLYPH_ATLAS_PADDING,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &padded_pixels,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_width * 4),
+                    rows_per_image: Some(padded_height),
+                },
+                wgpu::Extent3d {
+                    width: padded_width,
+                    height: padded_height,
+                    depth_or_array_layers: 1,
+                },
+            );
         }
     }
 
@@ -7372,6 +7422,40 @@ mod tests {
     }
 
     #[test]
+    fn glyph_atlas_uvs_cover_only_the_padded_glyph_interior() {
+        let (x0, y0, x1, y1) = atlas_uv_bounds(
+            AtlasEntry {
+                x: 10,
+                y: 20,
+                width: 4,
+                height: 6,
+            },
+            (100, 200),
+        );
+
+        assert_eq!(x0, 10.0 / 100.0);
+        assert_eq!(y0, 20.0 / 200.0);
+        assert_eq!(x1, 14.0 / 100.0);
+        assert_eq!(y1, 26.0 / 200.0);
+    }
+
+    #[test]
+    fn glyph_atlas_allocates_a_duplicate_edge_padding_border() {
+        let mut atlas = GlyphAtlas::new(16, 16);
+        let key_a = GlyphCacheKey::new(1, 1, 13.0, false, false);
+        let key_b = GlyphCacheKey::new(1, 2, 13.0, false, false);
+        let bitmap = GlyphBitmap::missing(4.0, 4);
+
+        let first = atlas.allocate(key_a, &bitmap).expect("first atlas entry");
+        let second = atlas.allocate(key_b, &bitmap).expect("second atlas entry");
+
+        assert_eq!((first.x, first.y), (1, 1));
+        assert_eq!((first.width, first.height), (4, 4));
+        assert_eq!((second.x, second.y), (7, 1));
+        assert!(second.x >= first.x + first.width + GLYPH_ATLAS_PADDING * 2);
+    }
+
+    #[test]
     fn frame_clear_draw_call_is_instrumented_only_when_used() {
         assert_eq!(frame_clear_extra_draw_calls(false, 0), 1);
         assert_eq!(frame_clear_extra_draw_calls(true, 0), 0);
@@ -7604,7 +7688,7 @@ mod tests {
 
     #[test]
     fn atlas_allocates_and_clears_when_full() {
-        let mut atlas = GlyphAtlas::new(8, 8);
+        let mut atlas = GlyphAtlas::new(16, 8);
         let key_a = GlyphCacheKey::new(1, u16::from(b'a'), 13.0, false, false);
         let key_b = GlyphCacheKey::new(1, u16::from(b'b'), 13.0, false, false);
         let bitmap = GlyphBitmap::missing(4.0, 4);

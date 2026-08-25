@@ -1133,4 +1133,32 @@ mod tests {
                 .is_ok_and(|bitmap| bitmap.format == GlyphBitmapFormat::Rgba)
         }));
     }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_nerd_font_powerline_glyphs_resolve_and_rasterize() {
+        let mut fonts = FontSystem::new(FontConfig {
+            family: "CaskaydiaCove NF".to_owned(),
+            ..FontConfig::default()
+        });
+        let metrics = fonts.cell_metrics().expect("configured font metrics");
+        for sample in ["\u{e0b6}", "\u{e62a}", "\u{e0b4}", "\u{e725}"] {
+            let run = fonts
+                .shape_text(sample, false, false)
+                .expect("shape powerline glyph");
+            assert_eq!(run.glyphs.len(), 1);
+            assert!(
+                run.families_used
+                    .iter()
+                    .any(|family| family == "CaskaydiaCove NF")
+            );
+            assert!((run.advance_width - metrics.cell_width).abs() < 0.01);
+
+            let glyph = run.glyphs[0];
+            let bitmap = fonts.rasterize_glyph(glyph.key).unwrap();
+            assert!(glyph.key.glyph_id != 0);
+            assert!(bitmap.width > 0 && bitmap.height > 0);
+            assert!(bitmap.pixels.iter().any(|pixel| *pixel != 0));
+        }
+    }
 }
