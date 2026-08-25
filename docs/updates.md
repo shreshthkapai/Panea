@@ -4,7 +4,7 @@ Panea publishes immutable, versioned artifacts through GitHub Releases. The
 release tag, Cargo workspace version, binary version, and package metadata must
 agree exactly.
 
-Panea uses normal semantic versions such as `v0.1.0` and `v0.1.1`. The planned
+Panea uses normal semantic versions such as `v0.1.0` and `v0.1.2`. The planned
 update implementation has one `stable` channel. Additional release channels are
 intentionally deferred until there is a demonstrated need for them.
 
@@ -17,9 +17,11 @@ or `panea-update-v1.json`. Users currently update explicitly by downloading a
 newer immutable release and running the platform installer or replacing their
 portable installation.
 
-The `v0.1.0` and `v0.1.1` Windows and macOS artifacts are intentionally
-unsigned while the project has no release certificates. GitHub Release notes
-identify that state; SmartScreen and Gatekeeper warnings are expected.
+The `v0.1.0` and `v0.1.2` Windows and macOS artifacts are intentionally
+unsigned while the project has no release certificates. The `v0.1.1` source
+tag has no published artifacts because its release validation failed. GitHub
+Release notes identify the unsigned state; SmartScreen and Gatekeeper warnings
+are expected.
 Checksums and attestations provide integrity and build provenance, but they are
 not substitutes for an operating-system publisher signature. The release
 workflow requires signing by default after the temporary repository policy is

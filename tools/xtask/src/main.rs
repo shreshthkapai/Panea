@@ -1,9 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
-    io::Cursor,
+    io::{Cursor, Read},
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -4439,9 +4440,98 @@ impl PackageSmokeResult {
     }
 }
 
+struct CapturedProcessOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+enum CapturedProcessError {
+    TimedOut { stderr: Vec<u8> },
+    Failed(String),
+}
+
+fn spawn_output_reader<R>(mut reader: R) -> mpsc::Receiver<Result<Vec<u8>, String>>
+where
+    R: Read + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = reader
+            .read_to_end(&mut output)
+            .map(|_| output)
+            .map_err(|error| error.to_string());
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn receive_output(
+    receiver: &mpsc::Receiver<Result<Vec<u8>, String>>,
+    stream: &str,
+    deadline: Instant,
+) -> Result<Vec<u8>, CapturedProcessError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    receiver
+        .recv_timeout(remaining)
+        .map_err(|error| {
+            CapturedProcessError::Failed(format!("failed to drain child {stream}: {error}"))
+        })?
+        .map_err(CapturedProcessError::Failed)
+}
+
+fn supervise_captured_process(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> Result<CapturedProcessOutput, CapturedProcessError> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CapturedProcessError::Failed("child stdout was not piped".to_owned()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CapturedProcessError::Failed("child stderr was not piped".to_owned()))?;
+    let stdout_reader = spawn_output_reader(stdout);
+    let stderr_reader = spawn_output_reader(stderr);
+    let started = Instant::now();
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stderr = stderr_reader
+                    .recv_timeout(Duration::from_millis(250))
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default();
+                return Err(CapturedProcessError::TimedOut { stderr });
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CapturedProcessError::Failed(error.to_string()));
+            }
+        }
+    };
+
+    let drain_deadline = Instant::now() + Duration::from_secs(2);
+    let stdout = receive_output(&stdout_reader, "stdout", drain_deadline)?;
+    let stderr = receive_output(&stderr_reader, "stderr", drain_deadline)?;
+    Ok(CapturedProcessOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 fn run_packaged_doctor(binary_path: &Path, timeout: Duration) -> PackageSmokeResult {
     let started = Instant::now();
-    let mut child = match Command::new(binary_path)
+    let child = match Command::new(binary_path)
         .args(["doctor", "--json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -4458,34 +4548,7 @@ fn run_packaged_doctor(binary_path: &Path, timeout: Duration) -> PackageSmokeRes
         }
     };
 
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() >= package_process_supervisor_timeout(timeout) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return PackageSmokeResult {
-                    name: "doctor",
-                    status: PackageSmokeStatus::TimedOut,
-                    duration: started.elapsed(),
-                    detail: format!("{} doctor --json exceeded timeout", binary_path.display()),
-                };
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(25)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return PackageSmokeResult {
-                    name: "doctor",
-                    status: PackageSmokeStatus::Failed,
-                    duration: started.elapsed(),
-                    detail: format!("failed while waiting for doctor smoke: {error}"),
-                };
-            }
-        }
-    }
-
-    match child.wait_with_output() {
+    match supervise_captured_process(child, package_process_supervisor_timeout(timeout)) {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if stdout.contains("\"name\":\"doctor\"")
@@ -4517,7 +4580,17 @@ fn run_packaged_doctor(binary_path: &Path, timeout: Duration) -> PackageSmokeRes
                 preview_bytes(&output.stderr)
             ),
         },
-        Err(error) => PackageSmokeResult {
+        Err(CapturedProcessError::TimedOut { stderr }) => PackageSmokeResult {
+            name: "doctor",
+            status: PackageSmokeStatus::TimedOut,
+            duration: started.elapsed(),
+            detail: format!(
+                "{} doctor --json exceeded timeout: {}",
+                binary_path.display(),
+                preview_bytes(&stderr)
+            ),
+        },
+        Err(CapturedProcessError::Failed(error)) => PackageSmokeResult {
             name: "doctor",
             status: PackageSmokeStatus::Failed,
             duration: started.elapsed(),
@@ -4529,7 +4602,7 @@ fn run_packaged_doctor(binary_path: &Path, timeout: Duration) -> PackageSmokeRes
 fn run_packaged_shell_smoke(binary_path: &Path, timeout: Duration) -> PackageSmokeResult {
     let started = Instant::now();
     let timeout_ms = timeout.as_millis().to_string();
-    let mut child = match Command::new(binary_path)
+    let child = match Command::new(binary_path)
         .args(["shell-smoke", "--json", "--timeout-ms", timeout_ms.as_str()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -4549,34 +4622,7 @@ fn run_packaged_shell_smoke(binary_path: &Path, timeout: Duration) -> PackageSmo
         }
     };
 
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() >= package_process_supervisor_timeout(timeout) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return PackageSmokeResult {
-                    name: "shell-launch",
-                    status: PackageSmokeStatus::TimedOut,
-                    duration: started.elapsed(),
-                    detail: format!("{} shell-smoke exceeded timeout", binary_path.display()),
-                };
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(25)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return PackageSmokeResult {
-                    name: "shell-launch",
-                    status: PackageSmokeStatus::Failed,
-                    duration: started.elapsed(),
-                    detail: format!("failed while waiting for shell smoke: {error}"),
-                };
-            }
-        }
-    }
-
-    match child.wait_with_output() {
+    match supervise_captured_process(child, package_process_supervisor_timeout(timeout)) {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if stdout.contains("\"name\":\"shell-smoke\"")
@@ -4615,7 +4661,17 @@ fn run_packaged_shell_smoke(binary_path: &Path, timeout: Duration) -> PackageSmo
                 preview_bytes(&output.stderr)
             ),
         },
-        Err(error) => PackageSmokeResult {
+        Err(CapturedProcessError::TimedOut { stderr }) => PackageSmokeResult {
+            name: "shell-launch",
+            status: PackageSmokeStatus::TimedOut,
+            duration: started.elapsed(),
+            detail: format!(
+                "{} shell-smoke exceeded timeout: {}",
+                binary_path.display(),
+                preview_bytes(&stderr)
+            ),
+        },
+        Err(CapturedProcessError::Failed(error)) => PackageSmokeResult {
             name: "shell-launch",
             status: PackageSmokeStatus::Failed,
             duration: started.elapsed(),
@@ -4659,7 +4715,7 @@ fn run_packaged_gui_smoke_mode(
     let started = Instant::now();
     let timeout_ms = timeout.as_millis().to_string();
     let gui_binary = packaged_gui_binary(binary_path);
-    let mut child = match Command::new(&gui_binary)
+    let child = match Command::new(&gui_binary)
         .args([
             "gui-smoke",
             mode,
@@ -4684,33 +4740,7 @@ fn run_packaged_gui_smoke_mode(
             };
         }
     };
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() >= package_process_supervisor_timeout(timeout) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return PackageSmokeResult {
-                    name: "gui-launch",
-                    status: PackageSmokeStatus::TimedOut,
-                    duration: started.elapsed(),
-                    detail: format!("{} gui-smoke exceeded timeout", gui_binary.display()),
-                };
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(25)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return PackageSmokeResult {
-                    name: "gui-launch",
-                    status: PackageSmokeStatus::Failed,
-                    duration: started.elapsed(),
-                    detail: format!("failed while waiting for gui smoke: {error}"),
-                };
-            }
-        }
-    }
-    match child.wait_with_output() {
+    match supervise_captured_process(child, package_process_supervisor_timeout(timeout)) {
         Ok(output)
             if output.status.success()
                 && String::from_utf8_lossy(&output.stdout).contains("\"status\":\"passed\"") =>
@@ -4733,7 +4763,17 @@ fn run_packaged_gui_smoke_mode(
                 preview_bytes(&output.stderr)
             ),
         },
-        Err(error) => PackageSmokeResult {
+        Err(CapturedProcessError::TimedOut { stderr }) => PackageSmokeResult {
+            name: "gui-launch",
+            status: PackageSmokeStatus::TimedOut,
+            duration: started.elapsed(),
+            detail: format!(
+                "{} gui-smoke exceeded timeout: {}",
+                gui_binary.display(),
+                preview_bytes(&stderr)
+            ),
+        },
+        Err(CapturedProcessError::Failed(error)) => PackageSmokeResult {
             name: "gui-launch",
             status: PackageSmokeStatus::Failed,
             duration: started.elapsed(),
@@ -4816,30 +4856,26 @@ fn run_windows_installer_smoke(options: &PackageOptions) -> PackageSmokeResult {
 }
 
 fn run_bounded_command(command: &mut Command, timeout: Duration) -> Result<(), String> {
-    let started = Instant::now();
-    let mut child = command
+    let child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| error.to_string())?;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => {
-                return Err(format!("command exited with {status}"));
-            }
-            Ok(None) if started.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("command exceeded {} ms", timeout.as_millis()));
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(25)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error.to_string());
-            }
-        }
+
+    match supervise_captured_process(child, timeout) {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(format!(
+            "command exited with {}: stdout={} stderr={}",
+            output.status,
+            preview_bytes(&output.stdout),
+            preview_bytes(&output.stderr)
+        )),
+        Err(CapturedProcessError::TimedOut { stderr }) => Err(format!(
+            "command exceeded {} ms: {}",
+            timeout.as_millis(),
+            preview_bytes(&stderr)
+        )),
+        Err(CapturedProcessError::Failed(error)) => Err(error),
     }
 }
 
@@ -6255,6 +6291,60 @@ mod tests {
         assert_eq!(
             package_process_supervisor_timeout(Duration::from_secs(60)),
             Duration::from_secs(62)
+        );
+    }
+
+    #[test]
+    fn package_output_drain_handles_payloads_larger_than_a_windows_pipe() {
+        let payload = vec![b'x'; 256 * 1024];
+        let reader = spawn_output_reader(Cursor::new(payload.clone()));
+
+        assert_eq!(
+            reader
+                .recv_timeout(Duration::from_secs(1))
+                .expect("output reader thread")
+                .expect("read"),
+            payload
+        );
+    }
+
+    #[test]
+    fn package_process_supervisor_drains_output_while_child_runs() {
+        const CHILD_ENV: &str = "PANEA_XTASK_LARGE_OUTPUT_CHILD";
+        const PAYLOAD_SIZE: usize = 256 * 1024;
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let mut stdout = std::io::stdout().lock();
+            std::io::Write::write_all(&mut stdout, &vec![b'x'; PAYLOAD_SIZE])
+                .expect("write child output");
+            return;
+        }
+
+        let child = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "tests::package_process_supervisor_drains_output_while_child_runs",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn output child");
+        let output = supervise_captured_process(child, Duration::from_secs(5))
+            .map_err(|error| match error {
+                CapturedProcessError::TimedOut { stderr } => {
+                    format!("child timed out: {}", String::from_utf8_lossy(&stderr))
+                }
+                CapturedProcessError::Failed(error) => error,
+            })
+            .expect("supervise output child");
+
+        assert!(output.status.success());
+        assert!(
+            output.stdout.iter().filter(|byte| **byte == b'x').count() >= PAYLOAD_SIZE,
+            "captured output was truncated to {} bytes",
+            output.stdout.len()
         );
     }
 
