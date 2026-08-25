@@ -17,12 +17,13 @@ or `panea-update-v1.json`. Users currently update explicitly by downloading a
 newer immutable release and running the platform installer or replacing their
 portable installation.
 
-The `v0.1.0` Windows and macOS artifacts are intentionally unsigned while the
-project has no release certificates. GitHub Release notes identify that state;
-SmartScreen and Gatekeeper warnings are expected. Checksums and attestations
-provide integrity and build provenance, but they are not substitutes for an
-operating-system publisher signature. The release workflow requires signing by
-default after the temporary repository policy is removed.
+The `v0.1.0` and `v0.1.1` Windows and macOS artifacts are intentionally
+unsigned while the project has no release certificates. GitHub Release notes
+identify that state; SmartScreen and Gatekeeper warnings are expected.
+Checksums and attestations provide integrity and build provenance, but they are
+not substitutes for an operating-system publisher signature. The release
+workflow requires signing by default after the temporary repository policy is
+removed.
 
 The remaining sections define the updater's future security and UX contract;
 they must not be read as claiming that the updater is currently available.

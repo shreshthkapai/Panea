@@ -2824,7 +2824,7 @@ fn apply_live_config_reload(
         match section {
             ReloadableSection::Colors => {
                 current.colors = next.colors.clone();
-                renderer.set_background(render_color(current.colors.background));
+                renderer.set_background(window_background(current));
             }
             ReloadableSection::Cursor => current.cursor = next.cursor.clone(),
             ReloadableSection::Diagnostics => {
@@ -2978,8 +2978,16 @@ fn renderer_options(config: &AppConfig) -> RendererOptions {
         gpu_timestamps: config.renderer.gpu_timestamps,
         transparent: config.window.opacity < 1.0,
         glyph_cache_entries: config.performance.glyph_cache_entries,
-        background: render_color(config.colors.background),
+        background: window_background(config),
     }
+}
+
+fn window_background(config: &AppConfig) -> RenderColor {
+    let mut background = render_color(config.colors.background);
+    background.alpha = ((f64::from(background.alpha) * config.window.opacity)
+        .round()
+        .clamp(0.0, 255.0)) as u8;
+    background
 }
 
 fn cursor_animation_settings(config: &AppConfig) -> CursorAnimationSettings {
@@ -9002,6 +9010,28 @@ mod tests {
         assert_eq!(
             renderer_options(&config).background,
             RenderColor::rgb(17, 34, 51)
+        );
+    }
+
+    #[test]
+    fn transparent_window_applies_opacity_to_renderer_surface_background() {
+        let mut config = AppConfig::default();
+        config.window.opacity = 0.92;
+        config.colors.background = config_core::RgbaColor {
+            red: 30,
+            green: 30,
+            blue: 46,
+            alpha: 255,
+        };
+
+        assert_eq!(
+            renderer_options(&config).background,
+            RenderColor {
+                red: 30,
+                green: 30,
+                blue: 46,
+                alpha: 235,
+            }
         );
     }
 

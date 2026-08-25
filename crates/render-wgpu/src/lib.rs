@@ -4839,6 +4839,28 @@ fn prepare_damage_clear_batch(damage_regions: &[DamageRegion], color: RenderColo
     batch
 }
 
+fn prepare_frame_clear_batch(
+    load_previous: bool,
+    damage_regions: &[DamageRegion],
+    width: u32,
+    height: u32,
+    color: RenderColor,
+) -> QuadBatch {
+    if load_previous {
+        return prepare_damage_clear_batch(damage_regions, color);
+    }
+
+    prepare_damage_clear_batch(
+        &[DamageRegion {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }],
+        color,
+    )
+}
+
 fn fill_rect(frame: &mut CpuFrame, rect: RenderRect, color: RenderColor) {
     let x0 = rect.x.max(0) as u32;
     let y0 = rect.y.max(0) as u32;
@@ -5661,10 +5683,13 @@ impl GpuTerminalRenderer {
         }
         let load_retained_frame =
             should_load_retained_frame(retained_damage_enabled, prepare_full_frame);
-        batches.instrumentation.draw_call_count =
-            batches.instrumentation.draw_call_count.saturating_add(
-                retained_damage_extra_draw_calls(load_retained_frame, batches.damage_regions.len()),
-            );
+        batches.instrumentation.draw_call_count = batches
+            .instrumentation
+            .draw_call_count
+            .saturating_add(frame_clear_extra_draw_calls(
+                load_retained_frame,
+                batches.damage_regions.len(),
+            ));
         let result =
             backend.present_batches(&batches, retained_damage_enabled, load_retained_frame);
         batches.instrumentation.gpu_submit_time = Some(gpu_started.elapsed());
@@ -5818,8 +5843,8 @@ fn should_load_retained_frame(retained_damage_enabled: bool, prepare_full_frame:
     retained_damage_enabled && !prepare_full_frame
 }
 
-fn retained_damage_extra_draw_calls(load_previous: bool, damage_region_count: usize) -> u32 {
-    u32::from(load_previous && damage_region_count > 0)
+fn frame_clear_extra_draw_calls(load_previous: bool, damage_region_count: usize) -> u32 {
+    u32::from(!load_previous || damage_region_count > 0)
 }
 
 impl GpuBackend {
@@ -6394,22 +6419,12 @@ impl GpuBackend {
         let load_previous = load_retained_frame
             && self.retained_frame.texture.is_some()
             && self.retained_frame.initialized;
-        let damage_clear = prepare_damage_clear_batch(
-            if load_previous {
-                &batches.damage_regions
-            } else {
-                &[]
-            },
-            if self.transparent {
-                RenderColor {
-                    red: 0,
-                    green: 0,
-                    blue: 0,
-                    alpha: 0,
-                }
-            } else {
-                self.background
-            },
+        let damage_clear = prepare_frame_clear_batch(
+            load_previous,
+            &batches.damage_regions,
+            self.config.width,
+            self.config.height,
+            surface_background_color(self.transparent, self.background),
         );
         self.batches.damage_clear.upload(
             &upload_context,
@@ -6482,11 +6497,10 @@ impl GpuBackend {
             &mut encoder,
             target_view,
             load_previous,
-            if self.transparent {
-                wgpu::Color::TRANSPARENT
-            } else {
-                surface_clear_color(self.background, self.config.format)
-            },
+            surface_clear_color(
+                surface_background_color(self.transparent, self.background),
+                self.config.format,
+            ),
             GpuFrameDraw {
                 clear_pipeline: &self.clear_pipeline,
                 quad_pipeline: &self.quad_pipeline,
@@ -6570,18 +6584,36 @@ impl GpuBackend {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("panea-startup-background-encoder"),
             });
+        let background = surface_background_color(self.transparent, self.background);
+        let clear = prepare_frame_clear_batch(
+            false,
+            &[],
+            self.config.width,
+            self.config.height,
+            background,
+        );
+        self.batches.damage_clear.upload(
+            &GpuUploadContext {
+                device: &self.device,
+                queue: &self.queue,
+                width: self.config.width,
+                height: self.config.height,
+            },
+            "startup-background",
+            &clear.vertices,
+            &clear.indices,
+        );
         {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("panea-startup-background-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(if self.transparent {
-                            wgpu::Color::TRANSPARENT
-                        } else {
-                            surface_clear_color(self.background, self.config.format)
-                        }),
+                        load: wgpu::LoadOp::Clear(surface_clear_color(
+                            background,
+                            self.config.format,
+                        )),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -6589,11 +6621,19 @@ impl GpuBackend {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
+            pass.set_pipeline(&self.clear_pipeline);
+            draw_buffers(&mut pass, &self.batches.damage_clear);
         }
         self.queue.submit(Some(encoder.finish()));
         output.present();
         Ok(PresentOutcome::Submitted)
     }
+}
+
+fn surface_background_color(_transparent: bool, background: RenderColor) -> RenderColor {
+    // Transparency selects the compositor alpha mode; it must not create
+    // alpha-zero holes outside the terminal cell grid.
+    background
 }
 
 fn surface_clear_color(color: RenderColor, format: wgpu::TextureFormat) -> wgpu::Color {
@@ -6676,8 +6716,12 @@ fn encode_retained_frame<'a>(
     pass.set_pipeline(draw.clear_pipeline);
     draw_buffers(&mut pass, &draw.batches.damage_clear);
 
-    pass.set_pipeline(draw.quad_pipeline);
+    // Cell backgrounds replace the surface clear so their configured alpha is
+    // not compounded with the translucent window background beneath them.
+    pass.set_pipeline(draw.clear_pipeline);
     draw_buffers(&mut pass, &draw.batches.background);
+
+    pass.set_pipeline(draw.quad_pipeline);
     draw_buffers(&mut pass, &draw.batches.selections);
     draw_buffers(&mut pass, &draw.batches.cursor);
 
@@ -6996,6 +7040,7 @@ mod tests {
     fn render_retained_sequence(
         first: TestFrame,
         second: TestFrame,
+        clear_color: wgpu::Color,
     ) -> Result<Option<TestPixels>, String> {
         const WIDTH: u32 = 16;
         const HEIGHT: u32 = 16;
@@ -7111,7 +7156,7 @@ mod tests {
                 &mut encoder,
                 &retained_view,
                 load_previous,
-                wgpu::Color::TRANSPARENT,
+                clear_color,
                 GpuFrameDraw {
                     clear_pipeline: &clear_pipeline,
                     quad_pipeline: &pipeline,
@@ -7200,7 +7245,9 @@ mod tests {
             },
             YELLOW,
         );
-        let Some(pixels) = render_retained_sequence(first, second).expect("GPU sequence") else {
+        let Some(pixels) = render_retained_sequence(first, second, wgpu::Color::TRANSPARENT)
+            .expect("GPU sequence")
+        else {
             return;
         };
 
@@ -7208,6 +7255,43 @@ mod tests {
         assert_eq!(pixels.at(12, 2), [0, 255, 0, 255]);
         assert_eq!(pixels.at(2, 12), [0, 0, 255, 255]);
         assert_eq!(pixels.at(12, 12), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn translucent_background_replaces_clear_without_alpha_compounding() {
+        let background = RenderColor {
+            red: 30,
+            green: 30,
+            blue: 46,
+            alpha: 235,
+        };
+        let first = TestFrame {
+            clears: Vec::new(),
+            quads: vec![(
+                RenderRect {
+                    x: 0,
+                    y: 0,
+                    width: 8,
+                    height: 8,
+                },
+                background,
+            )],
+        };
+        let second = TestFrame {
+            clears: Vec::new(),
+            quads: Vec::new(),
+        };
+        let Some(pixels) = render_retained_sequence(
+            first,
+            second,
+            surface_clear_color(background, wgpu::TextureFormat::Rgba8Unorm),
+        )
+        .expect("GPU sequence") else {
+            return;
+        };
+
+        assert_eq!(pixels.at(2, 2), [30, 30, 46, 235]);
+        assert_eq!(pixels.at(12, 12), [30, 30, 46, 235]);
     }
 
     #[test]
@@ -7271,10 +7355,27 @@ mod tests {
     }
 
     #[test]
-    fn retained_damage_clear_draw_call_is_instrumented_only_when_used() {
-        assert_eq!(retained_damage_extra_draw_calls(false, 2), 0);
-        assert_eq!(retained_damage_extra_draw_calls(true, 0), 0);
-        assert_eq!(retained_damage_extra_draw_calls(true, 2), 1);
+    fn full_frame_clear_covers_the_entire_surface() {
+        let background = RenderColor {
+            red: 30,
+            green: 30,
+            blue: 46,
+            alpha: 235,
+        };
+
+        let batch = prepare_frame_clear_batch(false, &[], 1920, 1080, background);
+
+        assert_eq!(batch.quad_count(), 1);
+        assert_eq!(batch.vertices[0].position_px, [0.0, 0.0]);
+        assert_eq!(batch.vertices[2].position_px, [1920.0, 1080.0]);
+        assert_eq!(batch.vertices[0].color[3], 235.0 / 255.0);
+    }
+
+    #[test]
+    fn frame_clear_draw_call_is_instrumented_only_when_used() {
+        assert_eq!(frame_clear_extra_draw_calls(false, 0), 1);
+        assert_eq!(frame_clear_extra_draw_calls(true, 0), 0);
+        assert_eq!(frame_clear_extra_draw_calls(true, 2), 1);
     }
 
     fn metrics() -> CellMetrics {
@@ -7399,6 +7500,19 @@ mod tests {
         assert!(srgb.g < unorm.g);
         assert!((srgb.b - 1.0).abs() < f64::EPSILON);
         assert!((srgb.a - 128.0 / 255.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn transparent_surface_clear_uses_configured_background_alpha() {
+        let background = RenderColor {
+            red: 30,
+            green: 30,
+            blue: 46,
+            alpha: 235,
+        };
+
+        assert_eq!(surface_background_color(true, background), background);
+        assert_eq!(surface_background_color(false, background), background);
     }
 
     #[test]
