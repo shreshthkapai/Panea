@@ -189,6 +189,11 @@ pub struct AtlasEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AtlasCacheKey {
     Glyph(GlyphCacheKey),
+    PowerlineCap {
+        codepoint: char,
+        width: u32,
+        height: u32,
+    },
     PaneaLogo,
 }
 
@@ -2226,6 +2231,52 @@ impl RenderBatchPlanner {
         cell: &RenderCell,
         context: &mut GlyphBatchContext<'_>,
     ) -> Result<(), RendererError> {
+        if let Some(cap) = SolidPowerlineCap::from_text(&cell.text) {
+            let key = AtlasCacheKey::PowerlineCap {
+                codepoint: cap.codepoint(),
+                width: context.rect.width,
+                height: context.rect.height,
+            };
+            let atlas_hit = self.atlas.entry(key);
+            let entry = if let Some(entry) = atlas_hit {
+                context.instrumentation.glyphs.cache_hits =
+                    context.instrumentation.glyphs.cache_hits.saturating_add(1);
+                Some(entry)
+            } else {
+                context.instrumentation.glyphs.cache_misses = context
+                    .instrumentation
+                    .glyphs
+                    .cache_misses
+                    .saturating_add(1);
+                let bitmap =
+                    rasterize_solid_powerline_cap(cap, context.rect.width, context.rect.height);
+                self.atlas.allocate(key, &bitmap).inspect(|entry| {
+                    context.instrumentation.glyphs.atlas_uploads = context
+                        .instrumentation
+                        .glyphs
+                        .atlas_uploads
+                        .saturating_add(1);
+                    context.atlas_uploads.push(AtlasUpload {
+                        key,
+                        entry: *entry,
+                        pixels: bitmap.pixels.clone(),
+                        format: bitmap.format,
+                    });
+                })
+            };
+            if let Some(entry) = entry {
+                push_glyph_quad(
+                    glyphs,
+                    context.rect,
+                    entry,
+                    self.atlas.dimensions(),
+                    cell.foreground,
+                    false,
+                );
+            }
+            return Ok(());
+        }
+
         if cell.text.trim().is_empty() {
             return Ok(());
         }
@@ -2524,6 +2575,70 @@ fn terminal_text_runs(cells: &[RenderCell]) -> Vec<RenderCell> {
         }
     }
     runs
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SolidPowerlineCap {
+    Right,
+    Left,
+}
+
+impl SolidPowerlineCap {
+    fn from_text(text: &str) -> Option<Self> {
+        match text {
+            "\u{e0b4}" => Some(Self::Right),
+            "\u{e0b6}" => Some(Self::Left),
+            _ => None,
+        }
+    }
+
+    const fn codepoint(self) -> char {
+        match self {
+            Self::Right => '\u{e0b4}',
+            Self::Left => '\u{e0b6}',
+        }
+    }
+}
+
+fn rasterize_solid_powerline_cap(cap: SolidPowerlineCap, width: u32, height: u32) -> GlyphBitmap {
+    const SAMPLE_GRID: u32 = 4;
+
+    let width = width.max(1);
+    let height = height.max(1);
+    let mut pixels = vec![0_u8; (width * height) as usize];
+    let samples_per_pixel = SAMPLE_GRID * SAMPLE_GRID;
+    for y in 0..height {
+        for x in 0..width {
+            let mut covered = 0_u32;
+            for sample_y in 0..SAMPLE_GRID {
+                let normalized_y =
+                    (y as f32 + (sample_y as f32 + 0.5) / SAMPLE_GRID as f32) / height as f32;
+                let ellipse_y = normalized_y.mul_add(2.0, -1.0);
+                let horizontal_extent = (1.0 - ellipse_y * ellipse_y).max(0.0).sqrt();
+                for sample_x in 0..SAMPLE_GRID {
+                    let normalized_x =
+                        (x as f32 + (sample_x as f32 + 0.5) / SAMPLE_GRID as f32) / width as f32;
+                    let inside = match cap {
+                        SolidPowerlineCap::Right => normalized_x <= horizontal_extent,
+                        SolidPowerlineCap::Left => normalized_x >= 1.0 - horizontal_extent,
+                    };
+                    covered += u32::from(inside);
+                }
+            }
+            pixels[(y * width + x) as usize] =
+                ((covered * u32::from(u8::MAX)) / samples_per_pixel) as u8;
+        }
+    }
+
+    GlyphBitmap {
+        width,
+        height,
+        offset_x: 0,
+        offset_y: 0,
+        advance_width: width as f32,
+        pixels,
+        format: GlyphBitmapFormat::Alpha,
+    }
 }
 
 fn damaged_terminal_text_runs(
@@ -4541,6 +4656,12 @@ impl TerminalRasterizer {
         _instrumentation: &mut RenderInstrumentation,
     ) -> Result<(), RendererError> {
         let rect = offset_region(text_run_region(cell, metrics), offset);
+
+        if let Some(cap) = SolidPowerlineCap::from_text(&cell.text) {
+            let bitmap = rasterize_solid_powerline_cap(cap, rect.width, rect.height);
+            draw_glyph(frame, rect.x, rect.y, &bitmap, cell.foreground);
+            return Ok(());
+        }
 
         let mut pen_x = rect.x as f32;
         let mut pen_y = rect.y as f32;
@@ -7823,6 +7944,60 @@ mod tests {
         assert_eq!(batches.glyphs.glyph_count, 3);
         assert!(batches.instrumentation.draw_call_count <= 3);
         assert!(batches.instrumentation.glyphs.atlas_uploads > 0);
+    }
+
+    #[test]
+    fn solid_powerline_caps_fill_exactly_one_terminal_cell() {
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let metrics = fonts.cell_metrics().expect("cell metrics");
+        let mut planner = RenderBatchPlanner::default();
+        let batches = planner
+            .prepare_full(
+                &scene_without_cursor(vec![cell(0, 0, "\u{e0b6}"), cell(0, 1, "\u{e0b4}")]),
+                &mut fonts,
+            )
+            .expect("prepare powerline caps");
+
+        assert_eq!(batches.glyphs.glyph_count, 2);
+        for (index, position) in [
+            CellPosition { row: 0, col: 0 },
+            CellPosition { row: 0, col: 1 },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let expected = cell_region(position, metrics);
+            let vertices = &batches.glyphs.vertices[index * 4..index * 4 + 4];
+            let actual = RenderRect {
+                x: vertices[0].position_px[0].round() as i32,
+                y: vertices[0].position_px[1].round() as i32,
+                width: (vertices[2].position_px[0] - vertices[0].position_px[0]).round() as u32,
+                height: (vertices[2].position_px[1] - vertices[0].position_px[1]).round() as u32,
+            };
+            assert_eq!(actual, expected, "powerline cap {index} escaped its cell");
+        }
+
+        assert_eq!(batches.atlas_uploads.len(), 2);
+        let left = &batches.atlas_uploads[0];
+        let right = &batches.atlas_uploads[1];
+        for (upload, col) in [(left, 0), (right, 1)] {
+            let expected = cell_region(CellPosition { row: 0, col }, metrics);
+            assert_eq!(upload.format, GlyphBitmapFormat::Alpha);
+            assert_eq!(upload.entry.width, expected.width);
+            assert_eq!(upload.entry.height, expected.height);
+        }
+        let alpha_at = |upload: &AtlasUpload, x: u32, y: u32| {
+            upload.pixels[(y * upload.entry.width + x) as usize]
+        };
+        let left_last_x = left.entry.width - 1;
+        let right_last_x = right.entry.width - 1;
+        let middle_y = left.entry.height / 2;
+        assert!(alpha_at(left, 0, 0) < 128);
+        assert!(alpha_at(left, left_last_x, 0) > 128);
+        assert!(alpha_at(left, 0, middle_y) > 128);
+        assert!(alpha_at(right, right_last_x, 0) < 128);
+        assert!(alpha_at(right, 0, 0) > 128);
+        assert!(alpha_at(right, right_last_x, middle_y) > 128);
     }
 
     #[test]
