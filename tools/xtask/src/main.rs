@@ -6224,6 +6224,7 @@ mod tests {
         assert!(release_workflow.contains("actions/download-artifact@v4"));
         assert!(release_workflow.contains("actions/attest-build-provenance@v2"));
         assert!(release_workflow.contains("gh release create"));
+        assert!(release_workflow.contains("--repo \"$GITHUB_REPOSITORY\""));
         assert!(release_workflow.contains("--verify-tag"));
         assert!(release_workflow.contains("Windows and macOS artifacts are unsigned"));
         assert!(!release_workflow.contains("merge-multiple: true"));
