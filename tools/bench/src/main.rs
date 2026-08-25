@@ -85,6 +85,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             5,
         ),
         "render-many-panes" => render_many_panes(),
+        "render-coding-agent" => batch_scene_bench(
+            "render-coding-agent",
+            coding_agent_scene(DEFAULT_COLS, DEFAULT_ROWS),
+            20,
+        ),
+        "render-partial-update" => partial_update_bench(),
         "render-cursor-animation" => cursor_animation_cost(),
         "render-command-blocks" => render_command_blocks(),
         "cat-large-file" => parse_fixture("cat-large-file", large_log_fixture(20_000), 1),
@@ -105,7 +111,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 fn print_help() {
     println!(
-        "usage: cargo xtask bench <all|profiles|render-grid|render-full-ascii|render-mixed-unicode|render-emoji-heavy|render-fast-scrolling|render-large-scrollback-viewport|render-many-panes|render-cursor-animation|render-command-blocks|cat-large-file|color-heavy|scrollback|resize|input-latency|unicode|alternate-screen|cursor-animation|command-blocks|fullscreen-chrome>"
+        "usage: cargo xtask bench <all|profiles|render-grid|render-full-ascii|render-mixed-unicode|render-emoji-heavy|render-fast-scrolling|render-large-scrollback-viewport|render-many-panes|render-coding-agent|render-partial-update|render-cursor-animation|render-command-blocks|cat-large-file|color-heavy|scrollback|resize|input-latency|unicode|alternate-screen|cursor-animation|command-blocks|fullscreen-chrome>"
     );
 }
 
@@ -140,6 +146,12 @@ fn run_all() -> Result<(), Box<dyn Error>> {
     parse_fixture("alternate-screen", alternate_screen_fixture(2_000), 20)?;
     cursor_animation_cost()?;
     render_many_panes()?;
+    batch_scene_bench(
+        "render-coding-agent",
+        coding_agent_scene(DEFAULT_COLS, DEFAULT_ROWS),
+        20,
+    )?;
+    partial_update_bench()?;
     render_command_blocks()?;
     fullscreen_chrome_benchmark()?;
     Ok(())
@@ -380,17 +392,17 @@ fn render_grid() -> Result<(), Box<dyn Error>> {
     );
     let mut fonts = FontSystem::new(FontConfig::default());
     let mut rasterizer = TerminalRasterizer::default();
-    let cold = rasterizer
-        .prepare_batches(&scene, &mut fonts)?
-        .instrumentation;
+    let cold_batches = rasterizer.prepare_batches(&scene, &mut fonts)?;
+    let cold = cold_batches.instrumentation;
+    let mut recycled = Some(cold_batches);
     let started = Instant::now();
     let iterations = 5;
     let mut last = RenderInstrumentation::default();
 
     for _ in 0..iterations {
-        last = rasterizer
-            .prepare_batches(&scene, &mut fonts)?
-            .instrumentation;
+        let batches = rasterizer.prepare_batches_reusing(&scene, &mut fonts, recycled.take())?;
+        last = batches.instrumentation;
+        recycled = Some(batches);
     }
 
     println!(
@@ -415,16 +427,16 @@ fn batch_scene_bench(
 ) -> Result<(), Box<dyn Error>> {
     let mut fonts = FontSystem::new(FontConfig::default());
     let mut rasterizer = TerminalRasterizer::default();
-    let cold = rasterizer
-        .prepare_batches(&scene, &mut fonts)?
-        .instrumentation;
+    let cold_batches = rasterizer.prepare_batches(&scene, &mut fonts)?;
+    let cold = cold_batches.instrumentation;
+    let mut recycled = Some(cold_batches);
     let started = Instant::now();
     let mut last = RenderInstrumentation::default();
 
     for _ in 0..iterations {
-        last = rasterizer
-            .prepare_batches(&scene, &mut fonts)?
-            .instrumentation;
+        let batches = rasterizer.prepare_batches_reusing(&scene, &mut fonts, recycled.take())?;
+        last = batches.instrumentation;
+        recycled = Some(batches);
     }
 
     println!(
@@ -436,6 +448,56 @@ fn batch_scene_bench(
         name,
         iterations,
         bytes: scene.grid.cells.len(),
+        elapsed: started.elapsed(),
+        instrumentation: last,
+    });
+    Ok(())
+}
+
+fn partial_update_bench() -> Result<(), Box<dyn Error>> {
+    let mut scene = coding_agent_scene(DEFAULT_COLS, DEFAULT_ROWS);
+    let mut fonts = FontSystem::new(FontConfig::default());
+    let metrics = fonts.cell_metrics()?;
+    let mut rasterizer = TerminalRasterizer::default();
+    let mut recycled = Some(rasterizer.prepare_full_batches(&scene, &mut fonts)?);
+    let target_row = 8_u16;
+    let target_col = 24_u16;
+    let target_index =
+        usize::from(target_row) * usize::from(DEFAULT_COLS) + usize::from(target_col);
+    let iterations = 500_u64;
+    let mut samples = Vec::with_capacity(iterations as usize);
+    let mut last = RenderInstrumentation::default();
+    let started = Instant::now();
+
+    for iteration in 0..iterations {
+        scene.grid.cells[target_index].text = if iteration % 2 == 0 { "x" } else { " " }.to_owned();
+        let x0 = (f32::from(target_col) * metrics.cell_width).floor() as i32;
+        let x1 = (f32::from(target_col + 1) * metrics.cell_width).ceil() as i32;
+        let y0 = (f32::from(target_row) * metrics.cell_height).floor() as i32;
+        let y1 = (f32::from(target_row + 1) * metrics.cell_height).ceil() as i32;
+        scene.damage_regions = vec![RenderRect {
+            x: x0,
+            y: y0,
+            width: x1.saturating_sub(x0).max(1) as u32,
+            height: y1.saturating_sub(y0).max(1) as u32,
+        }];
+        let batches = rasterizer.prepare_batches_reusing(&scene, &mut fonts, recycled.take())?;
+        last = batches.instrumentation;
+        samples.push(last.cpu_prepare_time);
+        recycled = Some(batches);
+    }
+
+    samples.sort_unstable();
+    let p50 = samples[samples.len() / 2];
+    let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
+    println!(
+        "bench=render-partial-update-distribution p50={p50:?} p95={p95:?} damage_regions={} draw_calls={}",
+        last.damage_region_count, last.draw_call_count
+    );
+    print_result(BenchmarkResult {
+        name: "render-partial-update",
+        iterations,
+        bytes: iterations as usize,
         elapsed: started.elapsed(),
         instrumentation: last,
     });
@@ -763,6 +825,7 @@ fn generated_scene(cols: u16, rows: u16, feature_mode: OptionalFeatureCostMode) 
             position: CellPosition { row: 2, col: 4 },
             shape: RenderCursorShape::Block,
             color: RenderColor::rgb(255, 255, 255),
+            text_color: None,
             visible: true,
             thickness_percent: 15,
             corner_radius_px: 0,
@@ -796,6 +859,48 @@ fn generated_scene(cols: u16, rows: u16, feature_mode: OptionalFeatureCostMode) 
         animations,
         ..RenderScene::default()
     }
+}
+
+fn coding_agent_scene(cols: u16, rows: u16) -> RenderScene {
+    let mut scene = generated_scene(cols, rows, OptionalFeatureCostMode::Disabled);
+    for cell in &mut scene.grid.cells {
+        cell.text = " ".to_owned();
+        cell.foreground = RenderColor::rgb(214, 222, 244);
+        cell.background = RenderColor::rgb(18, 18, 28);
+        cell.style = RenderCellStyle::default();
+    }
+
+    let lines = [
+        ">_ Panea coding-agent render fixture",
+        "model: terminal correctness + stable incremental shaping",
+        "directory: ~/panea",
+        "",
+        "Tip: visit https://chatgpt.com/codex?app=landing-page=true",
+        "",
+        "- cursor redraw must preserve stable text geometry",
+        "- unchanged glyphs remain cached and resident",
+        "Ask Codex to do anything",
+    ];
+    for (row, line) in lines.into_iter().enumerate().take(usize::from(rows)) {
+        for (col, ch) in line.chars().enumerate().take(usize::from(cols)) {
+            let index = row * usize::from(cols) + col;
+            scene.grid.cells[index].text = ch.to_string();
+        }
+    }
+    scene.cursor = Some(CursorVisual {
+        position: CellPosition {
+            row: i64::from(rows.min(9).saturating_sub(1)),
+            col: 26_u16.min(cols.saturating_sub(1)),
+        },
+        shape: RenderCursorShape::Block,
+        color: RenderColor::rgb(235, 235, 245),
+        text_color: None,
+        visible: true,
+        thickness_percent: 15,
+        corner_radius_px: 0,
+        inactive: false,
+    });
+    scene
 }
 
 fn unicode_scene(cols: u16, rows: u16, emoji_heavy: bool) -> RenderScene {
@@ -877,6 +982,7 @@ fn scene_from_terminal(terminal: &TerminalEmulator) -> RenderScene {
                 CursorShape::Underline => RenderCursorShape::Underline,
             },
             color: RenderColor::rgb(235, 235, 235),
+            text_color: None,
             visible: cursor.visible,
             thickness_percent: 15,
             corner_radius_px: 0,

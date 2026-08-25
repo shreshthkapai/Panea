@@ -90,6 +90,17 @@ test renders four regions, replaces one damaged region through the same
 production compositor, reads the texture back, and verifies that unchanged
 pixels survive while damaged pixels are replaced.
 
+Glyph bitmap and atlas hits are constant-time. Shaped runs use shared immutable
+storage with deterministic bounded eviction, and the GPU renderer recycles CPU
+vertex/index allocations between frames. Incremental text preparation shapes a
+complete style run for stable ligature and glyph positioning, then emits only
+glyphs intersecting the damaged span. Adjacent damage cells coalesce before GPU
+clear geometry is built.
+
+Cursor text color is applied by the cursor overlay while terminal-cell colors
+remain unchanged. Cursor blink and movement therefore reuse identical shaping
+geometry instead of splitting and reshaping application-owned text runs.
+
 The CPU rasterizer remains in place for deterministic snapshot-style tests. It
 does not replace the normal WGPU batch submission path.
 

@@ -69,6 +69,7 @@ pub struct CursorVisual {
     pub position: CellPosition,
     pub shape: RenderCursorShape,
     pub color: RenderColor,
+    pub text_color: Option<RenderColor>,
     pub visible: bool,
     pub thickness_percent: u8,
     pub corner_radius_px: u8,

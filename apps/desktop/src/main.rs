@@ -6537,17 +6537,19 @@ impl PaneRuntime {
                 } else {
                     SelectionKind::Normal
                 };
-                self.terminal.state_mut().set_selection(Selection {
-                    start: position,
-                    end: position,
-                    kind: self.selection_kind,
-                });
-                true
+                let had_selection = self.terminal.selection_state().is_some();
+                self.terminal.state_mut().clear_selection();
+                had_selection
             }
             MouseEventKind::Moved => {
                 let Some(anchor) = self.selection_anchor else {
                     return false;
                 };
+                if anchor == position {
+                    let had_selection = self.terminal.selection_state().is_some();
+                    self.terminal.state_mut().clear_selection();
+                    return had_selection;
+                }
                 self.terminal.state_mut().set_selection(Selection {
                     start: anchor,
                     end: position,
@@ -6559,6 +6561,11 @@ impl PaneRuntime {
                 let Some(anchor) = self.selection_anchor.take() else {
                     return false;
                 };
+                if anchor == position {
+                    let had_selection = self.terminal.selection_state().is_some();
+                    self.terminal.state_mut().clear_selection();
+                    return had_selection;
+                }
                 self.terminal.state_mut().set_selection(Selection {
                     start: anchor,
                     end: position,
@@ -7691,19 +7698,6 @@ fn scene_from_terminal(
                     .expect("selection foreground was checked"),
             );
         }
-        if cursor_visible
-            && row == cursor.position.row
-            && col == cursor.position.col
-            && matches!(
-                configured_cursor_shape,
-                RenderCursorShape::Block
-                    | RenderCursorShape::Custom
-                    | RenderCursorShape::CustomStaticShape
-            )
-            && let Some(cursor_text) = config.colors.cursor_text
-        {
-            foreground = render_color(cursor_text);
-        }
         cells.push(RenderCell {
             position,
             text: cell.text.clone(),
@@ -7714,8 +7708,7 @@ fn scene_from_terminal(
     }
 
     let semantic_overlays = metrics.map_or_else(Vec::new, |metrics| {
-        let mut overlays = url_hint_overlays(terminal, visible.viewport.size.rows, metrics);
-        overlays.extend(semantic_visual_overlays(
+        semantic_visual_overlays(
             semantic_timeline,
             command_output_collapsed,
             terminal.modes().contains(&TerminalMode::AlternateScreen),
@@ -7726,8 +7719,7 @@ fn scene_from_terminal(
                 metrics,
             },
             config,
-        ));
-        overlays
+        )
     });
     let search_highlights = metrics.map_or_else(Vec::new, |metrics| {
         search_overlays(search, visible.viewport, metrics, config)
@@ -7757,6 +7749,7 @@ fn scene_from_terminal(
                     .or(config.cursor.color)
                     .unwrap_or(config.colors.cursor)
             }),
+            text_color: config.colors.cursor_text.map(render_color),
             visible: cursor_visible,
             thickness_percent: (config.cursor.thickness.clamp(0.05, 1.0) * 100.0).round() as u8,
             corner_radius_px: cursor_radius_px(config, metrics),
@@ -7974,38 +7967,6 @@ fn cursor_radius_px(config: &AppConfig, metrics: Option<CellMetrics>) -> u8 {
     let cell_edge = metrics.map_or(16.0, |metrics| metrics.cell_width.min(metrics.cell_height));
     let radius = config.cursor.corner_radius.clamp(0.0, 0.5) * f64::from(cell_edge);
     radius.round() as u8
-}
-
-fn url_hint_overlays(
-    terminal: &TerminalEmulator,
-    rows: u16,
-    metrics: CellMetrics,
-) -> Vec<OverlayPrimitive> {
-    (0..rows)
-        .flat_map(|row| visible_url_hints(terminal, row))
-        .map(|hint| OverlayPrimitive {
-            kind: OverlayKind::Semantic,
-            bounds: RenderRect {
-                x: (f32::from(hint.start.col) * metrics.cell_width).floor() as i32,
-                y: (hint.start.row.max(0) as f32 * metrics.cell_height).floor() as i32,
-                width: (f32::from(hint.end.col.saturating_sub(hint.start.col)) * metrics.cell_width)
-                    .ceil() as u32,
-                height: metrics.cell_height.ceil() as u32,
-            },
-            color: RenderColor {
-                red: 80,
-                green: 150,
-                blue: 255,
-                alpha: 64,
-            },
-            border_color: None,
-            border_width_px: 0,
-            corner_radius_px: 2,
-            z_index: 10,
-            label: Some(hint.text),
-            label_color: None,
-        })
-        .collect()
 }
 
 fn visible_url_hints(terminal: &TerminalEmulator, row: u16) -> Vec<semantics::DetectedHint> {
@@ -9540,6 +9501,44 @@ mod tests {
     }
 
     #[test]
+    fn plain_mouse_click_does_not_leave_a_single_cell_selection() {
+        let mut pane = test_pane(20, 4);
+        pane.terminal.apply_bytes(b"panea").expect("terminal text");
+        let metrics = test_metrics();
+        let mut click = mouse_event(MouseEventKind::Pressed(MouseButton::Left));
+        click.x = f64::from(metrics.cell_width) * 2.5;
+        click.y = f64::from(metrics.cell_height) * 0.5;
+
+        pane.handle_selection_or_scrollback(click, metrics);
+        click.kind = MouseEventKind::Released(MouseButton::Left);
+        pane.handle_selection_or_scrollback(click, metrics);
+
+        assert!(pane.terminal.selection_state().is_none());
+    }
+
+    #[test]
+    fn mouse_drag_still_selects_across_terminal_cells() {
+        let mut pane = test_pane(20, 4);
+        pane.terminal.apply_bytes(b"panea").expect("terminal text");
+        let metrics = test_metrics();
+        let mut mouse = mouse_event(MouseEventKind::Pressed(MouseButton::Left));
+        mouse.x = f64::from(metrics.cell_width) * 0.5;
+        mouse.y = f64::from(metrics.cell_height) * 0.5;
+        pane.handle_selection_or_scrollback(mouse, metrics);
+
+        mouse.kind = MouseEventKind::Moved;
+        mouse.x = f64::from(metrics.cell_width) * 2.5;
+        pane.handle_selection_or_scrollback(mouse, metrics);
+        mouse.kind = MouseEventKind::Released(MouseButton::Left);
+        pane.handle_selection_or_scrollback(mouse, metrics);
+
+        assert_eq!(
+            pane.terminal.state().selected_text().as_deref(),
+            Some("pan")
+        );
+    }
+
+    #[test]
     fn sgr_mouse_reports_press_drag_release_and_modifiers() {
         let mut protocol = MouseProtocolState::default();
         let mut modes = BTreeSet::from([TerminalMode::MouseCellMotion, TerminalMode::SgrMouse]);
@@ -10434,6 +10433,48 @@ mod tests {
         assert_eq!(
             resolved_cursor_shape(&config, CursorShape::Block, &modes, false),
             RenderCursorShape::HollowBlock
+        );
+    }
+
+    #[test]
+    fn cursor_presentation_does_not_restyle_or_decorate_terminal_text() {
+        let mut pane = test_pane(80, 4);
+        pane.terminal
+            .apply_bytes(b"abc\x1b[2D https://example.com")
+            .expect("terminal output");
+        let mut config = AppConfig::default();
+        config.colors.cursor_text = Some(config_core::RgbaColor {
+            red: 1,
+            green: 2,
+            blue: 3,
+            alpha: 255,
+        });
+
+        let scene = scene_from_terminal(
+            &pane.terminal,
+            &pane.semantic_timeline,
+            &pane.search,
+            &pane.command_output_collapsed,
+            Some(test_metrics()),
+            &config,
+            CursorPresentation {
+                window_focused: true,
+                blink_visible: true,
+            },
+        );
+
+        assert_eq!(
+            scene.grid.cells[1].foreground,
+            render_color(config.colors.foreground),
+            "cursor presentation must not split or reshape the terminal text run"
+        );
+        assert_eq!(
+            scene.cursor.and_then(|cursor| cursor.text_color),
+            config.colors.cursor_text.map(render_color)
+        );
+        assert!(
+            scene.semantic_overlays.is_empty(),
+            "detected URLs must not alter application-owned UI by default"
         );
     }
 

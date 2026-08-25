@@ -984,9 +984,16 @@ impl GlyphCache {
         key: GlyphCacheKey,
         make: impl FnOnce() -> GlyphBitmap,
     ) -> Arc<GlyphBitmap> {
+        self.get_or_insert_with_status(key, make).0
+    }
+
+    pub fn get_or_insert_with_status(
+        &mut self,
+        key: GlyphCacheKey,
+        make: impl FnOnce() -> GlyphBitmap,
+    ) -> (Arc<GlyphBitmap>, bool) {
         if let Some(bitmap) = self.entries.get(&key).cloned() {
-            self.touch(key);
-            return bitmap;
+            return (bitmap, true);
         }
 
         while self.entries.len() >= self.capacity {
@@ -998,7 +1005,7 @@ impl GlyphCache {
         let bitmap = Arc::new(make());
         self.entries.insert(key, Arc::clone(&bitmap));
         self.order.push_back(key);
-        bitmap
+        (bitmap, false)
     }
 
     #[must_use]
@@ -1014,11 +1021,6 @@ impl GlyphCache {
     #[must_use]
     pub fn contains_key(&self, key: GlyphCacheKey) -> bool {
         self.entries.contains_key(&key)
-    }
-
-    fn touch(&mut self, key: GlyphCacheKey) {
-        self.order.retain(|entry| *entry != key);
-        self.order.push_back(key);
     }
 }
 
@@ -1051,6 +1053,23 @@ mod tests {
         cache.get_or_insert_with(key_c, || GlyphBitmap::missing(8.0, 12));
 
         assert_eq!(cache.len(), 2);
+        assert!(!cache.entries.contains_key(&key_a));
+        assert!(cache.entries.contains_key(&key_b));
+        assert!(cache.entries.contains_key(&key_c));
+    }
+
+    #[test]
+    fn glyph_cache_hits_do_not_scan_or_reorder_the_eviction_queue() {
+        let mut cache = GlyphCache::new(2);
+        let key_a = GlyphCacheKey::new(1, u16::from(b'a'), 13.0, false, false);
+        let key_b = GlyphCacheKey::new(1, u16::from(b'b'), 13.0, false, false);
+        let key_c = GlyphCacheKey::new(1, u16::from(b'c'), 13.0, false, false);
+
+        cache.get_or_insert_with(key_a, || GlyphBitmap::missing(8.0, 12));
+        cache.get_or_insert_with(key_b, || GlyphBitmap::missing(8.0, 12));
+        cache.get_or_insert_with(key_a, || panic!("cache hit must not rasterize"));
+        cache.get_or_insert_with(key_c, || GlyphBitmap::missing(8.0, 12));
+
         assert!(!cache.entries.contains_key(&key_a));
         assert!(cache.entries.contains_key(&key_b));
         assert!(cache.entries.contains_key(&key_c));

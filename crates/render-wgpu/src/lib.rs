@@ -211,7 +211,7 @@ pub struct GlyphAtlas {
     cursor_y: u32,
     row_height: u32,
     entries: HashMap<AtlasCacheKey, AtlasEntry>,
-    lru: VecDeque<AtlasCacheKey>,
+    used_bytes: u64,
 }
 
 const GLYPH_ATLAS_PADDING: u32 = 1;
@@ -226,7 +226,7 @@ impl GlyphAtlas {
             cursor_y: 0,
             row_height: 0,
             entries: HashMap::new(),
-            lru: VecDeque::new(),
+            used_bytes: 0,
         }
     }
 
@@ -235,10 +235,18 @@ impl GlyphAtlas {
         key: impl Into<AtlasCacheKey>,
         bitmap: &GlyphBitmap,
     ) -> Option<AtlasEntry> {
+        self.allocate_with_status(key, bitmap)
+            .map(|(entry, _)| entry)
+    }
+
+    fn allocate_with_status(
+        &mut self,
+        key: impl Into<AtlasCacheKey>,
+        bitmap: &GlyphBitmap,
+    ) -> Option<(AtlasEntry, bool)> {
         let key = key.into();
         if let Some(entry) = self.entries.get(&key).copied() {
-            self.touch(key);
-            return Some(entry);
+            return Some((entry, true));
         }
 
         let width = bitmap.width.max(1);
@@ -268,8 +276,10 @@ impl GlyphAtlas {
         self.cursor_x += allocation_width;
         self.row_height = self.row_height.max(allocation_height);
         self.entries.insert(key, entry);
-        self.lru.push_back(key);
-        Some(entry)
+        self.used_bytes = self
+            .used_bytes
+            .saturating_add(u64::from(width) * u64::from(height) * 4);
+        Some((entry, false))
     }
 
     #[must_use]
@@ -293,11 +303,8 @@ impl GlyphAtlas {
     }
 
     #[must_use]
-    pub fn used_bytes(&self) -> u64 {
-        self.entries
-            .values()
-            .map(|entry| u64::from(entry.width) * u64::from(entry.height) * 4)
-            .sum()
+    pub const fn used_bytes(&self) -> u64 {
+        self.used_bytes
     }
 
     #[must_use]
@@ -310,12 +317,7 @@ impl GlyphAtlas {
         self.cursor_y = 0;
         self.row_height = 0;
         self.entries.clear();
-        self.lru.clear();
-    }
-
-    fn touch(&mut self, key: AtlasCacheKey) {
-        self.lru.retain(|entry| *entry != key);
-        self.lru.push_back(key);
+        self.used_bytes = 0;
     }
 }
 
@@ -654,7 +656,7 @@ fn merge_regions(regions: Vec<DamageRegion>) -> Vec<DamageRegion> {
     for mut region in regions {
         let mut index = 0;
         while index < merged.len() {
-            if rects_intersect(region, merged[index]) {
+            if rects_overlap_or_share_edge(region, merged[index]) {
                 region = union_region(region, merged.swap_remove(index));
                 index = 0;
             } else {
@@ -664,6 +666,20 @@ fn merge_regions(regions: Vec<DamageRegion>) -> Vec<DamageRegion> {
         merged.push(region);
     }
     merged
+}
+
+fn rects_overlap_or_share_edge(a: RenderRect, b: RenderRect) -> bool {
+    let ax0 = i64::from(a.x);
+    let ay0 = i64::from(a.y);
+    let ax1 = ax0 + i64::from(a.width);
+    let ay1 = ay0 + i64::from(a.height);
+    let bx0 = i64::from(b.x);
+    let by0 = i64::from(b.y);
+    let bx1 = bx0 + i64::from(b.width);
+    let by1 = by0 + i64::from(b.height);
+    let horizontal = ax0 <= bx1 && ax1 >= bx0 && ay0 < by1 && ay1 > by0;
+    let vertical = ay0 <= by1 && ay1 >= by0 && ax0 < bx1 && ax1 > bx0;
+    horizontal || vertical
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1839,6 +1855,12 @@ impl QuadBatch {
     pub fn quad_count(&self) -> usize {
         self.indices.len() / 6
     }
+
+    fn clear_for_reuse(&mut self, kind: QuadBatchKind) {
+        self.kind = kind;
+        self.vertices.clear();
+        self.indices.clear();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1852,6 +1874,12 @@ impl GlyphBatch {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.indices.is_empty()
+    }
+
+    fn clear_for_reuse(&mut self) {
+        self.vertices.clear();
+        self.indices.clear();
+        self.glyph_count = 0;
     }
 }
 
@@ -1882,6 +1910,33 @@ pub struct PreparedRenderBatches {
 }
 
 impl PreparedRenderBatches {
+    fn empty() -> Self {
+        Self {
+            frame_width: 1,
+            frame_height: 1,
+            damage_regions: Vec::new(),
+            background: QuadBatch::new(QuadBatchKind::Background),
+            glyphs: GlyphBatch {
+                vertices: Vec::new(),
+                indices: Vec::new(),
+                glyph_count: 0,
+            },
+            overlay_glyphs: GlyphBatch {
+                vertices: Vec::new(),
+                indices: Vec::new(),
+                glyph_count: 0,
+            },
+            decorations: QuadBatch::new(QuadBatchKind::Decoration),
+            window_chrome: QuadBatch::new(QuadBatchKind::Decoration),
+            selections: QuadBatch::new(QuadBatchKind::Selection),
+            cursor: QuadBatch::new(QuadBatchKind::Cursor),
+            cursor_image: QuadBatch::new(QuadBatchKind::Cursor),
+            cursor_image_asset: None,
+            atlas_uploads: Vec::new(),
+            instrumentation: RenderInstrumentation::default(),
+        }
+    }
+
     #[must_use]
     pub fn draw_call_count(&self) -> u32 {
         [
@@ -1915,7 +1970,8 @@ type GlyphRunItem = ShapedGlyph;
 pub struct RenderBatchPlanner {
     glyph_cache: GlyphCache,
     atlas: GlyphAtlas,
-    glyph_runs: HashMap<GlyphRunKey, Vec<GlyphRunItem>>,
+    glyph_runs: HashMap<GlyphRunKey, Arc<[GlyphRunItem]>>,
+    glyph_run_order: VecDeque<GlyphRunKey>,
     max_glyph_runs: usize,
 }
 
@@ -1925,6 +1981,14 @@ struct GlyphBatchContext<'a> {
     fonts: &'a mut FontSystem,
     metrics: CellMetrics,
     rect: RenderRect,
+    clip_regions: Option<&'a [DamageRegion]>,
+    cursor_text: Option<CursorTextOverride>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CursorTextOverride {
+    bounds: RenderRect,
+    color: RenderColor,
 }
 
 impl Default for RenderBatchPlanner {
@@ -1940,6 +2004,7 @@ impl RenderBatchPlanner {
             glyph_cache: GlyphCache::new(glyph_capacity),
             atlas: GlyphAtlas::new(atlas_width, atlas_height),
             glyph_runs: HashMap::new(),
+            glyph_run_order: VecDeque::new(),
             max_glyph_runs: glyph_capacity.max(1),
         }
     }
@@ -1948,6 +2013,15 @@ impl RenderBatchPlanner {
         &mut self,
         scene: &RenderScene,
         fonts: &mut FontSystem,
+    ) -> Result<PreparedRenderBatches, RendererError> {
+        self.prepare_reusing(scene, fonts, None)
+    }
+
+    pub fn prepare_reusing(
+        &mut self,
+        scene: &RenderScene,
+        fonts: &mut FontSystem,
+        recycled: Option<PreparedRenderBatches>,
     ) -> Result<PreparedRenderBatches, RendererError> {
         let started = Instant::now();
         let metrics = fonts.cell_metrics()?;
@@ -1977,30 +2051,36 @@ impl RenderBatchPlanner {
                     .saturating_add(window_chrome.bounds.height),
             );
         }
-        let damage_regions = effective_damage_regions(scene, metrics);
-
-        let mut background = QuadBatch::new(QuadBatchKind::Background);
-        let mut glyphs = GlyphBatch {
-            vertices: Vec::new(),
-            indices: Vec::new(),
-            glyph_count: 0,
-        };
-        let mut overlay_glyphs = GlyphBatch {
-            vertices: Vec::new(),
-            indices: Vec::new(),
-            glyph_count: 0,
-        };
-        let mut decorations = QuadBatch::new(QuadBatchKind::Decoration);
-        let mut window_chrome = QuadBatch::new(QuadBatchKind::Decoration);
-        let mut selections = QuadBatch::new(QuadBatchKind::Selection);
-        let mut cursor = QuadBatch::new(QuadBatchKind::Cursor);
-        let mut cursor_image = QuadBatch::new(QuadBatchKind::Cursor);
-        let mut atlas_uploads = Vec::new();
+        let mut recycled = recycled.unwrap_or_else(PreparedRenderBatches::empty);
+        recycled.damage_regions.clear();
+        recycled
+            .damage_regions
+            .extend(effective_damage_regions(scene, metrics));
+        let damage_regions = recycled.damage_regions;
+        let mut background = recycled.background;
+        background.clear_for_reuse(QuadBatchKind::Background);
+        let mut glyphs = recycled.glyphs;
+        glyphs.clear_for_reuse();
+        let mut overlay_glyphs = recycled.overlay_glyphs;
+        overlay_glyphs.clear_for_reuse();
+        let mut decorations = recycled.decorations;
+        decorations.clear_for_reuse(QuadBatchKind::Decoration);
+        let mut window_chrome = recycled.window_chrome;
+        window_chrome.clear_for_reuse(QuadBatchKind::Decoration);
+        let mut selections = recycled.selections;
+        selections.clear_for_reuse(QuadBatchKind::Selection);
+        let mut cursor = recycled.cursor;
+        cursor.clear_for_reuse(QuadBatchKind::Cursor);
+        let mut cursor_image = recycled.cursor_image;
+        cursor_image.clear_for_reuse(QuadBatchKind::Cursor);
+        let mut atlas_uploads = recycled.atlas_uploads;
+        atlas_uploads.clear();
         let mut instrumentation = RenderInstrumentation {
             damage_region_count: damage_regions.len(),
             animated_region_count: scene.animations.len(),
             ..RenderInstrumentation::default()
         };
+        let cursor_text = cursor_text_override(scene, metrics);
         instrumentation.glyphs.atlas_used_bytes = self.atlas.used_bytes();
         instrumentation.glyphs.atlas_capacity_bytes = self.atlas.capacity_bytes();
 
@@ -2027,6 +2107,8 @@ impl RenderBatchPlanner {
                 fonts,
                 metrics,
                 rect,
+                clip_regions: Some(&damage_regions),
+                cursor_text,
             };
             self.push_glyphs(&mut glyphs, &cell, &mut glyph_context)?;
         }
@@ -2074,6 +2156,8 @@ impl RenderBatchPlanner {
                     fonts,
                     metrics,
                     rect: offset_region(overlay_label_rect(overlay, metrics), offset),
+                    clip_regions: None,
+                    cursor_text: None,
                 };
                 self.push_overlay_label_glyphs(&mut overlay_glyphs, overlay, &mut glyph_context)?;
             }
@@ -2158,6 +2242,8 @@ impl RenderBatchPlanner {
                     fonts,
                     metrics,
                     rect: visual.bounds,
+                    clip_regions: None,
+                    cursor_text: None,
                 },
             )?;
         }
@@ -2200,10 +2286,19 @@ impl RenderBatchPlanner {
         scene: &RenderScene,
         fonts: &mut FontSystem,
     ) -> Result<PreparedRenderBatches, RendererError> {
+        self.prepare_full_reusing(scene, fonts, None)
+    }
+
+    pub fn prepare_full_reusing(
+        &mut self,
+        scene: &RenderScene,
+        fonts: &mut FontSystem,
+        recycled: Option<PreparedRenderBatches>,
+    ) -> Result<PreparedRenderBatches, RendererError> {
         let metrics = fonts.cell_metrics()?;
         let mut scene = scene.clone();
         scene.damage_regions = vec![scene_grid_region(&scene, metrics)];
-        self.prepare(&scene, fonts)
+        self.prepare_reusing(&scene, fonts, recycled)
     }
 
     #[must_use]
@@ -2231,9 +2326,9 @@ impl RenderBatchPlanner {
         cell: &RenderCell,
         context: &mut GlyphBatchContext<'_>,
     ) -> Result<(), RendererError> {
-        if let Some(cap) = SolidPowerlineCap::from_text(&cell.text) {
+        if let Some(powerline) = SolidPowerlineGlyph::from_text(&cell.text) {
             let key = AtlasCacheKey::PowerlineCap {
-                codepoint: cap.codepoint(),
+                codepoint: powerline.codepoint(),
                 width: context.rect.width,
                 height: context.rect.height,
             };
@@ -2248,8 +2343,11 @@ impl RenderBatchPlanner {
                     .glyphs
                     .cache_misses
                     .saturating_add(1);
-                let bitmap =
-                    rasterize_solid_powerline_cap(cap, context.rect.width, context.rect.height);
+                let bitmap = rasterize_solid_powerline_glyph(
+                    powerline,
+                    context.rect.width,
+                    context.rect.height,
+                );
                 self.atlas.allocate(key, &bitmap).inspect(|entry| {
                     context.instrumentation.glyphs.atlas_uploads = context
                         .instrumentation
@@ -2270,7 +2368,7 @@ impl RenderBatchPlanner {
                     context.rect,
                     entry,
                     self.atlas.dimensions(),
-                    cell.foreground,
+                    glyph_color(context.cursor_text, context.rect, cell.foreground),
                     false,
                 );
             }
@@ -2289,28 +2387,48 @@ impl RenderBatchPlanner {
             italic: cell.style.italic,
         };
         let run = if let Some(run) = self.glyph_runs.get(&run_key) {
-            run.clone()
+            Arc::clone(run)
         } else {
             while self.glyph_runs.len() >= self.max_glyph_runs {
-                let Some(oldest) = self.glyph_runs.keys().next().cloned() else {
+                let Some(oldest) = self.glyph_run_order.pop_front() else {
                     break;
                 };
                 self.glyph_runs.remove(&oldest);
             }
-            let run = context
+            let run: Arc<[GlyphRunItem]> = context
                 .fonts
                 .shape_text(&cell.text, cell.style.bold, cell.style.italic)?
-                .glyphs;
-            self.glyph_runs.insert(run_key, run.clone());
+                .glyphs
+                .into();
+            self.glyph_runs.insert(run_key.clone(), Arc::clone(&run));
+            self.glyph_run_order.push_back(run_key);
             run
         };
 
         let mut pen_x = context.rect.x as f32;
         let mut pen_y = glyph_baseline_y(context.rect, context.metrics);
-        for item in run {
+        for item in run.iter().copied() {
+            let coverage = RenderRect {
+                x: (pen_x + item.x_offset).floor() as i32,
+                y: context.rect.y,
+                width: item
+                    .x_advance
+                    .abs()
+                    .ceil()
+                    .max(context.metrics.cell_width)
+                    .max(1.0) as u32,
+                height: context.rect.height.max(1),
+            };
+            if context
+                .clip_regions
+                .is_some_and(|regions| !intersects_any(coverage, regions))
+            {
+                pen_x += item.x_advance;
+                pen_y += item.y_advance;
+                continue;
+            }
             let key = item.key;
-            let cache_hit = self.glyph_cache.contains_key(key);
-            let bitmap = self.glyph_cache.get_or_insert_with(key, || {
+            let (bitmap, cache_hit) = self.glyph_cache.get_or_insert_with_status(key, || {
                 context
                     .fonts
                     .rasterize_glyph(key)
@@ -2327,8 +2445,8 @@ impl RenderBatchPlanner {
                     .saturating_add(1);
             }
 
-            let atlas_hit = self.atlas.entry(key).is_some();
-            if let Some(entry) = self.atlas.allocate(key, bitmap.as_ref()) {
+            if let Some((entry, atlas_hit)) = self.atlas.allocate_with_status(key, bitmap.as_ref())
+            {
                 if !atlas_hit {
                     context.instrumentation.glyphs.atlas_uploads = context
                         .instrumentation
@@ -2342,17 +2460,18 @@ impl RenderBatchPlanner {
                         format: bitmap.format,
                     });
                 }
+                let glyph_rect = RenderRect {
+                    x: (pen_x + item.x_offset).round() as i32 + bitmap.offset_x,
+                    y: (pen_y - item.y_offset).round() as i32 + bitmap.offset_y,
+                    width: bitmap.width,
+                    height: bitmap.height,
+                };
                 push_glyph_quad(
                     glyphs,
-                    RenderRect {
-                        x: (pen_x + item.x_offset).round() as i32 + bitmap.offset_x,
-                        y: (pen_y - item.y_offset).round() as i32 + bitmap.offset_y,
-                        width: bitmap.width,
-                        height: bitmap.height,
-                    },
+                    glyph_rect,
                     entry,
                     self.atlas.dimensions(),
-                    cell.foreground,
+                    glyph_color(context.cursor_text, glyph_rect, cell.foreground),
                     bitmap.format == GlyphBitmapFormat::Rgba,
                 );
             }
@@ -2576,29 +2695,39 @@ fn terminal_text_runs(cells: &[RenderCell]) -> Vec<RenderCell> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SolidPowerlineCap {
-    Right,
-    Left,
+enum SolidPowerlineGlyph {
+    RoundedRight,
+    RoundedLeft,
+    TriangleRight,
+    TriangleLeft,
 }
 
-impl SolidPowerlineCap {
+impl SolidPowerlineGlyph {
     fn from_text(text: &str) -> Option<Self> {
         match text {
-            "\u{e0b4}" => Some(Self::Right),
-            "\u{e0b6}" => Some(Self::Left),
+            "\u{e0b4}" => Some(Self::RoundedRight),
+            "\u{e0b6}" => Some(Self::RoundedLeft),
+            "\u{e0b0}" => Some(Self::TriangleRight),
+            "\u{e0b2}" => Some(Self::TriangleLeft),
             _ => None,
         }
     }
 
     const fn codepoint(self) -> char {
         match self {
-            Self::Right => '\u{e0b4}',
-            Self::Left => '\u{e0b6}',
+            Self::RoundedRight => '\u{e0b4}',
+            Self::RoundedLeft => '\u{e0b6}',
+            Self::TriangleRight => '\u{e0b0}',
+            Self::TriangleLeft => '\u{e0b2}',
         }
     }
 }
 
-fn rasterize_solid_powerline_cap(cap: SolidPowerlineCap, width: u32, height: u32) -> GlyphBitmap {
+fn rasterize_solid_powerline_glyph(
+    powerline: SolidPowerlineGlyph,
+    width: u32,
+    height: u32,
+) -> GlyphBitmap {
     const SAMPLE_GRID: u32 = 4;
 
     let width = width.max(1);
@@ -2611,14 +2740,21 @@ fn rasterize_solid_powerline_cap(cap: SolidPowerlineCap, width: u32, height: u32
             for sample_y in 0..SAMPLE_GRID {
                 let normalized_y =
                     (y as f32 + (sample_y as f32 + 0.5) / SAMPLE_GRID as f32) / height as f32;
-                let ellipse_y = normalized_y.mul_add(2.0, -1.0);
-                let horizontal_extent = (1.0 - ellipse_y * ellipse_y).max(0.0).sqrt();
+                let centered_y = normalized_y.mul_add(2.0, -1.0);
                 for sample_x in 0..SAMPLE_GRID {
                     let normalized_x =
                         (x as f32 + (sample_x as f32 + 0.5) / SAMPLE_GRID as f32) / width as f32;
-                    let inside = match cap {
-                        SolidPowerlineCap::Right => normalized_x <= horizontal_extent,
-                        SolidPowerlineCap::Left => normalized_x >= 1.0 - horizontal_extent,
+                    let inside = match powerline {
+                        SolidPowerlineGlyph::RoundedRight => {
+                            normalized_x <= (1.0 - centered_y * centered_y).max(0.0).sqrt()
+                        }
+                        SolidPowerlineGlyph::RoundedLeft => {
+                            normalized_x >= 1.0 - (1.0 - centered_y * centered_y).max(0.0).sqrt()
+                        }
+                        SolidPowerlineGlyph::TriangleRight => {
+                            normalized_x <= 1.0 - centered_y.abs()
+                        }
+                        SolidPowerlineGlyph::TriangleLeft => normalized_x >= centered_y.abs(),
                     };
                     covered += u32::from(inside);
                 }
@@ -2645,17 +2781,15 @@ fn damaged_terminal_text_runs(
     metrics: CellMetrics,
     offset: render_core::RenderOffset,
 ) -> Vec<RenderCell> {
-    let damaged = cells
-        .iter()
-        .filter(|cell| {
+    terminal_text_runs(cells)
+        .into_iter()
+        .filter(|run| {
             intersects_any(
-                cell_region_at(cell.position, metrics, offset),
+                offset_region(text_run_region(run, metrics), offset),
                 damage_regions,
             )
         })
-        .cloned()
-        .collect::<Vec<_>>();
-    terminal_text_runs(&damaged)
+        .collect()
 }
 
 fn text_run_region(cell: &RenderCell, metrics: CellMetrics) -> RenderRect {
@@ -2684,6 +2818,34 @@ fn effective_damage_regions(scene: &RenderScene, metrics: CellMetrics) -> Vec<Da
 
 fn intersects_any(rect: RenderRect, regions: &[DamageRegion]) -> bool {
     regions.iter().any(|region| rects_intersect(rect, *region))
+}
+
+fn glyph_color(
+    cursor_text: Option<CursorTextOverride>,
+    glyph_bounds: RenderRect,
+    fallback: RenderColor,
+) -> RenderColor {
+    cursor_text
+        .filter(|override_| rects_intersect(glyph_bounds, override_.bounds))
+        .map_or(fallback, |override_| override_.color)
+}
+
+fn cursor_text_override(scene: &RenderScene, metrics: CellMetrics) -> Option<CursorTextOverride> {
+    let cursor = scene.cursor?;
+    if !cursor.visible
+        || !matches!(
+            cursor.shape,
+            RenderCursorShape::Block
+                | RenderCursorShape::Custom
+                | RenderCursorShape::CustomStaticShape
+        )
+    {
+        return None;
+    }
+    Some(CursorTextOverride {
+        bounds: cell_region_at(cursor.position, metrics, scene.content_offset),
+        color: cursor.text_color?,
+    })
 }
 
 fn overlay_draws_behind_terminal_text(kind: OverlayKind) -> bool {
@@ -4342,6 +4504,7 @@ fn cursor(row: i64, col: u16, shape: RenderCursorShape, inactive: bool) -> Curso
         } else {
             RenderColor::rgb(245, 245, 235)
         },
+        text_color: None,
         visible: true,
         thickness_percent: 16,
         corner_radius_px: 0,
@@ -4450,12 +4613,31 @@ impl TerminalRasterizer {
         self.batch_planner.prepare(scene, fonts)
     }
 
+    pub fn prepare_batches_reusing(
+        &mut self,
+        scene: &RenderScene,
+        fonts: &mut FontSystem,
+        recycled: Option<PreparedRenderBatches>,
+    ) -> Result<PreparedRenderBatches, RendererError> {
+        self.batch_planner.prepare_reusing(scene, fonts, recycled)
+    }
+
     pub fn prepare_full_batches(
         &mut self,
         scene: &RenderScene,
         fonts: &mut FontSystem,
     ) -> Result<PreparedRenderBatches, RendererError> {
         self.batch_planner.prepare_full(scene, fonts)
+    }
+
+    pub fn prepare_full_batches_reusing(
+        &mut self,
+        scene: &RenderScene,
+        fonts: &mut FontSystem,
+        recycled: Option<PreparedRenderBatches>,
+    ) -> Result<PreparedRenderBatches, RendererError> {
+        self.batch_planner
+            .prepare_full_reusing(scene, fonts, recycled)
     }
 
     #[must_use]
@@ -4605,6 +4787,7 @@ impl TerminalRasterizer {
             draw_cursor(&mut frame, cursor, metrics, scene.content_offset);
         }
 
+        let cursor_text = cursor_text_override(scene, metrics);
         for cell in terminal_text_runs(&scene.grid.cells) {
             self.draw_cell_foreground(
                 &mut frame,
@@ -4612,7 +4795,7 @@ impl TerminalRasterizer {
                 fonts,
                 metrics,
                 scene.content_offset,
-                &mut instrumentation,
+                cursor_text,
             )?;
         }
 
@@ -4679,13 +4862,19 @@ impl TerminalRasterizer {
         fonts: &mut FontSystem,
         metrics: CellMetrics,
         offset: render_core::RenderOffset,
-        _instrumentation: &mut RenderInstrumentation,
+        cursor_text: Option<CursorTextOverride>,
     ) -> Result<(), RendererError> {
         let rect = offset_region(text_run_region(cell, metrics), offset);
 
-        if let Some(cap) = SolidPowerlineCap::from_text(&cell.text) {
-            let bitmap = rasterize_solid_powerline_cap(cap, rect.width, rect.height);
-            draw_glyph(frame, rect.x, rect.y, &bitmap, cell.foreground);
+        if let Some(powerline) = SolidPowerlineGlyph::from_text(&cell.text) {
+            let bitmap = rasterize_solid_powerline_glyph(powerline, rect.width, rect.height);
+            draw_glyph(
+                frame,
+                rect.x,
+                rect.y,
+                &bitmap,
+                glyph_color(cursor_text, rect, cell.foreground),
+            );
             return Ok(());
         }
 
@@ -4699,12 +4888,18 @@ impl TerminalRasterizer {
                     .rasterize_glyph(key)
                     .unwrap_or_else(|_| missing_glyph_bitmap(metrics))
             });
+            let glyph_rect = RenderRect {
+                x: (pen_x + glyph.x_offset).round() as i32 + bitmap.offset_x,
+                y: (pen_y - glyph.y_offset).round() as i32 + bitmap.offset_y,
+                width: bitmap.width,
+                height: bitmap.height,
+            };
             draw_glyph(
                 frame,
-                (pen_x + glyph.x_offset).round() as i32 + bitmap.offset_x,
-                (pen_y - glyph.y_offset).round() as i32 + bitmap.offset_y,
+                glyph_rect.x,
+                glyph_rect.y,
                 bitmap.as_ref(),
-                cell.foreground,
+                glyph_color(cursor_text, glyph_rect, cell.foreground),
             );
             pen_x += glyph.x_advance;
             pen_y += glyph.y_advance;
@@ -5437,6 +5632,7 @@ pub struct GpuTerminalRenderer {
     options: RendererOptions,
     backend: Option<GpuBackend>,
     rasterizer: TerminalRasterizer,
+    recycled_batches: Option<PreparedRenderBatches>,
     last_instrumentation: RenderInstrumentation,
     recovery_status: RenderRecoveryStatus,
     recovery_attempts: u32,
@@ -5671,6 +5867,7 @@ impl GpuTerminalRenderer {
             options,
             backend: Some(backend),
             rasterizer: TerminalRasterizer::new(options.glyph_cache_entries.max(1), 2048, 2048),
+            recycled_batches: None,
             last_instrumentation: RenderInstrumentation::default(),
             recovery_status: RenderRecoveryStatus::Ready,
             recovery_attempts: 0,
@@ -5814,10 +6011,13 @@ impl GpuTerminalRenderer {
         if prepare_full_frame {
             backend.retained_frame.initialized = false;
         }
+        let recycled = self.recycled_batches.take();
         let mut batches = if prepare_full_frame {
-            self.rasterizer.prepare_full_batches(scene, fonts)?
+            self.rasterizer
+                .prepare_full_batches_reusing(scene, fonts, recycled)?
         } else {
-            self.rasterizer.prepare_batches(scene, fonts)?
+            self.rasterizer
+                .prepare_batches_reusing(scene, fonts, recycled)?
         };
         batches.instrumentation.gpu_time = backend.gpu_timing.last_duration();
         batches.instrumentation.gpu_timing_status = backend.gpu_timing.timing_status();
@@ -5841,7 +6041,7 @@ impl GpuTerminalRenderer {
         batches.instrumentation.frame_time = frame_started.elapsed();
         self.last_instrumentation = batches.instrumentation;
 
-        match result {
+        let outcome = match result {
             Ok(PresentOutcome::Submitted) => {
                 self.requires_full_redraw = false;
                 Ok(())
@@ -5860,7 +6060,9 @@ impl GpuTerminalRenderer {
                 Err(error)
             }
             Err(error) => Err(error),
-        }
+        };
+        self.recycled_batches = Some(batches);
+        outcome
     }
 
     #[must_use]
@@ -7152,6 +7354,17 @@ mod tests {
     const WHITE: RenderColor = RenderColor::rgb(255, 255, 255);
     const YELLOW: RenderColor = RenderColor::rgb(255, 255, 0);
 
+    fn damage_covers(regions: &[DamageRegion], expected: RenderRect) -> bool {
+        regions.iter().any(|region| {
+            region.x <= expected.x
+                && region.y <= expected.y
+                && i64::from(region.x) + i64::from(region.width)
+                    >= i64::from(expected.x) + i64::from(expected.width)
+                && i64::from(region.y) + i64::from(region.height)
+                    >= i64::from(expected.y) + i64::from(expected.height)
+        })
+    }
+
     struct TestFrame {
         clears: Vec<(RenderRect, RenderColor)>,
         quads: Vec<(RenderRect, RenderColor)>,
@@ -7818,6 +8031,7 @@ mod tests {
                 position: CellPosition { row: 0, col: 0 },
                 shape: RenderCursorShape::Block,
                 color: RenderColor::rgb(255, 255, 255),
+                text_color: None,
                 visible: true,
                 thickness_percent: 15,
                 corner_radius_px: 0,
@@ -7891,6 +8105,7 @@ mod tests {
             position: CellPosition { row: 1, col: 1 },
             shape: RenderCursorShape::Block,
             color: RenderColor::rgb(255, 255, 255),
+            text_color: None,
             visible: true,
             thickness_percent: 15,
             corner_radius_px: 0,
@@ -7898,9 +8113,33 @@ mod tests {
         });
 
         let damage = tracker.update(&second, metrics());
-        assert!(damage.iter().any(|region| region.x == 8 && region.y == 0));
-        assert!(damage.iter().any(|region| region.x == 0 && region.y == 0));
-        assert!(damage.iter().any(|region| region.x == 8 && region.y == 16));
+        assert!(damage_covers(
+            &damage,
+            RenderRect {
+                x: 8,
+                y: 0,
+                width: 8,
+                height: 16
+            }
+        ));
+        assert!(damage_covers(
+            &damage,
+            RenderRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 16
+            }
+        ));
+        assert!(damage_covers(
+            &damage,
+            RenderRect {
+                x: 8,
+                y: 16,
+                width: 8,
+                height: 16
+            }
+        ));
     }
 
     #[test]
@@ -7924,7 +8163,15 @@ mod tests {
 
         for col in 0..4 {
             assert!(
-                damage.iter().any(|region| region.x == col * 8),
+                damage_covers(
+                    &damage,
+                    RenderRect {
+                        x: col * 8,
+                        y: 0,
+                        width: 8,
+                        height: 16
+                    }
+                ),
                 "column {col} should be repainted for shaping context"
             );
         }
@@ -7955,8 +8202,24 @@ mod tests {
         let second = scene(vec![cell(0, 0, "a")]);
         let damage = tracker.update(&second, metrics());
 
-        assert!(damage.iter().any(|region| region.x == 8 && region.y == 0));
-        assert!(damage.iter().any(|region| region.y == 16));
+        assert!(damage_covers(
+            &damage,
+            RenderRect {
+                x: 8,
+                y: 0,
+                width: 8,
+                height: 16
+            }
+        ));
+        assert!(damage_covers(
+            &damage,
+            RenderRect {
+                x: 0,
+                y: 16,
+                width: 16,
+                height: 16
+            }
+        ));
     }
 
     #[test]
@@ -8058,6 +8321,49 @@ mod tests {
         assert!(alpha_at(right, right_last_x, 0) < 128);
         assert!(alpha_at(right, 0, 0) > 128);
         assert!(alpha_at(right, right_last_x, middle_y) > 128);
+    }
+
+    #[test]
+    fn solid_powerline_triangles_fill_exactly_one_terminal_cell() {
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let metrics = fonts.cell_metrics().expect("cell metrics");
+        let mut planner = RenderBatchPlanner::default();
+        let batches = planner
+            .prepare_full(
+                &scene_without_cursor(vec![cell(0, 0, "\u{e0b2}"), cell(0, 1, "\u{e0b0}")]),
+                &mut fonts,
+            )
+            .expect("prepare powerline triangles");
+
+        assert_eq!(batches.glyphs.glyph_count, 2);
+        for (index, position) in [
+            CellPosition { row: 0, col: 0 },
+            CellPosition { row: 0, col: 1 },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let expected = cell_region(position, metrics);
+            let vertices = &batches.glyphs.vertices[index * 4..index * 4 + 4];
+            let actual = RenderRect {
+                x: vertices[0].position_px[0].round() as i32,
+                y: vertices[0].position_px[1].round() as i32,
+                width: (vertices[2].position_px[0] - vertices[0].position_px[0]).round() as u32,
+                height: (vertices[2].position_px[1] - vertices[0].position_px[1]).round() as u32,
+            };
+            assert_eq!(
+                actual, expected,
+                "powerline triangle {index} escaped its cell"
+            );
+        }
+
+        assert_eq!(batches.atlas_uploads.len(), 2);
+        for (upload, col) in batches.atlas_uploads.iter().zip(0_u16..=1) {
+            let expected = cell_region(CellPosition { row: 0, col }, metrics);
+            assert_eq!(upload.format, GlyphBitmapFormat::Alpha);
+            assert_eq!(upload.entry.width, expected.width);
+            assert_eq!(upload.entry.height, expected.height);
+        }
     }
 
     #[test]
@@ -8164,6 +8470,24 @@ mod tests {
     }
 
     #[test]
+    fn batch_planner_reuses_cpu_geometry_storage_between_frames() {
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let mut planner = RenderBatchPlanner::default();
+        let test_scene = scene_without_cursor(vec![cell(0, 0, "panea")]);
+        let Ok(first) = planner.prepare_full(&test_scene, &mut fonts) else {
+            return;
+        };
+        let background_ptr = first.background.vertices.as_ptr();
+
+        let second = planner
+            .prepare_full_reusing(&test_scene, &mut fonts, Some(first))
+            .expect("same resolved font should prepare a recycled frame");
+
+        assert_eq!(second.background.vertices.as_ptr(), background_ptr);
+        assert!(second.background.vertices.capacity() > 0);
+    }
+
+    #[test]
     fn shaped_terminal_run_stays_aligned_with_cursor_cell() {
         const TEXT: &str = "panea-grid-cursor-check";
         let mut fonts = FontSystem::new_with_scale_factor(font_system::FontConfig::default(), 1.25);
@@ -8181,6 +8505,7 @@ mod tests {
             },
             shape: RenderCursorShape::Beam,
             color: RenderColor::rgb(255, 255, 255),
+            text_color: None,
             visible: true,
             thickness_percent: 15,
             corner_radius_px: 0,
@@ -8208,6 +8533,50 @@ mod tests {
             "text geometry escaped its terminal cells: text_right={text_right}, cursor_left={cursor_left}, cell_width={}",
             metrics.cell_width
         );
+    }
+
+    #[test]
+    fn cursor_text_color_changes_color_without_changing_glyph_geometry() {
+        let cells = vec![cell(0, 0, "a"), cell(0, 1, "b"), cell(0, 2, "c")];
+        let mut base = scene_without_cursor(cells);
+        let mut with_cursor = base.clone();
+        with_cursor.cursor = Some(CursorVisual {
+            position: CellPosition { row: 0, col: 1 },
+            shape: RenderCursorShape::Block,
+            color: RenderColor::rgb(255, 255, 255),
+            text_color: Some(RenderColor::rgb(1, 2, 3)),
+            visible: true,
+            thickness_percent: 15,
+            corner_radius_px: 0,
+            inactive: false,
+        });
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let mut planner = RenderBatchPlanner::default();
+        let Ok(without_batches) = planner.prepare_full(&base, &mut fonts) else {
+            return;
+        };
+        base.damage_regions.clear();
+        let with_batches = planner
+            .prepare_full(&with_cursor, &mut fonts)
+            .expect("cursor-colored run should prepare");
+
+        let without_positions = without_batches
+            .glyphs
+            .vertices
+            .iter()
+            .map(|vertex| vertex.position_px)
+            .collect::<Vec<_>>();
+        let with_positions = with_batches
+            .glyphs
+            .vertices
+            .iter()
+            .map(|vertex| vertex.position_px)
+            .collect::<Vec<_>>();
+        assert_eq!(with_positions, without_positions);
+        assert!(planner.glyph_runs.keys().any(|key| key.text == "abc"));
+        assert!(with_batches.glyphs.vertices.iter().any(|vertex| {
+            vertex.color[0] < 0.01 && vertex.color[1] < 0.02 && vertex.color[2] < 0.02
+        }));
     }
 
     #[test]
@@ -8298,7 +8667,32 @@ mod tests {
     }
 
     #[test]
-    fn incremental_batch_does_not_repaint_an_entire_intersecting_text_run() {
+    fn adjacent_cell_damage_coalesces_into_one_clear_region() {
+        let cell_width = 8;
+        let regions = (0..40)
+            .map(|col| RenderRect {
+                x: col * cell_width,
+                y: 0,
+                width: cell_width as u32,
+                height: 16,
+            })
+            .collect();
+
+        let merged = merge_regions(regions);
+
+        assert_eq!(
+            merged,
+            vec![RenderRect {
+                x: 0,
+                y: 0,
+                width: 320,
+                height: 16
+            }]
+        );
+    }
+
+    #[test]
+    fn incremental_batch_shapes_with_complete_run_context_but_emits_only_damaged_glyphs() {
         let mut fonts = FontSystem::new(font_system::FontConfig::default());
         let mut planner = RenderBatchPlanner::default();
         let mut test_scene = scene_without_cursor(vec![
@@ -8317,7 +8711,15 @@ mod tests {
         };
 
         assert_eq!(batches.background.quad_count(), 1);
-        assert_eq!(batches.glyphs.glyph_count, 1);
+        assert!(
+            (1..4).contains(&batches.glyphs.glyph_count),
+            "only glyphs intersecting the damaged cell, including fractional overhang, should be emitted"
+        );
+        assert!(
+            planner.glyph_runs.keys().any(|key| key.text == "abcd"),
+            "incremental rendering must not reshape a damaged suffix without its line context"
+        );
+        assert!(!planner.glyph_runs.keys().any(|key| key.text == "d"));
     }
 
     #[test]
@@ -8362,6 +8764,7 @@ mod tests {
             position: CellPosition { row: 0, col: 0 },
             shape: RenderCursorShape::Block,
             color: RenderColor::rgb(255, 255, 255),
+            text_color: None,
             visible: true,
             thickness_percent: 15,
             corner_radius_px: 4,
@@ -8388,11 +8791,17 @@ mod tests {
         let mut second = first.clone();
         second.grid.cells[0].text = "b".to_owned();
         let damage = tracker.update(&second, metrics());
-        assert_eq!(damage.len(), 3);
-        for (index, region) in damage.iter().enumerate() {
-            assert_eq!(region.x, 12 + i32::try_from(index).unwrap() * 8);
-            assert_eq!(region.y, 8);
-            assert!(region.width <= metrics().cell_width.ceil() as u32);
+        assert_eq!(damage.len(), 1);
+        for index in 0..3 {
+            assert!(damage_covers(
+                &damage,
+                RenderRect {
+                    x: 12 + index * 8,
+                    y: 8,
+                    width: 8,
+                    height: 16
+                }
+            ));
         }
     }
 
@@ -8420,6 +8829,7 @@ mod tests {
             position: CellPosition { row: 1, col: 1 },
             shape: RenderCursorShape::Block,
             color: RenderColor::rgb(255, 255, 255),
+            text_color: None,
             visible: true,
             thickness_percent: 15,
             corner_radius_px: 0,

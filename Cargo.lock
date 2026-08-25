@@ -158,7 +158,7 @@ dependencies = [
 
 [[package]]
 name = "assets"
-version = "0.1.7"
+version = "0.1.8"
 
 [[package]]
 name = "async-broadcast"
@@ -602,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "config-core"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -611,14 +611,14 @@ dependencies = [
 
 [[package]]
 name = "config-lua"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "config-core",
 ]
 
 [[package]]
 name = "config-toml"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "config-core",
  "serde_json",
@@ -749,7 +749,7 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "diagnostics"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "config-core",
  "platform-core",
@@ -964,7 +964,7 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "font-system"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ab_glyph",
  "fontdb",
@@ -1795,7 +1795,7 @@ dependencies = [
 
 [[package]]
 name = "mux"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "serde",
 ]
@@ -2363,7 +2363,7 @@ dependencies = [
 
 [[package]]
 name = "panea-bench"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "config-core",
  "diagnostics",
@@ -2377,7 +2377,7 @@ dependencies = [
 
 [[package]]
 name = "panea-desktop"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "config-core",
  "config-lua",
@@ -2407,7 +2407,7 @@ dependencies = [
 
 [[package]]
 name = "panea-ios"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "config-core",
  "font-system",
@@ -2422,7 +2422,7 @@ dependencies = [
 
 [[package]]
 name = "panea-windows-installer"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "winres",
 ]
@@ -2530,11 +2530,11 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "platform-core"
-version = "0.1.7"
+version = "0.1.8"
 
 [[package]]
 name = "platform-winit"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "arboard",
  "notify-rust",
@@ -2859,11 +2859,11 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "render-core"
-version = "0.1.7"
+version = "0.1.8"
 
 [[package]]
 name = "render-wgpu"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "assets",
  "bytemuck",
@@ -3021,7 +3021,7 @@ dependencies = [
 
 [[package]]
 name = "security"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "base64",
  "keyring",
@@ -3056,7 +3056,7 @@ dependencies = [
 
 [[package]]
 name = "semantics"
-version = "0.1.7"
+version = "0.1.8"
 
 [[package]]
 name = "semver"
@@ -3161,7 +3161,7 @@ dependencies = [
 
 [[package]]
 name = "shell-integration"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "proptest",
  "semantics",
@@ -3410,7 +3410,7 @@ dependencies = [
 
 [[package]]
 name = "term-core"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "proptest",
  "unicode-segmentation",
@@ -3419,7 +3419,7 @@ dependencies = [
 
 [[package]]
 name = "term-parser"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "proptest",
  "term-core",
@@ -3681,11 +3681,11 @@ dependencies = [
 
 [[package]]
 name = "transport-core"
-version = "0.1.7"
+version = "0.1.8"
 
 [[package]]
 name = "transport-pty"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "portable-pty",
  "transport-core",
@@ -3693,7 +3693,7 @@ dependencies = [
 
 [[package]]
 name = "transport-ssh"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "security",
  "ssh2",
@@ -4667,7 +4667,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "assets",
  "config-core",
