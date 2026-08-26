@@ -1,6 +1,7 @@
 use std::{
     env,
     error::Error,
+    hint::black_box,
     process::ExitCode,
     sync::Arc,
     time::{Duration, Instant},
@@ -18,7 +19,9 @@ use render_core::{
     RenderGrid, RenderInstrumentation, RenderRect, RenderScene, WindowChromeControlKind,
     WindowChromeControlVisual, WindowChromeVisual,
 };
-use render_wgpu::{DamageTracker, TerminalRasterizer};
+use render_wgpu::{
+    CursorOverlayFrame, DamageTracker, TerminalRasterizer, prepare_cursor_overlay_reusing,
+};
 use term_core::{
     CellAttributes, Color, CursorShape, TerminalCore, TerminalSize as CoreTerminalSize,
 };
@@ -470,7 +473,7 @@ fn partial_update_bench() -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
 
     for iteration in 0..iterations {
-        scene.grid.cells[target_index].text = if iteration % 2 == 0 { "x" } else { " " }.to_owned();
+        scene.grid.cells[target_index].text = if iteration % 2 == 0 { "x" } else { " " }.into();
         let x0 = (f32::from(target_col) * metrics.cell_width).floor() as i32;
         let x1 = (f32::from(target_col + 1) * metrics.cell_width).ceil() as i32;
         let y0 = (f32::from(target_row) * metrics.cell_height).floor() as i32;
@@ -537,13 +540,15 @@ fn parse_and_render(
     let mut rasterizer = TerminalRasterizer::default();
     let started = Instant::now();
     let mut last = RenderInstrumentation::default();
+    let mut recycled = None;
 
     for _ in 0..iterations {
         terminal.apply_bytes(&fixture)?;
         let scene = scene_from_terminal(&terminal);
-        last = rasterizer
-            .rasterize_instrumented(&scene, &mut fonts)?
-            .instrumentation;
+        let batches =
+            rasterizer.prepare_full_batches_reusing(&scene, &mut fonts, recycled.take())?;
+        last = batches.instrumentation;
+        recycled = Some(batches);
     }
 
     print_result(BenchmarkResult {
@@ -588,10 +593,11 @@ fn input_latency() -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
 
     for _ in 0..iterations {
-        terminal.apply_bytes(b"x")?;
+        terminal.apply_bytes(black_box(b"x"))?;
     }
 
     let elapsed = started.elapsed();
+    black_box(terminal.cursor_state());
     let average = elapsed / iterations as u32;
     println!(
         "bench=input-latency iterations={iterations} total={elapsed:?} average_per_input={average:?}"
@@ -616,6 +622,32 @@ fn cursor_animation_cost() -> Result<(), Box<dyn Error>> {
     if !disabled_report.passed {
         return Err("disabled cursor animation recorded render work".into());
     }
+
+    let overlay_scene = generated_scene(
+        DEFAULT_COLS,
+        DEFAULT_ROWS,
+        OptionalFeatureCostMode::EnabledDefault,
+    );
+    let overlay = CursorOverlayFrame::from_scene(&overlay_scene);
+    let metrics = fonts.cell_metrics()?;
+    let iterations = 100_000u32;
+    let mut recycled = None;
+    let started = Instant::now();
+    for _ in 0..iterations {
+        recycled = Some(black_box(prepare_cursor_overlay_reusing(
+            black_box(&overlay),
+            metrics,
+            recycled.take(),
+        )));
+    }
+    let elapsed = started.elapsed();
+    let average = elapsed / iterations;
+    println!(
+        "feature=cursor-overlay iterations={iterations} total={elapsed:?} average={average:?} draw_calls={}",
+        recycled
+            .as_ref()
+            .map_or(0, render_wgpu::PreparedCursorOverlay::draw_call_count)
+    );
 
     for mode in [
         OptionalFeatureCostMode::EnabledDefault,
@@ -790,7 +822,7 @@ fn generated_scene(cols: u16, rows: u16, feature_mode: OptionalFeatureCostMode) 
                     row: i64::from(row),
                     col,
                 },
-                text: ch.to_owned(),
+                text: ch.into(),
                 foreground: RenderColor::rgb(230, 230, 230),
                 background: if row % 2 == 0 {
                     RenderColor::rgb(12, 12, 12)
@@ -864,7 +896,7 @@ fn generated_scene(cols: u16, rows: u16, feature_mode: OptionalFeatureCostMode) 
 fn coding_agent_scene(cols: u16, rows: u16) -> RenderScene {
     let mut scene = generated_scene(cols, rows, OptionalFeatureCostMode::Disabled);
     for cell in &mut scene.grid.cells {
-        cell.text = " ".to_owned();
+        cell.text = " ".into();
         cell.foreground = RenderColor::rgb(214, 222, 244);
         cell.background = RenderColor::rgb(18, 18, 28);
         cell.style = RenderCellStyle::default();
@@ -884,7 +916,7 @@ fn coding_agent_scene(cols: u16, rows: u16) -> RenderScene {
     for (row, line) in lines.into_iter().enumerate().take(usize::from(rows)) {
         for (col, ch) in line.chars().enumerate().take(usize::from(cols)) {
             let index = row * usize::from(cols) + col;
-            scene.grid.cells[index].text = ch.to_string();
+            scene.grid.cells[index].text = ch.to_string().into();
         }
     }
     scene.cursor = Some(CursorVisual {
@@ -917,7 +949,7 @@ fn unicode_scene(cols: u16, rows: u16, emoji_heavy: bool) -> RenderScene {
     };
     let mut scene = generated_scene(cols, rows, OptionalFeatureCostMode::Disabled);
     for (index, cell) in scene.grid.cells.iter_mut().enumerate() {
-        cell.text = samples[index % samples.len()].to_owned();
+        cell.text = samples[index % samples.len()].into();
     }
     scene
 }
@@ -936,6 +968,7 @@ fn animation(id: u64, x: i32, y: i32) -> AnimationHandle {
         start_region: region,
         end_region: region,
         color: RenderColor::rgb(120, 190, 255),
+        quad: None,
         elapsed: Duration::from_millis(16),
         remaining: Some(Duration::from_millis(120)),
     }

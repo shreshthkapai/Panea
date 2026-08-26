@@ -296,11 +296,16 @@ provider polling.
 [cursor]
 shape = "block"
 blink = true
+animation = "static" # static, panea, or custom
 animations_enabled = false
 smooth_movement = false
 typing_pulse = false
 typing_stretch = false
 trail = false
+trail_delay_ms = 1
+trail_start_threshold_cells = 2
+trail_decay_fast_ms = 100
+trail_decay_slow_ms = 400
 blink_easing = false
 short_lived_glow = false
 shadow = false
@@ -345,6 +350,15 @@ block_margin_px = 3
 block_padding_px = 6
 badge_gap_px = 4
 ```
+
+`cursor.animation = "panea"` enables Panea's fast directional tilt and short
+elastic extension. It keeps the logical cursor at its destination immediately,
+leans with horizontal movement, and collapses the extension from the previous
+cell within a bounded cursor-local region.
+`"static"` performs
+no animation work. `"custom"` enables the individual effect controls shown
+above. Existing configs that omit `cursor.animation` continue to use
+`animations_enabled` and the individual controls for compatibility.
 
 `cursor.image.path` accepts GIF animation or a static PNG. Relative paths are
 resolved from the config file directory; `~/...` uses the current platform home

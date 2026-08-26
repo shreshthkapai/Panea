@@ -4,6 +4,8 @@ pub const LAYER: &str = "render performance";
 
 use std::{sync::Arc, time::Duration};
 
+pub use compact_str::CompactString as RenderText;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderColor {
     pub red: u8,
@@ -33,7 +35,7 @@ pub struct CellPosition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderCell {
     pub position: CellPosition,
-    pub text: String,
+    pub text: RenderText,
     pub foreground: RenderColor,
     pub background: RenderColor,
     pub style: RenderCellStyle,
@@ -237,11 +239,19 @@ pub enum AnimationKind {
     CursorSmoothMovement,
     CursorTypingPulse,
     CursorTypingStretch,
+    CursorTilt,
+    CursorElasticExtension,
     CursorTrail,
     CursorBlinkEasing,
     CursorGlow,
     CursorShadow,
     OverlayTransition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnimationQuad {
+    /// Corner coordinates in 1/256th pixel units, clockwise from top-left.
+    pub corners_subpixels: [[i32; 2]; 4],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,6 +262,7 @@ pub struct AnimationHandle {
     pub start_region: RenderRect,
     pub end_region: RenderRect,
     pub color: RenderColor,
+    pub quad: Option<AnimationQuad>,
     pub elapsed: Duration,
     pub remaining: Option<Duration>,
 }
@@ -533,13 +544,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn render_core_has_no_crate_dependencies() {
+    fn render_core_has_no_gpu_platform_or_session_dependencies() {
         let manifest = include_str!("../Cargo.toml");
 
-        assert!(
-            !manifest.contains("[dependencies]"),
-            "render-core must stay renderer-independent and avoid GPU API dependencies"
-        );
+        for forbidden in [
+            "wgpu",
+            "winit",
+            "platform-",
+            "transport-",
+            "term-core",
+            "term-parser",
+            "shell-integration",
+        ] {
+            assert!(
+                !manifest.contains(forbidden),
+                "render-core must not depend on {forbidden}"
+            );
+        }
     }
 
     #[derive(Debug, Default)]
@@ -583,7 +604,7 @@ mod tests {
                 rows: 1,
                 cells: vec![RenderCell {
                     position: CellPosition { row: 0, col: 0 },
-                    text: "P".to_owned(),
+                    text: "P".into(),
                     foreground: RenderColor::rgb(230, 230, 230),
                     background: RenderColor::rgb(10, 10, 10),
                     style: RenderCellStyle::default(),
@@ -605,6 +626,19 @@ mod tests {
         assert_eq!(renderer.rendered_cells, 1);
         assert_eq!(renderer.status(), RenderSurfaceStatus::Ready);
         assert_eq!(instrumentation.damage_region_count, 1);
+    }
+
+    #[test]
+    fn ordinary_render_cell_text_stays_inline() {
+        let cell = RenderCell {
+            position: CellPosition { row: 0, col: 0 },
+            text: "x".into(),
+            foreground: RenderColor::rgb(255, 255, 255),
+            background: RenderColor::rgb(0, 0, 0),
+            style: RenderCellStyle::default(),
+        };
+
+        assert!(!cell.text.is_heap_allocated());
     }
 
     #[test]

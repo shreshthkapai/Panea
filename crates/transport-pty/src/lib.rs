@@ -504,6 +504,10 @@ impl TerminalTransport for LocalPtyTransport {
         }
     }
 
+    fn periodic_poll_interval(&self) -> Option<Duration> {
+        None
+    }
+
     fn write_input(&mut self, bytes: &[u8]) -> TransportResult<()> {
         if matches!(
             self.state,
@@ -891,10 +895,10 @@ mod tests {
     fn event_loop_emits_shell_output_without_blocking() {
         let transport =
             LocalPtyTransport::spawn(smoke_profile(), test_size()).expect("spawn shell");
-        let event_loop = TransportEventLoop::spawn_with_queue_bound(transport, 16);
+        let event_loop = TransportEventLoop::spawn(transport);
 
         event_loop
-            .send_command(TransportCommand::WriteInput(shell_print_command().to_vec()))
+            .send_command(TransportCommand::write_input(shell_print_command()))
             .expect("send command");
 
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -907,7 +911,7 @@ mod tests {
                         .any(|window| window == b"\x1b[6n")
                     {
                         event_loop
-                            .send_command(TransportCommand::WriteInput(b"\x1b[1;1R".to_vec()))
+                            .send_command(TransportCommand::write_input(b"\x1b[1;1R".as_slice()))
                             .expect("answer terminal cursor query");
                     }
 

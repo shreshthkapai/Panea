@@ -210,6 +210,10 @@ impl SshTransport {
 }
 
 impl TerminalTransport for SshTransport {
+    fn periodic_poll_interval(&self) -> Option<Duration> {
+        Some(Duration::from_millis(8))
+    }
+
     fn write_input(&mut self, bytes: &[u8]) -> TransportResult<()> {
         if self.output_closed {
             return Err(TransportError::new("SSH session is closed"));

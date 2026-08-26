@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     error::Error,
     fs,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -46,14 +46,15 @@ use platform_winit::{
     apply_window_mode_with_decoration, create_event_loop, platform_capabilities,
 };
 use render_core::{
-    CellPosition, CursorVisual, OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle,
-    RenderColor, RenderCursorShape, RenderGrid, RenderInstrumentation, RenderOffset, RenderRect,
-    RenderScene, SelectionVisual, WindowChromeControlKind, WindowChromeControlVisual,
-    WindowChromeVisual,
+    CellPosition, CursorVisual, FrameRequestReason, OverlayKind, OverlayPrimitive, RenderCell,
+    RenderCellStyle, RenderColor, RenderCursorShape, RenderGrid, RenderInstrumentation,
+    RenderOffset, RenderRect, RenderScene, SelectionVisual, WindowChromeControlKind,
+    WindowChromeControlVisual, WindowChromeVisual,
 };
 use render_wgpu::{
     AnimatedCursorImageCache, AnimatedCursorImageRequest, AnimatedCursorImageRuntime,
-    AnimatedCursorImageStatus, CursorAnimationRuntime, CursorAnimationSettings, CursorBlinkRuntime,
+    AnimatedCursorImageStatus, AnimationFramePacer, AnimationFramePacerDecision,
+    CursorAnimationRuntime, CursorAnimationSettings, CursorBlinkRuntime, CursorOverlayFrame,
     CursorVectorCache, CursorVectorRequest, CursorVectorRuntime, CursorVectorStatus, DamageTracker,
     FrameDecision, FrameScheduler, GpuTerminalRenderer, PresentMode, RendererError,
     RendererOptions, RetainedDamageStatus,
@@ -86,8 +87,8 @@ use term_core::{
 };
 use term_parser::TerminalEmulator;
 use transport_core::{
-    TerminalSize as TransportSize, TerminalTransport, TransportOutput, TransportResult,
-    TransportState, TransportWakeHandle,
+    TerminalSize as TransportSize, TerminalTransport, TransportCommand, TransportEvent,
+    TransportEventLoop, TransportOutput, TransportResult, TransportState, TransportWakeHandle,
 };
 use transport_pty::{LocalPtyTransport, LocalShellKind, LocalShellProfile};
 use transport_ssh::{SshConnectionProfile, SshTransport};
@@ -1229,6 +1230,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
     );
     let mut scheduler = FrameScheduler::new();
     let mut damage_tracker = DamageTracker::new();
+    let mut retained_scene: Option<RenderScene> = None;
     let mut performance_overlay_ui = PerformanceOverlayUiState::new(&config.diagnostics);
     let mut performance_overlay = PerformanceOverlay::new(performance_overlay_ui.enabled, "wgpu");
     update_performance_overlay_context(
@@ -1238,6 +1240,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
     );
     let mut performance_budget = performance_budget_from_config(&config);
     let mut cursor_animator = CursorAnimationRuntime::new();
+    let mut animation_frame_pacer = AnimationFramePacer::new();
     let mut cursor_blink = CursorBlinkRuntime::new();
     let mut window_focused = true;
     let mut pointer_visible = true;
@@ -1286,6 +1289,10 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
         match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
                 WindowEvent::RedrawRequested => {
+                    let frame_reason = match scheduler.next_frame() {
+                        FrameDecision::FrameNeeded(reason) => reason,
+                        FrameDecision::NoFrameNeeded => FrameRequestReason::Explicit,
+                    };
                     let metrics = fonts.cell_metrics().ok();
                     let observed_size = window.inner_size();
                     if surface_size_is_renderable(observed_size) && observed_size != surface_size {
@@ -1294,32 +1301,58 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                         pending_terminal_resize.queue(surface_size);
                         damage_tracker.request_full_redraw();
                     }
-                    let mut scene = scene_from_mux(
-                        &mux_runtime,
-                        metrics,
-                        &config,
-                        Some(&mut cursor_animator),
-                        Some(&mut cursor_image_runtime),
-                        Some(&mut cursor_vector_runtime),
-                        CursorPresentation {
-                            blink_visible: cursor_blink.visible(),
-                            window_focused,
-                        },
+                    let other_animation_active = cursor_image_runtime.next_frame_after().is_some()
+                        || fullscreen_chrome.next_deadline().is_some();
+                    let reuse_cursor_scene = should_reuse_scene_for_cursor_animation(
+                        frame_reason,
+                        retained_scene.is_some(),
+                        cursor_animator.needs_frame(),
+                        other_animation_active,
+                        performance_overlay.is_enabled(),
                     );
-                    append_fullscreen_chrome_visual(
-                        &mut scene,
-                        &fullscreen_chrome,
-                        &config.window.title,
-                        config.window.fullscreen_titlebar.show_window_controls,
-                    );
-                    if let Some(metrics) = metrics {
-                        append_performance_overlay(
-                            &mut scene,
-                            &performance_overlay,
-                            &performance_overlay_ui,
-                            performance_budget,
+                    let mut scene = if reuse_cursor_scene {
+                        let mut scene = retained_scene
+                            .take()
+                            .expect("cursor-only frame requires a retained scene");
+                        if let Some(metrics) = metrics {
+                            cursor_animator.refresh_retained_scene(
+                                &mut scene,
+                                metrics,
+                                cursor_animation_settings(&config),
+                            );
+                        }
+                        scene
+                    } else {
+                        let mut scene = scene_from_mux(
+                            &mux_runtime,
                             metrics,
+                            &config,
+                            Some(&mut cursor_animator),
+                            Some(&mut cursor_image_runtime),
+                            Some(&mut cursor_vector_runtime),
+                            CursorPresentation {
+                                blink_visible: cursor_blink.visible(),
+                                window_focused,
+                            },
                         );
+                        append_fullscreen_chrome_visual(
+                            &mut scene,
+                            &fullscreen_chrome,
+                            &config.window.title,
+                            config.window.fullscreen_titlebar.show_window_controls,
+                        );
+                        if let Some(metrics) = metrics {
+                            append_performance_overlay(
+                                &mut scene,
+                                &performance_overlay,
+                                &performance_overlay_ui,
+                                performance_budget,
+                                metrics,
+                            );
+                        }
+                        scene
+                    };
+                    if let Some(metrics) = metrics {
                         if let Some(cursor) = scene.cursor {
                             let x = scene.content_offset.x.max(0) as f64
                                 + f64::from(cursor.position.col) * f64::from(metrics.cell_width);
@@ -1334,12 +1367,26 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                 ),
                             );
                         }
-                        scene.damage_regions = damage_tracker.update(&scene, metrics);
+                        scene.damage_regions = if reuse_cursor_scene {
+                            damage_tracker.update_animations_only(&scene, metrics)
+                        } else {
+                            damage_tracker.update(&scene, metrics)
+                        };
                     }
                     let idle_wakeups = scheduler.take_idle_wakeups();
-                    match catch_unwind(AssertUnwindSafe(|| {
+                    let render_result = catch_unwind(AssertUnwindSafe(|| {
+                        if reuse_cursor_scene
+                            && let Some(metrics) = metrics
+                            && renderer.render_cursor_overlay(
+                                &CursorOverlayFrame::from_scene(&scene),
+                                metrics,
+                            )?
+                        {
+                            return Ok(());
+                        }
                         renderer.render_scene(&scene, &mut fonts)
-                    })) {
+                    }));
+                    match render_result {
                         Ok(Ok(())) => {
                             let mut instrumentation = renderer.last_instrumentation();
                             instrumentation.idle_wakeups = idle_wakeups;
@@ -1428,6 +1475,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                             scheduler.terminal_content_changed();
                         }
                     }
+                    retained_scene = Some(scene);
                 }
                 _ => {
                     // PTY output can contain synchronous terminal queries (for
@@ -2450,6 +2498,10 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                 }
                 let animation_delay = cursor_animator.next_frame_after(cursor_settings);
                 let cursor_image_delay = cursor_image_runtime.next_frame_after();
+                let visual_animation_delay = [animation_delay, cursor_image_delay]
+                    .into_iter()
+                    .flatten()
+                    .min();
                 let blink_delay = cursor_blink.next_frame_after();
                 let power_delay = power_monitor.next_refresh_after();
                 // SSH currently exposes non-blocking reads without a native
@@ -2458,22 +2510,18 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                 let transport_poll_delay = mux_runtime
                     .requires_periodic_transport_poll()
                     .then_some(Duration::from_millis(8));
-                let next_delay = [
-                    animation_delay,
-                    cursor_image_delay,
-                    blink_delay,
-                    power_delay,
-                    transport_poll_delay,
-                ]
+                let next_delay = [blink_delay, power_delay, transport_poll_delay]
                 .into_iter()
                 .flatten()
                 .min();
-                let mut next_wake = next_delay.map(|delay| Instant::now() + delay);
-                if next_delay.is_some()
-                    && (animation_delay.is_some() || cursor_image_delay.is_some())
-                {
-                    scheduler.animation_changed();
-                }
+                let mut next_wake = next_delay.map(|delay| now + delay);
+                pace_animation_wake(
+                    now,
+                    visual_animation_delay,
+                    &mut animation_frame_pacer,
+                    &mut scheduler,
+                    &mut next_wake,
+                );
                 if gui_smoke_mode == Some(GuiSmokeMode::Startup)
                     && !gui_smoke_startup_validated
                     && let Some(observed_at) = gui_smoke_startup_prompt_observed_at
@@ -2499,7 +2547,7 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                     target.set_control_flow(ControlFlow::WaitUntil(deadline));
                 }
 
-                if matches!(scheduler.next_frame(), FrameDecision::FrameNeeded(_)) {
+                if scheduler.has_pending_frame() {
                     window.request_redraw();
                 }
             }
@@ -2518,6 +2566,40 @@ fn retain_earliest_deadline(current: &mut Option<Instant>, candidate: Instant) {
     if current.is_none_or(|deadline| candidate < deadline) {
         *current = Some(candidate);
     }
+}
+
+fn pace_animation_wake(
+    now: Instant,
+    next_frame_after: Option<Duration>,
+    pacer: &mut AnimationFramePacer,
+    scheduler: &mut FrameScheduler,
+    next_wake: &mut Option<Instant>,
+) -> bool {
+    match pacer.poll(now, next_frame_after) {
+        AnimationFramePacerDecision::Idle => false,
+        AnimationFramePacerDecision::WaitUntil(deadline) => {
+            retain_earliest_deadline(next_wake, deadline);
+            false
+        }
+        AnimationFramePacerDecision::FrameDue => {
+            scheduler.animation_changed();
+            true
+        }
+    }
+}
+
+const fn should_reuse_scene_for_cursor_animation(
+    reason: FrameRequestReason,
+    cached_scene_available: bool,
+    cursor_animation_active: bool,
+    other_animation_active: bool,
+    performance_overlay_active: bool,
+) -> bool {
+    matches!(reason, FrameRequestReason::Animation)
+        && cached_scene_available
+        && cursor_animation_active
+        && !other_animation_active
+        && !performance_overlay_active
 }
 
 fn reload_requires_terminal_resize(plan: &ReloadPlan) -> bool {
@@ -3002,9 +3084,10 @@ fn renderer_options(config: &AppConfig) -> RendererOptions {
     RendererOptions {
         present_mode: match config.renderer.present_mode {
             PresentModePreference::Immediate => PresentMode::Immediate,
-            PresentModePreference::Auto
-            | PresentModePreference::Fifo
-            | PresentModePreference::Mailbox => PresentMode::Vsync,
+            PresentModePreference::Fifo => PresentMode::Fifo,
+            PresentModePreference::Mailbox => PresentMode::Mailbox,
+            PresentModePreference::Auto if config.renderer.vsync => PresentMode::Auto,
+            PresentModePreference::Auto => PresentMode::Immediate,
         },
         damage_tracking: config.renderer.damage_tracking,
         gpu_timestamps: config.renderer.gpu_timestamps,
@@ -3029,19 +3112,37 @@ fn cursor_animation_settings(config: &AppConfig) -> CursorAnimationSettings {
         .map_or(config.performance.max_animation_fps, |limit| {
             limit.min(config.performance.max_animation_fps)
         });
-    CursorAnimationSettings {
+    let mut settings = CursorAnimationSettings {
         enabled: config.cursor.animations_enabled,
+        tilt: false,
         smooth_movement: config.cursor.smooth_movement,
         typing_pulse: config.cursor.typing_pulse,
         typing_stretch: config.cursor.typing_stretch,
         trail: config.cursor.trail,
+        trail_delay: Duration::from_millis(u64::from(config.cursor.trail_delay_ms)),
+        trail_start_threshold_cells: config.cursor.trail_start_threshold_cells,
+        trail_decay_fast: Duration::from_millis(u64::from(config.cursor.trail_decay_fast_ms)),
+        trail_decay_slow: Duration::from_millis(u64::from(config.cursor.trail_decay_slow_ms)),
         blink_easing: config.cursor.blink_easing,
         short_lived_glow: config.cursor.short_lived_glow,
         shadow: config.cursor.shadow,
         fps,
         max_active_animations: config.performance.max_active_animations,
         max_animated_region_pixels: config.performance.max_animated_region_pixels,
+    };
+    match config.cursor.animation {
+        Some(config_core::CursorAnimationProfile::Static) => settings.enabled = false,
+        Some(config_core::CursorAnimationProfile::Panea) => {
+            return CursorAnimationSettings::panea(
+                fps,
+                config.performance.max_active_animations,
+                config.performance.max_animated_region_pixels,
+            );
+        }
+        Some(config_core::CursorAnimationProfile::Custom) => settings.enabled = true,
+        None => {}
     }
+    settings
 }
 
 fn request_cursor_image_if_enabled(
@@ -3136,10 +3237,12 @@ fn spawn_session_transport(
             if let Some(directory) = &spec.working_directory {
                 profile.working_directory = Some(PathBuf::from(directory));
             }
-            let mut transport = LocalPtyTransport::spawn(profile, size)?;
-            transport.set_output_waker(Some(output_waker.clone()));
+            let transport = LocalPtyTransport::spawn(profile, size)?;
             Ok(InitialTransport {
-                transport: PaneTransport::Local(Box::new(transport)),
+                transport: PaneTransport::Local(PaneTransportLoop::new(
+                    transport,
+                    output_waker.clone(),
+                )),
                 semantic_mode: semantic_mode_for_activation(&activation),
                 parse_semantic_events: activation.parses_escape_sequences(),
                 activation_diagnostics: activation.diagnostics,
@@ -3299,10 +3402,86 @@ impl SecretPromptProvider for ChannelSecretPromptProvider {
     }
 }
 
+const MAX_OUTPUT_BYTES_PER_GUI_TICK: usize = 64 * 1024;
+
+struct PaneTransportLoop {
+    io: Option<TransportEventLoop>,
+    pending_events: VecDeque<TransportEvent>,
+    output_waker: TransportWakeHandle,
+}
+
+impl PaneTransportLoop {
+    fn new<T>(transport: T, output_waker: TransportWakeHandle) -> Self
+    where
+        T: TerminalTransport + 'static,
+    {
+        let worker_waker = output_waker.clone();
+        Self {
+            io: Some(TransportEventLoop::spawn_with_waker(
+                transport,
+                worker_waker,
+            )),
+            pending_events: VecDeque::new(),
+            output_waker,
+        }
+    }
+
+    fn send(&self, command: TransportCommand) -> TransportResult<()> {
+        self.io
+            .as_ref()
+            .ok_or_else(|| transport_core::TransportError::new("transport worker is closed"))?
+            .send_command(command)
+            .map_err(|error| transport_core::TransportError::new(error.to_string()))
+    }
+
+    fn poll_output(&mut self) -> TransportResult<TransportOutput> {
+        let Some(io) = self.io.as_ref() else {
+            return Ok(TransportOutput::closed());
+        };
+        let mut output = TransportOutput::bytes(Vec::new());
+        while output.bytes.len() < MAX_OUTPUT_BYTES_PER_GUI_TICK {
+            let Some(event) = self.pending_events.pop_front().or_else(|| io.poll_event()) else {
+                break;
+            };
+            match event {
+                TransportEvent::Output(mut bytes) => {
+                    let remaining = MAX_OUTPUT_BYTES_PER_GUI_TICK - output.bytes.len();
+                    if bytes.len() > remaining {
+                        let overflow = bytes.split_off(remaining);
+                        self.pending_events
+                            .push_front(TransportEvent::Output(overflow));
+                    }
+                    output.bytes.append(&mut bytes);
+                }
+                TransportEvent::Lifecycle(event) => {
+                    output.closed |=
+                        matches!(event, transport_core::TransportLifecycleEvent::Closed);
+                    output.lifecycle.push(event);
+                }
+                TransportEvent::Error(message) => {
+                    return Err(transport_core::TransportError::new(message));
+                }
+            }
+        }
+        if !self.pending_events.is_empty() {
+            self.output_waker.wake();
+        }
+        Ok(output)
+    }
+
+    fn shutdown(&mut self) -> TransportResult<()> {
+        let Some(io) = self.io.take() else {
+            return Ok(());
+        };
+        io.shutdown()
+            .map_err(|error| transport_core::TransportError::new(error.to_string()))
+    }
+}
+
 enum PaneTransport {
-    Local(Box<LocalPtyTransport>),
+    Local(PaneTransportLoop),
     ConnectingSsh(PendingSshTransport),
-    Ssh(Box<SshTransport>),
+    Ssh(PaneTransportLoop),
     Failed { message: String, reported: bool },
 }
 
@@ -3368,13 +3547,15 @@ impl PaneTransport {
             )),
         };
         match result {
-            Ok(mut transport) => {
-                transport.set_output_waker(Some(pending.output_waker.clone()));
-                transport.resize(pending.requested_size)?;
+            Ok(transport) => {
+                let io = PaneTransportLoop::new(transport, pending.output_waker.clone());
+                io.send(TransportCommand::Resize(pending.requested_size))?;
                 if !pending.pending_input.is_empty() {
-                    transport.write_input(&pending.pending_input)?;
+                    io.send(TransportCommand::write_input(std::mem::take(
+                        &mut pending.pending_input,
+                    )))?;
                 }
-                *self = Self::Ssh(Box::new(transport));
+                *self = Self::Ssh(io);
                 Ok(())
             }
             Err(error) => {
@@ -3391,8 +3572,9 @@ impl PaneTransport {
     fn write_input(&mut self, bytes: &[u8]) -> TransportResult<()> {
         self.promote_ssh()?;
         match self {
-            Self::Local(transport) => transport.write_input(bytes),
-            Self::Ssh(transport) => transport.write_input(bytes),
+            Self::Local(transport) | Self::Ssh(transport) => {
+                transport.send(TransportCommand::write_input(bytes))
+            }
             Self::ConnectingSsh(pending) => {
                 if pending.pending_input.len().saturating_add(bytes.len())
                     > MAX_PENDING_SSH_INPUT_BYTES
@@ -3413,8 +3595,9 @@ impl PaneTransport {
     fn resize(&mut self, size: TransportSize) -> TransportResult<()> {
         self.promote_ssh()?;
         match self {
-            Self::Local(transport) => transport.resize(size),
-            Self::Ssh(transport) => transport.resize(size),
+            Self::Local(transport) | Self::Ssh(transport) => {
+                transport.send(TransportCommand::Resize(size))
+            }
             Self::ConnectingSsh(pending) => {
                 pending.requested_size = size;
                 Ok(())
@@ -3428,8 +3611,7 @@ impl PaneTransport {
     fn poll_output(&mut self) -> TransportResult<TransportOutput> {
         self.promote_ssh()?;
         match self {
-            Self::Local(transport) => transport.poll_output(),
-            Self::Ssh(transport) => transport.poll_output(),
+            Self::Local(transport) | Self::Ssh(transport) => transport.poll_output(),
             Self::ConnectingSsh(_) => Ok(TransportOutput::bytes(Vec::new())),
             Self::Failed { message, reported } => {
                 if *reported {
@@ -3444,14 +3626,13 @@ impl PaneTransport {
 
     fn shutdown(&mut self) -> TransportResult<()> {
         match self {
-            Self::Local(transport) => transport.shutdown(),
-            Self::Ssh(transport) => transport.shutdown(),
+            Self::Local(transport) | Self::Ssh(transport) => transport.shutdown(),
             Self::ConnectingSsh(_) | Self::Failed { .. } => Ok(()),
         }
     }
 
     fn requires_periodic_poll(&self) -> bool {
-        matches!(self, Self::ConnectingSsh(_) | Self::Ssh(_))
+        matches!(self, Self::ConnectingSsh(_))
     }
 }
 
@@ -6641,9 +6822,15 @@ impl PaneRuntime {
     }
 
     fn write_input(&mut self, bytes: &[u8]) {
-        if self.transport.is_some()
-            && let Some(detector) = self.heuristic_detector.as_mut()
-        {
+        let Some(transport) = self.transport.as_mut() else {
+            return;
+        };
+
+        // Terminal input has priority over optional semantic bookkeeping. The
+        // transport worker owns all potentially blocking backend I/O.
+        write_terminal_input(&mut self.terminal, transport, bytes);
+
+        if let Some(detector) = self.heuristic_detector.as_mut() {
             let cursor = self.terminal.state().cursor_buffer_position();
             let events = detector.observe_input(
                 bytes,
@@ -6656,9 +6843,6 @@ impl PaneRuntime {
             for event in events {
                 self.semantic_timeline.apply_event(event);
             }
-        }
-        if let Some(transport) = self.transport.as_mut() {
-            write_terminal_input(&mut self.terminal, transport, bytes);
         }
     }
 
@@ -6774,6 +6958,9 @@ impl PaneRuntime {
                 stats.content_changed = true;
                 stats.closed = !self.disconnect_notified;
                 self.disconnect_notified = true;
+                break;
+            }
+            if !output.bytes.is_empty() {
                 break;
             }
         }
@@ -7419,7 +7606,7 @@ fn append_tab_bar_cells(scene: &mut RenderScene, runtime: &MuxRuntime, config: &
             }
             scene.grid.cells.push(RenderCell {
                 position: CellPosition { row: 0, col },
-                text: ch.to_string(),
+                text: ch.to_string().into(),
                 foreground: render_color(if active {
                     config.mux.appearance.active_tab_foreground
                 } else {
@@ -7441,7 +7628,7 @@ fn append_tab_bar_cells(scene: &mut RenderScene, runtime: &MuxRuntime, config: &
     while col < runtime.surface_cols {
         scene.grid.cells.push(RenderCell {
             position: CellPosition { row: 0, col },
-            text: " ".to_owned(),
+            text: " ".into(),
             foreground: render_color(config.mux.appearance.inactive_tab_foreground),
             background: render_color(config.mux.appearance.tab_bar_background),
             style: RenderCellStyle::default(),
@@ -7722,7 +7909,7 @@ fn scene_from_terminal(
     config: &AppConfig,
     presentation: CursorPresentation,
 ) -> RenderScene {
-    let visible = terminal.visible_grid();
+    let viewport = terminal.state().viewport();
     let cursor = terminal.cursor_state();
     let modes = terminal.modes();
     let configured_cursor_shape =
@@ -7731,17 +7918,19 @@ fn scene_from_terminal(
         && terminal.state().viewport_offset() == 0
         && (!presentation.window_focused || presentation.blink_visible);
     let selection = terminal.selection_state();
-    let mut cells = Vec::with_capacity(visible.cells.len());
-    let cols = visible.viewport.size.cols;
+    let mut cells =
+        Vec::with_capacity(usize::from(viewport.size.cols) * usize::from(viewport.size.rows));
+    let cols = viewport.size.cols;
+    let mut index = 0usize;
 
-    for (index, cell) in visible.cells.iter().enumerate() {
+    terminal.state().for_each_visible_cell(|cell| {
         let row = (index / usize::from(cols)) as i64;
         let col = (index % usize::from(cols)) as u16;
         let (mut foreground, background) = colors_for_attributes(cell.attributes, config);
         let position = CellPosition { row, col };
         if config.colors.selection_foreground.is_some_and(|_| {
             selection.is_some_and(|selection| {
-                selection_contains(selection, visible.viewport.origin_row + row, col)
+                selection_contains(selection, viewport.origin_row + row, col)
             })
         }) {
             foreground = render_color(
@@ -7758,7 +7947,8 @@ fn scene_from_terminal(
             background,
             style: style_for_attributes(cell.attributes),
         });
-    }
+        index = index.saturating_add(1);
+    });
 
     let semantic_overlays = metrics.map_or_else(Vec::new, |metrics| {
         semantic_visual_overlays(
@@ -7766,25 +7956,25 @@ fn scene_from_terminal(
             command_output_collapsed,
             terminal.modes().contains(&TerminalMode::AlternateScreen),
             SemanticOverlayViewport {
-                origin_row: visible.viewport.origin_row,
-                rows: visible.viewport.size.rows,
-                cols: visible.viewport.size.cols,
+                origin_row: viewport.origin_row,
+                rows: viewport.size.rows,
+                cols: viewport.size.cols,
                 metrics,
             },
             config,
         )
     });
     let search_highlights = metrics.map_or_else(Vec::new, |metrics| {
-        search_overlays(search, visible.viewport, metrics, config)
+        search_overlays(search, viewport, metrics, config)
     });
 
-    let selections = selection_visual(terminal, visible.viewport, config)
+    let selections = selection_visual(terminal, viewport, config)
         .into_iter()
         .collect();
     RenderScene {
         grid: RenderGrid {
-            columns: visible.viewport.size.cols,
-            rows: visible.viewport.size.rows,
+            columns: viewport.size.cols,
+            rows: viewport.size.rows,
             cells,
         },
         cursor: Some(CursorVisual {
@@ -9023,6 +9213,144 @@ mod tests {
     use super::*;
     use semantics::{SemanticEventKind, SemanticTimeline};
 
+    struct BlockingInputTransport {
+        started: mpsc::Sender<Vec<u8>>,
+        release: mpsc::Receiver<()>,
+    }
+
+    struct BurstOutputTransport {
+        bytes: Option<Vec<u8>>,
+    }
+
+    impl TerminalTransport for BurstOutputTransport {
+        fn write_input(&mut self, _bytes: &[u8]) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _size: TransportSize) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn poll_output(&mut self) -> TransportResult<TransportOutput> {
+            Ok(TransportOutput::bytes(
+                self.bytes.take().unwrap_or_default(),
+            ))
+        }
+
+        fn shutdown(&mut self) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn session_metadata(&self) -> transport_core::SessionMetadata {
+            transport_core::SessionMetadata {
+                id: "burst-output-test".to_owned(),
+                kind: transport_core::TransportKind::LocalPty,
+                title: None,
+                shell: None,
+                current_working_directory: None,
+                remote_host: None,
+            }
+        }
+
+        fn state(&self) -> TransportState {
+            TransportState::Running
+        }
+    }
+
+    impl TerminalTransport for BlockingInputTransport {
+        fn write_input(&mut self, bytes: &[u8]) -> TransportResult<()> {
+            let _ = self.started.send(bytes.to_vec());
+            let _ = self.release.recv_timeout(Duration::from_secs(1));
+            Ok(())
+        }
+
+        fn resize(&mut self, _size: TransportSize) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn poll_output(&mut self) -> TransportResult<TransportOutput> {
+            Ok(TransportOutput::bytes(Vec::new()))
+        }
+
+        fn shutdown(&mut self) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn session_metadata(&self) -> transport_core::SessionMetadata {
+            transport_core::SessionMetadata {
+                id: "blocking-input-test".to_owned(),
+                kind: transport_core::TransportKind::LocalPty,
+                title: None,
+                shell: None,
+                current_working_directory: None,
+                remote_host: None,
+            }
+        }
+
+        fn state(&self) -> TransportState {
+            TransportState::Running
+        }
+    }
+
+    #[test]
+    fn desktop_pane_input_never_waits_for_the_transport_backend() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut transport = PaneTransportLoop::new(
+            BlockingInputTransport {
+                started: started_tx,
+                release: release_rx,
+            },
+            test_transport_waker(),
+        );
+
+        let started_at = Instant::now();
+        transport
+            .send(TransportCommand::write_input(b"x".as_slice()))
+            .expect("queue input");
+        assert!(
+            started_at.elapsed() < Duration::from_millis(20),
+            "window-thread input must only enqueue bytes"
+        );
+        assert_eq!(
+            started_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("transport worker receives input"),
+            b"x"
+        );
+        let _ = release_tx.send(());
+        transport.shutdown().expect("shutdown worker");
+    }
+
+    #[test]
+    fn desktop_transport_output_is_bounded_per_gui_tick() {
+        let expected = vec![b'x'; MAX_OUTPUT_BYTES_PER_GUI_TICK * 2 + 17];
+        let mut transport = PaneTransportLoop::new(
+            BurstOutputTransport {
+                bytes: Some(expected.clone()),
+            },
+            test_transport_waker(),
+        );
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let mut received = Vec::new();
+
+        while received.len() < expected.len() && Instant::now() < deadline {
+            let output = transport.poll_output().expect("poll burst output");
+            assert!(
+                output.bytes.len() <= MAX_OUTPUT_BYTES_PER_GUI_TICK,
+                "one GUI tick received {} bytes",
+                output.bytes.len()
+            );
+            received.extend_from_slice(&output.bytes);
+            if output.bytes.is_empty() {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        assert_eq!(received, expected);
+        transport.shutdown().expect("shutdown output worker");
+    }
+
     #[test]
     fn desktop_startup_uses_configured_background_before_window_reveal() {
         let mut config = AppConfig::default();
@@ -9156,6 +9484,123 @@ mod tests {
             },
         );
         assert_eq!(effective, configured);
+    }
+
+    #[test]
+    fn desktop_cursor_trail_is_immediate_and_fast_for_typing() {
+        let mut config = AppConfig::default();
+        config.cursor.animations_enabled = true;
+        config.cursor.trail = true;
+        config.cursor.trail_delay_ms = 0;
+        config.cursor.trail_start_threshold_cells = 0;
+        config.cursor.trail_decay_fast_ms = 80;
+        config.cursor.trail_decay_slow_ms = 320;
+
+        let settings = cursor_animation_settings(&config);
+
+        assert_eq!(settings.trail_delay, Duration::ZERO);
+        assert_eq!(settings.trail_start_threshold_cells, 0);
+        assert_eq!(settings.trail_decay_fast, Duration::from_millis(80));
+        assert_eq!(settings.trail_decay_slow, Duration::from_millis(320));
+    }
+
+    #[test]
+    fn panea_cursor_animation_profile_compiles_to_a_fast_tilt_overlay() {
+        let mut config = AppConfig::default();
+        config.cursor.animation = Some(config_core::CursorAnimationProfile::Panea);
+
+        let settings = cursor_animation_settings(&config);
+
+        assert!(settings.enabled);
+        assert!(settings.tilt);
+        assert!(!settings.trail);
+        assert!(!settings.smooth_movement);
+        assert!(!settings.typing_pulse);
+        assert!(!settings.typing_stretch);
+    }
+
+    #[test]
+    fn cursor_animation_profiles_preserve_static_and_legacy_behavior() {
+        let mut config = AppConfig::default();
+        assert!(!cursor_animation_settings(&config).any_effect_enabled());
+
+        config.cursor.animations_enabled = true;
+        config.cursor.trail = true;
+        let custom = cursor_animation_settings(&config);
+        assert!(custom.any_effect_enabled());
+        assert!(!custom.tilt);
+
+        config.cursor.animation = Some(config_core::CursorAnimationProfile::Static);
+        assert!(!cursor_animation_settings(&config).any_effect_enabled());
+
+        config.cursor.animation = Some(config_core::CursorAnimationProfile::Custom);
+        config.cursor.animations_enabled = false;
+        assert!(cursor_animation_settings(&config).any_effect_enabled());
+    }
+
+    #[test]
+    fn desktop_animation_wake_does_not_request_redraw_before_deadline() {
+        let started = Instant::now();
+        let mut pacer = render_wgpu::AnimationFramePacer::new();
+        let mut scheduler = FrameScheduler::new();
+        let mut next_wake = None;
+
+        assert!(!pace_animation_wake(
+            started,
+            Some(Duration::from_millis(8)),
+            &mut pacer,
+            &mut scheduler,
+            &mut next_wake,
+        ));
+        assert_eq!(
+            scheduler.next_frame(),
+            FrameDecision::NoFrameNeeded,
+            "a future animation deadline must not spin the render loop"
+        );
+
+        assert!(pace_animation_wake(
+            started + Duration::from_millis(8),
+            Some(Duration::from_millis(8)),
+            &mut pacer,
+            &mut scheduler,
+            &mut next_wake,
+        ));
+        assert!(matches!(
+            scheduler.next_frame(),
+            FrameDecision::FrameNeeded(_)
+        ));
+    }
+
+    #[test]
+    fn desktop_reuses_scene_only_for_an_isolated_cursor_animation_frame() {
+        assert!(should_reuse_scene_for_cursor_animation(
+            render_core::FrameRequestReason::Animation,
+            true,
+            true,
+            false,
+            false,
+        ));
+        assert!(!should_reuse_scene_for_cursor_animation(
+            render_core::FrameRequestReason::TerminalContentChanged,
+            true,
+            true,
+            false,
+            false,
+        ));
+        assert!(!should_reuse_scene_for_cursor_animation(
+            render_core::FrameRequestReason::Animation,
+            true,
+            true,
+            true,
+            false,
+        ));
+        assert!(!should_reuse_scene_for_cursor_animation(
+            render_core::FrameRequestReason::Animation,
+            true,
+            true,
+            false,
+            true,
+        ));
     }
 
     #[test]

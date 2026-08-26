@@ -18,8 +18,8 @@ use std::{
 use config_core::{
     AppConfig, ClipboardConfigPatch, ColorConfigPatch, CommandBlockStyle, CommandBlocksConfigPatch,
     ConfigDiagnostic, ConfigDiagnosticSeverity, ConfigPlatform, ConfigProvider,
-    ConfigProviderError, CursorConfigPatch, CursorShape, DecorationStrategyConfig,
-    DiagnosticsConfigPatch, FontConfigPatch, FullscreenChromeAnimation,
+    ConfigProviderError, CursorAnimationProfile, CursorConfigPatch, CursorShape,
+    DecorationStrategyConfig, DiagnosticsConfigPatch, FontConfigPatch, FullscreenChromeAnimation,
     FullscreenTitlebarConfigPatch, InputOutputGroupingStyle, KeyBinding, LinuxBackendConfig,
     LoadedAppConfig, LogLevel, MouseBinding, NotificationConfigPatch, Osc52ClipboardConfigPatch,
     PerformanceConfigPatch, PerformanceOverlayDetail, PerformanceOverlayPosition,
@@ -941,6 +941,10 @@ fn set_config_value(config: &mut AppConfig, path: &str, value: &ConfigValue) -> 
             config.cursor.inactive_shape = parse_cursor_shape(value_as_string_ref(value)?)?;
         }
         "cursor.inactive_color" => config.cursor.inactive_color = Some(value_as_color(value)?),
+        "cursor.animation" => {
+            config.cursor.animation =
+                Some(parse_cursor_animation_profile(value_as_string_ref(value)?)?);
+        }
         "cursor.animations_enabled" => config.cursor.animations_enabled = value_as_bool(value)?,
         "cursor.smooth_movement" => config.cursor.smooth_movement = value_as_bool(value)?,
         "cursor.typing_pulse" => config.cursor.typing_pulse = value_as_bool(value)?,
@@ -1266,6 +1270,12 @@ fn set_platform_override_value(
                 .get_or_insert_with(CursorConfigPatch::default)
                 .shape = Some(parse_cursor_shape(value_as_string_ref(value)?)?);
         }
+        "cursor.animation" => {
+            entry
+                .cursor
+                .get_or_insert_with(CursorConfigPatch::default)
+                .animation = Some(parse_cursor_animation_profile(value_as_string_ref(value)?)?);
+        }
         "cursor.animations_enabled" => {
             entry
                 .cursor
@@ -1516,6 +1526,15 @@ fn parse_cursor_shape(value: &str) -> Result<CursorShape, String> {
     }
 }
 
+fn parse_cursor_animation_profile(value: &str) -> Result<CursorAnimationProfile, String> {
+    match normalized(value).as_str() {
+        "static" | "none" | "off" => Ok(CursorAnimationProfile::Static),
+        "panea" => Ok(CursorAnimationProfile::Panea),
+        "custom" => Ok(CursorAnimationProfile::Custom),
+        other => Err(format!("unknown cursor animation profile '{other}'")),
+    }
+}
+
 fn parse_command_block_style(value: &str) -> Result<CommandBlockStyle, String> {
     match normalized(value).as_str() {
         "subtle" => Ok(CommandBlockStyle::Subtle),
@@ -1623,6 +1642,7 @@ mod tests {
             panea.theme("generated-night", "#101820", "#f4f7fb", "#4dd4ac")
             panea.set("font.size", 15)
             panea.set("font.fallback_families", ["Noto Color Emoji", "Segoe UI Emoji"])
+            panea.set("cursor.animation", "panea")
             panea.set("command_blocks.enabled", true)
             panea.set("command_blocks.style", "card")
             panea.set("mux.default_workspace", "dev")
@@ -1639,6 +1659,10 @@ mod tests {
 
         assert_eq!(loaded.config.visual_theme.name, "generated-night");
         assert_eq!(loaded.config.font.size, 15.0);
+        assert_eq!(
+            loaded.config.cursor.animation,
+            Some(config_core::CursorAnimationProfile::Panea)
+        );
         assert_eq!(loaded.config.command_blocks.style, CommandBlockStyle::Card);
         assert_eq!(loaded.config.mux.default_workspace, "dev");
         assert_eq!(
@@ -1682,6 +1706,7 @@ mod tests {
         let loaded = parse_str(
             r#"
             panea.platform_set("windows", "font.family", "Cascadia Mono")
+            panea.platform_set("windows", "cursor.animation", "panea")
             panea.platform_set("linux_wayland", "window.linux_backend", "wayland")
             "#,
             None,
@@ -1706,6 +1731,19 @@ mod tests {
                 .family
                 .as_deref(),
             Some("Cascadia Mono")
+        );
+        assert_eq!(
+            loaded
+                .config
+                .platform_overrides
+                .windows
+                .as_ref()
+                .unwrap()
+                .cursor
+                .as_ref()
+                .unwrap()
+                .animation,
+            Some(config_core::CursorAnimationProfile::Panea)
         );
     }
 

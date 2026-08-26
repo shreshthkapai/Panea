@@ -49,8 +49,18 @@ impl TerminalEmulator {
 
 impl TerminalCore for TerminalEmulator {
     fn apply_bytes(&mut self, bytes: &[u8]) -> TerminalResult<()> {
-        let actions = self.parser.parse(bytes);
-        self.state.apply_actions(actions)
+        let parser = &mut self.parser;
+        let state = &mut self.state;
+        let mut result = Ok(());
+        parser.parse_outputs(bytes, |output| {
+            if result.is_ok() {
+                match output {
+                    ParserOutput::Text(text) => state.apply_printable_text(text),
+                    ParserOutput::Action(action) => result = state.apply_action(action),
+                }
+            }
+        });
+        result
     }
 
     fn resize(&mut self, size: TerminalSize) -> TerminalResult<()> {
@@ -87,6 +97,11 @@ pub struct Parser {
     active_charset: CharacterSetSlot,
 }
 
+enum ParserOutput<'a> {
+    Text(&'a str),
+    Action(TerminalAction),
+}
+
 impl Default for Parser {
     fn default() -> Self {
         Self {
@@ -103,36 +118,47 @@ impl Parser {
     #[must_use]
     pub fn parse(&mut self, bytes: &[u8]) -> Vec<TerminalAction> {
         let mut actions = Vec::new();
+        self.parse_with(bytes, |action| actions.push(action));
+        actions
+    }
 
+    fn parse_with(&mut self, bytes: &[u8], mut emit: impl FnMut(TerminalAction)) {
+        self.parse_outputs(bytes, |output| match output {
+            ParserOutput::Text(text) => text.chars().map(TerminalAction::Print).for_each(&mut emit),
+            ParserOutput::Action(action) => emit(action),
+        });
+    }
+
+    fn parse_outputs(&mut self, bytes: &[u8], mut emit: impl FnMut(ParserOutput<'_>)) {
         for byte in bytes {
             match &mut self.state {
                 ParserState::Ground => match *byte {
                     0x1b => {
-                        self.flush_print_buffer(&mut actions, false);
+                        self.flush_print_buffer(&mut emit, false);
                         self.state = ParserState::Escape;
                     }
                     b'\r' => {
-                        self.flush_print_buffer(&mut actions, false);
-                        actions.push(TerminalAction::CarriageReturn);
+                        self.flush_print_buffer(&mut emit, false);
+                        emit(ParserOutput::Action(TerminalAction::CarriageReturn));
                     }
                     b'\n' => {
-                        self.flush_print_buffer(&mut actions, false);
-                        actions.push(TerminalAction::LineFeed);
+                        self.flush_print_buffer(&mut emit, false);
+                        emit(ParserOutput::Action(TerminalAction::LineFeed));
                     }
                     0x08 => {
-                        self.flush_print_buffer(&mut actions, false);
-                        actions.push(TerminalAction::Backspace);
+                        self.flush_print_buffer(&mut emit, false);
+                        emit(ParserOutput::Action(TerminalAction::Backspace));
                     }
                     b'\t' => {
-                        self.flush_print_buffer(&mut actions, false);
-                        actions.push(TerminalAction::Tab);
+                        self.flush_print_buffer(&mut emit, false);
+                        emit(ParserOutput::Action(TerminalAction::Tab));
                     }
                     0x0e => {
-                        self.flush_print_buffer(&mut actions, false);
+                        self.flush_print_buffer(&mut emit, false);
                         self.active_charset = CharacterSetSlot::G1;
                     }
                     0x0f => {
-                        self.flush_print_buffer(&mut actions, false);
+                        self.flush_print_buffer(&mut emit, false);
                         self.active_charset = CharacterSetSlot::G0;
                     }
                     0x00..=0x1f | 0x7f => {}
@@ -142,8 +168,10 @@ impl Parser {
                             CharacterSetSlot::G1 => self.g1_charset,
                         } == CharacterSet::DecSpecial =>
                     {
-                        self.flush_print_buffer(&mut actions, false);
-                        actions.push(TerminalAction::Print(dec_special_graphic(byte)));
+                        self.flush_print_buffer(&mut emit, false);
+                        emit(ParserOutput::Action(TerminalAction::Print(
+                            dec_special_graphic(byte),
+                        )));
                     }
                     _ => self.print_buffer.push(*byte),
                 },
@@ -170,27 +198,27 @@ impl Parser {
                         }
                     }
                     b'7' => {
-                        actions.push(TerminalAction::SaveCursor);
+                        emit(ParserOutput::Action(TerminalAction::SaveCursor));
                         self.state = ParserState::Ground;
                     }
                     b'8' => {
-                        actions.push(TerminalAction::RestoreCursor);
+                        emit(ParserOutput::Action(TerminalAction::RestoreCursor));
                         self.state = ParserState::Ground;
                     }
                     b'H' => {
-                        actions.push(TerminalAction::SetTabStop);
+                        emit(ParserOutput::Action(TerminalAction::SetTabStop));
                         self.state = ParserState::Ground;
                     }
                     b'D' => {
-                        actions.push(TerminalAction::LineFeed);
+                        emit(ParserOutput::Action(TerminalAction::LineFeed));
                         self.state = ParserState::Ground;
                     }
                     b'E' => {
-                        actions.push(TerminalAction::NextLine);
+                        emit(ParserOutput::Action(TerminalAction::NextLine));
                         self.state = ParserState::Ground;
                     }
                     b'M' => {
-                        actions.push(TerminalAction::ReverseIndex);
+                        emit(ParserOutput::Action(TerminalAction::ReverseIndex));
                         self.state = ParserState::Ground;
                     }
                     b'(' | b')' | b'*' | b'+' => {
@@ -200,21 +228,21 @@ impl Parser {
                         });
                     }
                     b'=' => {
-                        actions.push(TerminalAction::SetMode {
+                        emit(ParserOutput::Action(TerminalAction::SetMode {
                             mode: TerminalMode::ApplicationKeypad,
                             enabled: true,
-                        });
+                        }));
                         self.state = ParserState::Ground;
                     }
                     b'>' => {
-                        actions.push(TerminalAction::SetMode {
+                        emit(ParserOutput::Action(TerminalAction::SetMode {
                             mode: TerminalMode::ApplicationKeypad,
                             enabled: false,
-                        });
+                        }));
                         self.state = ParserState::Ground;
                     }
                     b'c' => {
-                        actions.push(TerminalAction::Reset);
+                        emit(ParserOutput::Action(TerminalAction::Reset));
                         self.g0_charset = CharacterSet::Ascii;
                         self.g1_charset = CharacterSet::Ascii;
                         self.active_charset = CharacterSetSlot::G0;
@@ -231,7 +259,9 @@ impl Parser {
                     }
                     if csi.consume(*byte) {
                         let action_set = dispatch_csi(csi);
-                        actions.extend(action_set);
+                        action_set
+                            .into_iter()
+                            .for_each(|action| emit(ParserOutput::Action(action)));
                         self.state = ParserState::Ground;
                     }
                 }
@@ -240,14 +270,18 @@ impl Parser {
                     content,
                 } => match (*byte, *escape_seen) {
                     (0x07, _) => {
-                        actions.extend(dispatch_osc(content));
+                        dispatch_osc(content)
+                            .into_iter()
+                            .for_each(|action| emit(ParserOutput::Action(action)));
                         self.state = ParserState::Ground;
                     }
                     (b'\\', true) => {
                         if content.last() == Some(&0x1b) {
                             content.pop();
                         }
-                        actions.extend(dispatch_osc(content));
+                        dispatch_osc(content)
+                            .into_iter()
+                            .for_each(|action| emit(ParserOutput::Action(action)));
                         self.state = ParserState::Ground;
                     }
                     (0x1b, _) => {
@@ -300,7 +334,9 @@ impl Parser {
                             content.pop();
                         }
                         if *kind == StringControlKind::Dcs {
-                            actions.extend(dispatch_dcs(content));
+                            dispatch_dcs(content)
+                                .into_iter()
+                                .for_each(|action| emit(ParserOutput::Action(action)));
                         }
                         self.state = ParserState::Ground;
                     }
@@ -332,17 +368,19 @@ impl Parser {
         }
 
         if matches!(self.state, ParserState::Ground) {
-            self.flush_print_buffer(&mut actions, true);
+            self.flush_print_buffer(&mut emit, true);
         }
-
-        actions
     }
 
-    fn flush_print_buffer(&mut self, actions: &mut Vec<TerminalAction>, preserve_incomplete: bool) {
+    fn flush_print_buffer(
+        &mut self,
+        emit: &mut impl FnMut(ParserOutput<'_>),
+        preserve_incomplete: bool,
+    ) {
         while !self.print_buffer.is_empty() {
             match std::str::from_utf8(&self.print_buffer) {
                 Ok(text) => {
-                    actions.extend(text.chars().map(TerminalAction::Print));
+                    emit(ParserOutput::Text(text));
                     self.print_buffer.clear();
                     return;
                 }
@@ -351,7 +389,7 @@ impl Parser {
                     if valid_up_to > 0 {
                         let valid = std::str::from_utf8(&self.print_buffer[..valid_up_to])
                             .expect("valid_up_to always names valid UTF-8");
-                        actions.extend(valid.chars().map(TerminalAction::Print));
+                        emit(ParserOutput::Text(valid));
                         self.print_buffer.drain(..valid_up_to);
                     }
 
@@ -871,6 +909,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn streaming_parser_matches_collected_actions() {
+        let input = b"plain \xe7\x95\x8c\x1b[31mred\x1b[0m\r\n\x1b]2;Panea\x07\x1bP$qm\x1b\\";
+        let expected = Parser::default().parse(input);
+        let mut actual = Vec::new();
+        Parser::default().parse_with(input, |action| actual.push(action));
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn streaming_parser_keeps_printable_ascii_as_one_span() {
+        let mut output = Vec::new();
+
+        Parser::default().parse_outputs(b"panea\r", |item| match item {
+            ParserOutput::Text(text) => output.push(format!("text:{text}")),
+            ParserOutput::Action(TerminalAction::CarriageReturn) => {
+                output.push("action:cr".to_owned());
+            }
+            ParserOutput::Action(action) => output.push(format!("action:{action:?}")),
+        });
+
+        assert_eq!(output, ["text:panea", "action:cr"]);
     }
 
     #[test]

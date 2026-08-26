@@ -10,6 +10,7 @@ description = "Platform-neutral terminal grid, cursor, modes, scrollback, select
 workspace = true
 
 [dependencies]
+compact_str.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
 

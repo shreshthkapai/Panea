@@ -781,11 +781,16 @@ fn known_paths() -> BTreeSet<&'static str> {
         "cursor.inactive_shape",
         "cursor.inactive_color",
         "cursor.mode_specific_styles",
+        "cursor.animation",
         "cursor.animations_enabled",
         "cursor.smooth_movement",
         "cursor.typing_pulse",
         "cursor.typing_stretch",
         "cursor.trail",
+        "cursor.trail_delay_ms",
+        "cursor.trail_start_threshold_cells",
+        "cursor.trail_decay_fast_ms",
+        "cursor.trail_decay_slow_ms",
         "cursor.blink_easing",
         "cursor.short_lived_glow",
         "cursor.shadow",
@@ -1309,6 +1314,10 @@ mod tests {
                 "custom-cursor.toml",
                 include_str!("../../assets/config-examples/custom-cursor.toml"),
             ),
+            (
+                "cursor-profiles/motion.toml",
+                include_str!("../../assets/cursor-profiles/motion.toml"),
+            ),
         ] {
             parse_str(contents, None, ConfigPlatform::Unknown)
                 .unwrap_or_else(|error| panic!("{name} should parse: {error}"));
@@ -1459,11 +1468,16 @@ mod tests {
             schema_version = 2
 
             [cursor]
+            animation = "panea"
             animations_enabled = true
             smooth_movement = true
             typing_pulse = true
             typing_stretch = true
             trail = true
+            trail_delay_ms = 0
+            trail_start_threshold_cells = 0
+            trail_decay_fast_ms = 45
+            trail_decay_slow_ms = 140
             blink_easing = true
             short_lived_glow = true
             shadow = true
@@ -1480,6 +1494,10 @@ mod tests {
         .expect("portable cursor config should parse");
 
         assert!(loaded.config.cursor.shadow);
+        assert_eq!(
+            loaded.config.cursor.animation,
+            Some(config_core::CursorAnimationProfile::Panea)
+        );
         assert!(loaded.config.cursor.image.enabled);
         assert_eq!(loaded.config.cursor.image.path, "assets/cursor.gif");
         assert!(

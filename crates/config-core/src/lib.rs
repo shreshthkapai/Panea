@@ -275,6 +275,32 @@ impl AppConfig {
                 "cursor corner radius must be between 0.0 and 0.5 terminal cells",
             );
         }
+        if self.cursor.trail_delay_ms > 100 {
+            report.error(
+                "cursor.trail_delay_ms",
+                "cursor trail delay must be between 0 and 100 ms",
+            );
+        }
+        if self.cursor.trail_start_threshold_cells > 32 {
+            report.error(
+                "cursor.trail_start_threshold_cells",
+                "cursor trail threshold must be between 0 and 32 cells",
+            );
+        }
+        if !(10..=1_000).contains(&self.cursor.trail_decay_fast_ms) {
+            report.error(
+                "cursor.trail_decay_fast_ms",
+                "cursor trail fast decay must be between 10 and 1000 ms",
+            );
+        }
+        if self.cursor.trail_decay_slow_ms < self.cursor.trail_decay_fast_ms
+            || self.cursor.trail_decay_slow_ms > 2_000
+        {
+            report.error(
+                "cursor.trail_decay_slow_ms",
+                "cursor trail slow decay must be at least the fast decay and no more than 2000 ms",
+            );
+        }
         for mode in self.cursor.mode_specific_styles.keys() {
             if !matches!(
                 mode.trim().to_ascii_lowercase().as_str(),
@@ -1394,6 +1420,14 @@ pub enum CursorShape {
     CustomStaticShape,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorAnimationProfile {
+    Static,
+    Panea,
+    Custom,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CursorConfig {
@@ -1406,11 +1440,16 @@ pub struct CursorConfig {
     pub inactive_shape: CursorShape,
     pub inactive_color: Option<RgbaColor>,
     pub mode_specific_styles: BTreeMap<String, CursorShape>,
+    pub animation: Option<CursorAnimationProfile>,
     pub animations_enabled: bool,
     pub smooth_movement: bool,
     pub typing_pulse: bool,
     pub typing_stretch: bool,
     pub trail: bool,
+    pub trail_delay_ms: u16,
+    pub trail_start_threshold_cells: u16,
+    pub trail_decay_fast_ms: u16,
+    pub trail_decay_slow_ms: u16,
     pub blink_easing: bool,
     pub short_lived_glow: bool,
     pub shadow: bool,
@@ -1430,11 +1469,16 @@ impl Default for CursorConfig {
             inactive_shape: CursorShape::HollowBlock,
             inactive_color: None,
             mode_specific_styles: BTreeMap::new(),
+            animation: None,
             animations_enabled: false,
             smooth_movement: false,
             typing_pulse: false,
             typing_stretch: false,
             trail: false,
+            trail_delay_ms: 1,
+            trail_start_threshold_cells: 2,
+            trail_decay_fast_ms: 100,
+            trail_decay_slow_ms: 400,
             blink_easing: false,
             short_lived_glow: false,
             shadow: false,
@@ -2516,11 +2560,16 @@ pub struct CursorConfigPatch {
     pub inactive_shape: Option<CursorShape>,
     pub inactive_color: Option<Option<RgbaColor>>,
     pub mode_specific_styles: Option<BTreeMap<String, CursorShape>>,
+    pub animation: Option<CursorAnimationProfile>,
     pub animations_enabled: Option<bool>,
     pub smooth_movement: Option<bool>,
     pub typing_pulse: Option<bool>,
     pub typing_stretch: Option<bool>,
     pub trail: Option<bool>,
+    pub trail_delay_ms: Option<u16>,
+    pub trail_start_threshold_cells: Option<u16>,
+    pub trail_decay_fast_ms: Option<u16>,
+    pub trail_decay_slow_ms: Option<u16>,
     pub blink_easing: Option<bool>,
     pub short_lived_glow: Option<bool>,
     pub shadow: Option<bool>,
@@ -2543,11 +2592,21 @@ impl CursorConfigPatch {
             config.inactive_color = inactive_color;
         }
         apply_opt(&mut config.mode_specific_styles, &self.mode_specific_styles);
+        if let Some(animation) = self.animation {
+            config.animation = Some(animation);
+        }
         apply_opt(&mut config.animations_enabled, &self.animations_enabled);
         apply_opt(&mut config.smooth_movement, &self.smooth_movement);
         apply_opt(&mut config.typing_pulse, &self.typing_pulse);
         apply_opt(&mut config.typing_stretch, &self.typing_stretch);
         apply_opt(&mut config.trail, &self.trail);
+        apply_opt(&mut config.trail_delay_ms, &self.trail_delay_ms);
+        apply_opt(
+            &mut config.trail_start_threshold_cells,
+            &self.trail_start_threshold_cells,
+        );
+        apply_opt(&mut config.trail_decay_fast_ms, &self.trail_decay_fast_ms);
+        apply_opt(&mut config.trail_decay_slow_ms, &self.trail_decay_slow_ms);
         apply_opt(&mut config.blink_easing, &self.blink_easing);
         apply_opt(&mut config.short_lived_glow, &self.short_lived_glow);
         apply_opt(&mut config.shadow, &self.shadow);
@@ -3337,6 +3396,13 @@ pub fn export_schema() -> ConfigSchema {
                         false,
                     ),
                     field(
+                        "cursor.animation",
+                        "static | panea | custom",
+                        "static",
+                        true,
+                        false,
+                    ),
+                    field(
                         "cursor.animations_enabled",
                         "boolean",
                         default.cursor.animations_enabled,
@@ -3365,6 +3431,34 @@ pub fn export_schema() -> ConfigSchema {
                         false,
                     ),
                     field("cursor.trail", "boolean", default.cursor.trail, true, false),
+                    field(
+                        "cursor.trail_delay_ms",
+                        "integer",
+                        default.cursor.trail_delay_ms,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "cursor.trail_start_threshold_cells",
+                        "integer",
+                        default.cursor.trail_start_threshold_cells,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "cursor.trail_decay_fast_ms",
+                        "integer",
+                        default.cursor.trail_decay_fast_ms,
+                        true,
+                        false,
+                    ),
+                    field(
+                        "cursor.trail_decay_slow_ms",
+                        "integer",
+                        default.cursor.trail_decay_slow_ms,
+                        true,
+                        false,
+                    ),
                     field(
                         "cursor.blink_easing",
                         "boolean",
@@ -4518,6 +4612,92 @@ mod tests {
     }
 
     #[test]
+    fn cursor_trail_timing_is_portable_config_with_safe_defaults() {
+        let defaults = AppConfig::default();
+        assert_eq!(defaults.cursor.trail_delay_ms, 1);
+        assert_eq!(defaults.cursor.trail_start_threshold_cells, 2);
+        assert_eq!(defaults.cursor.trail_decay_fast_ms, 100);
+        assert_eq!(defaults.cursor.trail_decay_slow_ms, 400);
+
+        let config: AppConfig = toml::from_str(
+            r#"
+            [cursor]
+            trail_delay_ms = 0
+            trail_start_threshold_cells = 0
+            trail_decay_fast_ms = 80
+            trail_decay_slow_ms = 320
+            "#,
+        )
+        .expect("cursor trail timing should parse on every platform");
+        assert_eq!(config.cursor.trail_delay_ms, 0);
+        assert_eq!(config.cursor.trail_start_threshold_cells, 0);
+        assert_eq!(config.cursor.trail_decay_fast_ms, 80);
+        assert_eq!(config.cursor.trail_decay_slow_ms, 320);
+        assert!(!config.validate().has_errors());
+
+        let schema = export_schema();
+        let cursor = schema
+            .sections
+            .iter()
+            .find(|section| section.name == "cursor")
+            .expect("cursor schema section");
+        for path in [
+            "cursor.trail_delay_ms",
+            "cursor.trail_start_threshold_cells",
+            "cursor.trail_decay_fast_ms",
+            "cursor.trail_decay_slow_ms",
+        ] {
+            assert!(cursor.fields.iter().any(|field| field.path == path));
+        }
+    }
+
+    #[test]
+    fn panea_cursor_animation_profile_is_opt_in_and_round_trips() {
+        let defaults = AppConfig::default();
+        assert_eq!(defaults.cursor.animation, None);
+        let defaults_toml = toml::to_string(&defaults).expect("default config should serialize");
+        assert!(
+            !defaults_toml.contains("animation = \"panea\""),
+            "Panea motion must not become the default cursor behavior"
+        );
+
+        let configured: AppConfig = toml::from_str(
+            r#"
+            [cursor]
+            animation = "panea"
+            "#,
+        )
+        .expect("Panea cursor animation should parse on every platform");
+        let serialized =
+            toml::to_string(&configured).expect("Panea cursor animation should serialize");
+
+        assert!(
+            serialized.contains("animation = \"panea\""),
+            "the portable config model must preserve the selected animation profile"
+        );
+    }
+
+    #[test]
+    fn cursor_trail_timing_rejects_unbounded_or_reversed_decay() {
+        let mut config = AppConfig::default();
+        config.cursor.trail_delay_ms = 101;
+        config.cursor.trail_start_threshold_cells = 33;
+        config.cursor.trail_decay_fast_ms = 1_001;
+        config.cursor.trail_decay_slow_ms = 50;
+
+        let paths = config
+            .validate()
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.path)
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"cursor.trail_delay_ms".to_owned()));
+        assert!(paths.contains(&"cursor.trail_start_threshold_cells".to_owned()));
+        assert!(paths.contains(&"cursor.trail_decay_fast_ms".to_owned()));
+        assert!(paths.contains(&"cursor.trail_decay_slow_ms".to_owned()));
+    }
+
+    #[test]
     fn platform_override_refines_colors_margins_and_inactive_cursor() {
         let config: AppConfig = toml::from_str(
             r#"
@@ -4529,6 +4709,7 @@ mod tests {
             foreground = { red = 1, green = 2, blue = 3, alpha = 255 }
 
             [platform.windows.cursor]
+            animation = "panea"
             inactive_shape = "underline"
             inactive_color = { red = 4, green = 5, blue = 6, alpha = 255 }
             "#,
@@ -4540,6 +4721,10 @@ mod tests {
         assert_eq!(resolved.window.opacity, 0.9);
         assert_eq!(resolved.colors.foreground, RgbaColor::rgb(1, 2, 3));
         assert_eq!(resolved.cursor.inactive_shape, CursorShape::Underline);
+        assert_eq!(
+            resolved.cursor.animation,
+            Some(CursorAnimationProfile::Panea)
+        );
         assert_eq!(
             resolved.cursor.inactive_color,
             Some(RgbaColor::rgb(4, 5, 6))

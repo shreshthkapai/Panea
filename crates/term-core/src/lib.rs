@@ -4,6 +4,7 @@ pub const LAYER: &str = "core correctness";
 
 use std::{cmp::Ordering, collections::BTreeSet, error::Error, fmt};
 
+use compact_str::CompactString;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -271,7 +272,7 @@ impl CellAttributes {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
-    pub text: String,
+    pub text: CompactString,
     pub attributes: CellAttributes,
     pub width: u8,
     pub wide_continuation: bool,
@@ -281,7 +282,7 @@ impl Cell {
     #[must_use]
     pub fn blank(attributes: CellAttributes) -> Self {
         Self {
-            text: " ".to_owned(),
+            text: CompactString::new(" "),
             attributes,
             width: 1,
             wide_continuation: false,
@@ -289,8 +290,8 @@ impl Cell {
     }
 
     #[must_use]
-    pub fn text(text: impl Into<String>, attributes: CellAttributes) -> Self {
-        let text = text.into();
+    pub fn text(text: impl AsRef<str>, attributes: CellAttributes) -> Self {
+        let text = CompactString::new(text);
         let width = cell_width_for_text(&text) as u8;
         Self {
             text,
@@ -311,7 +312,7 @@ impl Cell {
     #[must_use]
     pub fn wide_continuation(attributes: CellAttributes) -> Self {
         Self {
-            text: " ".to_owned(),
+            text: CompactString::new(" "),
             attributes,
             width: 0,
             wide_continuation: true,
@@ -755,6 +756,45 @@ impl TerminalState {
         Ok(())
     }
 
+    /// Applies parser-decoded printable text without allocating one action per scalar.
+    pub fn apply_printable_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        let scrollback_before = self.primary.scrollback.len();
+        if text.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
+            let autowrap = self.modes.contains(&TerminalMode::AutoWrap);
+            let insert = self.modes.contains(&TerminalMode::Insert);
+            let attributes = self.attributes;
+            let use_scrollback = self.active_is_primary();
+            self.active_mut().print_ascii_text(
+                text.as_bytes(),
+                attributes,
+                autowrap,
+                insert,
+                use_scrollback,
+            );
+            self.last_printed = text.chars().next_back();
+        } else {
+            for ch in text.chars() {
+                self.print(ch);
+            }
+        }
+
+        if self.viewport_offset > 0 {
+            self.viewport_offset = self
+                .viewport_offset
+                .saturating_add(
+                    self.primary
+                        .scrollback
+                        .len()
+                        .saturating_sub(scrollback_before),
+                )
+                .min(self.primary.scrollback.len());
+        }
+    }
+
     #[must_use]
     pub fn grid(&self) -> Grid {
         let active = self.active();
@@ -771,6 +811,17 @@ impl TerminalState {
             .lines
             .get(usize::from(row))
             .and_then(|line| line.cells.get(usize::from(col)))
+    }
+
+    pub fn for_each_visible_cell(&self, mut visitor: impl FnMut(&Cell)) {
+        let viewport = self.viewport();
+        let start = usize::try_from(viewport.origin_row).unwrap_or(0);
+        let rows = usize::from(viewport.size.rows);
+        for row in start..start.saturating_add(rows) {
+            if let Some(line) = self.buffer_line(row) {
+                line.cells.iter().for_each(&mut visitor);
+            }
+        }
     }
 
     #[must_use]
@@ -996,7 +1047,7 @@ impl TerminalState {
         self.alternate.is_none()
     }
 
-    fn viewport(&self) -> Viewport {
+    pub fn viewport(&self) -> Viewport {
         Viewport {
             origin_row: if self.active_is_primary() {
                 self.primary
@@ -1329,15 +1380,10 @@ impl TerminalCore for TerminalState {
 
     fn visible_grid(&self) -> VisibleGrid {
         let viewport = self.viewport();
-        let start = usize::try_from(viewport.origin_row).unwrap_or(0);
-        let rows = usize::from(viewport.size.rows);
-        VisibleGrid {
-            viewport,
-            cells: (start..start.saturating_add(rows))
-                .filter_map(|row| self.buffer_line(row))
-                .flat_map(|line| line.cells.iter().cloned())
-                .collect(),
-        }
+        let mut cells =
+            Vec::with_capacity(usize::from(viewport.size.cols) * usize::from(viewport.size.rows));
+        self.for_each_visible_cell(|cell| cells.push(cell.clone()));
+        VisibleGrid { viewport, cells }
     }
 
     fn scrollback(&self) -> Scrollback {
@@ -1453,7 +1499,8 @@ impl ScreenBuffer {
             .get_mut(self.cursor_row)
             .and_then(|line| line.cells.get_mut(self.cursor_col))
         {
-            *cell = Cell::text(ch.to_string(), attributes);
+            let mut encoded = [0; 4];
+            *cell = Cell::text(ch.encode_utf8(&mut encoded), attributes);
         }
 
         if width == 2
@@ -1471,6 +1518,64 @@ impl ScreenBuffer {
             self.wrap_pending = autowrap;
         } else {
             self.cursor_col += advance;
+        }
+    }
+
+    fn print_ascii_text(
+        &mut self,
+        text: &[u8],
+        attributes: CellAttributes,
+        autowrap: bool,
+        insert: bool,
+        append_scrollback: bool,
+    ) {
+        debug_assert!(text.iter().all(|byte| (0x20..=0x7e).contains(byte)));
+
+        for &byte in text {
+            if self.wrap_pending {
+                if autowrap {
+                    if let Some(line) = self.lines.get_mut(self.cursor_row) {
+                        line.hard_wrapped = true;
+                    }
+                    self.wrap_line(append_scrollback, attributes);
+                }
+                self.wrap_pending = false;
+            }
+
+            if insert {
+                self.insert_chars(1, attributes);
+            }
+
+            let requires_grapheme_clear = self
+                .lines
+                .get(self.cursor_row)
+                .and_then(|line| line.cells.get(self.cursor_col))
+                .is_some_and(|cell| cell.wide_continuation || cell.width > 1);
+            if requires_grapheme_clear {
+                self.clear_grapheme_at(self.cursor_row, self.cursor_col, attributes);
+            }
+
+            if let Some(cell) = self
+                .lines
+                .get_mut(self.cursor_row)
+                .and_then(|line| line.cells.get_mut(self.cursor_col))
+            {
+                let mut encoded = [0; 4];
+                *cell = Cell {
+                    text: CompactString::new(char::from(byte).encode_utf8(&mut encoded)),
+                    attributes,
+                    width: 1,
+                    wide_continuation: false,
+                };
+            }
+
+            let cols = usize::from(self.size.cols);
+            if self.cursor_col + 1 >= cols {
+                self.cursor_col = cols.saturating_sub(1);
+                self.wrap_pending = autowrap;
+            } else {
+                self.cursor_col += 1;
+            }
         }
     }
 
@@ -2581,6 +2686,84 @@ mod tests {
         assert_eq!(accented.width, 1);
         assert_eq!(line_text(&terminal, 0), "e\u{301}x");
         assert_eq!(terminal.cursor_state().position, GridPosition::new(0, 2));
+    }
+
+    #[test]
+    fn ordinary_cell_text_stays_inline() {
+        let cell = Cell::text("x", CellAttributes::default());
+
+        assert!(!cell.text.is_heap_allocated());
+    }
+
+    #[test]
+    fn printable_text_batch_matches_scalar_actions() {
+        let mut scenarios = Vec::new();
+
+        scenarios.push((TerminalState::new(TerminalSize::new(5, 2)), "abcdefghi"));
+
+        let mut no_wrap = TerminalState::new(TerminalSize::new(5, 2));
+        no_wrap
+            .apply_action(TerminalAction::SetMode {
+                mode: TerminalMode::AutoWrap,
+                enabled: false,
+            })
+            .unwrap();
+        no_wrap
+            .apply_action(TerminalAction::SetCursorPosition { row: 1, col: 5 })
+            .unwrap();
+        scenarios.push((no_wrap, "abc"));
+
+        let mut insert = TerminalState::new(TerminalSize::new(8, 2));
+        insert
+            .apply_actions("abcd".chars().map(TerminalAction::Print))
+            .unwrap();
+        insert
+            .apply_action(TerminalAction::SetCursorPosition { row: 1, col: 2 })
+            .unwrap();
+        insert
+            .apply_action(TerminalAction::SetMode {
+                mode: TerminalMode::Insert,
+                enabled: true,
+            })
+            .unwrap();
+        scenarios.push((insert, "XY"));
+
+        let mut wide = TerminalState::new(TerminalSize::new(8, 2));
+        wide.apply_actions("a界b".chars().map(TerminalAction::Print))
+            .unwrap();
+        wide.apply_action(TerminalAction::SetCursorPosition { row: 1, col: 3 })
+            .unwrap();
+        scenarios.push((wide, "xy"));
+
+        scenarios.push((
+            TerminalState::new(TerminalSize::new(12, 2)),
+            "a界e\u{301}👍🏽z",
+        ));
+
+        for (initial, text) in scenarios {
+            let mut batched = initial.clone();
+            let mut scalar = initial;
+
+            batched.apply_printable_text(text);
+            scalar
+                .apply_actions(text.chars().map(TerminalAction::Print))
+                .unwrap();
+
+            assert_eq!(batched, scalar, "batch differed for {text:?}");
+        }
+    }
+
+    #[test]
+    fn borrowed_visible_cells_match_the_owned_grid() {
+        let mut terminal = TerminalState::new(TerminalSize::new(5, 2));
+        terminal.apply_printable_text("abcdefghi");
+        let owned = terminal.visible_grid();
+        let mut borrowed = Vec::new();
+
+        terminal.for_each_visible_cell(|cell| borrowed.push(cell.clone()));
+
+        assert_eq!(borrowed, owned.cells);
+        assert_eq!(terminal.viewport(), owned.viewport);
     }
 
     #[test]

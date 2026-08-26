@@ -22,21 +22,46 @@ use font_system::{
 };
 use image::{AnimationDecoder, ImageDecoder};
 use render_core::{
-    AnimationHandle, AnimationKind, CellPosition, CursorImageAsset, CursorImageFrame,
-    CursorImageVisual, CursorVectorAsset, CursorVectorPrimitive, CursorVectorVisual, CursorVisual,
-    DamageRegion, FrameRequestReason, GpuTimingStatus, OverlayKind, OverlayPrimitive, RenderCell,
-    RenderCellStyle, RenderColor, RenderCursorShape, RenderDecoration, RenderGrid,
-    RenderInstrumentation, RenderRecoveryEvent, RenderRecoveryReason, RenderRecoveryStatus,
-    RenderRect, RenderScene, RenderSurfaceStatus, SelectionVisual, WindowChromeControlKind,
-    WindowChromeControlVisual, WindowChromeVisual,
+    AnimationHandle, AnimationKind, AnimationQuad, CellPosition, CursorImageAsset,
+    CursorImageFrame, CursorImageVisual, CursorVectorAsset, CursorVectorPrimitive,
+    CursorVectorVisual, CursorVisual, DamageRegion, FrameRequestReason, GpuTimingStatus,
+    OverlayKind, OverlayPrimitive, RenderCell, RenderCellStyle, RenderColor, RenderCursorShape,
+    RenderDecoration, RenderGrid, RenderInstrumentation, RenderRecoveryEvent, RenderRecoveryReason,
+    RenderRecoveryStatus, RenderRect, RenderScene, RenderSurfaceStatus, RenderText,
+    SelectionVisual, WindowChromeControlKind, WindowChromeControlVisual, WindowChromeVisual,
 };
 use serde::Deserialize;
 use winit::window::Window;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresentMode {
-    Vsync,
+    Auto,
+    Fifo,
+    Mailbox,
     Immediate,
+}
+
+const DESIRED_MAXIMUM_FRAME_LATENCY: u32 = 1;
+
+fn select_present_mode(
+    requested: PresentMode,
+    available: &[wgpu::PresentMode],
+) -> wgpu::PresentMode {
+    let supports = |mode| available.contains(&mode);
+    match requested {
+        PresentMode::Auto | PresentMode::Mailbox if supports(wgpu::PresentMode::Mailbox) => {
+            wgpu::PresentMode::Mailbox
+        }
+        PresentMode::Immediate if supports(wgpu::PresentMode::Immediate) => {
+            wgpu::PresentMode::Immediate
+        }
+        PresentMode::Immediate if supports(wgpu::PresentMode::Mailbox) => {
+            wgpu::PresentMode::Mailbox
+        }
+        PresentMode::Auto | PresentMode::Fifo | PresentMode::Mailbox | PresentMode::Immediate => {
+            wgpu::PresentMode::Fifo
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,7 +108,7 @@ pub struct RendererOptions {
 impl Default for RendererOptions {
     fn default() -> Self {
         Self {
-            present_mode: PresentMode::Vsync,
+            present_mode: PresentMode::Auto,
             damage_tracking: false,
             gpu_timestamps: false,
             transparent: false,
@@ -372,8 +397,11 @@ impl DamageTracker {
             self.previous_cursor = scene.cursor;
             self.previous_cursor_image = scene.cursor_image.clone();
             self.previous_cursor_vector = scene.cursor_vector.clone();
-            self.previous_visuals = visual_regions(scene, metrics);
-            self.remember_visuals(scene);
+            self.previous_visuals = static_visual_regions(scene, metrics);
+            self.remember_static_visuals(scene);
+            self.previous_animations = scene.animations.clone();
+            self.previous_cursor_image = scene.cursor_image.clone();
+            self.previous_cursor_vector = scene.cursor_vector.clone();
             return vec![scene_grid_region(scene, metrics)];
         }
 
@@ -434,42 +462,92 @@ impl DamageTracker {
             self.previous_cursor = scene.cursor;
         }
 
-        if self.visuals_changed(scene) {
+        if self.static_visuals_changed(scene) {
             regions.extend(self.previous_visuals.iter().copied());
-            self.previous_visuals = visual_regions(scene, metrics);
+            self.previous_visuals = static_visual_regions(scene, metrics);
             regions.extend(self.previous_visuals.iter().copied());
-            self.remember_visuals(scene);
+            self.remember_static_visuals(scene);
+        }
+
+        if self.previous_animations != scene.animations {
+            regions.extend(animation_regions(
+                &self.previous_animations,
+                scene.content_offset,
+            ));
+            regions.extend(animation_regions(&scene.animations, scene.content_offset));
+            self.previous_animations = scene.animations.clone();
+        }
+
+        if self.previous_cursor_image != scene.cursor_image {
+            if let Some(previous) = &self.previous_cursor_image {
+                regions.push(offset_region(previous.bounds, scene.content_offset));
+            }
+            if let Some(current) = &scene.cursor_image {
+                regions.push(offset_region(current.bounds, scene.content_offset));
+            }
+            self.previous_cursor_image = scene.cursor_image.clone();
+        }
+
+        if self.previous_cursor_vector != scene.cursor_vector {
+            if let Some(previous) = &self.previous_cursor_vector {
+                regions.push(offset_region(previous.bounds, scene.content_offset));
+            }
+            if let Some(current) = &scene.cursor_vector {
+                regions.push(offset_region(current.bounds, scene.content_offset));
+            }
+            self.previous_cursor_vector = scene.cursor_vector.clone();
         }
 
         merge_regions(regions)
     }
 
-    fn visuals_changed(&self, scene: &RenderScene) -> bool {
+    pub fn update_animations_only(
+        &mut self,
+        scene: &RenderScene,
+        metrics: CellMetrics,
+    ) -> Vec<DamageRegion> {
+        let size = (scene.grid.columns, scene.grid.rows);
+        if self.force_full
+            || self.previous_size != Some(size)
+            || self.previous_offset != scene.content_offset
+            || self.previous_cursor != scene.cursor
+            || self.static_visuals_changed(scene)
+            || self.previous_cursor_image != scene.cursor_image
+            || self.previous_cursor_vector != scene.cursor_vector
+        {
+            return self.update(scene, metrics);
+        }
+
+        if self.previous_animations == scene.animations {
+            return Vec::new();
+        }
+        let mut regions =
+            animation_regions(&self.previous_animations, scene.content_offset).collect::<Vec<_>>();
+        regions.extend(animation_regions(&scene.animations, scene.content_offset));
+        self.previous_animations = scene.animations.clone();
+        merge_regions(regions)
+    }
+
+    fn static_visuals_changed(&self, scene: &RenderScene) -> bool {
         self.previous_search_highlights != scene.search_highlights
             || self.previous_semantic_overlays != scene.semantic_overlays
             || self.previous_surface_overlays != scene.surface_overlays
             || self.previous_window_chrome != scene.window_chrome
             || self.previous_decorations != scene.decorations
             || self.previous_selections != scene.selections
-            || self.previous_animations != scene.animations
-            || self.previous_cursor_image != scene.cursor_image
-            || self.previous_cursor_vector != scene.cursor_vector
     }
 
-    fn remember_visuals(&mut self, scene: &RenderScene) {
+    fn remember_static_visuals(&mut self, scene: &RenderScene) {
         self.previous_search_highlights = scene.search_highlights.clone();
         self.previous_semantic_overlays = scene.semantic_overlays.clone();
         self.previous_surface_overlays = scene.surface_overlays.clone();
         self.previous_window_chrome = scene.window_chrome.clone();
         self.previous_decorations = scene.decorations.clone();
         self.previous_selections = scene.selections.clone();
-        self.previous_animations = scene.animations.clone();
-        self.previous_cursor_image = scene.cursor_image.clone();
-        self.previous_cursor_vector = scene.cursor_vector.clone();
     }
 }
 
-fn visual_regions(scene: &RenderScene, metrics: CellMetrics) -> Vec<DamageRegion> {
+fn static_visual_regions(scene: &RenderScene, metrics: CellMetrics) -> Vec<DamageRegion> {
     let mut regions = scene
         .search_highlights
         .iter()
@@ -482,19 +560,7 @@ fn visual_regions(scene: &RenderScene, metrics: CellMetrics) -> Vec<DamageRegion
                 .iter()
                 .map(|decoration| offset_region(decoration.bounds, scene.content_offset)),
         )
-        .chain(
-            scene
-                .animations
-                .iter()
-                .map(|animation| offset_region(animation.affected_region, scene.content_offset)),
-        )
         .collect::<Vec<_>>();
-    if let Some(cursor_image) = &scene.cursor_image {
-        regions.push(offset_region(cursor_image.bounds, scene.content_offset));
-    }
-    if let Some(cursor_vector) = &scene.cursor_vector {
-        regions.push(offset_region(cursor_vector.bounds, scene.content_offset));
-    }
     if let Some(window_chrome) = &scene.window_chrome {
         regions.push(window_chrome.bounds);
     }
@@ -507,9 +573,18 @@ fn visual_regions(scene: &RenderScene, metrics: CellMetrics) -> Vec<DamageRegion
     regions
 }
 
+fn animation_regions(
+    animations: &[AnimationHandle],
+    offset: render_core::RenderOffset,
+) -> impl Iterator<Item = DamageRegion> + '_ {
+    animations
+        .iter()
+        .map(move |animation| offset_region(animation.affected_region, offset))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CellFingerprint {
-    text: String,
+    text: RenderText,
     foreground: RenderColor,
     background: RenderColor,
     style: RenderCellStyle,
@@ -653,19 +728,23 @@ fn offset_region(mut region: RenderRect, offset: render_core::RenderOffset) -> R
 
 fn merge_regions(regions: Vec<DamageRegion>) -> Vec<DamageRegion> {
     let mut merged: Vec<DamageRegion> = Vec::with_capacity(regions.len());
-    for mut region in regions {
-        let mut index = 0;
-        while index < merged.len() {
-            if rects_overlap_or_share_edge(region, merged[index]) {
-                region = union_region(region, merged.swap_remove(index));
-                index = 0;
-            } else {
-                index += 1;
-            }
-        }
-        merged.push(region);
+    for region in regions {
+        push_merged_region(&mut merged, region);
     }
     merged
+}
+
+fn push_merged_region(merged: &mut Vec<DamageRegion>, mut region: DamageRegion) {
+    let mut index = 0;
+    while index < merged.len() {
+        if rects_overlap_or_share_edge(region, merged[index]) {
+            region = union_region(region, merged.swap_remove(index));
+            index = 0;
+        } else {
+            index += 1;
+        }
+    }
+    merged.push(region);
 }
 
 fn rects_overlap_or_share_edge(a: RenderRect, b: RenderRect) -> bool {
@@ -692,6 +771,47 @@ pub enum FrameDecision {
 pub struct FrameScheduler {
     pending: Option<FrameRequestReason>,
     idle_wakeups: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnimationFramePacerDecision {
+    Idle,
+    WaitUntil(Instant),
+    FrameDue,
+}
+
+#[derive(Debug, Default)]
+pub struct AnimationFramePacer {
+    deadline: Option<Instant>,
+}
+
+impl AnimationFramePacer {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { deadline: None }
+    }
+
+    pub fn poll(
+        &mut self,
+        now: Instant,
+        next_frame_after: Option<Duration>,
+    ) -> AnimationFramePacerDecision {
+        let Some(delay) = next_frame_after else {
+            self.deadline = None;
+            return AnimationFramePacerDecision::Idle;
+        };
+        let requested = now + delay;
+        let deadline = self
+            .deadline
+            .map_or(requested, |deadline| deadline.min(requested));
+        if now >= deadline {
+            self.deadline = None;
+            AnimationFramePacerDecision::FrameDue
+        } else {
+            self.deadline = Some(deadline);
+            AnimationFramePacerDecision::WaitUntil(deadline)
+        }
+    }
 }
 
 impl FrameScheduler {
@@ -721,7 +841,17 @@ impl FrameScheduler {
     }
 
     pub fn request(&mut self, reason: FrameRequestReason) {
-        self.pending = Some(reason);
+        if self
+            .pending
+            .is_none_or(|pending| frame_request_priority(reason) > frame_request_priority(pending))
+        {
+            self.pending = Some(reason);
+        }
+    }
+
+    #[must_use]
+    pub const fn has_pending_frame(&self) -> bool {
+        self.pending.is_some()
     }
 
     #[must_use]
@@ -744,6 +874,17 @@ impl FrameScheduler {
         let idle_wakeups = self.idle_wakeups;
         self.idle_wakeups = 0;
         idle_wakeups
+    }
+}
+
+const fn frame_request_priority(reason: FrameRequestReason) -> u8 {
+    match reason {
+        FrameRequestReason::Explicit => 6,
+        FrameRequestReason::WindowResized => 5,
+        FrameRequestReason::TerminalContentChanged => 4,
+        FrameRequestReason::SelectionChanged => 3,
+        FrameRequestReason::CursorBlink => 2,
+        FrameRequestReason::Animation => 1,
     }
 }
 
@@ -822,10 +963,15 @@ impl CursorBlinkRuntime {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CursorAnimationSettings {
     pub enabled: bool,
+    pub tilt: bool,
     pub smooth_movement: bool,
     pub typing_pulse: bool,
     pub typing_stretch: bool,
     pub trail: bool,
+    pub trail_delay: Duration,
+    pub trail_start_threshold_cells: u16,
+    pub trail_decay_fast: Duration,
+    pub trail_decay_slow: Duration,
     pub blink_easing: bool,
     pub short_lived_glow: bool,
     pub shadow: bool,
@@ -838,10 +984,15 @@ impl Default for CursorAnimationSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            tilt: false,
             smooth_movement: false,
             typing_pulse: false,
             typing_stretch: false,
             trail: false,
+            trail_delay: Duration::from_millis(1),
+            trail_start_threshold_cells: 2,
+            trail_decay_fast: Duration::from_millis(100),
+            trail_decay_slow: Duration::from_millis(400),
             blink_easing: false,
             short_lived_glow: false,
             shadow: false,
@@ -852,11 +1003,266 @@ impl Default for CursorAnimationSettings {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingCursorTrailTarget {
+    region: RenderRect,
+    color: RenderColor,
+    observed_at: Instant,
+}
+
+#[derive(Debug)]
+struct PersistentCursorTrail {
+    corners: [[f32; 2]; 4],
+    target: [[f32; 2]; 4],
+    target_region: RenderRect,
+    color: RenderColor,
+    initialized: bool,
+    active: bool,
+    pending_target: Option<PendingCursorTrailTarget>,
+}
+
+impl Default for PersistentCursorTrail {
+    fn default() -> Self {
+        Self {
+            corners: [[0.0; 2]; 4],
+            target: [[0.0; 2]; 4],
+            target_region: RenderRect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            },
+            color: RenderColor::rgb(0, 0, 0),
+            initialized: false,
+            active: false,
+            pending_target: None,
+        }
+    }
+}
+
+impl PersistentCursorTrail {
+    fn reset(&mut self) {
+        self.initialized = false;
+        self.active = false;
+        self.pending_target = None;
+    }
+
+    fn retarget(
+        &mut self,
+        target_region: RenderRect,
+        color: RenderColor,
+        cell_size: [u32; 2],
+        settings: CursorAnimationSettings,
+    ) {
+        let target = rect_quad(target_region);
+        self.pending_target = None;
+        self.color = color;
+        self.target_region = target_region;
+        if !self.initialized {
+            self.corners = target;
+            self.target = target;
+            self.initialized = true;
+            return;
+        }
+        if self.target == target {
+            return;
+        }
+
+        self.target = target;
+        if !self.active
+            && cursor_trail_move_within_threshold(
+                quad_bounds(self.corners),
+                target_region,
+                cell_size,
+                settings.trail_start_threshold_cells,
+            )
+        {
+            self.corners = target;
+            return;
+        }
+        self.active = true;
+    }
+
+    fn observe_target(
+        &mut self,
+        target_region: RenderRect,
+        color: RenderColor,
+        cell_size: [u32; 2],
+        settings: CursorAnimationSettings,
+        now: Instant,
+    ) {
+        if !self.initialized || settings.trail_delay.is_zero() {
+            self.retarget(target_region, color, cell_size, settings);
+            return;
+        }
+        if self.target_region == target_region {
+            self.color = color;
+            self.pending_target = None;
+            return;
+        }
+
+        let Some(pending) = self.pending_target else {
+            self.pending_target = Some(PendingCursorTrailTarget {
+                region: target_region,
+                color,
+                observed_at: now,
+            });
+            return;
+        };
+        if pending.region != target_region {
+            self.pending_target = Some(PendingCursorTrailTarget {
+                region: target_region,
+                color,
+                observed_at: now,
+            });
+            return;
+        }
+        if now.saturating_duration_since(pending.observed_at) >= settings.trail_delay {
+            self.retarget(target_region, color, cell_size, settings);
+        } else if pending.color != color {
+            self.pending_target = Some(PendingCursorTrailTarget { color, ..pending });
+        }
+    }
+
+    fn pending_delay(&self, now: Instant, settings: CursorAnimationSettings) -> Option<Duration> {
+        self.pending_target.map(|pending| {
+            settings
+                .trail_delay
+                .saturating_sub(now.saturating_duration_since(pending.observed_at))
+        })
+    }
+
+    fn advance(&mut self, elapsed: Duration, settings: CursorAnimationSettings) {
+        if !self.active || elapsed.is_zero() {
+            return;
+        }
+
+        let target_center = [
+            (self.target[0][0] + self.target[2][0]) * 0.5,
+            (self.target[0][1] + self.target[2][1]) * 0.5,
+        ];
+        let half_diagonal = (self.target[2][0] - self.target[0][0])
+            .hypot(self.target[2][1] - self.target[0][1])
+            .mul_add(0.5, 0.0)
+            .max(f32::EPSILON);
+        let mut deltas = [[0.0; 2]; 4];
+        let mut projections = [0.0; 4];
+        for index in 0..4 {
+            let delta = [
+                self.target[index][0] - self.corners[index][0],
+                self.target[index][1] - self.corners[index][1],
+            ];
+            deltas[index] = delta;
+            let length = delta[0].hypot(delta[1]);
+            if length > f32::EPSILON {
+                projections[index] = (delta[0] * (self.target[index][0] - target_center[0])
+                    + delta[1] * (self.target[index][1] - target_center[1]))
+                    / (half_diagonal * length);
+            }
+        }
+        let minimum = projections.iter().copied().fold(f32::INFINITY, f32::min);
+        let maximum = projections
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let span = maximum - minimum;
+        let fast = settings.trail_decay_fast.as_secs_f32().max(0.001);
+        let slow = settings
+            .trail_decay_slow
+            .max(settings.trail_decay_fast)
+            .as_secs_f32()
+            .max(fast);
+        let elapsed = elapsed.as_secs_f32();
+
+        for index in 0..4 {
+            let blend = if span <= f32::EPSILON {
+                0.0
+            } else {
+                ((projections[index] - minimum) / span).clamp(0.0, 1.0)
+            };
+            let decay = slow + (fast - slow) * blend;
+            let step = 1.0 - (-10.0 * elapsed / decay).exp2();
+            self.corners[index][0] += deltas[index][0] * step;
+            self.corners[index][1] += deltas[index][1] * step;
+        }
+
+        if self
+            .corners
+            .iter()
+            .zip(self.target)
+            .all(|(corner, target)| {
+                (corner[0] - target[0]).abs() < 0.5 && (corner[1] - target[1]).abs() < 0.5
+            })
+        {
+            self.corners = self.target;
+            self.active = false;
+        }
+        let region =
+            cursor_animation_region(union_region(quad_bounds(self.corners), self.target_region));
+        if region.width.saturating_mul(region.height) > settings.max_animated_region_pixels {
+            self.corners = self.target;
+            self.active = false;
+        }
+    }
+
+    const fn needs_frame(&self) -> bool {
+        self.active
+    }
+
+    fn visual(&self, settings: CursorAnimationSettings) -> Option<AnimationHandle> {
+        self.active.then(|| {
+            let current_bounds = quad_bounds(self.corners);
+            let region = cursor_animation_region(union_region(current_bounds, self.target_region));
+            debug_assert!(
+                region.width.saturating_mul(region.height) <= settings.max_animated_region_pixels
+            );
+            AnimationHandle {
+                id: u64::MAX,
+                kind: AnimationKind::CursorTrail,
+                affected_region: region,
+                start_region: current_bounds,
+                end_region: self.target_region,
+                color: self.color,
+                quad: Some(animation_quad(self.corners)),
+                elapsed: Duration::ZERO,
+                remaining: None,
+            }
+        })
+    }
+}
+
 impl CursorAnimationSettings {
+    #[must_use]
+    pub const fn panea(
+        fps: u16,
+        max_active_animations: u16,
+        max_animated_region_pixels: u32,
+    ) -> Self {
+        Self {
+            enabled: true,
+            tilt: true,
+            smooth_movement: false,
+            typing_pulse: false,
+            typing_stretch: false,
+            trail: false,
+            trail_delay: Duration::ZERO,
+            trail_start_threshold_cells: 0,
+            trail_decay_fast: Duration::from_millis(45),
+            trail_decay_slow: Duration::from_millis(140),
+            blink_easing: false,
+            short_lived_glow: false,
+            shadow: false,
+            fps,
+            max_active_animations,
+            max_animated_region_pixels,
+        }
+    }
+
     #[must_use]
     pub const fn any_effect_enabled(self) -> bool {
         self.enabled
-            && (self.smooth_movement
+            && (self.tilt
+                || self.smooth_movement
                 || self.typing_pulse
                 || self.typing_stretch
                 || self.trail
@@ -878,6 +1284,7 @@ impl CursorAnimationSettings {
 pub struct CursorAnimationRuntime {
     previous_cursor: Option<CursorVisual>,
     active: Vec<AnimationHandle>,
+    trail: PersistentCursorTrail,
     next_id: u64,
     last_tick: Instant,
     typing_requested: bool,
@@ -898,6 +1305,7 @@ impl Default for CursorAnimationRuntime {
         Self {
             previous_cursor: None,
             active: Vec::new(),
+            trail: PersistentCursorTrail::default(),
             next_id: 1,
             last_tick: Instant::now(),
             typing_requested: false,
@@ -915,6 +1323,19 @@ impl CursorAnimationRuntime {
         self.typing_requested = true;
     }
 
+    pub fn refresh_retained_scene(
+        &mut self,
+        scene: &mut RenderScene,
+        metrics: CellMetrics,
+        settings: CursorAnimationSettings,
+    ) {
+        scene
+            .animations
+            .retain(|animation| !cursor_runtime_owns(animation.kind));
+        scene.damage_regions.clear();
+        self.populate_scene(scene, metrics, settings);
+    }
+
     pub fn populate_scene(
         &mut self,
         scene: &mut RenderScene,
@@ -924,6 +1345,7 @@ impl CursorAnimationRuntime {
         if !settings.any_effect_enabled() {
             self.previous_cursor = scene.cursor;
             self.active.clear();
+            self.trail.reset();
             self.typing_requested = false;
             return;
         }
@@ -932,15 +1354,43 @@ impl CursorAnimationRuntime {
         let elapsed = now.saturating_duration_since(self.last_tick);
         self.last_tick = now;
         advance_animations(&mut self.active, elapsed);
+        self.trail.advance(elapsed, settings);
 
         let current = scene.cursor;
         if let Some(cursor) = current {
             let current_cell = cell_region(cursor.position, metrics);
             let current_region = cursor_animation_region(current_cell);
+            if settings.trail && cursor.visible {
+                self.trail.observe_target(
+                    cursor_visual_region(cursor, metrics),
+                    cursor.color,
+                    [current_cell.width, current_cell.height],
+                    settings,
+                    now,
+                );
+            } else {
+                self.trail.reset();
+            }
             if let Some(previous) = self.previous_cursor
                 && previous.position != cursor.position
             {
                 let previous_cell = cell_region(previous.position, metrics);
+                if settings.tilt
+                    && previous.position.row == cursor.position.row
+                    && previous.position.col != cursor.position.col
+                {
+                    self.push_tilt_animation(
+                        settings,
+                        previous,
+                        cursor,
+                        if cursor.position.col > previous.position.col {
+                            1.0
+                        } else {
+                            -1.0
+                        },
+                        metrics,
+                    );
+                }
                 if settings.smooth_movement {
                     self.push_animation(
                         settings,
@@ -951,19 +1401,6 @@ impl CursorAnimationRuntime {
                             end_region: current_cell,
                             color: cursor.color,
                             duration: Duration::from_millis(120),
-                        },
-                    );
-                }
-                if settings.trail {
-                    self.push_animation(
-                        settings,
-                        CursorAnimationSpec {
-                            kind: AnimationKind::CursorTrail,
-                            affected_region: cursor_animation_region(previous_cell),
-                            start_region: previous_cell,
-                            end_region: current_cell,
-                            color: cursor.color,
-                            duration: Duration::from_millis(180),
                         },
                     );
                 }
@@ -1041,6 +1478,8 @@ impl CursorAnimationRuntime {
                     },
                 );
             }
+        } else {
+            self.trail.reset();
         }
 
         self.previous_cursor = current;
@@ -1051,16 +1490,26 @@ impl CursorAnimationRuntime {
                 .map(|animation| animation.affected_region),
         );
         scene.animations.extend(self.active.iter().copied());
+        if let Some(trail) = self.trail.visual(settings) {
+            scene.damage_regions.push(trail.affected_region);
+            scene.animations.push(trail);
+        }
     }
 
     #[must_use]
     pub fn needs_frame(&self) -> bool {
-        !self.active.is_empty()
+        !self.active.is_empty() || self.trail.needs_frame()
     }
 
     #[must_use]
     pub fn next_frame_after(&self, settings: CursorAnimationSettings) -> Option<Duration> {
-        self.needs_frame().then(|| settings.frame_interval())
+        let active_delay = self.needs_frame().then(|| settings.frame_interval());
+        let pending_delay = self.trail.pending_delay(Instant::now(), settings);
+        match (active_delay, pending_delay) {
+            (Some(active), Some(pending)) => Some(active.min(pending)),
+            (Some(delay), None) | (None, Some(delay)) => Some(delay),
+            (None, None) => None,
+        }
     }
 
     fn push_animation(&mut self, settings: CursorAnimationSettings, spec: CursorAnimationSpec) {
@@ -1078,6 +1527,7 @@ impl CursorAnimationRuntime {
             start_region: spec.start_region,
             end_region: spec.end_region,
             color: spec.color,
+            quad: None,
             elapsed: Duration::ZERO,
             remaining: Some(spec.duration),
         };
@@ -1094,6 +1544,102 @@ impl CursorAnimationRuntime {
         }
         self.next_id = self.next_id.saturating_add(1);
     }
+
+    fn push_tilt_animation(
+        &mut self,
+        settings: CursorAnimationSettings,
+        previous: CursorVisual,
+        cursor: CursorVisual,
+        direction: f32,
+        metrics: CellMetrics,
+    ) {
+        let region = cursor_visual_region(cursor, metrics);
+        let previous_region = cursor_visual_region(previous, metrics);
+        let shear = (region.height as f32 * 0.45)
+            .min(metrics.cell_width)
+            .max(1.0)
+            * direction;
+        let half_shear = shear * 0.5;
+        let mut corners = rect_quad(region);
+        corners[0][0] += half_shear;
+        corners[1][0] += half_shear;
+        corners[2][0] -= half_shear;
+        corners[3][0] -= half_shear;
+        let affected_region = expand_region(quad_bounds(corners), 2);
+        if affected_region.width.saturating_mul(affected_region.height)
+            > settings.max_animated_region_pixels
+        {
+            return;
+        }
+
+        let tilt = AnimationHandle {
+            id: self.next_id,
+            kind: AnimationKind::CursorTilt,
+            affected_region,
+            start_region: region,
+            end_region: region,
+            color: cursor.color,
+            quad: Some(animation_quad(corners)),
+            elapsed: Duration::ZERO,
+            remaining: Some(Duration::from_millis(90)),
+        };
+        if !self.store_animation(settings, tilt) {
+            return;
+        }
+
+        let mut extension_corners = rect_quad(previous_region);
+        if direction > 0.0 {
+            extension_corners[1] = corners[0];
+            extension_corners[2] = corners[3];
+        } else {
+            extension_corners[0] = corners[1];
+            extension_corners[3] = corners[2];
+        }
+        let extension_region = cursor_animation_region(quad_bounds(extension_corners));
+        let extension = AnimationHandle {
+            id: self.next_id,
+            kind: AnimationKind::CursorElasticExtension,
+            affected_region: extension_region,
+            start_region: previous_region,
+            end_region: region,
+            color: cursor.color,
+            quad: Some(animation_quad(extension_corners)),
+            elapsed: Duration::ZERO,
+            remaining: Some(Duration::from_millis(90)),
+        };
+        self.store_animation(settings, extension);
+    }
+
+    fn store_animation(
+        &mut self,
+        settings: CursorAnimationSettings,
+        animation: AnimationHandle,
+    ) -> bool {
+        let pixels = animation
+            .affected_region
+            .width
+            .saturating_mul(animation.affected_region.height);
+        if pixels > settings.max_animated_region_pixels {
+            return false;
+        }
+        if let Some(existing) = self
+            .active
+            .iter_mut()
+            .find(|active| active.kind == animation.kind)
+        {
+            *existing = animation;
+        } else if self.active.len() < usize::from(settings.max_active_animations) {
+            self.active.push(animation);
+        } else {
+            return false;
+        }
+        self.next_id = self.next_id.saturating_add(1);
+        true
+    }
+}
+
+const fn cursor_runtime_owns(kind: AnimationKind) -> bool {
+    !matches!(kind, AnimationKind::OverlayTransition)
 }
 
 fn advance_animations(animations: &mut Vec<AnimationHandle>, elapsed: Duration) {
@@ -1102,10 +1648,7 @@ fn advance_animations(animations: &mut Vec<AnimationHandle>, elapsed: Duration) 
         if let Some(remaining) = animation.remaining {
             animation.remaining = Some(remaining.checked_sub(elapsed).unwrap_or(Duration::ZERO));
         }
-        if matches!(
-            animation.kind,
-            AnimationKind::CursorSmoothMovement | AnimationKind::CursorTrail
-        ) {
+        if animation.kind == AnimationKind::CursorSmoothMovement {
             let progress = animation_progress(*animation);
             animation.affected_region = cursor_animation_region(interpolate_region(
                 animation.start_region,
@@ -1119,6 +1662,26 @@ fn advance_animations(animations: &mut Vec<AnimationHandle>, elapsed: Duration) 
 
 fn cursor_animation_region(rect: RenderRect) -> RenderRect {
     expand_region(rect, 4)
+}
+
+fn cursor_visual_region(cursor: CursorVisual, metrics: CellMetrics) -> RenderRect {
+    let mut rect = cell_region(cursor.position, metrics);
+    let thickness = u32::from(cursor.thickness_percent.clamp(1, 100));
+    match cursor.shape {
+        RenderCursorShape::Beam => {
+            rect.width = ((rect.width * thickness) / 100).max(1);
+        }
+        RenderCursorShape::Underline => {
+            let cell_height = rect.height;
+            rect.height = ((rect.height * thickness) / 100).max(1);
+            rect.y += cell_height.saturating_sub(rect.height) as i32;
+        }
+        RenderCursorShape::Block
+        | RenderCursorShape::HollowBlock
+        | RenderCursorShape::Custom
+        | RenderCursorShape::CustomStaticShape => {}
+    }
+    rect
 }
 
 fn expand_region(rect: RenderRect, amount: i32) -> RenderRect {
@@ -1818,6 +2381,7 @@ fn decode_cursor_image_header(bytes: &[u8]) -> Option<(u32, u32, u16)> {
 pub enum QuadBatchKind {
     Background,
     Decoration,
+    CursorTrail,
     Selection,
     Cursor,
 }
@@ -1900,6 +2464,8 @@ pub struct PreparedRenderBatches {
     pub glyphs: GlyphBatch,
     pub overlay_glyphs: GlyphBatch,
     pub decorations: QuadBatch,
+    pub cursor_effects: QuadBatch,
+    pub cursor_trail: QuadBatch,
     pub window_chrome: QuadBatch,
     pub selections: QuadBatch,
     pub cursor: QuadBatch,
@@ -1907,6 +2473,140 @@ pub struct PreparedRenderBatches {
     pub cursor_image_asset: Option<Arc<CursorImageAsset>>,
     pub atlas_uploads: Vec<AtlasUpload>,
     pub instrumentation: RenderInstrumentation,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CursorOverlayFrame {
+    pub cursor: Option<CursorVisual>,
+    pub animations: Vec<AnimationHandle>,
+    pub content_offset: render_core::RenderOffset,
+}
+
+impl CursorOverlayFrame {
+    #[must_use]
+    pub fn from_scene(scene: &RenderScene) -> Self {
+        Self {
+            cursor: scene.cursor,
+            animations: scene
+                .animations
+                .iter()
+                .filter(|animation| cursor_runtime_owns(animation.kind))
+                .copied()
+                .collect(),
+            content_offset: scene.content_offset,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedCursorOverlay {
+    pub effects: QuadBatch,
+    pub cursor_trail: QuadBatch,
+    pub cursor: QuadBatch,
+    pub animated_pixels: u32,
+    damage_regions: Vec<DamageRegion>,
+    merged_damage_regions: Vec<DamageRegion>,
+}
+
+impl PreparedCursorOverlay {
+    #[must_use]
+    pub fn draw_call_count(&self) -> u32 {
+        [
+            !self.effects.is_empty(),
+            !self.cursor_trail.is_empty(),
+            !self.cursor.is_empty(),
+        ]
+        .into_iter()
+        .filter(|non_empty| *non_empty)
+        .count() as u32
+    }
+}
+
+#[must_use]
+pub fn prepare_cursor_overlay(
+    frame: &CursorOverlayFrame,
+    metrics: CellMetrics,
+) -> PreparedCursorOverlay {
+    prepare_cursor_overlay_reusing(frame, metrics, None)
+}
+
+#[must_use]
+pub fn prepare_cursor_overlay_reusing(
+    frame: &CursorOverlayFrame,
+    metrics: CellMetrics,
+    recycled: Option<PreparedCursorOverlay>,
+) -> PreparedCursorOverlay {
+    let mut prepared = recycled.unwrap_or_else(|| PreparedCursorOverlay {
+        effects: QuadBatch::new(QuadBatchKind::Decoration),
+        cursor_trail: QuadBatch::new(QuadBatchKind::CursorTrail),
+        cursor: QuadBatch::new(QuadBatchKind::Cursor),
+        animated_pixels: 0,
+        damage_regions: Vec::new(),
+        merged_damage_regions: Vec::new(),
+    });
+    prepared.effects.clear_for_reuse(QuadBatchKind::Decoration);
+    prepared
+        .cursor_trail
+        .clear_for_reuse(QuadBatchKind::CursorTrail);
+    prepared.cursor.clear_for_reuse(QuadBatchKind::Cursor);
+    prepared.damage_regions.clear();
+    prepared.damage_regions.extend(
+        frame
+            .animations
+            .iter()
+            .map(|animation| offset_region(animation.affected_region, frame.content_offset))
+            .chain(frame.cursor.map(|cursor| {
+                offset_region(cursor_visual_region(cursor, metrics), frame.content_offset)
+            })),
+    );
+
+    push_animation_quads(
+        &mut prepared.effects,
+        &mut prepared.cursor_trail,
+        &frame.animations,
+        &prepared.damage_regions,
+        frame.content_offset,
+        false,
+    );
+    if let Some(cursor_visual) = frame.cursor
+        && cursor_visual.visible
+        && !frame
+            .animations
+            .iter()
+            .any(|animation| animation.kind == AnimationKind::CursorSmoothMovement)
+    {
+        push_cursor_quads(
+            &mut prepared.cursor,
+            cursor_visual,
+            metrics,
+            &prepared.damage_regions,
+            frame.content_offset,
+        );
+    }
+
+    prepared.merged_damage_regions.clear();
+    for region in prepared.damage_regions.iter().copied() {
+        push_merged_region(&mut prepared.merged_damage_regions, region);
+    }
+    prepared.animated_pixels = prepared
+        .merged_damage_regions
+        .iter()
+        .fold(0u32, |pixels, region| {
+            pixels.saturating_add(region.width.saturating_mul(region.height))
+        });
+    prepared
+}
+
+fn can_present_cursor_overlay(
+    retained_damage_enabled: bool,
+    retained_frame_initialized: bool,
+    retained_cursor: Option<CursorVisual>,
+    frame: &CursorOverlayFrame,
+) -> bool {
+    retained_damage_enabled
+        && retained_frame_initialized
+        && retained_cursor == frame.cursor
+        && frame.cursor.is_some_and(|cursor| cursor.visible)
 }
 
 impl PreparedRenderBatches {
@@ -1927,6 +2627,8 @@ impl PreparedRenderBatches {
                 glyph_count: 0,
             },
             decorations: QuadBatch::new(QuadBatchKind::Decoration),
+            cursor_effects: QuadBatch::new(QuadBatchKind::Decoration),
+            cursor_trail: QuadBatch::new(QuadBatchKind::CursorTrail),
             window_chrome: QuadBatch::new(QuadBatchKind::Decoration),
             selections: QuadBatch::new(QuadBatchKind::Selection),
             cursor: QuadBatch::new(QuadBatchKind::Cursor),
@@ -1944,6 +2646,8 @@ impl PreparedRenderBatches {
             !self.glyphs.is_empty(),
             !self.overlay_glyphs.is_empty(),
             !self.decorations.is_empty(),
+            !self.cursor_effects.is_empty(),
+            !self.cursor_trail.is_empty(),
             !self.window_chrome.is_empty(),
             !self.selections.is_empty(),
             !self.cursor.is_empty(),
@@ -1958,7 +2662,7 @@ impl PreparedRenderBatches {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct GlyphRunKey {
     font_generation: u64,
-    text: String,
+    text: RenderText,
     size_millipoints: u32,
     bold: bool,
     italic: bool,
@@ -2065,6 +2769,10 @@ impl RenderBatchPlanner {
         overlay_glyphs.clear_for_reuse();
         let mut decorations = recycled.decorations;
         decorations.clear_for_reuse(QuadBatchKind::Decoration);
+        let mut cursor_effects = recycled.cursor_effects;
+        cursor_effects.clear_for_reuse(QuadBatchKind::Decoration);
+        let mut cursor_trail = recycled.cursor_trail;
+        cursor_trail.clear_for_reuse(QuadBatchKind::CursorTrail);
         let mut window_chrome = recycled.window_chrome;
         window_chrome.clear_for_reuse(QuadBatchKind::Decoration);
         let mut selections = recycled.selections;
@@ -2183,7 +2891,8 @@ impl RenderBatchPlanner {
         }
 
         push_animation_quads(
-            &mut decorations,
+            &mut cursor_effects,
+            &mut cursor_trail,
             &scene.animations,
             &damage_regions,
             scene.content_offset,
@@ -2194,10 +2903,12 @@ impl RenderBatchPlanner {
             && cursor_visual.visible
             && scene.cursor_image.is_none()
             && scene.cursor_vector.is_none()
-            && !scene
-                .animations
-                .iter()
-                .any(|animation| animation.kind == AnimationKind::CursorSmoothMovement)
+            && !scene.animations.iter().any(|animation| {
+                matches!(
+                    animation.kind,
+                    AnimationKind::CursorSmoothMovement | AnimationKind::CursorTilt
+                )
+            })
         {
             push_cursor_quads(
                 &mut cursor,
@@ -2253,6 +2964,8 @@ impl RenderBatchPlanner {
             !glyphs.is_empty(),
             !overlay_glyphs.is_empty(),
             !decorations.is_empty(),
+            !cursor_effects.is_empty(),
+            !cursor_trail.is_empty(),
             !window_chrome.is_empty(),
             !selections.is_empty(),
             !cursor.is_empty(),
@@ -2271,6 +2984,8 @@ impl RenderBatchPlanner {
             glyphs,
             overlay_glyphs,
             decorations,
+            cursor_effects,
+            cursor_trail,
             window_chrome,
             selections,
             cursor,
@@ -2497,7 +3212,7 @@ impl RenderBatchPlanner {
 
         let cell = RenderCell {
             position: CellPosition { row: 0, col: 0 },
-            text: label.clone(),
+            text: label.clone().into(),
             foreground: overlay
                 .label_color
                 .unwrap_or_else(|| overlay_label_color(overlay.kind)),
@@ -2666,6 +3381,12 @@ fn window_chrome_title_overlay(
 }
 
 fn terminal_text_runs(cells: &[RenderCell]) -> Vec<RenderCell> {
+    terminal_text_runs_from_iter(cells.iter())
+}
+
+fn terminal_text_runs_from_iter<'a>(
+    cells: impl IntoIterator<Item = &'a RenderCell>,
+) -> Vec<RenderCell> {
     let mut runs: Vec<RenderCell> = Vec::new();
 
     for cell in cells {
@@ -2781,15 +3502,53 @@ fn damaged_terminal_text_runs(
     metrics: CellMetrics,
     offset: render_core::RenderOffset,
 ) -> Vec<RenderCell> {
-    terminal_text_runs(cells)
-        .into_iter()
-        .filter(|run| {
-            intersects_any(
-                offset_region(text_run_region(run, metrics), offset),
-                damage_regions,
-            )
-        })
-        .collect()
+    damaged_terminal_text_runs_with_stats(cells, damage_regions, metrics, offset).runs
+}
+
+struct DamagedTerminalTextRuns {
+    runs: Vec<RenderCell>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    source_cells: usize,
+}
+
+fn damaged_terminal_text_runs_with_stats(
+    cells: &[RenderCell],
+    damage_regions: &[DamageRegion],
+    metrics: CellMetrics,
+    offset: render_core::RenderOffset,
+) -> DamagedTerminalTextRuns {
+    let mut source_cells = 0;
+    let runs = terminal_text_runs_from_iter(cells.iter().filter(|cell| {
+        let selected =
+            row_intersects_any_damage(cell.position.row, metrics, offset, damage_regions);
+        source_cells += usize::from(selected);
+        selected
+    }))
+    .into_iter()
+    .filter(|run| {
+        intersects_any(
+            offset_region(text_run_region(run, metrics), offset),
+            damage_regions,
+        )
+    })
+    .collect();
+    DamagedTerminalTextRuns { runs, source_cells }
+}
+
+fn row_intersects_any_damage(
+    row: i64,
+    metrics: CellMetrics,
+    offset: render_core::RenderOffset,
+    damage_regions: &[DamageRegion],
+) -> bool {
+    let row_rect = cell_region_at(CellPosition { row, col: 0 }, metrics, offset);
+    let row_top = i64::from(row_rect.y);
+    let row_bottom = row_top.saturating_add(i64::from(row_rect.height));
+    damage_regions.iter().any(|damage| {
+        let damage_top = i64::from(damage.y);
+        let damage_bottom = damage_top.saturating_add(i64::from(damage.height));
+        row_top < damage_bottom && row_bottom > damage_top
+    })
 }
 
 fn text_run_region(cell: &RenderCell, metrics: CellMetrics) -> RenderRect {
@@ -3068,6 +3827,23 @@ fn push_quad(
     indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
+fn push_positioned_quad(batch: &mut QuadBatch, positions: [[f32; 2]; 4], color: RenderColor) {
+    let Ok(base) = u32::try_from(batch.vertices.len()) else {
+        return;
+    };
+    let color = color_to_f32(color);
+    batch
+        .vertices
+        .extend(positions.map(|position_px| BatchVertex {
+            position_px,
+            uv: [0.0, 0.0],
+            color,
+        }));
+    batch
+        .indices
+        .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
 fn color_to_f32(color: RenderColor) -> [f32; 4] {
     [
         f32::from(color.red) / 255.0,
@@ -3168,7 +3944,8 @@ fn missing_glyph_bitmap(metrics: CellMetrics) -> GlyphBitmap {
 }
 
 fn push_animation_quads(
-    batch: &mut QuadBatch,
+    effects_batch: &mut QuadBatch,
+    trail_batch: &mut QuadBatch,
     animations: &[AnimationHandle],
     damage_regions: &[DamageRegion],
     offset: render_core::RenderOffset,
@@ -3184,13 +3961,56 @@ fn push_animation_quads(
         let progress = animation_progress(*animation);
         let color = animation_color(*animation);
         match animation.kind {
+            AnimationKind::CursorTilt => {
+                if !image_cursor_active {
+                    let target = rect_quad(end_region);
+                    let progress = ease_out_cubic(progress);
+                    let positions = animation
+                        .quad
+                        .map(|quad| offset_animation_quad_pixels(quad, offset))
+                        .unwrap_or(target);
+                    let positions = std::array::from_fn(|index| {
+                        [
+                            positions[index][0]
+                                + (target[index][0] - positions[index][0]) * progress,
+                            positions[index][1]
+                                + (target[index][1] - positions[index][1]) * progress,
+                        ]
+                    });
+                    push_positioned_quad(effects_batch, positions, color);
+                }
+            }
+            AnimationKind::CursorElasticExtension => {
+                if !image_cursor_active {
+                    let target = rect_quad(end_region);
+                    let progress = ease_out_cubic(progress);
+                    let positions = animation
+                        .quad
+                        .map(|quad| offset_animation_quad_pixels(quad, offset))
+                        .unwrap_or(target);
+                    let positions = std::array::from_fn(|index| {
+                        [
+                            positions[index][0]
+                                + (target[index][0] - positions[index][0]) * progress,
+                            positions[index][1]
+                                + (target[index][1] - positions[index][1]) * progress,
+                        ]
+                    });
+                    push_positioned_quad(effects_batch, positions, color);
+                }
+            }
             AnimationKind::CursorTypingStretch => {
-                push_rounded_quads(batch, stretch_region(end_region, progress), 2, color);
+                push_rounded_quads(
+                    effects_batch,
+                    stretch_region(end_region, progress),
+                    2,
+                    color,
+                );
             }
             AnimationKind::CursorSmoothMovement => {
                 if !image_cursor_active {
                     push_rounded_quads(
-                        batch,
+                        effects_batch,
                         interpolate_region(start_region, end_region, ease_out_cubic(progress)),
                         2,
                         color,
@@ -3198,34 +4018,156 @@ fn push_animation_quads(
                 }
             }
             AnimationKind::CursorTrail => {
-                let trail = interpolate_region(start_region, end_region, progress * 0.75);
-                push_rounded_quads(batch, trail, 2, color);
+                push_clipped_cursor_trail(
+                    trail_batch,
+                    animation.quad.map_or_else(
+                        || cursor_trail_quad(start_region, end_region, animation.elapsed),
+                        |quad| offset_animation_quad_pixels(quad, offset),
+                    ),
+                    start_region,
+                    end_region,
+                    color,
+                );
             }
             AnimationKind::CursorTypingPulse => {
                 let expansion = ((1.0 - progress) * 4.0).round() as i32;
-                push_rounded_stroke_quads(batch, expand_region(end_region, expansion), 1, 3, color);
+                push_rounded_stroke_quads(
+                    effects_batch,
+                    expand_region(end_region, expansion),
+                    1,
+                    3,
+                    color,
+                );
             }
             AnimationKind::CursorBlinkEasing => {
-                push_rounded_quads(batch, end_region, 2, color);
+                push_rounded_quads(effects_batch, end_region, 2, color);
             }
             AnimationKind::CursorGlow => {
                 for expansion in [2, 4, 6] {
                     let mut layer = color;
                     layer.alpha /= expansion as u8;
-                    push_rounded_quads(batch, expand_region(end_region, expansion), 4, layer);
+                    push_rounded_quads(
+                        effects_batch,
+                        expand_region(end_region, expansion),
+                        4,
+                        layer,
+                    );
                 }
             }
             AnimationKind::CursorShadow => {
                 let mut shadow = end_region;
                 shadow.x = shadow.x.saturating_add(2);
                 shadow.y = shadow.y.saturating_add(2);
-                push_rounded_quads(batch, shadow, 2, color);
+                push_rounded_quads(effects_batch, shadow, 2, color);
             }
             AnimationKind::OverlayTransition => {
-                push_solid_quad(batch, affected_region, color);
+                push_solid_quad(effects_batch, affected_region, color);
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TrailClipBoundary {
+    MaxX(f32),
+    MinX(f32),
+    MaxY(f32),
+    MinY(f32),
+}
+
+fn push_clipped_cursor_trail(
+    batch: &mut QuadBatch,
+    mut positions: [[f32; 2]; 4],
+    start: RenderRect,
+    target: RenderRect,
+    color: RenderColor,
+) {
+    let delta_x = target.x - start.x;
+    let delta_y = target.y - start.y;
+    let boundary = if delta_x.unsigned_abs() >= delta_y.unsigned_abs() && delta_x != 0 {
+        if delta_x > 0 {
+            positions[1] = [target.x as f32, target.y as f32];
+            positions[2] = [target.x as f32, (target.y + target.height as i32) as f32];
+            TrailClipBoundary::MaxX(target.x as f32)
+        } else {
+            let target_right = (target.x + target.width as i32) as f32;
+            positions[0] = [target_right, target.y as f32];
+            positions[3] = [target_right, (target.y + target.height as i32) as f32];
+            TrailClipBoundary::MinX((target.x + target.width as i32) as f32)
+        }
+    } else if delta_y != 0 {
+        if delta_y > 0 {
+            positions[2] = [(target.x + target.width as i32) as f32, target.y as f32];
+            positions[3] = [target.x as f32, target.y as f32];
+            TrailClipBoundary::MaxY(target.y as f32)
+        } else {
+            let target_bottom = (target.y + target.height as i32) as f32;
+            positions[0] = [target.x as f32, target_bottom];
+            positions[1] = [(target.x + target.width as i32) as f32, target_bottom];
+            TrailClipBoundary::MinY((target.y + target.height as i32) as f32)
+        }
+    } else {
+        return;
+    };
+
+    let (clipped, clipped_len) = clip_trail_polygon(positions, boundary);
+    push_solid_polygon(batch, &clipped[..clipped_len], color);
+}
+
+fn clip_trail_polygon(
+    positions: [[f32; 2]; 4],
+    boundary: TrailClipBoundary,
+) -> ([[f32; 2]; 6], usize) {
+    let mut output = [[0.0; 2]; 6];
+    let mut output_len = 0;
+    let mut previous = positions[3];
+    let mut previous_inside = trail_point_inside(previous, boundary);
+
+    for current in positions {
+        let current_inside = trail_point_inside(current, boundary);
+        if current_inside != previous_inside {
+            output[output_len] = trail_boundary_intersection(previous, current, boundary);
+            output_len += 1;
+        }
+        if current_inside {
+            output[output_len] = current;
+            output_len += 1;
+        }
+        previous = current;
+        previous_inside = current_inside;
+    }
+
+    (output, output_len)
+}
+
+fn trail_point_inside(point: [f32; 2], boundary: TrailClipBoundary) -> bool {
+    match boundary {
+        TrailClipBoundary::MaxX(limit) => point[0] <= limit,
+        TrailClipBoundary::MinX(limit) => point[0] >= limit,
+        TrailClipBoundary::MaxY(limit) => point[1] <= limit,
+        TrailClipBoundary::MinY(limit) => point[1] >= limit,
+    }
+}
+
+fn trail_boundary_intersection(
+    start: [f32; 2],
+    end: [f32; 2],
+    boundary: TrailClipBoundary,
+) -> [f32; 2] {
+    let (axis, limit) = match boundary {
+        TrailClipBoundary::MaxX(limit) | TrailClipBoundary::MinX(limit) => (0, limit),
+        TrailClipBoundary::MaxY(limit) | TrailClipBoundary::MinY(limit) => (1, limit),
+    };
+    let denominator = end[axis] - start[axis];
+    let t = if denominator.abs() <= f32::EPSILON {
+        0.0
+    } else {
+        ((limit - start[axis]) / denominator).clamp(0.0, 1.0)
+    };
+    [
+        start[0] + (end[0] - start[0]) * t,
+        start[1] + (end[1] - start[1]) * t,
+    ]
 }
 
 fn push_cursor_image_quad(batch: &mut QuadBatch, rect: RenderRect, frame_index: u16, opacity: u8) {
@@ -3267,18 +4209,57 @@ fn push_cursor_image_quad(batch: &mut QuadBatch, rect: RenderRect, frame_index: 
         .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
+fn push_solid_polygon(batch: &mut QuadBatch, positions: &[[f32; 2]], color: RenderColor) {
+    if positions.len() < 3 {
+        return;
+    }
+    let twice_area = positions
+        .iter()
+        .zip(positions.iter().cycle().skip(1))
+        .take(positions.len())
+        .map(|(current, next)| current[0] * next[1] - next[0] * current[1])
+        .sum::<f32>();
+    if twice_area.abs() <= 0.01 {
+        return;
+    }
+    let Ok(base) = u32::try_from(batch.vertices.len()) else {
+        return;
+    };
+    let color = color_to_f32(color);
+    batch
+        .vertices
+        .extend(positions.iter().map(|position_px| BatchVertex {
+            position_px: *position_px,
+            uv: [0.0, 0.0],
+            color,
+        }));
+    for index in 1..positions.len() - 1 {
+        let Ok(index) = u32::try_from(index) else {
+            return;
+        };
+        batch.indices.extend([base, base + index, base + index + 1]);
+    }
+}
+
 fn animation_color(animation: AnimationHandle) -> RenderColor {
     let base_alpha: u8 = match animation.kind {
         AnimationKind::CursorSmoothMovement => 230,
         AnimationKind::CursorTypingPulse => 120,
         AnimationKind::CursorTypingStretch => 180,
-        AnimationKind::CursorTrail => 80,
+        AnimationKind::CursorTilt => 255,
+        AnimationKind::CursorElasticExtension => 210,
+        AnimationKind::CursorTrail => 255,
         AnimationKind::CursorBlinkEasing => 200,
         AnimationKind::CursorGlow => 96,
         AnimationKind::CursorShadow => 80,
         AnimationKind::OverlayTransition => 48,
     };
-    let alpha = if let Some(remaining) = animation.remaining {
+    let alpha = if matches!(
+        animation.kind,
+        AnimationKind::CursorTilt | AnimationKind::CursorTrail
+    ) {
+        base_alpha
+    } else if let Some(remaining) = animation.remaining {
         let total = animation
             .elapsed
             .saturating_add(remaining)
@@ -3327,6 +4308,139 @@ fn interpolate_region(start: RenderRect, end: RenderRect, progress: f32) -> Rend
     }
 }
 
+fn rect_quad(rect: RenderRect) -> [[f32; 2]; 4] {
+    let left = rect.x as f32;
+    let top = rect.y as f32;
+    let right = left + rect.width as f32;
+    let bottom = top + rect.height as f32;
+    [[left, top], [right, top], [right, bottom], [left, bottom]]
+}
+
+fn quad_bounds(corners: [[f32; 2]; 4]) -> RenderRect {
+    let minimum_x = corners
+        .iter()
+        .map(|corner| corner[0])
+        .fold(f32::INFINITY, f32::min)
+        .floor();
+    let minimum_y = corners
+        .iter()
+        .map(|corner| corner[1])
+        .fold(f32::INFINITY, f32::min)
+        .floor();
+    let maximum_x = corners
+        .iter()
+        .map(|corner| corner[0])
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil();
+    let maximum_y = corners
+        .iter()
+        .map(|corner| corner[1])
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil();
+    RenderRect {
+        x: minimum_x.clamp(i32::MIN as f32, i32::MAX as f32) as i32,
+        y: minimum_y.clamp(i32::MIN as f32, i32::MAX as f32) as i32,
+        width: (maximum_x - minimum_x).max(0.0).min(u32::MAX as f32) as u32,
+        height: (maximum_y - minimum_y).max(0.0).min(u32::MAX as f32) as u32,
+    }
+}
+
+fn cursor_trail_move_within_threshold(
+    from: RenderRect,
+    to: RenderRect,
+    cell_size: [u32; 2],
+    threshold_cells: u16,
+) -> bool {
+    let cell_width = cell_size[0].max(1);
+    let cell_height = cell_size[1].max(1);
+    let horizontal_cells = from.x.abs_diff(to.x) / cell_width;
+    let vertical_cells = from.y.abs_diff(to.y) / cell_height;
+    horizontal_cells <= u32::from(threshold_cells) && vertical_cells <= u32::from(threshold_cells)
+}
+
+fn animation_quad(corners: [[f32; 2]; 4]) -> AnimationQuad {
+    const SUBPIXELS_PER_PIXEL: f32 = 256.0;
+    AnimationQuad {
+        corners_subpixels: corners.map(|corner| {
+            [
+                (corner[0] * SUBPIXELS_PER_PIXEL)
+                    .round()
+                    .clamp(i32::MIN as f32, i32::MAX as f32) as i32,
+                (corner[1] * SUBPIXELS_PER_PIXEL)
+                    .round()
+                    .clamp(i32::MIN as f32, i32::MAX as f32) as i32,
+            ]
+        }),
+    }
+}
+
+fn animation_quad_pixels(quad: AnimationQuad) -> [[f32; 2]; 4] {
+    const PIXELS_PER_SUBPIXEL: f32 = 1.0 / 256.0;
+    quad.corners_subpixels.map(|corner| {
+        [
+            corner[0] as f32 * PIXELS_PER_SUBPIXEL,
+            corner[1] as f32 * PIXELS_PER_SUBPIXEL,
+        ]
+    })
+}
+
+fn offset_animation_quad_pixels(
+    quad: AnimationQuad,
+    offset: render_core::RenderOffset,
+) -> [[f32; 2]; 4] {
+    animation_quad_pixels(quad)
+        .map(|corner| [corner[0] + offset.x as f32, corner[1] + offset.y as f32])
+}
+
+fn cursor_trail_quad(start: RenderRect, end: RenderRect, elapsed: Duration) -> [[f32; 2]; 4] {
+    const FAST_DECAY_SECONDS: f32 = 0.1;
+    const SLOW_DECAY_SECONDS: f32 = 0.4;
+
+    let start = rect_quad(start);
+    let target = rect_quad(end);
+    let start_center = [
+        (start[0][0] + start[2][0]) * 0.5,
+        (start[0][1] + start[2][1]) * 0.5,
+    ];
+    let target_center = [
+        (target[0][0] + target[2][0]) * 0.5,
+        (target[0][1] + target[2][1]) * 0.5,
+    ];
+    let movement = [
+        target_center[0] - start_center[0],
+        target_center[1] - start_center[1],
+    ];
+    let movement_length = movement[0].hypot(movement[1]);
+    if movement_length <= f32::EPSILON {
+        return target;
+    }
+    let direction = [movement[0] / movement_length, movement[1] / movement_length];
+    let projections = target.map(|point| {
+        (point[0] - target_center[0]) * direction[0] + (point[1] - target_center[1]) * direction[1]
+    });
+    let projection_min = projections.iter().copied().fold(f32::INFINITY, f32::min);
+    let projection_max = projections
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let projection_span = projection_max - projection_min;
+    let elapsed = elapsed.as_secs_f32();
+
+    std::array::from_fn(|index| {
+        let leading = if projection_span <= f32::EPSILON {
+            0.0
+        } else {
+            ((projections[index] - projection_min) / projection_span).clamp(0.0, 1.0)
+        };
+        let decay = SLOW_DECAY_SECONDS + (FAST_DECAY_SECONDS - SLOW_DECAY_SECONDS) * leading;
+        let remaining = (-10.0 * elapsed / decay).exp2();
+        [
+            target[index][0] + (start[index][0] - target[index][0]) * remaining,
+            target[index][1] + (start[index][1] - target[index][1]) * remaining,
+        ]
+    })
+}
+
 fn stretch_region(rect: RenderRect, progress: f32) -> RenderRect {
     let expansion = ((1.0 - progress) * 4.0).round() as i32;
     RenderRect {
@@ -3346,7 +4460,7 @@ fn push_cursor_quads(
     damage_regions: &[DamageRegion],
     offset: render_core::RenderOffset,
 ) {
-    let mut rect = cell_region_at(cursor.position, metrics, offset);
+    let rect = offset_region(cursor_visual_region(cursor, metrics), offset);
     if !intersects_any(rect, damage_regions) {
         return;
     }
@@ -3354,6 +4468,8 @@ fn push_cursor_quads(
     let thickness = u32::from(cursor.thickness_percent.clamp(1, 100));
     match cursor.shape {
         RenderCursorShape::Block
+        | RenderCursorShape::Beam
+        | RenderCursorShape::Underline
         | RenderCursorShape::Custom
         | RenderCursorShape::CustomStaticShape => {}
         RenderCursorShape::HollowBlock => {
@@ -3366,14 +4482,6 @@ fn push_cursor_quads(
                 cursor.color,
             );
             return;
-        }
-        RenderCursorShape::Beam => {
-            rect.width = ((rect.width * thickness) / 100).max(1);
-        }
-        RenderCursorShape::Underline => {
-            let cell_height = rect.height;
-            rect.height = ((rect.height * thickness) / 100).max(1);
-            rect.y += cell_height.saturating_sub(rect.height) as i32;
         }
     }
     push_rounded_quads(
@@ -4410,7 +5518,7 @@ fn patterned_scene(cols: u16, rows: u16, samples: &[&str]) -> RenderScene {
                     row: i64::from(row),
                     col,
                 },
-                text: ch.to_string(),
+                text: ch.to_string().into(),
                 foreground: RenderColor::rgb(226, 226, 220),
                 background: if row % 2 == 0 {
                     RenderColor::rgb(12, 14, 16)
@@ -4454,7 +5562,7 @@ fn push_text_row(cells: &mut Vec<RenderCell>, row: i64, text: &str, style: Rende
                 row,
                 col: col as u16,
             },
-            text: ch.to_string(),
+            text: ch.to_string().into(),
             foreground: RenderColor::rgb(232, 232, 226),
             background: if row % 2 == 0 {
                 RenderColor::rgb(11, 14, 18)
@@ -4479,7 +5587,7 @@ fn pad_cells(mut cells: Vec<RenderCell>, cols: u16, rows: u16) -> Vec<RenderCell
                         row: i64::from(row),
                         col,
                     },
-                    text: " ".to_owned(),
+                    text: " ".into(),
                     foreground: RenderColor::rgb(232, 232, 226),
                     background: if row % 2 == 0 {
                         RenderColor::rgb(11, 14, 18)
@@ -4942,7 +6050,7 @@ impl TerminalRasterizer {
 
         let cell = RenderCell {
             position: CellPosition { row: 0, col: 0 },
-            text: label.clone(),
+            text: label.clone().into(),
             foreground: overlay
                 .label_color
                 .unwrap_or_else(|| overlay_label_color(overlay.kind)),
@@ -5165,6 +6273,8 @@ struct PersistentBatchBuffers {
     glyphs: GpuBatchBuffers,
     overlay_glyphs: GpuBatchBuffers,
     decorations: GpuBatchBuffers,
+    cursor_effects: GpuBatchBuffers,
+    cursor_trail: GpuBatchBuffers,
     window_chrome: GpuBatchBuffers,
     selections: GpuBatchBuffers,
     cursor: GpuBatchBuffers,
@@ -5545,10 +6655,12 @@ fn draw_cursor(
         return;
     }
 
-    let mut rect = cell_region_at(cursor.position, metrics, offset);
+    let rect = offset_region(cursor_visual_region(cursor, metrics), offset);
     let thickness = u32::from(cursor.thickness_percent.clamp(1, 100));
     match cursor.shape {
         RenderCursorShape::Block
+        | RenderCursorShape::Beam
+        | RenderCursorShape::Underline
         | RenderCursorShape::Custom
         | RenderCursorShape::CustomStaticShape => {}
         RenderCursorShape::HollowBlock => {
@@ -5561,14 +6673,6 @@ fn draw_cursor(
                 cursor.color,
             );
             return;
-        }
-        RenderCursorShape::Beam => {
-            rect.width = ((rect.width * thickness) / 100).max(1);
-        }
-        RenderCursorShape::Underline => {
-            let cell_height = rect.height;
-            rect.height = ((rect.height * thickness) / 100).max(1);
-            rect.y += cell_height.saturating_sub(rect.height) as i32;
         }
     }
     draw_rounded_rect(
@@ -5633,11 +6737,13 @@ pub struct GpuTerminalRenderer {
     backend: Option<GpuBackend>,
     rasterizer: TerminalRasterizer,
     recycled_batches: Option<PreparedRenderBatches>,
+    recycled_cursor_overlay: Option<PreparedCursorOverlay>,
     last_instrumentation: RenderInstrumentation,
     recovery_status: RenderRecoveryStatus,
     recovery_attempts: u32,
     recovery_events: Vec<RenderRecoveryEvent>,
     requires_full_redraw: bool,
+    retained_cursor: Option<CursorVisual>,
 }
 
 struct GpuBackend {
@@ -5868,11 +6974,13 @@ impl GpuTerminalRenderer {
             backend: Some(backend),
             rasterizer: TerminalRasterizer::new(options.glyph_cache_entries.max(1), 2048, 2048),
             recycled_batches: None,
+            recycled_cursor_overlay: None,
             last_instrumentation: RenderInstrumentation::default(),
             recovery_status: RenderRecoveryStatus::Ready,
             recovery_attempts: 0,
             recovery_events: Vec::new(),
             requires_full_redraw: true,
+            retained_cursor: None,
         })
     }
 
@@ -5881,6 +6989,7 @@ impl GpuTerminalRenderer {
             backend.resize(width, height);
         }
         self.requires_full_redraw = true;
+        self.retained_cursor = None;
     }
 
     pub fn set_glyph_cache_capacity(&mut self, entries: usize) {
@@ -5891,6 +7000,7 @@ impl GpuTerminalRenderer {
         self.options.glyph_cache_entries = entries;
         self.rasterizer = TerminalRasterizer::new(entries, 2048, 2048);
         self.requires_full_redraw = true;
+        self.retained_cursor = None;
     }
 
     pub fn set_background(&mut self, background: RenderColor) {
@@ -5947,6 +7057,7 @@ impl GpuTerminalRenderer {
 
     pub fn request_full_redraw(&mut self) {
         self.requires_full_redraw = true;
+        self.retained_cursor = None;
     }
 
     #[must_use]
@@ -6044,6 +7155,11 @@ impl GpuTerminalRenderer {
         let outcome = match result {
             Ok(PresentOutcome::Submitted) => {
                 self.requires_full_redraw = false;
+                self.retained_cursor = if retained_damage_enabled && !batches.cursor.is_empty() {
+                    scene.cursor
+                } else {
+                    None
+                };
                 Ok(())
             }
             Ok(PresentOutcome::Timeout) => Ok(()),
@@ -6063,6 +7179,65 @@ impl GpuTerminalRenderer {
         };
         self.recycled_batches = Some(batches);
         outcome
+    }
+
+    pub fn render_cursor_overlay(
+        &mut self,
+        frame: &CursorOverlayFrame,
+        metrics: CellMetrics,
+    ) -> Result<bool, RendererError> {
+        let Some(backend) = self.backend.as_mut() else {
+            return Ok(false);
+        };
+        if let Some(signal) = backend.take_device_loss_signal() {
+            let error = RendererError::DeviceLost {
+                reason: signal.reason,
+                message: signal.message,
+            };
+            self.mark_backend_lost(&error);
+            return Err(error);
+        }
+        let retained_damage_enabled =
+            self.options.damage_tracking && backend.supports_retained_damage();
+        if !can_present_cursor_overlay(
+            retained_damage_enabled,
+            backend.retained_frame.initialized,
+            self.retained_cursor,
+            frame,
+        ) {
+            return Ok(false);
+        }
+
+        let frame_started = Instant::now();
+        let prepare_started = Instant::now();
+        let batches =
+            prepare_cursor_overlay_reusing(frame, metrics, self.recycled_cursor_overlay.take());
+        let cpu_prepare_time = prepare_started.elapsed();
+        let gpu_started = Instant::now();
+        let result = backend.present_cursor_overlay(&batches);
+        let gpu_submit_time = gpu_started.elapsed();
+        self.last_instrumentation = RenderInstrumentation {
+            frame_time: frame_started.elapsed(),
+            cpu_prepare_time,
+            gpu_submit_time: Some(gpu_submit_time),
+            gpu_time: backend.gpu_timing.last_duration(),
+            gpu_timing_status: backend.gpu_timing.timing_status(),
+            damage_region_count: usize::from(batches.animated_pixels > 0),
+            draw_call_count: batches.draw_call_count(),
+            animated_region_count: frame.animations.len(),
+            ..RenderInstrumentation::default()
+        };
+        self.recycled_cursor_overlay = Some(batches);
+
+        match result? {
+            PresentOutcome::Submitted | PresentOutcome::Timeout => Ok(true),
+            PresentOutcome::SurfaceReconfigured(reason) => {
+                self.record_surface_recovery(reason);
+                self.requires_full_redraw = true;
+                self.retained_cursor = None;
+                Ok(false)
+            }
+        }
     }
 
     #[must_use]
@@ -6124,6 +7299,7 @@ impl GpuTerminalRenderer {
         self.rasterizer.reset_gpu_resident_glyphs();
         self.last_instrumentation = RenderInstrumentation::default();
         self.requires_full_redraw = true;
+        self.retained_cursor = None;
     }
 
     fn retry_present_after_surface_reconfigure(
@@ -6248,15 +7424,11 @@ impl GpuBackend {
             .copied()
             .find(wgpu::TextureFormat::is_srgb)
             .unwrap_or(caps.formats[0]);
-        let present_mode = match options.present_mode {
-            PresentMode::Vsync => wgpu::PresentMode::Fifo,
-            PresentMode::Immediate => caps
-                .present_modes
-                .iter()
-                .copied()
-                .find(|mode| *mode == wgpu::PresentMode::Immediate)
-                .unwrap_or(wgpu::PresentMode::Fifo),
-        };
+        let present_mode = select_present_mode(options.present_mode, &caps.present_modes);
+        eprintln!(
+            "renderer present mode: requested={:?} effective={present_mode:?} max_frame_latency={DESIRED_MAXIMUM_FRAME_LATENCY}",
+            options.present_mode
+        );
         let alpha_mode = if options.transparent {
             caps.alpha_modes
                 .iter()
@@ -6285,7 +7457,7 @@ impl GpuBackend {
             present_mode,
             alpha_mode,
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: DESIRED_MAXIMUM_FRAME_LATENCY,
         };
         surface.configure(&device, &config);
 
@@ -6833,6 +8005,18 @@ impl GpuBackend {
             &batches.decorations.vertices,
             &batches.decorations.indices,
         );
+        self.batches.cursor_effects.upload(
+            &upload_context,
+            "cursor-effects",
+            &batches.cursor_effects.vertices,
+            &batches.cursor_effects.indices,
+        );
+        self.batches.cursor_trail.upload(
+            &upload_context,
+            "cursor-trail",
+            &batches.cursor_trail.vertices,
+            &batches.cursor_trail.indices,
+        );
         self.batches.window_chrome.upload(
             &upload_context,
             "window-chrome",
@@ -6895,14 +8079,7 @@ impl GpuBackend {
                 quad_pipeline: &self.quad_pipeline,
                 glyph_pipeline: &self.glyph_pipeline,
                 glyph_bind_group: self.glyph_bind_group.as_ref(),
-                cursor_image_pipeline: self
-                    .cursor_image_resources
-                    .as_ref()
-                    .map(|resources| &resources.pipeline),
-                cursor_image_bind_group: self.cursor_image_bind_group.as_ref(),
                 batches: &self.batches,
-                cursor_image_active: self.cursor_image_asset_id
-                    == batches.cursor_image_asset.as_ref().map(|asset| asset.id),
             },
             timestamp_writes,
         );
@@ -6930,6 +8107,22 @@ impl GpuBackend {
             self.retained_frame.initialized = true;
         }
 
+        encode_cursor_overlay(
+            &mut encoder,
+            &view,
+            GpuCursorOverlayDraw {
+                quad_pipeline: &self.quad_pipeline,
+                cursor_image_pipeline: self
+                    .cursor_image_resources
+                    .as_ref()
+                    .map(|resources| &resources.pipeline),
+                cursor_image_bind_group: self.cursor_image_bind_group.as_ref(),
+                batches: &self.batches,
+                cursor_image_active: self.cursor_image_asset_id
+                    == batches.cursor_image_asset.as_ref().map(|asset| asset.id),
+            },
+        );
+
         if timestamp_written {
             self.gpu_timing.resolve_after_pass(&mut encoder);
         }
@@ -6937,6 +8130,101 @@ impl GpuBackend {
         if timestamp_written {
             self.gpu_timing.start_readback();
         }
+        output.present();
+        Ok(PresentOutcome::Submitted)
+    }
+
+    fn present_cursor_overlay(
+        &mut self,
+        batches: &PreparedCursorOverlay,
+    ) -> Result<PresentOutcome, RendererError> {
+        let Some(retained_frame) = self.retained_frame.texture.as_ref() else {
+            return Ok(PresentOutcome::SurfaceReconfigured(
+                RenderRecoveryReason::SurfaceOutdated,
+            ));
+        };
+        let output = match self.surface.get_current_texture() {
+            Ok(output) => output,
+            Err(wgpu::SurfaceError::Lost) => {
+                self.surface.configure(&self.device, &self.config);
+                return Ok(PresentOutcome::SurfaceReconfigured(
+                    RenderRecoveryReason::SurfaceLost,
+                ));
+            }
+            Err(wgpu::SurfaceError::Outdated) => {
+                self.surface.configure(&self.device, &self.config);
+                return Ok(PresentOutcome::SurfaceReconfigured(
+                    RenderRecoveryReason::SurfaceOutdated,
+                ));
+            }
+            Err(wgpu::SurfaceError::Timeout) => return Ok(PresentOutcome::Timeout),
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                return Err(RendererError::DeviceLost {
+                    reason: RenderRecoveryReason::OutOfMemory,
+                    message: "surface reported out-of-memory; GPU resources must be recreated"
+                        .to_owned(),
+                });
+            }
+        };
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let upload_context = GpuUploadContext {
+            device: &self.device,
+            queue: &self.queue,
+            width: self.config.width,
+            height: self.config.height,
+        };
+        self.batches.cursor_effects.upload(
+            &upload_context,
+            "cursor-effects-fast",
+            &batches.effects.vertices,
+            &batches.effects.indices,
+        );
+        self.batches.cursor_trail.upload(
+            &upload_context,
+            "cursor-trail-fast",
+            &batches.cursor_trail.vertices,
+            &batches.cursor_trail.indices,
+        );
+        self.batches.cursor_image.index_count = 0;
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("panea-cursor-overlay-encoder"),
+            });
+        encoder.copy_texture_to_texture(
+            wgpu::ImageCopyTexture {
+                texture: retained_frame,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyTexture {
+                texture: &output.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        encode_cursor_overlay(
+            &mut encoder,
+            &view,
+            GpuCursorOverlayDraw {
+                quad_pipeline: &self.quad_pipeline,
+                cursor_image_pipeline: None,
+                cursor_image_bind_group: None,
+                batches: &self.batches,
+                cursor_image_active: false,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
         output.present();
         Ok(PresentOutcome::Submitted)
     }
@@ -7069,6 +8357,11 @@ struct GpuFrameDraw<'a> {
     quad_pipeline: &'a wgpu::RenderPipeline,
     glyph_pipeline: &'a wgpu::RenderPipeline,
     glyph_bind_group: Option<&'a wgpu::BindGroup>,
+    batches: &'a PersistentBatchBuffers,
+}
+
+struct GpuCursorOverlayDraw<'a> {
+    quad_pipeline: &'a wgpu::RenderPipeline,
     cursor_image_pipeline: Option<&'a wgpu::RenderPipeline>,
     cursor_image_bind_group: Option<&'a wgpu::BindGroup>,
     batches: &'a PersistentBatchBuffers,
@@ -7128,6 +8421,32 @@ fn encode_retained_frame<'a>(
         pass.set_bind_group(0, glyph_bind_group, &[]);
         draw_buffers(&mut pass, &draw.batches.overlay_glyphs);
     }
+    load_previous
+}
+
+fn encode_cursor_overlay<'a>(
+    encoder: &'a mut wgpu::CommandEncoder,
+    target: &'a wgpu::TextureView,
+    draw: GpuCursorOverlayDraw<'a>,
+) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("panea-cursor-overlay-pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        occlusion_query_set: None,
+        timestamp_writes: None,
+    });
+
+    pass.set_pipeline(draw.quad_pipeline);
+    draw_buffers(&mut pass, &draw.batches.cursor_trail);
+    draw_buffers(&mut pass, &draw.batches.cursor_effects);
     if draw.cursor_image_active
         && let Some(cursor_image_pipeline) = draw.cursor_image_pipeline
         && let Some(cursor_image_bind_group) = draw.cursor_image_bind_group
@@ -7136,8 +8455,6 @@ fn encode_retained_frame<'a>(
         pass.set_bind_group(0, cursor_image_bind_group, &[]);
         draw_buffers(&mut pass, &draw.batches.cursor_image);
     }
-
-    load_previous
 }
 
 fn draw_buffers<'a>(pass: &mut wgpu::RenderPass<'a>, buffers: &'a GpuBatchBuffers) {
@@ -7562,10 +8879,7 @@ mod tests {
                     quad_pipeline: &pipeline,
                     glyph_pipeline: &pipeline,
                     glyph_bind_group: None,
-                    cursor_image_pipeline: None,
-                    cursor_image_bind_group: None,
                     batches: gpu_batches,
-                    cursor_image_active: false,
                 },
                 None,
             );
@@ -7713,6 +9027,43 @@ mod tests {
                 .to_string()
                 .contains("cannot receive")
         );
+    }
+
+    #[test]
+    fn automatic_present_mode_prefers_mailbox_then_fifo() {
+        assert_eq!(
+            select_present_mode(
+                PresentMode::Auto,
+                &[wgpu::PresentMode::Fifo, wgpu::PresentMode::Mailbox],
+            ),
+            wgpu::PresentMode::Mailbox
+        );
+        assert_eq!(
+            select_present_mode(PresentMode::Auto, &[wgpu::PresentMode::Fifo]),
+            wgpu::PresentMode::Fifo
+        );
+    }
+
+    #[test]
+    fn explicit_present_modes_use_cross_backend_fallbacks() {
+        let fifo_and_mailbox = [wgpu::PresentMode::Fifo, wgpu::PresentMode::Mailbox];
+        assert_eq!(
+            select_present_mode(PresentMode::Fifo, &fifo_and_mailbox),
+            wgpu::PresentMode::Fifo
+        );
+        assert_eq!(
+            select_present_mode(PresentMode::Mailbox, &fifo_and_mailbox),
+            wgpu::PresentMode::Mailbox
+        );
+        assert_eq!(
+            select_present_mode(PresentMode::Immediate, &fifo_and_mailbox),
+            wgpu::PresentMode::Mailbox
+        );
+    }
+
+    #[test]
+    fn renderer_keeps_only_one_frame_queued_for_input_latency() {
+        assert_eq!(DESIRED_MAXIMUM_FRAME_LATENCY, 1);
     }
 
     #[test]
@@ -7946,7 +9297,7 @@ mod tests {
     fn cell(row: i64, col: u16, text: &str) -> RenderCell {
         RenderCell {
             position: CellPosition { row, col },
-            text: text.to_owned(),
+            text: text.into(),
             foreground: RenderColor::rgb(230, 230, 230),
             background: RenderColor::rgb(12, 12, 12),
             style: RenderCellStyle::default(),
@@ -8052,6 +9403,31 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].text, "=> ");
         assert_eq!(runs[1].text, "x");
+    }
+
+    #[test]
+    fn partial_damage_selects_only_affected_rows_for_text_shaping() {
+        let cells = (0..40_i64)
+            .flat_map(|row| (0..80_u16).map(move |col| cell(row, col, "x")))
+            .collect::<Vec<_>>();
+        let damage = [RenderRect {
+            x: 24 * 8,
+            y: 17 * 16,
+            width: 8,
+            height: 16,
+        }];
+
+        let selected = damaged_terminal_text_runs_with_stats(
+            &cells,
+            &damage,
+            metrics(),
+            render_core::RenderOffset::default(),
+        );
+
+        assert_eq!(selected.source_cells, 80);
+        assert_eq!(selected.runs.len(), 1);
+        assert_eq!(selected.runs[0].position.row, 17);
+        assert_eq!(selected.runs[0].text.len(), 80);
     }
 
     #[test]
@@ -8223,16 +9599,146 @@ mod tests {
     }
 
     #[test]
+    fn cursor_animation_damage_does_not_redraw_static_semantic_overlays() {
+        let cursor_animation = |x| AnimationHandle {
+            id: 1,
+            kind: AnimationKind::CursorTrail,
+            affected_region: RenderRect {
+                x,
+                y: 0,
+                width: 12,
+                height: 20,
+            },
+            start_region: RenderRect {
+                x,
+                y: 0,
+                width: 2,
+                height: 16,
+            },
+            end_region: RenderRect {
+                x: x + 8,
+                y: 0,
+                width: 2,
+                height: 16,
+            },
+            color: RenderColor::rgb(245, 224, 220),
+            quad: None,
+            elapsed: Duration::ZERO,
+            remaining: None,
+        };
+        let static_overlay = OverlayPrimitive {
+            kind: OverlayKind::CommandBlock,
+            bounds: RenderRect {
+                x: 0,
+                y: 120,
+                width: 1_000,
+                height: 400,
+            },
+            color: RenderColor::rgb(20, 20, 20),
+            border_color: None,
+            border_width_px: 0,
+            corner_radius_px: 0,
+            z_index: 0,
+            label: None,
+            label_color: None,
+        };
+        let mut tracker = DamageTracker::new();
+        let mut first = scene(vec![cell(0, 0, "a")]);
+        first.semantic_overlays.push(static_overlay.clone());
+        first.animations.push(cursor_animation(0));
+        let _ = tracker.update(&first, metrics());
+
+        let mut second = first.clone();
+        second.animations = vec![cursor_animation(4)];
+        let damage = tracker.update(&second, metrics());
+
+        assert!(damage_covers(&damage, cursor_animation(0).affected_region));
+        assert!(damage_covers(&damage, cursor_animation(4).affected_region));
+        assert!(
+            damage.iter().all(|region| region.y < 120),
+            "an unchanged command-block overlay must not be damaged by cursor motion: {damage:?}"
+        );
+    }
+
+    #[test]
     fn frame_scheduler_stays_idle_without_work() {
         let mut scheduler = FrameScheduler::new();
+        assert!(!scheduler.has_pending_frame());
         assert_eq!(scheduler.next_frame(), FrameDecision::NoFrameNeeded);
 
+        scheduler.terminal_content_changed();
+        assert!(scheduler.has_pending_frame());
+        assert_eq!(
+            scheduler.next_frame(),
+            FrameDecision::FrameNeeded(FrameRequestReason::TerminalContentChanged)
+        );
+        assert!(!scheduler.has_pending_frame());
+        assert_eq!(scheduler.next_frame(), FrameDecision::NoFrameNeeded);
+    }
+
+    #[test]
+    fn frame_scheduler_never_lets_animation_displace_terminal_content() {
+        let mut scheduler = FrameScheduler::new();
+
+        scheduler.terminal_content_changed();
+        scheduler.animation_changed();
+
+        assert_eq!(
+            scheduler.next_frame(),
+            FrameDecision::FrameNeeded(FrameRequestReason::TerminalContentChanged),
+            "cursor animation must never postpone newly echoed terminal content"
+        );
+
+        scheduler.animation_changed();
         scheduler.terminal_content_changed();
         assert_eq!(
             scheduler.next_frame(),
             FrameDecision::FrameNeeded(FrameRequestReason::TerminalContentChanged)
         );
-        assert_eq!(scheduler.next_frame(), FrameDecision::NoFrameNeeded);
+    }
+
+    #[test]
+    fn animation_frame_pacer_waits_for_its_deadline_without_drifting() {
+        let started = Instant::now();
+        let interval = Duration::from_millis(8);
+        let deadline = started + interval;
+        let mut pacer = AnimationFramePacer::new();
+
+        assert_eq!(
+            pacer.poll(started, Some(interval)),
+            AnimationFramePacerDecision::WaitUntil(deadline)
+        );
+        assert_eq!(
+            pacer.poll(started + Duration::from_millis(3), Some(interval)),
+            AnimationFramePacerDecision::WaitUntil(deadline)
+        );
+        assert_eq!(
+            pacer.poll(deadline, Some(interval)),
+            AnimationFramePacerDecision::FrameDue
+        );
+        assert_eq!(
+            pacer.poll(deadline, Some(interval)),
+            AnimationFramePacerDecision::WaitUntil(deadline + interval)
+        );
+    }
+
+    #[test]
+    fn animation_frame_pacer_cancels_a_pending_wake_when_idle() {
+        let started = Instant::now();
+        let mut pacer = AnimationFramePacer::new();
+
+        assert!(matches!(
+            pacer.poll(started, Some(Duration::from_millis(8))),
+            AnimationFramePacerDecision::WaitUntil(_)
+        ));
+        assert_eq!(
+            pacer.poll(started + Duration::from_millis(1), None),
+            AnimationFramePacerDecision::Idle
+        );
+        assert_eq!(
+            pacer.poll(started + Duration::from_millis(20), None),
+            AnimationFramePacerDecision::Idle
+        );
     }
 
     #[test]
@@ -8740,6 +10246,175 @@ mod tests {
     }
 
     #[test]
+    fn panea_cursor_motion_tilts_and_extends_right() {
+        let settings = CursorAnimationSettings::panea(165, 4, 250_000);
+        let beam = |col| CursorVisual {
+            position: CellPosition { row: 0, col },
+            shape: RenderCursorShape::Beam,
+            color: RenderColor::rgb(120, 190, 255),
+            text_color: None,
+            visible: true,
+            thickness_percent: 22,
+            corner_radius_px: 0,
+            inactive: false,
+        };
+        let mut runtime = CursorAnimationRuntime::new();
+        let mut initial = scene(vec![cell(0, 0, "a")]);
+        initial.cursor = Some(beam(0));
+
+        runtime.populate_scene(&mut initial, metrics(), settings);
+
+        assert!(initial.animations.is_empty(), "startup must remain static");
+        let mut moved = scene(vec![cell(0, 0, "a")]);
+        moved.cursor = Some(beam(1));
+        runtime.populate_scene(&mut moved, metrics(), settings);
+
+        let tilt = moved
+            .animations
+            .iter()
+            .find(|animation| animation.kind == AnimationKind::CursorTilt)
+            .expect("rightward motion should produce the Panea tilt overlay");
+        assert!(
+            moved
+                .animations
+                .iter()
+                .all(|animation| animation.kind != AnimationKind::CursorTrail),
+            "the Panea preset must not extend geometry across previous cells"
+        );
+        let corners = animation_quad_pixels(tilt.quad.expect("tilt requires explicit geometry"));
+        assert!(
+            corners[0][0] > corners[3][0] && corners[1][0] > corners[2][0],
+            "rightward movement should lean the cursor like /"
+        );
+        assert!(
+            corners[0][0] - corners[3][0] >= metrics().cell_width * 0.85,
+            "the Panea lean should be clearly visible"
+        );
+        let extension = moved
+            .animations
+            .iter()
+            .find(|animation| animation.kind == AnimationKind::CursorElasticExtension)
+            .expect("rightward motion should stretch behind the destination cursor");
+        let extension_corners = animation_quad_pixels(
+            extension
+                .quad
+                .expect("elastic extension requires explicit geometry"),
+        );
+        assert!(
+            extension_corners
+                .iter()
+                .any(|corner| corner[0] < tilt.end_region.x as f32 - metrics().cell_width * 0.5),
+            "the elastic quad should extend toward the previous cursor cell"
+        );
+        assert!(extension.start_region.x < extension.end_region.x);
+        assert_eq!(extension.remaining, Some(Duration::from_millis(90)));
+        assert_eq!(tilt.start_region, tilt.end_region);
+        assert_eq!(tilt.end_region.x, metrics().cell_width.round() as i32);
+        assert!(runtime.needs_frame());
+        assert!(
+            tilt.affected_region.width <= metrics().cell_width.ceil() as u32 + 8,
+            "Panea motion must not damage unrelated terminal columns: width={}",
+            tilt.affected_region.width
+        );
+        assert!(
+            tilt.affected_region.height <= metrics().cell_height.ceil() as u32 + 8,
+            "Panea motion must not damage unrelated terminal rows"
+        );
+    }
+
+    #[test]
+    fn panea_cursor_motion_tilts_and_extends_left() {
+        let settings = CursorAnimationSettings::panea(165, 4, 250_000);
+        let beam = |col| CursorVisual {
+            position: CellPosition { row: 0, col },
+            shape: RenderCursorShape::Beam,
+            color: RenderColor::rgb(120, 190, 255),
+            text_color: None,
+            visible: true,
+            thickness_percent: 22,
+            corner_radius_px: 0,
+            inactive: false,
+        };
+        let mut runtime = CursorAnimationRuntime::new();
+        let mut initial = scene(vec![cell(0, 0, "a")]);
+        initial.cursor = Some(beam(1));
+        runtime.populate_scene(&mut initial, metrics(), settings);
+
+        let mut moved = scene(vec![cell(0, 0, "a")]);
+        moved.cursor = Some(beam(0));
+        runtime.populate_scene(&mut moved, metrics(), settings);
+
+        let tilt = moved
+            .animations
+            .iter()
+            .find(|animation| animation.kind == AnimationKind::CursorTilt)
+            .expect("leftward motion should produce the Panea tilt overlay");
+        let corners = animation_quad_pixels(tilt.quad.expect("tilt requires explicit geometry"));
+        assert!(
+            corners[0][0] < corners[3][0] && corners[1][0] < corners[2][0],
+            "leftward movement should lean the cursor like \\"
+        );
+        assert!(
+            corners[3][0] - corners[0][0] >= metrics().cell_width * 0.85,
+            "the reverse lean should be clearly visible"
+        );
+        let extension = moved
+            .animations
+            .iter()
+            .find(|animation| animation.kind == AnimationKind::CursorElasticExtension)
+            .expect("leftward motion should stretch behind the destination cursor");
+        let extension_corners = animation_quad_pixels(
+            extension
+                .quad
+                .expect("elastic extension requires explicit geometry"),
+        );
+        assert!(
+            extension_corners.iter().any(|corner| {
+                corner[0] > tilt.end_region.x as f32 + metrics().cell_width * 0.5
+            }),
+            "the reverse elastic quad should extend toward the previous cursor cell"
+        );
+        assert!(extension.start_region.x > extension.end_region.x);
+        assert_eq!(tilt.remaining, Some(Duration::from_millis(90)));
+        assert_eq!(tilt.start_region, tilt.end_region);
+    }
+
+    #[test]
+    fn panea_motion_batches_tilt_and_extension_without_legacy_trail() {
+        let settings = CursorAnimationSettings::panea(165, 4, 250_000);
+        let beam = |col| CursorVisual {
+            position: CellPosition { row: 0, col },
+            shape: RenderCursorShape::Beam,
+            color: RenderColor::rgb(120, 190, 255),
+            text_color: None,
+            visible: true,
+            thickness_percent: 22,
+            corner_radius_px: 0,
+            inactive: false,
+        };
+        let mut runtime = CursorAnimationRuntime::new();
+        let mut initial = scene(vec![cell(0, 0, "a")]);
+        initial.cursor = Some(beam(0));
+        runtime.populate_scene(&mut initial, metrics(), settings);
+
+        let mut moved = scene(vec![cell(0, 0, "a")]);
+        moved.cursor = Some(beam(1));
+        runtime.populate_scene(&mut moved, metrics(), settings);
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let mut planner = RenderBatchPlanner::default();
+        let batches = planner
+            .prepare(&moved, &mut fonts)
+            .expect("tilted cursor frame should prepare");
+
+        assert!(
+            batches.cursor.is_empty(),
+            "the straight cursor must not render beneath the tilted cursor"
+        );
+        assert_eq!(batches.cursor_effects.quad_count(), 2);
+        assert!(batches.cursor_trail.is_empty());
+    }
+
+    #[test]
     fn cursor_blink_runtime_is_bounded_and_activity_restores_visibility() {
         let mut runtime = CursorBlinkRuntime::new();
         let started = runtime.phase_started;
@@ -8789,7 +10464,7 @@ mod tests {
         assert_eq!(initial[0].y, 0);
 
         let mut second = first.clone();
-        second.grid.cells[0].text = "b".to_owned();
+        second.grid.cells[0].text = "b".into();
         let damage = tracker.update(&second, metrics());
         assert_eq!(damage.len(), 1);
         for index in 0..3 {
@@ -8810,10 +10485,15 @@ mod tests {
         let mut runtime = CursorAnimationRuntime::new();
         let settings = CursorAnimationSettings {
             enabled: true,
+            tilt: false,
             smooth_movement: true,
             typing_pulse: true,
             typing_stretch: true,
             trail: true,
+            trail_delay: Duration::ZERO,
+            trail_start_threshold_cells: 0,
+            trail_decay_fast: Duration::from_millis(100),
+            trail_decay_slow: Duration::from_millis(400),
             blink_easing: false,
             short_lived_glow: true,
             shadow: true,
@@ -8857,6 +10537,821 @@ mod tests {
     }
 
     #[test]
+    fn cursor_trail_ignores_single_cell_typing_moves() {
+        let mut runtime = CursorAnimationRuntime::new();
+        let settings = CursorAnimationSettings {
+            enabled: true,
+            trail: true,
+            trail_delay: Duration::ZERO,
+            ..CursorAnimationSettings::default()
+        };
+        let beam = |col| CursorVisual {
+            position: CellPosition { row: 0, col },
+            shape: RenderCursorShape::Beam,
+            color: RenderColor::rgb(255, 255, 255),
+            text_color: None,
+            visible: true,
+            thickness_percent: 8,
+            corner_radius_px: 0,
+            inactive: false,
+        };
+        let mut first = scene(vec![cell(0, 0, "a")]);
+        first.cursor = Some(beam(0));
+        runtime.populate_scene(&mut first, metrics(), settings);
+
+        let mut second = scene(vec![cell(0, 0, "a")]);
+        second.cursor = Some(beam(1));
+        runtime.populate_scene(&mut second, metrics(), settings);
+
+        assert!(
+            second
+                .animations
+                .iter()
+                .all(|animation| animation.kind != AnimationKind::CursorTrail),
+            "single-cell typing should not leave a cursor trail"
+        );
+
+        std::thread::sleep(Duration::from_millis(2));
+        let mut stable = scene(vec![cell(0, 0, "a")]);
+        stable.cursor = Some(beam(1));
+        runtime.populate_scene(&mut stable, metrics(), settings);
+        assert!(
+            stable
+                .animations
+                .iter()
+                .all(|animation| animation.kind != AnimationKind::CursorTrail),
+            "beam width must not be mistaken for terminal cell width"
+        );
+    }
+
+    #[test]
+    fn cursor_trail_connects_an_immediate_cursor_across_one_typed_cell() {
+        let mut runtime = CursorAnimationRuntime::new();
+        let settings = CursorAnimationSettings {
+            enabled: true,
+            trail: true,
+            trail_delay: Duration::ZERO,
+            trail_start_threshold_cells: 0,
+            ..CursorAnimationSettings::default()
+        };
+        let beam = |col| CursorVisual {
+            position: CellPosition { row: 0, col },
+            shape: RenderCursorShape::Beam,
+            color: RenderColor::rgb(245, 224, 220),
+            text_color: None,
+            visible: true,
+            thickness_percent: 22,
+            corner_radius_px: 0,
+            inactive: false,
+        };
+        let mut initial = scene(vec![cell(0, 0, "a")]);
+        initial.cursor = Some(beam(0));
+        runtime.populate_scene(&mut initial, metrics(), settings);
+
+        let mut typed = scene(vec![cell(0, 0, "a")]);
+        typed.cursor = Some(beam(1));
+        runtime.populate_scene(&mut typed, metrics(), settings);
+        let trail = typed
+            .animations
+            .iter()
+            .find(|animation| animation.kind == AnimationKind::CursorTrail)
+            .expect("one-cell typing must start the configured trail");
+        typed.damage_regions = vec![trail.affected_region];
+
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let mut planner = RenderBatchPlanner::default();
+        let batches = planner
+            .prepare(&typed, &mut fonts)
+            .expect("one-cell cursor frame should prepare");
+        let target_left = cell_region(CellPosition { row: 0, col: 1 }, metrics()).x as f32;
+
+        assert!(
+            !batches.cursor.is_empty(),
+            "destination cursor is immediate"
+        );
+        assert!(
+            batches
+                .cursor_trail
+                .vertices
+                .iter()
+                .any(|vertex| (vertex.position_px[0] - target_left).abs() < 0.01),
+            "elastic trail must remain connected to the destination cursor"
+        );
+        assert!(
+            batches
+                .cursor_trail
+                .vertices
+                .iter()
+                .any(|vertex| { vertex.position_px[0] < target_left - metrics().cell_width * 0.5 }),
+            "one-cell movement must retain visibly displaced trailing geometry"
+        );
+    }
+
+    #[test]
+    fn cursor_overlay_frame_prepares_without_terminal_cells_fonts_or_atlas_work() {
+        let cursor = CursorVisual {
+            position: CellPosition { row: 4, col: 12 },
+            shape: RenderCursorShape::Beam,
+            color: RenderColor::rgb(245, 224, 220),
+            text_color: None,
+            visible: true,
+            thickness_percent: 22,
+            corner_radius_px: 0,
+            inactive: false,
+        };
+        let start = cursor_visual_region(
+            CursorVisual {
+                position: CellPosition { row: 4, col: 11 },
+                ..cursor
+            },
+            metrics(),
+        );
+        let end = cursor_visual_region(cursor, metrics());
+        let overlay = CursorOverlayFrame {
+            cursor: Some(cursor),
+            animations: vec![AnimationHandle {
+                id: 1,
+                kind: AnimationKind::CursorTrail,
+                affected_region: cursor_animation_region(union_region(start, end)),
+                start_region: start,
+                end_region: end,
+                color: cursor.color,
+                quad: Some(animation_quad([
+                    [start.x as f32, start.y as f32],
+                    [end.x as f32, end.y as f32],
+                    [end.x as f32, (end.y + end.height as i32) as f32],
+                    [start.x as f32, (start.y + start.height as i32) as f32],
+                ])),
+                elapsed: Duration::ZERO,
+                remaining: None,
+            }],
+            content_offset: render_core::RenderOffset { x: 10, y: 8 },
+        };
+
+        let batches = prepare_cursor_overlay(&overlay, metrics());
+
+        assert!(!batches.cursor.is_empty());
+        assert!(!batches.cursor_trail.is_empty());
+        assert_eq!(batches.draw_call_count(), 2);
+        assert!(batches.animated_pixels > 0);
+    }
+
+    #[test]
+    fn cursor_overlay_reuses_cpu_geometry_storage_between_frames() {
+        let overlay = CursorOverlayFrame {
+            cursor: Some(cursor(0, 2, RenderCursorShape::Beam, false)),
+            animations: vec![AnimationHandle {
+                id: 1,
+                kind: AnimationKind::CursorTrail,
+                affected_region: RenderRect {
+                    x: 0,
+                    y: 0,
+                    width: 24,
+                    height: 20,
+                },
+                start_region: RenderRect {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 20,
+                },
+                end_region: RenderRect {
+                    x: 16,
+                    y: 0,
+                    width: 2,
+                    height: 20,
+                },
+                color: RenderColor::rgb(120, 190, 255),
+                quad: None,
+                elapsed: Duration::from_millis(16),
+                remaining: None,
+            }],
+            content_offset: render_core::RenderOffset::default(),
+        };
+
+        let first = prepare_cursor_overlay(&overlay, metrics());
+        let trail_ptr = first.cursor_trail.vertices.as_ptr();
+        let cursor_ptr = first.cursor.vertices.as_ptr();
+        let second = prepare_cursor_overlay_reusing(&overlay, metrics(), Some(first));
+
+        assert_eq!(second.cursor_trail.vertices.as_ptr(), trail_ptr);
+        assert_eq!(second.cursor.vertices.as_ptr(), cursor_ptr);
+    }
+
+    #[test]
+    fn cursor_overlay_frame_is_a_small_value_detached_from_the_terminal_grid() {
+        assert!(
+            std::mem::size_of::<CursorOverlayFrame>() <= 128,
+            "cursor animation frames must not retain or clone terminal grids"
+        );
+    }
+
+    #[test]
+    fn cursor_overlay_fast_path_requires_the_same_cursor_baked_into_the_retained_frame() {
+        let cursor = CursorVisual {
+            position: CellPosition { row: 2, col: 7 },
+            shape: RenderCursorShape::Beam,
+            color: RenderColor::rgb(245, 224, 220),
+            text_color: None,
+            visible: true,
+            thickness_percent: 22,
+            corner_radius_px: 0,
+            inactive: false,
+        };
+        let frame = CursorOverlayFrame {
+            cursor: Some(cursor),
+            animations: Vec::new(),
+            content_offset: render_core::RenderOffset::default(),
+        };
+
+        assert!(can_present_cursor_overlay(true, true, Some(cursor), &frame));
+        assert!(!can_present_cursor_overlay(
+            false,
+            true,
+            Some(cursor),
+            &frame
+        ));
+        assert!(!can_present_cursor_overlay(
+            true,
+            false,
+            Some(cursor),
+            &frame
+        ));
+        assert!(!can_present_cursor_overlay(true, true, None, &frame));
+        assert!(!can_present_cursor_overlay(
+            true,
+            true,
+            Some(CursorVisual {
+                position: CellPosition { row: 2, col: 6 },
+                ..cursor
+            }),
+            &frame,
+        ));
+    }
+
+    #[test]
+    fn cursor_animation_refresh_reuses_scene_without_accumulating_visuals() {
+        let mut runtime = CursorAnimationRuntime::new();
+        let settings = CursorAnimationSettings {
+            enabled: true,
+            trail: true,
+            trail_delay: Duration::ZERO,
+            trail_start_threshold_cells: 0,
+            ..CursorAnimationSettings::default()
+        };
+        let beam = |col| CursorVisual {
+            position: CellPosition { row: 0, col },
+            shape: RenderCursorShape::Beam,
+            color: RenderColor::rgb(245, 224, 220),
+            text_color: None,
+            visible: true,
+            thickness_percent: 22,
+            corner_radius_px: 0,
+            inactive: false,
+        };
+        let mut retained = scene(vec![cell(0, 0, "a"), cell(0, 1, "b")]);
+        retained.cursor = Some(beam(0));
+        runtime.populate_scene(&mut retained, metrics(), settings);
+        retained.cursor = Some(beam(1));
+        runtime.refresh_retained_scene(&mut retained, metrics(), settings);
+        let first_count = retained
+            .animations
+            .iter()
+            .filter(|animation| animation.kind == AnimationKind::CursorTrail)
+            .count();
+
+        runtime.refresh_retained_scene(&mut retained, metrics(), settings);
+
+        assert_eq!(retained.grid.cells.len(), 2);
+        assert_eq!(first_count, 1);
+        assert_eq!(
+            retained
+                .animations
+                .iter()
+                .filter(|animation| animation.kind == AnimationKind::CursorTrail)
+                .count(),
+            1,
+            "retained animation frames must replace, not append, cursor visuals"
+        );
+    }
+
+    #[test]
+    fn cursor_trail_uses_cursor_shape_and_local_damage() {
+        let mut runtime = CursorAnimationRuntime::new();
+        let settings = CursorAnimationSettings {
+            enabled: true,
+            trail: true,
+            trail_delay: Duration::ZERO,
+            ..CursorAnimationSettings::default()
+        };
+        let beam = |col| CursorVisual {
+            position: CellPosition { row: 0, col },
+            shape: RenderCursorShape::Beam,
+            color: RenderColor::rgb(255, 255, 255),
+            text_color: None,
+            visible: true,
+            thickness_percent: 8,
+            corner_radius_px: 0,
+            inactive: false,
+        };
+        let mut first = scene(vec![cell(0, 0, "a")]);
+        first.cursor = Some(beam(0));
+        runtime.populate_scene(&mut first, metrics(), settings);
+
+        let mut second = scene(vec![cell(0, 0, "a")]);
+        second.cursor = Some(beam(4));
+        runtime.populate_scene(&mut second, metrics(), settings);
+
+        let trail = second
+            .animations
+            .iter()
+            .find(|animation| animation.kind == AnimationKind::CursorTrail)
+            .expect("large cursor jump should create a trail");
+        assert_eq!(trail.start_region.width, 1);
+        assert_eq!(trail.end_region.width, 1);
+        let quad = trail
+            .quad
+            .expect("persistent trail should expose its GPU quad");
+        let bounds = quad_bounds(animation_quad_pixels(quad));
+        assert!(trail.affected_region.x <= bounds.x);
+        assert!(
+            trail.affected_region.x + trail.affected_region.width as i32
+                >= bounds.x + bounds.width as i32
+        );
+        assert_eq!(
+            trail.affected_region,
+            cursor_animation_region(union_region(trail.start_region, trail.end_region)),
+            "damage must cover exactly the local trail bridge and its clear margin"
+        );
+    }
+
+    #[test]
+    fn cursor_trail_moves_leading_corners_faster_than_trailing_corners() {
+        let start = RenderRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 16,
+        };
+        let end = RenderRect {
+            x: 80,
+            y: 32,
+            width: 2,
+            height: 16,
+        };
+
+        let initial = cursor_trail_quad(start, end, Duration::ZERO);
+        assert_eq!(initial, rect_quad(start));
+
+        let moving = cursor_trail_quad(start, end, Duration::from_millis(100));
+        let target = rect_quad(end);
+        let distance =
+            |point: [f32; 2], goal: [f32; 2]| (point[0] - goal[0]).hypot(point[1] - goal[1]);
+        assert!(
+            distance(moving[2], target[2]) < distance(moving[0], target[0]),
+            "the leading corner should catch the target before the trailing corner"
+        );
+        assert_ne!(moving[0][0], moving[3][0]);
+
+        let settled = cursor_trail_quad(start, end, Duration::from_millis(400));
+        assert!(
+            settled
+                .iter()
+                .zip(target)
+                .all(|(point, goal)| distance(*point, goal) < 0.2),
+            "all corners should settle within a subpixel after the slow decay"
+        );
+    }
+
+    #[test]
+    fn cursor_trail_preserves_inflight_geometry_when_retargeted() {
+        let settings = CursorAnimationSettings {
+            enabled: true,
+            trail: true,
+            trail_start_threshold_cells: 0,
+            ..CursorAnimationSettings::default()
+        };
+        let start = RenderRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 16,
+        };
+        let first_target = RenderRect { x: 8, ..start };
+        let second_target = RenderRect { x: 16, ..start };
+        let mut trail = PersistentCursorTrail::default();
+        trail.retarget(start, RenderColor::rgb(120, 190, 255), [8, 16], settings);
+        trail.retarget(
+            first_target,
+            RenderColor::rgb(120, 190, 255),
+            [8, 16],
+            settings,
+        );
+        trail.advance(Duration::from_millis(16), settings);
+        let inflight = trail.corners;
+
+        trail.retarget(
+            second_target,
+            RenderColor::rgb(120, 190, 255),
+            [8, 16],
+            settings,
+        );
+
+        assert_eq!(trail.corners, inflight);
+        assert!(trail.needs_frame());
+    }
+
+    #[test]
+    fn cursor_trail_waits_for_a_stable_target_before_animating() {
+        let settings = CursorAnimationSettings {
+            enabled: true,
+            trail: true,
+            trail_start_threshold_cells: 2,
+            ..CursorAnimationSettings::default()
+        };
+        let block = |col| CursorVisual {
+            position: CellPosition { row: 0, col },
+            shape: RenderCursorShape::Block,
+            color: RenderColor::rgb(255, 80, 120),
+            text_color: None,
+            visible: true,
+            thickness_percent: 100,
+            corner_radius_px: 0,
+            inactive: false,
+        };
+        let mut runtime = CursorAnimationRuntime::new();
+
+        let mut initial = scene(vec![cell(0, 0, "a")]);
+        initial.cursor = Some(block(0));
+        runtime.populate_scene(&mut initial, metrics(), settings);
+
+        let mut first_observation = scene(vec![cell(0, 0, "a")]);
+        first_observation.cursor = Some(block(4));
+        runtime.populate_scene(&mut first_observation, metrics(), settings);
+        assert!(
+            first_observation
+                .animations
+                .iter()
+                .all(|animation| animation.kind != AnimationKind::CursorTrail),
+            "a newly observed cursor target must not animate immediately"
+        );
+
+        std::thread::sleep(Duration::from_millis(2));
+        let mut stable_observation = scene(vec![cell(0, 0, "a")]);
+        stable_observation.cursor = Some(block(4));
+        runtime.populate_scene(&mut stable_observation, metrics(), settings);
+        assert!(
+            stable_observation
+                .animations
+                .iter()
+                .any(|animation| animation.kind == AnimationKind::CursorTrail),
+            "a stable cursor jump larger than the threshold should animate"
+        );
+    }
+
+    #[test]
+    fn persistent_cursor_trail_converges_without_fixed_duration_redraws() {
+        let settings = CursorAnimationSettings {
+            enabled: true,
+            trail: true,
+            trail_start_threshold_cells: 0,
+            ..CursorAnimationSettings::default()
+        };
+        let start = RenderRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 16,
+        };
+        let target = RenderRect { x: 8, ..start };
+        let mut trail = PersistentCursorTrail::default();
+        trail.retarget(start, RenderColor::rgb(120, 190, 255), [8, 16], settings);
+        trail.retarget(target, RenderColor::rgb(120, 190, 255), [8, 16], settings);
+
+        for _ in 0..50 {
+            trail.advance(Duration::from_millis(8), settings);
+            if !trail.needs_frame() {
+                break;
+            }
+        }
+
+        assert!(!trail.needs_frame());
+        assert_eq!(trail.corners, rect_quad(target));
+    }
+
+    #[test]
+    fn cursor_trail_batches_one_clipped_deformed_gpu_polygon() {
+        let start = RenderRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 16,
+        };
+        let end = RenderRect {
+            x: 80,
+            y: 32,
+            width: 2,
+            height: 16,
+        };
+        let affected_region = cursor_animation_region(union_region(start, end));
+        let expected = cursor_trail_quad(start, end, Duration::from_millis(100));
+        let animation = AnimationHandle {
+            id: 1,
+            kind: AnimationKind::CursorTrail,
+            affected_region,
+            start_region: start,
+            end_region: end,
+            color: RenderColor::rgb(120, 190, 255),
+            quad: Some(animation_quad(expected)),
+            elapsed: Duration::from_millis(100),
+            remaining: Some(Duration::from_millis(300)),
+        };
+        let mut effects = QuadBatch::new(QuadBatchKind::Decoration);
+        let mut trail = QuadBatch::new(QuadBatchKind::CursorTrail);
+        let offset = render_core::RenderOffset { x: 12, y: 8 };
+
+        push_animation_quads(
+            &mut effects,
+            &mut trail,
+            &[animation],
+            &[offset_region(affected_region, offset)],
+            offset,
+            false,
+        );
+
+        assert!(effects.is_empty());
+        assert!(!trail.is_empty());
+        let target_edge = (end.x + offset.x) as f32;
+        assert!(
+            trail
+                .vertices
+                .iter()
+                .all(|vertex| vertex.position_px[0] <= target_edge),
+            "the GPU trail must stop before the active cursor"
+        );
+    }
+
+    #[test]
+    fn cursor_trail_batches_separately_from_generic_decorations() {
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let mut planner = RenderBatchPlanner::default();
+        let start = RenderRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 16,
+        };
+        let end = RenderRect { x: 24, ..start };
+        let affected_region = cursor_animation_region(union_region(start, end));
+        let mut test_scene = scene(Vec::new());
+        test_scene.cursor = None;
+        test_scene.animations = vec![AnimationHandle {
+            id: 1,
+            kind: AnimationKind::CursorTrail,
+            affected_region,
+            start_region: start,
+            end_region: end,
+            color: RenderColor::rgb(120, 190, 255),
+            quad: Some(animation_quad([
+                [start.x as f32, start.y as f32],
+                [(end.x + end.width as i32) as f32, end.y as f32],
+                [
+                    (end.x + end.width as i32) as f32,
+                    (end.y + end.height as i32) as f32,
+                ],
+                [start.x as f32, (start.y + start.height as i32) as f32],
+            ])),
+            elapsed: Duration::ZERO,
+            remaining: None,
+        }];
+        test_scene.damage_regions = vec![affected_region];
+
+        let batches = planner.prepare(&test_scene, &mut fonts).unwrap();
+
+        assert!(!batches.cursor_trail.is_empty());
+        assert!(
+            batches.decorations.is_empty(),
+            "cursor motion must not share the generic overlay batch"
+        );
+    }
+
+    #[test]
+    fn cursor_effects_are_not_baked_into_static_terminal_decorations() {
+        let mut fonts = FontSystem::new(font_system::FontConfig::default());
+        let mut planner = RenderBatchPlanner::default();
+        let bounds = RenderRect {
+            x: 16,
+            y: 16,
+            width: 8,
+            height: 16,
+        };
+        let mut test_scene = scene(Vec::new());
+        test_scene.cursor = None;
+        test_scene.animations = vec![AnimationHandle {
+            id: 1,
+            kind: AnimationKind::CursorTypingPulse,
+            affected_region: cursor_animation_region(bounds),
+            start_region: bounds,
+            end_region: bounds,
+            color: RenderColor::rgb(120, 190, 255),
+            quad: None,
+            elapsed: Duration::from_millis(20),
+            remaining: Some(Duration::from_millis(120)),
+        }];
+        test_scene.damage_regions = vec![cursor_animation_region(bounds)];
+
+        let batches = planner.prepare(&test_scene, &mut fonts).unwrap();
+
+        assert!(batches.decorations.is_empty());
+        assert!(!batches.cursor_effects.is_empty());
+    }
+
+    #[test]
+    fn cursor_trail_geometry_does_not_cover_the_active_cursor() {
+        for (start_x, end_x) in [(0, 24), (24, 0)] {
+            let mut fonts = FontSystem::new(font_system::FontConfig::default());
+            let mut planner = RenderBatchPlanner::default();
+            let start = RenderRect {
+                x: start_x,
+                y: 0,
+                width: 2,
+                height: 16,
+            };
+            let end = RenderRect { x: end_x, ..start };
+            let affected_region = cursor_animation_region(union_region(start, end));
+            let left = start.x.min(end.x) as f32;
+            let right = (start.x.max(end.x) + end.width as i32) as f32;
+            let mut test_scene = scene(Vec::new());
+            test_scene.cursor = None;
+            test_scene.animations = vec![AnimationHandle {
+                id: 1,
+                kind: AnimationKind::CursorTrail,
+                affected_region,
+                start_region: start,
+                end_region: end,
+                color: RenderColor::rgb(120, 190, 255),
+                quad: Some(animation_quad([
+                    [left, 0.0],
+                    [right, 0.0],
+                    [right, 16.0],
+                    [left, 16.0],
+                ])),
+                elapsed: Duration::ZERO,
+                remaining: None,
+            }];
+            test_scene.damage_regions = vec![affected_region];
+
+            let batches = planner.prepare(&test_scene, &mut fonts).unwrap();
+            assert!(!batches.cursor_trail.is_empty());
+            if end.x > start.x {
+                assert!(
+                    batches
+                        .cursor_trail
+                        .vertices
+                        .iter()
+                        .all(|vertex| vertex.position_px[0] <= end.x as f32)
+                );
+            } else {
+                let active_cursor_right = (end.x + end.width as i32) as f32;
+                assert!(
+                    batches
+                        .cursor_trail
+                        .vertices
+                        .iter()
+                        .all(|vertex| vertex.position_px[0] >= active_cursor_right)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_trail_geometry_stays_attached_to_the_active_cursor_edge() {
+        let settings = CursorAnimationSettings {
+            enabled: true,
+            trail: true,
+            trail_start_threshold_cells: 0,
+            trail_decay_fast: Duration::from_millis(100),
+            trail_decay_slow: Duration::from_millis(400),
+            ..CursorAnimationSettings::default()
+        };
+        for (start_x, end_x) in [(0, 80), (80, 0)] {
+            let start = RenderRect {
+                x: start_x,
+                y: 0,
+                width: 2,
+                height: 16,
+            };
+            let end = RenderRect { x: end_x, ..start };
+            let mut persistent = PersistentCursorTrail::default();
+            persistent.retarget(start, RenderColor::rgb(120, 190, 255), [8, 16], settings);
+            persistent.retarget(end, RenderColor::rgb(120, 190, 255), [8, 16], settings);
+            persistent.advance(Duration::from_millis(8), settings);
+            let visual = persistent
+                .visual(settings)
+                .expect("trail should remain active");
+            assert!(
+                damage_covers(
+                    &[visual.affected_region],
+                    union_region(visual.start_region, visual.end_region)
+                ),
+                "declared trail damage must cover every anchored GPU pixel"
+            );
+            let mut batch = QuadBatch::new(QuadBatchKind::CursorTrail);
+
+            push_clipped_cursor_trail(
+                &mut batch,
+                animation_quad_pixels(visual.quad.expect("trail quad")),
+                visual.start_region,
+                visual.end_region,
+                visual.color,
+            );
+
+            let active_edge = if end.x > start.x {
+                end.x as f32
+            } else {
+                (end.x + end.width as i32) as f32
+            };
+            assert!(
+                batch
+                    .vertices
+                    .iter()
+                    .any(|vertex| (vertex.position_px[0] - active_edge).abs() < 0.01),
+                "the elastic trail must remain connected to the immediate caret"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_trail_uses_the_cursor_opacity() {
+        let animation = AnimationHandle {
+            id: 1,
+            kind: AnimationKind::CursorTrail,
+            affected_region: RenderRect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 20,
+            },
+            start_region: RenderRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 20,
+            },
+            end_region: RenderRect {
+                x: 8,
+                y: 0,
+                width: 2,
+                height: 20,
+            },
+            color: RenderColor {
+                red: 245,
+                green: 224,
+                blue: 220,
+                alpha: 255,
+            },
+            quad: None,
+            elapsed: Duration::ZERO,
+            remaining: None,
+        };
+
+        assert_eq!(animation_color(animation).alpha, 255);
+    }
+
+    #[test]
+    fn cursor_trail_damage_clears_previous_and_current_geometry() {
+        let previous = RenderRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 16,
+        };
+        let current = RenderRect { x: 6, ..previous };
+        let animation = |rect| AnimationHandle {
+            id: 1,
+            kind: AnimationKind::CursorTrail,
+            affected_region: cursor_animation_region(rect),
+            start_region: rect,
+            end_region: current,
+            color: RenderColor::rgb(120, 190, 255),
+            quad: Some(animation_quad(rect_quad(rect))),
+            elapsed: Duration::ZERO,
+            remaining: None,
+        };
+        let mut tracker = DamageTracker::new();
+        let mut first = scene(vec![cell(0, 0, "a")]);
+        first.animations = vec![animation(previous)];
+        let _ = tracker.update(&first, metrics());
+
+        let mut second = first.clone();
+        second.animations = vec![animation(current)];
+        let damage = tracker.update(&second, metrics());
+
+        assert!(damage_covers(&damage, cursor_animation_region(previous)));
+        assert!(damage_covers(&damage, cursor_animation_region(current)));
+    }
+
+    #[test]
     fn cursor_animation_quads_are_batched_separately_from_cells() {
         let mut fonts = FontSystem::new(font_system::FontConfig::default());
         let mut planner = RenderBatchPlanner::default();
@@ -8874,6 +11369,7 @@ mod tests {
             start_region: region,
             end_region: region,
             color: RenderColor::rgb(120, 190, 255),
+            quad: None,
             elapsed: Duration::from_millis(20),
             remaining: Some(Duration::from_millis(100)),
         }];
@@ -8883,7 +11379,11 @@ mod tests {
             return;
         };
 
-        assert!(batches.decorations.quad_count() >= 1);
+        assert!(batches.cursor_effects.quad_count() >= 1);
+        assert!(
+            batches.decorations.is_empty(),
+            "cursor animations must remain isolated from static terminal decorations"
+        );
         assert_eq!(batches.instrumentation.animated_region_count, 1);
     }
 

@@ -58,11 +58,18 @@ Layer: render-wgpu, render-core, config-core
 User-facing behavior: users can enable smooth movement, typing pulse/stretch,
 trail, blink easing, glow, and an optional image cursor asset with FPS and size
 budgets.
-Config keys: `cursor.animations_enabled`, `cursor.smooth_movement`,
+Config keys: `cursor.animation`, `cursor.animations_enabled`, `cursor.smooth_movement`,
 `cursor.typing_pulse`, `cursor.typing_stretch`, `cursor.trail`,
 `cursor.blink_easing`, `cursor.short_lived_glow`, `cursor.shadow`,
 `cursor.image.*`, and
 `performance.max_animation_fps`.
+
+`cursor.animation = "panea"` selects Panea's built-in directional tilt with a
+short elastic extension. The cursor leans with horizontal movement while the
+extension collapses from the previous cell, then both settle at the destination.
+The normal product default is static. `cursor.animation = "custom"` exposes the
+individual effect controls; configs without the profile key retain their
+existing `animations_enabled` behavior.
 macOS behavior: same config and render scene contract; runtime verification is
 still pending on a macOS host.
 Windows behavior: config, pixel decode, batching, damage, screenshot, and GPU

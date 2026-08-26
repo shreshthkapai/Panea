@@ -8,3 +8,6 @@ description = "Renderer-independent draw model, damage model, and visual primiti
 
 [lints]
 workspace = true
+
+[dependencies]
+compact_str.workspace = true
