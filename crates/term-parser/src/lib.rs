@@ -36,6 +36,16 @@ impl TerminalEmulator {
         &mut self.state
     }
 
+    #[must_use]
+    pub fn modes_ref(&self) -> &std::collections::BTreeSet<TerminalMode> {
+        self.state.modes_ref()
+    }
+
+    #[must_use]
+    pub fn scrollback_lines(&self) -> &[term_core::Line] {
+        self.state.scrollback_lines()
+    }
+
     pub fn apply_bytes_and_take_pending_output(&mut self, bytes: &[u8]) -> TerminalResult<Vec<u8>> {
         self.apply_bytes(bytes)?;
         Ok(self.state.take_pending_output())
@@ -934,6 +944,34 @@ mod tests {
         });
 
         assert_eq!(output, ["text:panea", "action:cr"]);
+    }
+
+    #[test]
+    fn borrowed_mode_view_tracks_parser_updates() {
+        let mut terminal = TerminalEmulator::new(TerminalSize::new(80, 24));
+        assert!(
+            !terminal
+                .modes_ref()
+                .contains(&TerminalMode::ApplicationCursorKeys)
+        );
+
+        terminal.apply_bytes(b"\x1b[?1h").expect("set mode");
+
+        assert!(
+            terminal
+                .modes_ref()
+                .contains(&TerminalMode::ApplicationCursorKeys)
+        );
+    }
+
+    #[test]
+    fn borrowed_scrollback_view_tracks_terminal_output() {
+        let mut terminal = TerminalEmulator::new(TerminalSize::new(4, 1));
+        terminal.apply_bytes(b"one\r\ntwo").unwrap();
+
+        let scrollback = terminal.scrollback_lines();
+        assert_eq!(scrollback.len(), 1);
+        assert_eq!(scrollback[0].raw_text(), "one");
     }
 
     #[test]

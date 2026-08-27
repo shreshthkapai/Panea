@@ -100,7 +100,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         "color-heavy" => parse_and_render("color-heavy", color_heavy_fixture(4_000), 2),
         "scrollback" => parse_fixture("scrollback", large_log_fixture(50_000), 1),
         "resize" => resize_bench(),
-        "input-latency" => input_latency(),
+        "parser-input" => parser_grid_input_cost(),
+        "input-latency" => {
+            eprintln!(
+                "'input-latency' is retained as an alias; this benchmark measures parser/grid cost only. Use 'cargo xtask bench gui-input' for prompt-to-present latency."
+            );
+            parser_grid_input_cost()
+        }
         "unicode" => parse_and_render("unicode", unicode_fixture(4_000), 2),
         "alternate-screen" => {
             parse_fixture("alternate-screen", alternate_screen_fixture(2_000), 20)
@@ -114,7 +120,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 fn print_help() {
     println!(
-        "usage: cargo xtask bench <all|profiles|render-grid|render-full-ascii|render-mixed-unicode|render-emoji-heavy|render-fast-scrolling|render-large-scrollback-viewport|render-many-panes|render-coding-agent|render-partial-update|render-cursor-animation|render-command-blocks|cat-large-file|color-heavy|scrollback|resize|input-latency|unicode|alternate-screen|cursor-animation|command-blocks|fullscreen-chrome>"
+        "usage: cargo xtask bench <all|gui-startup|gui-prompt|gui-input|profiles|render-grid|render-full-ascii|render-mixed-unicode|render-emoji-heavy|render-fast-scrolling|render-large-scrollback-viewport|render-many-panes|render-coding-agent|render-partial-update|render-cursor-animation|render-command-blocks|cat-large-file|color-heavy|scrollback|resize|parser-input|unicode|alternate-screen|cursor-animation|command-blocks|fullscreen-chrome>"
     );
 }
 
@@ -144,7 +150,7 @@ fn run_all() -> Result<(), Box<dyn Error>> {
     parse_and_render("color-heavy", color_heavy_fixture(4_000), 2)?;
     parse_fixture("scrollback", large_log_fixture(50_000), 1)?;
     resize_bench()?;
-    input_latency()?;
+    parser_grid_input_cost()?;
     parse_and_render("unicode", unicode_fixture(4_000), 2)?;
     parse_fixture("alternate-screen", alternate_screen_fixture(2_000), 20)?;
     cursor_animation_cost()?;
@@ -571,11 +577,22 @@ fn resize_bench() -> Result<(), Box<dyn Error>> {
         CoreTerminalSize::new(160, 48),
     ];
     let iterations = 24_u64;
+    let mut samples = Vec::with_capacity(iterations as usize);
     let started = Instant::now();
 
     for index in 0..iterations {
+        let sample_started = Instant::now();
         terminal.resize(sizes[index as usize % sizes.len()])?;
+        samples.push(sample_started.elapsed());
     }
+
+    samples.sort_unstable();
+    println!(
+        "bench=resize-distribution p50={:?} p95={:?} p99={:?}",
+        duration_percentile(&samples, 50),
+        duration_percentile(&samples, 95),
+        duration_percentile(&samples, 99),
+    );
 
     print_result(BenchmarkResult {
         name: "resize",
@@ -587,22 +604,41 @@ fn resize_bench() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn input_latency() -> Result<(), Box<dyn Error>> {
+fn parser_grid_input_cost() -> Result<(), Box<dyn Error>> {
     let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(DEFAULT_COLS, DEFAULT_ROWS));
-    let iterations = 20_000;
+    let sample_count = 2_000_usize;
+    let operations_per_sample = 64_u32;
+    let iterations = sample_count.saturating_mul(operations_per_sample as usize);
+    let mut samples = Vec::with_capacity(sample_count);
     let started = Instant::now();
 
-    for _ in 0..iterations {
-        terminal.apply_bytes(black_box(b"x"))?;
+    for _ in 0..sample_count {
+        let sample_started = Instant::now();
+        for _ in 0..operations_per_sample {
+            terminal.apply_bytes(black_box(b"x"))?;
+        }
+        samples.push(sample_started.elapsed() / operations_per_sample);
     }
 
     let elapsed = started.elapsed();
     black_box(terminal.cursor_state());
-    let average = elapsed / iterations as u32;
+    let average = elapsed / u32::try_from(iterations).unwrap_or(u32::MAX);
+    samples.sort_unstable();
     println!(
-        "bench=input-latency iterations={iterations} total={elapsed:?} average_per_input={average:?}"
+        "bench=parser-input scope=parser-and-grid-only excludes=platform,pty,shell,gpu,present iterations={iterations} total={elapsed:?} average={average:?} p50={:?} p95={:?} p99={:?}",
+        duration_percentile(&samples, 50),
+        duration_percentile(&samples, 95),
+        duration_percentile(&samples, 99),
     );
     Ok(())
+}
+
+fn duration_percentile(sorted: &[Duration], percentile: usize) -> Duration {
+    if sorted.is_empty() {
+        return Duration::ZERO;
+    }
+    let rank = sorted.len().saturating_mul(percentile).saturating_add(99) / 100;
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
 
 fn cursor_animation_cost() -> Result<(), Box<dyn Error>> {
@@ -1234,6 +1270,19 @@ mod tests {
             scheduler.next_frame(),
             FrameDecision::FrameNeeded(_)
         ));
+    }
+
+    #[test]
+    fn duration_distribution_uses_nearest_rank() {
+        let samples = [
+            Duration::from_micros(10),
+            Duration::from_micros(20),
+            Duration::from_micros(30),
+            Duration::from_micros(40),
+            Duration::from_micros(50),
+        ];
+        assert_eq!(duration_percentile(&samples, 50), Duration::from_micros(30));
+        assert_eq!(duration_percentile(&samples, 95), Duration::from_micros(50));
     }
 
     #[test]

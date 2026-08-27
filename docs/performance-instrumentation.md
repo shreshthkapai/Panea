@@ -53,6 +53,13 @@ Can diagnostics show its cost? Yes, the overlay and benchmark output use shared 
 - PTY and parser throughput are counted from existing per-pane polling and
   parsing work. Scrollback memory estimates are computed only when the overlay
   is enabled.
+- `panea gui-smoke --json` records config, window, font, session, GPU backend,
+  startup-background, first-scene, first-submit, prompt, input, output, and
+  presentation milestones. The report includes power source and charge where
+  available.
+- `cargo xtask bench gui-startup|gui-prompt|gui-input` collects bounded p50,
+  p95, and p99 distributions. `--config default` isolates portable product
+  defaults; `--config user` measures the real configured product.
 - Power state is sampled through `platform-core::PowerStateProvider` at a
   30-second interval outside render/input/PTY paths. Battery mode caps optional
   animation/cache budgets; AC power restores the exact configured settings.
@@ -63,6 +70,9 @@ Can diagnostics show its cost? Yes, the overlay and benchmark output use shared 
   Linux Wayland hardware/backends.
 - A user-facing keybinding/command-palette toggle remains desktop UI polish;
   config reload can already enable or disable the overlay live.
-- Absolute comparisons with Alacritty or WezTerm remain invalid until the same
+- Absolute comparisons with Alacritty, WezTerm, or Kitty remain invalid until the same
   public fixtures, machine, fonts, backend, dimensions, and warm-up policy are
   used. Panea does not claim a win based on unlike workloads.
+- Native macOS, Linux X11, and Linux Wayland GUI baselines still require real
+  hardware/compositor runners. Compilation or a headless test is not runtime
+  performance verification.

@@ -1030,6 +1030,16 @@ impl TerminalState {
         std::mem::take(&mut self.pending_clipboard_requests)
     }
 
+    #[must_use]
+    pub const fn modes_ref(&self) -> &BTreeSet<TerminalMode> {
+        &self.modes
+    }
+
+    #[must_use]
+    pub fn scrollback_lines(&self) -> &[Line] {
+        &self.primary.scrollback
+    }
+
     fn reset(&mut self) {
         let size = self.active().size;
         *self = Self::new(size);
@@ -1998,7 +2008,6 @@ impl ScreenBuffer {
             self.resize_rows(size);
             return;
         }
-        let logical = logical_lines(&self.scrollback, &self.lines);
         let target_physical = self.scrollback.len().saturating_add(self.cursor_row);
         let (target_logical, target_offset) = logical_cursor_position(
             &self.scrollback,
@@ -2008,6 +2017,10 @@ impl ScreenBuffer {
         );
         let (viewport_logical, viewport_offset) =
             logical_cursor_position(&self.scrollback, &self.lines, self.scrollback.len(), 0);
+        let logical = logical_lines(
+            std::mem::take(&mut self.scrollback),
+            std::mem::take(&mut self.lines),
+        );
         let mut reflowed = Vec::new();
         let mut cursor_physical = 0usize;
         let mut cursor_col = 0usize;
@@ -2032,7 +2045,7 @@ impl ScreenBuffer {
                 let mapped = reflow_cursor_position(&cells, viewport_offset, size.cols);
                 viewport_physical = reflowed.len().saturating_add(mapped.0);
             }
-            reflowed.extend(reflow_logical_lines(vec![cells], size.cols));
+            reflow_logical_line(cells, size.cols, &mut reflowed);
         }
         let rows = usize::from(size.rows);
         // Preserve the old viewport origin through horizontal reflow, then
@@ -2042,8 +2055,10 @@ impl ScreenBuffer {
         // shell output.
         let split = viewport_physical.max(cursor_physical.saturating_sub(rows.saturating_sub(1)));
         let viewport_end = split.saturating_add(rows).min(reflowed.len());
-        self.scrollback = reflowed[..split].to_vec();
-        self.lines = reflowed[split..viewport_end].to_vec();
+        let mut visible = reflowed.split_off(split);
+        visible.truncate(viewport_end.saturating_sub(split));
+        self.scrollback = reflowed;
+        self.lines = visible;
         self.lines.resize_with(rows, || Line::blank(size.cols));
         self.size = size;
         self.reset_scroll_region();
@@ -2090,21 +2105,25 @@ impl ScreenBuffer {
     }
 }
 
-fn logical_lines(scrollback: &[Line], visible: &[Line]) -> Vec<Vec<Cell>> {
-    let mut out: Vec<Vec<Cell>> = Vec::new();
-    let lines: Vec<&Line> = scrollback.iter().chain(visible.iter()).collect();
+fn logical_lines(scrollback: Vec<Line>, visible: Vec<Line>) -> Vec<Vec<Cell>> {
+    let capacity = scrollback.len().saturating_add(visible.len());
+    let mut out: Vec<Vec<Cell>> = Vec::with_capacity(capacity);
+    let mut previous_hard_wrapped = false;
 
-    for (index, line) in lines.iter().enumerate() {
-        let content = line_content(line);
-        if index > 0 && lines[index - 1].hard_wrapped {
+    for (index, line) in scrollback.into_iter().chain(visible).enumerate() {
+        let hard_wrapped = line.hard_wrapped;
+        let end = line_content_len(&line);
+        let mut content = line.cells;
+        content.truncate(end);
+        if index > 0 && previous_hard_wrapped {
             let last = out
                 .last_mut()
                 .expect("a previous physical line created a logical line");
             last.extend(content);
-            continue;
+        } else {
+            out.push(content);
         }
-
-        out.push(content);
+        previous_hard_wrapped = hard_wrapped;
     }
 
     if out.is_empty() {
@@ -2120,18 +2139,19 @@ fn logical_cursor_position(
     target_physical: usize,
     cursor_col: usize,
 ) -> (usize, usize) {
-    let lines = scrollback.iter().chain(visible.iter()).collect::<Vec<_>>();
     let mut logical_index = 0usize;
     let mut logical_offset = 0usize;
-    for (index, line) in lines.iter().enumerate() {
-        if index > 0 && !lines[index - 1].hard_wrapped {
+    let mut previous_hard_wrapped = false;
+    for (index, line) in scrollback.iter().chain(visible).enumerate() {
+        if index > 0 && !previous_hard_wrapped {
             logical_index = logical_index.saturating_add(1);
             logical_offset = 0;
         }
         if index == target_physical {
             return (logical_index, logical_offset.saturating_add(cursor_col));
         }
-        logical_offset = logical_offset.saturating_add(line_content(line).len());
+        logical_offset = logical_offset.saturating_add(line_content_len(line));
+        previous_hard_wrapped = line.hard_wrapped;
     }
     (logical_index, logical_offset)
 }
@@ -2144,7 +2164,7 @@ fn reflow_cursor_position(cells: &[Cell], offset: usize, cols: u16) -> (usize, u
 
     for cell in cells.iter().filter(|cell| !cell.wide_continuation) {
         let source_width = cell.width.max(1) as usize;
-        let width = cell_width_for_text_in_grid(&cell.text, cols);
+        let width = reflow_cell_width(cell, cols);
         if col > 0 && col + width > cols {
             row = row.saturating_add(1);
             col = 0;
@@ -2167,55 +2187,47 @@ fn reflow_cursor_position(cells: &[Cell], offset: usize, cols: u16) -> (usize, u
     }
 }
 
-fn line_content(line: &Line) -> Vec<Cell> {
-    let end = if line.hard_wrapped {
+fn line_content_len(line: &Line) -> usize {
+    if line.hard_wrapped {
         line.cells.len()
     } else {
         line.cells
             .iter()
             .rposition(|cell| cell.text != " ")
             .map_or(0, |index| index + 1)
-    };
-
-    line.cells.iter().take(end).cloned().collect()
+    }
 }
 
-fn reflow_logical_lines(logical: Vec<Vec<Cell>>, cols: u16) -> Vec<Line> {
+fn reflow_logical_line(cells: Vec<Cell>, cols: u16, out: &mut Vec<Line>) {
     let cols = usize::from(cols.max(1));
-    let mut out = Vec::new();
+    let mut line = Line {
+        cells: Vec::with_capacity(cols),
+        hard_wrapped: false,
+    };
+    let mut emitted_any = false;
 
-    for cells in logical {
-        let mut line = Line {
-            cells: Vec::with_capacity(cols),
-            hard_wrapped: false,
-        };
-        let mut emitted_any = false;
-
-        for cell in cells.into_iter().filter(|cell| !cell.wide_continuation) {
-            let width = cell_width_for_text_in_grid(&cell.text, cols);
-            if !line.cells.is_empty() && line.cells.len() + width > cols {
-                line.hard_wrapped = true;
-                line.resize_to(cols as u16, CellAttributes::default());
-                out.push(line);
-                line = Line {
-                    cells: Vec::with_capacity(cols),
-                    hard_wrapped: false,
-                };
-            }
-
-            push_cell_with_continuation(&mut line.cells, cell, cols);
-            emitted_any = true;
-        }
-
-        if emitted_any {
+    for cell in cells.into_iter().filter(|cell| !cell.wide_continuation) {
+        let width = reflow_cell_width(&cell, cols);
+        if !line.cells.is_empty() && line.cells.len() + width > cols {
+            line.hard_wrapped = true;
             line.resize_to(cols as u16, CellAttributes::default());
             out.push(line);
-        } else {
-            out.push(Line::blank(cols as u16));
+            line = Line {
+                cells: Vec::with_capacity(cols),
+                hard_wrapped: false,
+            };
         }
+
+        push_cell_with_continuation(&mut line.cells, cell, cols, width);
+        emitted_any = true;
     }
 
-    out
+    if emitted_any {
+        line.resize_to(cols as u16, CellAttributes::default());
+        out.push(line);
+    } else {
+        out.push(Line::blank(cols as u16));
+    }
 }
 
 fn trim_selection_text(mut text: String) -> String {
@@ -2236,6 +2248,16 @@ fn cell_width_for_text(text: &str) -> usize {
 fn cell_width_for_text_in_grid(text: &str, available_cols: usize) -> usize {
     let width = cell_width_for_text(text);
     if available_cols < width { 1 } else { width }
+}
+
+fn reflow_cell_width(cell: &Cell, available_cols: usize) -> usize {
+    if cell.width == 2 {
+        return usize::from(available_cols >= 2).saturating_add(1);
+    }
+    if cell.text.is_ascii() {
+        return 1;
+    }
+    cell_width_for_text_in_grid(&cell.text, available_cols)
 }
 
 fn scalar_cell_width(ch: char, cols: usize) -> usize {
@@ -2356,9 +2378,9 @@ fn grapheme_delete_end(line: &Line, start: usize, count: usize) -> Option<usize>
     Some(end.min(line.cells.len()))
 }
 
-fn push_cell_with_continuation(cells: &mut Vec<Cell>, mut cell: Cell, cols: usize) {
-    let available = cols.saturating_sub(cells.len());
-    let width = cell_width_for_text_in_grid(&cell.text, available);
+fn push_cell_with_continuation(cells: &mut Vec<Cell>, mut cell: Cell, cols: usize, width: usize) {
+    debug_assert!((1..=2).contains(&width));
+    debug_assert!(width <= cols.saturating_sub(cells.len()));
     cell.width = width as u8;
     cell.wide_continuation = false;
     let attributes = cell.attributes;
@@ -2924,6 +2946,17 @@ mod tests {
         assert_eq!(line_text(&terminal, 1), "界");
         assert!(terminal.cell(1, 1).unwrap().wide_continuation);
         assert_eq!(line_text(&terminal, 2), "b");
+    }
+
+    #[test]
+    fn reflow_width_uses_cached_ascii_width_but_recovers_clamped_wide_cells() {
+        let ascii = Cell::text("x", CellAttributes::default());
+        assert_eq!(reflow_cell_width(&ascii, 80), 1);
+
+        let mut previously_clamped = Cell::text("界", CellAttributes::default());
+        previously_clamped.width = 1;
+        assert_eq!(reflow_cell_width(&previously_clamped, 80), 2);
+        assert_eq!(reflow_cell_width(&previously_clamped, 1), 1);
     }
 
     #[test]

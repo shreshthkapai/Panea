@@ -21,6 +21,7 @@ diagnostics = { path = "../../crates/diagnostics" }
 image.workspace = true
 render-wgpu = { path = "../../crates/render-wgpu" }
 security = { path = "../../crates/security" }
+serde_json.workspace = true
 sha2.workspace = true
 shell-integration = { path = "../../crates/shell-integration" }
 term-core = { path = "../../crates/term-core" }

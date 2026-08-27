@@ -41,6 +41,91 @@ pub enum PresentMode {
     Immediate,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GpuBackendPreference {
+    #[default]
+    Auto,
+    Vulkan,
+    Metal,
+    Dx12,
+    Gl,
+}
+
+impl GpuBackendPreference {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Vulkan => "vulkan",
+            Self::Metal => "metal",
+            Self::Dx12 => "dx12",
+            Self::Gl => "gl",
+        }
+    }
+}
+
+fn instance_backends(preference: GpuBackendPreference) -> wgpu::Backends {
+    match preference {
+        GpuBackendPreference::Auto => wgpu::Backends::all(),
+        GpuBackendPreference::Vulkan => wgpu::Backends::VULKAN,
+        GpuBackendPreference::Metal => wgpu::Backends::METAL,
+        GpuBackendPreference::Dx12 => wgpu::Backends::DX12,
+        GpuBackendPreference::Gl => wgpu::Backends::GL,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeBackendFamily {
+    Windows,
+    Apple,
+    Unix,
+    Other,
+}
+
+fn native_backend_family() -> NativeBackendFamily {
+    if cfg!(target_os = "windows") {
+        NativeBackendFamily::Windows
+    } else if cfg!(target_vendor = "apple") {
+        NativeBackendFamily::Apple
+    } else if cfg!(unix) {
+        NativeBackendFamily::Unix
+    } else {
+        NativeBackendFamily::Other
+    }
+}
+
+fn backend_candidates_for(
+    family: NativeBackendFamily,
+    requested: GpuBackendPreference,
+    transparent: bool,
+) -> Vec<GpuBackendPreference> {
+    if requested != GpuBackendPreference::Auto {
+        return vec![requested];
+    }
+
+    match (family, transparent) {
+        (NativeBackendFamily::Windows, true) => vec![
+            GpuBackendPreference::Vulkan,
+            GpuBackendPreference::Dx12,
+            GpuBackendPreference::Gl,
+        ],
+        (NativeBackendFamily::Windows, false) => vec![
+            GpuBackendPreference::Dx12,
+            GpuBackendPreference::Vulkan,
+            GpuBackendPreference::Gl,
+        ],
+        (NativeBackendFamily::Apple, _) => vec![
+            GpuBackendPreference::Metal,
+            GpuBackendPreference::Vulkan,
+            GpuBackendPreference::Gl,
+        ],
+        (NativeBackendFamily::Unix, _) => {
+            vec![GpuBackendPreference::Vulkan, GpuBackendPreference::Gl]
+        }
+        (NativeBackendFamily::Other, _) => vec![GpuBackendPreference::Auto],
+    }
+}
+
 const DESIRED_MAXIMUM_FRAME_LATENCY: u32 = 1;
 
 fn select_present_mode(
@@ -97,6 +182,7 @@ fn retained_damage_status(requested: bool, surface_copy_supported: bool) -> Reta
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RendererOptions {
+    pub backend: GpuBackendPreference,
     pub present_mode: PresentMode,
     pub damage_tracking: bool,
     pub gpu_timestamps: bool,
@@ -108,6 +194,7 @@ pub struct RendererOptions {
 impl Default for RendererOptions {
     fn default() -> Self {
         Self {
+            backend: GpuBackendPreference::Auto,
             present_mode: PresentMode::Auto,
             damage_tracking: false,
             gpu_timestamps: false,
@@ -116,6 +203,41 @@ impl Default for RendererOptions {
             background: RenderColor::rgb(12, 12, 12),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RendererStartupTimings {
+    pub instance_and_surface: Duration,
+    pub adapter_request: Duration,
+    pub device_request: Duration,
+    pub surface_configuration: Duration,
+    pub pipeline_creation: Duration,
+    pub total: Duration,
+}
+
+impl RendererStartupTimings {
+    #[must_use]
+    pub fn accounted(self) -> Duration {
+        [
+            self.instance_and_surface,
+            self.adapter_request,
+            self.device_request,
+            self.surface_configuration,
+            self.pipeline_creation,
+        ]
+        .into_iter()
+        .fold(Duration::ZERO, Duration::saturating_add)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RendererStartupDiagnostics {
+    pub requested_backend: GpuBackendPreference,
+    pub effective_backend: String,
+    pub adapter: String,
+    pub attempted_backends: Vec<GpuBackendPreference>,
+    pub fallback_errors: Vec<String>,
+    pub timings: RendererStartupTimings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,7 +282,13 @@ pub async fn probe_gpu_adapter() -> Option<GpuAdapterProbe> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RendererError {
     SurfaceCreation(String),
-    AdapterUnavailable,
+    AdapterUnavailable {
+        requested: GpuBackendPreference,
+    },
+    BackendSelection {
+        requested: GpuBackendPreference,
+        attempts: Vec<String>,
+    },
     DeviceCreation(String),
     Surface(String),
     DeviceLost {
@@ -180,7 +308,20 @@ impl fmt::Display for RendererError {
             Self::SurfaceCreation(message) => {
                 write!(f, "failed to create render surface: {message}")
             }
-            Self::AdapterUnavailable => f.write_str("no compatible GPU adapter is available"),
+            Self::AdapterUnavailable { requested } => write!(
+                f,
+                "no compatible GPU adapter is available for renderer backend '{}'",
+                requested.as_str()
+            ),
+            Self::BackendSelection {
+                requested,
+                attempts,
+            } => write!(
+                f,
+                "renderer backend '{}' failed after bounded attempts: {}",
+                requested.as_str(),
+                attempts.join("; ")
+            ),
             Self::DeviceCreation(message) => write!(f, "failed to create GPU device: {message}"),
             Self::Surface(message) => write!(f, "surface error: {message}"),
             Self::DeviceLost { reason, message } => {
@@ -2686,6 +2827,7 @@ struct GlyphBatchContext<'a> {
     metrics: CellMetrics,
     rect: RenderRect,
     clip_regions: Option<&'a [DamageRegion]>,
+    content_clip: Option<RenderRect>,
     cursor_text: Option<CursorTextOverride>,
 }
 
@@ -2792,22 +2934,31 @@ impl RenderBatchPlanner {
         instrumentation.glyphs.atlas_used_bytes = self.atlas.used_bytes();
         instrumentation.glyphs.atlas_capacity_bytes = self.atlas.capacity_bytes();
 
-        for cell in &scene.grid.cells {
+        for (index, cell) in scene.grid.cells.iter().enumerate() {
             let rect = cell_region_at(cell.position, metrics, scene.content_offset);
             if !intersects_any(rect, &damage_regions) {
                 continue;
             }
 
+            let Some(rect) = clip_optional_rect(
+                rect,
+                content_clip_for_cell(scene, index, scene.content_offset),
+            ) else {
+                continue;
+            };
+
             push_solid_quad(&mut background, rect, cell.background);
             push_text_decorations(&mut decorations, cell, metrics, rect);
         }
 
-        for cell in damaged_terminal_text_runs(
+        for clipped_cell in damaged_terminal_text_runs(
             &scene.grid.cells,
             &damage_regions,
             metrics,
             scene.content_offset,
+            &scene.content_clips,
         ) {
+            let cell = clipped_cell.cell;
             let rect = cell_region_at(cell.position, metrics, scene.content_offset);
             let mut glyph_context = GlyphBatchContext {
                 atlas_uploads: &mut atlas_uploads,
@@ -2816,6 +2967,9 @@ impl RenderBatchPlanner {
                 metrics,
                 rect,
                 clip_regions: Some(&damage_regions),
+                content_clip: clipped_cell
+                    .clip
+                    .map(|clip| offset_region(clip, scene.content_offset)),
                 cursor_text,
             };
             self.push_glyphs(&mut glyphs, &cell, &mut glyph_context)?;
@@ -2824,19 +2978,42 @@ impl RenderBatchPlanner {
         let mut overlays = scene
             .search_highlights
             .iter()
-            .chain(scene.semantic_overlays.iter())
-            .map(|overlay| (overlay, scene.content_offset))
+            .enumerate()
+            .map(|(index, overlay)| {
+                (
+                    overlay,
+                    scene.content_offset,
+                    content_clip_for_search(scene, index, scene.content_offset),
+                )
+            })
+            .chain(
+                scene
+                    .semantic_overlays
+                    .iter()
+                    .enumerate()
+                    .map(|(index, overlay)| {
+                        (
+                            overlay,
+                            scene.content_offset,
+                            content_clip_for_semantic(scene, index, scene.content_offset),
+                        )
+                    }),
+            )
             .chain(
                 scene
                     .surface_overlays
                     .iter()
-                    .map(|overlay| (overlay, render_core::RenderOffset::default())),
+                    .map(|overlay| (overlay, render_core::RenderOffset::default(), None)),
             )
             .collect::<Vec<_>>();
-        overlays.sort_by_key(|(overlay, _)| overlay.z_index);
+        overlays.sort_by_key(|(overlay, _, _)| overlay.z_index);
 
-        for (overlay, offset) in overlays {
-            let bounds = offset_region(overlay.bounds, offset);
+        for (overlay, offset, content_clip) in overlays {
+            let Some(bounds) =
+                clip_optional_rect(offset_region(overlay.bounds, offset), content_clip)
+            else {
+                continue;
+            };
             if intersects_any(bounds, &damage_regions) {
                 let batch = if overlay_draws_behind_terminal_text(overlay.kind) {
                     &mut background
@@ -2865,6 +3042,7 @@ impl RenderBatchPlanner {
                     metrics,
                     rect: offset_region(overlay_label_rect(overlay, metrics), offset),
                     clip_regions: None,
+                    content_clip,
                     cursor_text: None,
                 };
                 self.push_overlay_label_glyphs(&mut overlay_glyphs, overlay, &mut glyph_context)?;
@@ -2881,9 +3059,13 @@ impl RenderBatchPlanner {
             }
         }
 
-        for selection in &scene.selections {
+        for (index, selection) in scene.selections.iter().enumerate() {
+            let content_clip = content_clip_for_selection(scene, index, scene.content_offset);
             for position in &selection.cells {
                 let rect = cell_region_at(*position, metrics, scene.content_offset);
+                let Some(rect) = clip_optional_rect(rect, content_clip) else {
+                    continue;
+                };
                 if intersects_any(rect, &damage_regions) {
                     push_solid_quad(&mut selections, rect, selection.color);
                 }
@@ -2954,6 +3136,7 @@ impl RenderBatchPlanner {
                     metrics,
                     rect: visual.bounds,
                     clip_regions: None,
+                    content_clip: None,
                     cursor_text: None,
                 },
             )?;
@@ -3078,13 +3261,14 @@ impl RenderBatchPlanner {
                 })
             };
             if let Some(entry) = entry {
-                push_glyph_quad(
+                push_clipped_glyph_quad(
                     glyphs,
                     context.rect,
                     entry,
                     self.atlas.dimensions(),
                     glyph_color(context.cursor_text, context.rect, cell.foreground),
                     false,
+                    context.content_clip,
                 );
             }
             return Ok(());
@@ -3181,13 +3365,14 @@ impl RenderBatchPlanner {
                     width: bitmap.width,
                     height: bitmap.height,
                 };
-                push_glyph_quad(
+                push_clipped_glyph_quad(
                     glyphs,
                     glyph_rect,
                     entry,
                     self.atlas.dimensions(),
                     glyph_color(context.cursor_text, glyph_rect, cell.foreground),
                     bitmap.format == GlyphBitmapFormat::Rgba,
+                    context.content_clip,
                 );
             }
             pen_x += item.x_advance;
@@ -3380,10 +3565,12 @@ fn window_chrome_title_overlay(
     })
 }
 
+#[cfg(test)]
 fn terminal_text_runs(cells: &[RenderCell]) -> Vec<RenderCell> {
     terminal_text_runs_from_iter(cells.iter())
 }
 
+#[cfg(test)]
 fn terminal_text_runs_from_iter<'a>(
     cells: impl IntoIterator<Item = &'a RenderCell>,
 ) -> Vec<RenderCell> {
@@ -3501,12 +3688,20 @@ fn damaged_terminal_text_runs(
     damage_regions: &[DamageRegion],
     metrics: CellMetrics,
     offset: render_core::RenderOffset,
-) -> Vec<RenderCell> {
-    damaged_terminal_text_runs_with_stats(cells, damage_regions, metrics, offset).runs
+    content_clips: &[render_core::RenderContentClip],
+) -> Vec<ClippedRenderCell> {
+    damaged_terminal_text_runs_with_stats(cells, damage_regions, metrics, offset, content_clips)
+        .runs
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClippedRenderCell {
+    cell: RenderCell,
+    clip: Option<RenderRect>,
 }
 
 struct DamagedTerminalTextRuns {
-    runs: Vec<RenderCell>,
+    runs: Vec<ClippedRenderCell>,
     #[cfg_attr(not(test), allow(dead_code))]
     source_cells: usize,
 }
@@ -3516,22 +3711,54 @@ fn damaged_terminal_text_runs_with_stats(
     damage_regions: &[DamageRegion],
     metrics: CellMetrics,
     offset: render_core::RenderOffset,
+    content_clips: &[render_core::RenderContentClip],
 ) -> DamagedTerminalTextRuns {
     let mut source_cells = 0;
-    let runs = terminal_text_runs_from_iter(cells.iter().filter(|cell| {
+    let mut runs: Vec<ClippedRenderCell> = Vec::new();
+    for (index, cell) in cells.iter().enumerate().filter(|(_, cell)| {
         let selected =
             row_intersects_any_damage(cell.position.row, metrics, offset, damage_regions);
         source_cells += usize::from(selected);
         selected
-    }))
-    .into_iter()
-    .filter(|run| {
-        intersects_any(
-            offset_region(text_run_region(run, metrics), offset),
-            damage_regions,
-        )
-    })
-    .collect();
+    }) {
+        let clip = content_clip_for_cell_ranges(content_clips, index);
+        let can_join = runs.last().is_some_and(|run| {
+            run.clip == clip
+                && run.cell.text.is_ascii()
+                && cell.text.is_ascii()
+                && run.cell.position.row == cell.position.row
+                && run
+                    .cell
+                    .position
+                    .col
+                    .saturating_add(run.cell.text.chars().count() as u16)
+                    == cell.position.col
+                && run.cell.foreground == cell.foreground
+                && run.cell.background == cell.background
+                && run.cell.style == cell.style
+        });
+        if can_join {
+            runs.last_mut()
+                .expect("run exists")
+                .cell
+                .text
+                .push_str(&cell.text);
+        } else {
+            runs.push(ClippedRenderCell {
+                cell: cell.clone(),
+                clip,
+            });
+        }
+    }
+    let runs = runs
+        .into_iter()
+        .filter(|run| {
+            intersects_any(
+                offset_region(text_run_region(&run.cell, metrics), offset),
+                damage_regions,
+            )
+        })
+        .collect();
     DamagedTerminalTextRuns { runs, source_cells }
 }
 
@@ -3579,6 +3806,61 @@ fn intersects_any(rect: RenderRect, regions: &[DamageRegion]) -> bool {
     regions.iter().any(|region| rects_intersect(rect, *region))
 }
 
+fn content_clip_for_cell_ranges(
+    clips: &[render_core::RenderContentClip],
+    index: usize,
+) -> Option<RenderRect> {
+    clips
+        .iter()
+        .find(|clip| clip.cells.contains(index))
+        .map(|clip| clip.bounds)
+}
+
+fn content_clip_for_cell(
+    scene: &RenderScene,
+    index: usize,
+    offset: render_core::RenderOffset,
+) -> Option<RenderRect> {
+    content_clip_for_cell_ranges(&scene.content_clips, index)
+        .map(|clip| offset_region(clip, offset))
+}
+
+fn content_clip_for_search(
+    scene: &RenderScene,
+    index: usize,
+    offset: render_core::RenderOffset,
+) -> Option<RenderRect> {
+    scene
+        .content_clips
+        .iter()
+        .find(|clip| clip.search_highlights.contains(index))
+        .map(|clip| offset_region(clip.bounds, offset))
+}
+
+fn content_clip_for_semantic(
+    scene: &RenderScene,
+    index: usize,
+    offset: render_core::RenderOffset,
+) -> Option<RenderRect> {
+    scene
+        .content_clips
+        .iter()
+        .find(|clip| clip.semantic_overlays.contains(index))
+        .map(|clip| offset_region(clip.bounds, offset))
+}
+
+fn content_clip_for_selection(
+    scene: &RenderScene,
+    index: usize,
+    offset: render_core::RenderOffset,
+) -> Option<RenderRect> {
+    scene
+        .content_clips
+        .iter()
+        .find(|clip| clip.selections.contains(index))
+        .map(|clip| offset_region(clip.bounds, offset))
+}
+
 fn glyph_color(
     cursor_text: Option<CursorTextOverride>,
     glyph_bounds: RenderRect,
@@ -3610,7 +3892,10 @@ fn cursor_text_override(scene: &RenderScene, metrics: CellMetrics) -> Option<Cur
 fn overlay_draws_behind_terminal_text(kind: OverlayKind) -> bool {
     matches!(
         kind,
-        OverlayKind::PromptDecoration | OverlayKind::CommandBlock | OverlayKind::InputOutputGroup
+        OverlayKind::Decoration
+            | OverlayKind::PromptDecoration
+            | OverlayKind::CommandBlock
+            | OverlayKind::InputOutputGroup
     )
 }
 
@@ -3655,6 +3940,26 @@ fn rects_intersect(a: RenderRect, b: RenderRect) -> bool {
     let by1 = by0 + i64::from(b.height);
 
     ax0 < bx1 && ax1 > bx0 && ay0 < by1 && ay1 > by0
+}
+
+fn rect_intersection(a: RenderRect, b: RenderRect) -> Option<RenderRect> {
+    let x0 = i64::from(a.x).max(i64::from(b.x));
+    let y0 = i64::from(a.y).max(i64::from(b.y));
+    let x1 = (i64::from(a.x) + i64::from(a.width)).min(i64::from(b.x) + i64::from(b.width));
+    let y1 = (i64::from(a.y) + i64::from(a.height)).min(i64::from(b.y) + i64::from(b.height));
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    Some(RenderRect {
+        x: i32::try_from(x0).ok()?,
+        y: i32::try_from(y0).ok()?,
+        width: u32::try_from(x1 - x0).ok()?,
+        height: u32::try_from(y1 - y0).ok()?,
+    })
+}
+
+fn clip_optional_rect(rect: RenderRect, clip: Option<RenderRect>) -> Option<RenderRect> {
+    clip.map_or(Some(rect), |clip| rect_intersection(rect, clip))
 }
 
 fn push_solid_quad(batch: &mut QuadBatch, rect: RenderRect, color: RenderColor) {
@@ -3763,6 +4068,57 @@ fn push_glyph_quad(
         &mut batch.indices,
         rect,
         [[uv.0, uv.1], [uv.2, uv.1], [uv.2, uv.3], [uv.0, uv.3]],
+        color,
+    );
+    if color_bitmap {
+        for vertex in batch.vertices.iter_mut().rev().take(4) {
+            vertex.color[3] = -vertex.color[3].max(f32::EPSILON);
+        }
+    }
+    batch.glyph_count = batch.glyph_count.saturating_add(1);
+}
+
+fn push_clipped_glyph_quad(
+    batch: &mut GlyphBatch,
+    rect: RenderRect,
+    atlas_entry: AtlasEntry,
+    atlas_dimensions: (u32, u32),
+    color: RenderColor,
+    color_bitmap: bool,
+    clip: Option<RenderRect>,
+) {
+    let Some(clipped) = clip_optional_rect(rect, clip) else {
+        return;
+    };
+    if clipped == rect {
+        push_glyph_quad(
+            batch,
+            rect,
+            atlas_entry,
+            atlas_dimensions,
+            color,
+            color_bitmap,
+        );
+        return;
+    }
+
+    let uv = atlas_uv_bounds(atlas_entry, atlas_dimensions);
+    let x0 = (clipped.x - rect.x) as f32 / rect.width.max(1) as f32;
+    let y0 = (clipped.y - rect.y) as f32 / rect.height.max(1) as f32;
+    let x1 = (clipped.x + clipped.width as i32 - rect.x) as f32 / rect.width.max(1) as f32;
+    let y1 = (clipped.y + clipped.height as i32 - rect.y) as f32 / rect.height.max(1) as f32;
+    let lerp = |start: f32, end: f32, value: f32| start + (end - start) * value;
+    let clipped_uv = [
+        [lerp(uv.0, uv.2, x0), lerp(uv.1, uv.3, y0)],
+        [lerp(uv.0, uv.2, x1), lerp(uv.1, uv.3, y0)],
+        [lerp(uv.0, uv.2, x1), lerp(uv.1, uv.3, y1)],
+        [lerp(uv.0, uv.2, x0), lerp(uv.1, uv.3, y1)],
+    ];
+    push_quad(
+        &mut batch.vertices,
+        &mut batch.indices,
+        clipped,
+        clipped_uv,
         color,
     );
     if color_bitmap {
@@ -5700,6 +6056,13 @@ pub struct InstrumentedCpuFrame {
     pub instrumentation: RenderInstrumentation,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CpuDrawPlacement {
+    metrics: CellMetrics,
+    offset: render_core::RenderOffset,
+    content_clip: Option<RenderRect>,
+}
+
 #[derive(Debug, Default)]
 pub struct TerminalRasterizer {
     batch_planner: RenderBatchPlanner,
@@ -5839,26 +6202,55 @@ impl TerminalRasterizer {
         let mut overlays = scene
             .search_highlights
             .iter()
-            .chain(scene.semantic_overlays.iter())
-            .map(|overlay| (overlay, scene.content_offset))
+            .enumerate()
+            .map(|(index, overlay)| {
+                (
+                    overlay,
+                    scene.content_offset,
+                    content_clip_for_search(scene, index, scene.content_offset),
+                )
+            })
+            .chain(
+                scene
+                    .semantic_overlays
+                    .iter()
+                    .enumerate()
+                    .map(|(index, overlay)| {
+                        (
+                            overlay,
+                            scene.content_offset,
+                            content_clip_for_semantic(scene, index, scene.content_offset),
+                        )
+                    }),
+            )
             .chain(
                 scene
                     .surface_overlays
                     .iter()
-                    .map(|overlay| (overlay, render_core::RenderOffset::default())),
+                    .map(|overlay| (overlay, render_core::RenderOffset::default(), None)),
             )
             .collect::<Vec<_>>();
-        overlays.sort_by_key(|(overlay, _)| overlay.z_index);
+        overlays.sort_by_key(|(overlay, _, _)| overlay.z_index);
 
-        for cell in &scene.grid.cells {
-            draw_cell_background(&mut frame, cell, metrics, scene.content_offset);
+        for (index, cell) in scene.grid.cells.iter().enumerate() {
+            draw_cell_background(
+                &mut frame,
+                cell,
+                metrics,
+                scene.content_offset,
+                content_clip_for_cell(scene, index, scene.content_offset),
+            );
         }
 
-        for (overlay, offset) in &overlays {
+        for (overlay, offset, content_clip) in &overlays {
             if !overlay_draws_behind_terminal_text(overlay.kind) {
                 continue;
             }
-            let bounds = offset_region(overlay.bounds, *offset);
+            let Some(bounds) =
+                clip_optional_rect(offset_region(overlay.bounds, *offset), *content_clip)
+            else {
+                continue;
+            };
             blend_rounded_rect(
                 &mut frame,
                 bounds,
@@ -5878,13 +6270,15 @@ impl TerminalRasterizer {
             }
         }
 
-        for selection in &scene.selections {
+        for (index, selection) in scene.selections.iter().enumerate() {
+            let content_clip = content_clip_for_selection(scene, index, scene.content_offset);
             for position in &selection.cells {
-                fill_rect(
-                    &mut frame,
+                if let Some(rect) = clip_optional_rect(
                     cell_region_at(*position, metrics, scene.content_offset),
-                    selection.color,
-                );
+                    content_clip,
+                ) {
+                    fill_rect(&mut frame, rect, selection.color);
+                }
                 instrumentation.draw_call_count = instrumentation.draw_call_count.saturating_add(1);
             }
         }
@@ -5896,22 +6290,43 @@ impl TerminalRasterizer {
         }
 
         let cursor_text = cursor_text_override(scene, metrics);
-        for cell in terminal_text_runs(&scene.grid.cells) {
+        let full_frame_damage = [RenderRect {
+            x: 0,
+            y: 0,
+            width: frame.width,
+            height: frame.height,
+        }];
+        for clipped_cell in damaged_terminal_text_runs(
+            &scene.grid.cells,
+            &full_frame_damage,
+            metrics,
+            scene.content_offset,
+            &scene.content_clips,
+        ) {
             self.draw_cell_foreground(
                 &mut frame,
-                &cell,
+                &clipped_cell.cell,
                 fonts,
-                metrics,
-                scene.content_offset,
+                CpuDrawPlacement {
+                    metrics,
+                    offset: scene.content_offset,
+                    content_clip: clipped_cell
+                        .clip
+                        .map(|clip| offset_region(clip, scene.content_offset)),
+                },
                 cursor_text,
             )?;
         }
 
-        for (overlay, offset) in overlays {
+        for (overlay, offset, content_clip) in overlays {
             if overlay_draws_behind_terminal_text(overlay.kind) {
                 continue;
             }
-            let bounds = offset_region(overlay.bounds, offset);
+            let Some(bounds) =
+                clip_optional_rect(offset_region(overlay.bounds, offset), content_clip)
+            else {
+                continue;
+            };
             blend_rounded_rect(
                 &mut frame,
                 bounds,
@@ -5933,8 +6348,11 @@ impl TerminalRasterizer {
                 &mut frame,
                 overlay,
                 fonts,
-                metrics,
-                offset,
+                CpuDrawPlacement {
+                    metrics,
+                    offset,
+                    content_clip,
+                },
                 &mut instrumentation,
             )?;
         }
@@ -5968,20 +6386,21 @@ impl TerminalRasterizer {
         frame: &mut CpuFrame,
         cell: &RenderCell,
         fonts: &mut FontSystem,
-        metrics: CellMetrics,
-        offset: render_core::RenderOffset,
+        placement: CpuDrawPlacement,
         cursor_text: Option<CursorTextOverride>,
     ) -> Result<(), RendererError> {
-        let rect = offset_region(text_run_region(cell, metrics), offset);
+        let metrics = placement.metrics;
+        let rect = offset_region(text_run_region(cell, metrics), placement.offset);
 
         if let Some(powerline) = SolidPowerlineGlyph::from_text(&cell.text) {
             let bitmap = rasterize_solid_powerline_glyph(powerline, rect.width, rect.height);
-            draw_glyph(
+            draw_glyph_clipped(
                 frame,
                 rect.x,
                 rect.y,
                 &bitmap,
                 glyph_color(cursor_text, rect, cell.foreground),
+                placement.content_clip,
             );
             return Ok(());
         }
@@ -6002,31 +6421,34 @@ impl TerminalRasterizer {
                 width: bitmap.width,
                 height: bitmap.height,
             };
-            draw_glyph(
+            draw_glyph_clipped(
                 frame,
                 glyph_rect.x,
                 glyph_rect.y,
                 bitmap.as_ref(),
                 glyph_color(cursor_text, glyph_rect, cell.foreground),
+                placement.content_clip,
             );
             pen_x += glyph.x_advance;
             pen_y += glyph.y_advance;
         }
 
-        if cell.style.underline {
-            fill_rect(
-                frame,
+        if cell.style.underline
+            && let Some(rect) = clip_optional_rect(
                 metric_decoration_rect(rect, metrics, metrics.underline_position),
-                cell.foreground,
-            );
+                placement.content_clip,
+            )
+        {
+            fill_rect(frame, rect, cell.foreground);
         }
 
-        if cell.style.strikethrough {
-            fill_rect(
-                frame,
+        if cell.style.strikethrough
+            && let Some(rect) = clip_optional_rect(
                 metric_decoration_rect(rect, metrics, metrics.strikethrough_position),
-                cell.foreground,
-            );
+                placement.content_clip,
+            )
+        {
+            fill_rect(frame, rect, cell.foreground);
         }
 
         Ok(())
@@ -6037,8 +6459,7 @@ impl TerminalRasterizer {
         frame: &mut CpuFrame,
         overlay: &OverlayPrimitive,
         fonts: &mut FontSystem,
-        metrics: CellMetrics,
-        offset: render_core::RenderOffset,
+        placement: CpuDrawPlacement,
         instrumentation: &mut RenderInstrumentation,
     ) -> Result<(), RendererError> {
         let Some(label) = &overlay.label else {
@@ -6062,7 +6483,8 @@ impl TerminalRasterizer {
             },
             style: RenderCellStyle::default(),
         };
-        let rect = offset_region(overlay_label_rect(overlay, metrics), offset);
+        let metrics = placement.metrics;
+        let rect = offset_region(overlay_label_rect(overlay, metrics), placement.offset);
         let mut pen_x = rect.x as f32;
         let mut pen_y = glyph_baseline_y(rect, metrics);
         let shaped = fonts.shape_text(&cell.text, false, false)?;
@@ -6073,12 +6495,13 @@ impl TerminalRasterizer {
                     .rasterize_glyph(key)
                     .unwrap_or_else(|_| missing_glyph_bitmap(metrics))
             });
-            draw_glyph(
+            draw_glyph_clipped(
                 frame,
                 (pen_x + glyph.x_offset).round() as i32 + bitmap.offset_x,
                 (pen_y - glyph.y_offset).round() as i32 + bitmap.offset_y,
                 bitmap.as_ref(),
                 cell.foreground,
+                placement.content_clip,
             );
             pen_x += glyph.x_advance;
             pen_y += glyph.y_advance;
@@ -6134,8 +6557,11 @@ impl TerminalRasterizer {
                 frame,
                 &overlay,
                 fonts,
-                metrics,
-                render_core::RenderOffset::default(),
+                CpuDrawPlacement {
+                    metrics,
+                    offset: render_core::RenderOffset::default(),
+                    content_clip: None,
+                },
                 instrumentation,
             )?;
         }
@@ -6148,12 +6574,13 @@ fn draw_cell_background(
     cell: &RenderCell,
     metrics: CellMetrics,
     offset: render_core::RenderOffset,
+    content_clip: Option<RenderRect>,
 ) {
-    fill_rect(
-        frame,
-        cell_region_at(cell.position, metrics, offset),
-        cell.background,
-    );
+    if let Some(rect) =
+        clip_optional_rect(cell_region_at(cell.position, metrics, offset), content_clip)
+    {
+        fill_rect(frame, rect, cell.background);
+    }
 }
 
 #[repr(C)]
@@ -6544,7 +6971,19 @@ fn stroke_rect(frame: &mut CpuFrame, rect: RenderRect, width: u32, color: Render
     );
 }
 
+#[cfg(test)]
 fn draw_glyph(frame: &mut CpuFrame, x: i32, y: i32, bitmap: &GlyphBitmap, color: RenderColor) {
+    draw_glyph_clipped(frame, x, y, bitmap, color, None);
+}
+
+fn draw_glyph_clipped(
+    frame: &mut CpuFrame,
+    x: i32,
+    y: i32,
+    bitmap: &GlyphBitmap,
+    color: RenderColor,
+    clip: Option<RenderRect>,
+) {
     for gy in 0..bitmap.height {
         for gx in 0..bitmap.width {
             let target_x = x + gx as i32;
@@ -6553,6 +6992,12 @@ fn draw_glyph(frame: &mut CpuFrame, x: i32, y: i32, bitmap: &GlyphBitmap, color:
                 || target_y < 0
                 || target_x >= frame.width as i32
                 || target_y >= frame.height as i32
+                || clip.is_some_and(|clip| {
+                    target_x < clip.x
+                        || target_y < clip.y
+                        || target_x >= clip.x.saturating_add(clip.width as i32)
+                        || target_y >= clip.y.saturating_add(clip.height as i32)
+                })
             {
                 continue;
             }
@@ -6770,6 +7215,7 @@ struct GpuBackend {
     gpu_timing: GpuTiming,
     transparent: bool,
     background: RenderColor,
+    startup_diagnostics: RendererStartupDiagnostics,
 }
 
 #[derive(Default)]
@@ -6990,6 +7436,13 @@ impl GpuTerminalRenderer {
         }
         self.requires_full_redraw = true;
         self.retained_cursor = None;
+    }
+
+    #[must_use]
+    pub fn startup_diagnostics(&self) -> Option<&RendererStartupDiagnostics> {
+        self.backend
+            .as_ref()
+            .map(|backend| &backend.startup_diagnostics)
     }
 
     pub fn set_glyph_cache_capacity(&mut self, entries: usize) {
@@ -7372,15 +7825,60 @@ fn frame_clear_extra_draw_calls(load_previous: bool, damage_region_count: usize)
 
 impl GpuBackend {
     async fn new(window: Arc<Window>, options: RendererOptions) -> Result<Self, RendererError> {
+        let overall_started = Instant::now();
+        let requested = options.backend;
+        let mut attempted_backends = Vec::new();
+        let mut fallback_errors = Vec::new();
+
+        for candidate in
+            backend_candidates_for(native_backend_family(), requested, options.transparent)
+        {
+            attempted_backends.push(candidate);
+            match Self::new_for_backend(Arc::clone(&window), options, candidate).await {
+                Ok(mut backend) => {
+                    backend.startup_diagnostics.requested_backend = requested;
+                    backend.startup_diagnostics.attempted_backends = attempted_backends;
+                    backend.startup_diagnostics.fallback_errors = fallback_errors;
+                    backend.startup_diagnostics.timings.total = overall_started.elapsed();
+                    return Ok(backend);
+                }
+                Err(RendererError::EmptySurface) => return Err(RendererError::EmptySurface),
+                Err(error) if requested != GpuBackendPreference::Auto => return Err(error),
+                Err(error) => {
+                    let failure = format!("{}: {error}", candidate.as_str());
+                    eprintln!("renderer backend fallback: {failure}");
+                    fallback_errors.push(failure);
+                }
+            }
+        }
+
+        Err(RendererError::BackendSelection {
+            requested,
+            attempts: fallback_errors,
+        })
+    }
+
+    async fn new_for_backend(
+        window: Arc<Window>,
+        options: RendererOptions,
+        candidate: GpuBackendPreference,
+    ) -> Result<Self, RendererError> {
+        let startup_started = Instant::now();
         let size = window.inner_size();
         if size.width == 0 || size.height == 0 {
             return Err(RendererError::EmptySurface);
         }
 
-        let instance = wgpu::Instance::default();
+        let phase_started = Instant::now();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: instance_backends(candidate),
+            ..wgpu::InstanceDescriptor::default()
+        });
         let surface = instance
             .create_surface(window)
             .map_err(|err| RendererError::SurfaceCreation(err.to_string()))?;
+        let instance_and_surface = phase_started.elapsed();
+        let phase_started = Instant::now();
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -7388,7 +7886,11 @@ impl GpuBackend {
                 force_fallback_adapter: false,
             })
             .await
-            .ok_or(RendererError::AdapterUnavailable)?;
+            .ok_or(RendererError::AdapterUnavailable {
+                requested: candidate,
+            })?;
+        let adapter_request = phase_started.elapsed();
+        let adapter_info = adapter.get_info();
         let adapter_features = adapter.features();
         let gpu_timestamps_supported = adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY);
         let required_features = if options.gpu_timestamps && gpu_timestamps_supported {
@@ -7396,6 +7898,7 @@ impl GpuBackend {
         } else {
             wgpu::Features::empty()
         };
+        let phase_started = Instant::now();
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -7407,6 +7910,7 @@ impl GpuBackend {
             )
             .await
             .map_err(|err| RendererError::DeviceCreation(err.to_string()))?;
+        let device_request = phase_started.elapsed();
         let device_loss_signal = Arc::new(Mutex::new(None));
         let callback_signal = Arc::clone(&device_loss_signal);
         device.set_device_lost_callback(move |reason, message| {
@@ -7417,6 +7921,7 @@ impl GpuBackend {
             }
         });
 
+        let phase_started = Instant::now();
         let caps = surface.get_capabilities(&adapter);
         let format = caps
             .formats
@@ -7460,7 +7965,9 @@ impl GpuBackend {
             desired_maximum_frame_latency: DESIRED_MAXIMUM_FRAME_LATENCY,
         };
         surface.configure(&device, &config);
+        let surface_configuration = phase_started.elapsed();
 
+        let phase_started = Instant::now();
         let batch_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("panea-batch-shader"),
             source: wgpu::ShaderSource::Wgsl(BATCH_SHADER.into()),
@@ -7549,6 +8056,22 @@ impl GpuBackend {
         } else {
             GpuTiming::disabled()
         };
+        let pipeline_creation = phase_started.elapsed();
+        let startup_diagnostics = RendererStartupDiagnostics {
+            requested_backend: candidate,
+            effective_backend: format!("{:?}", adapter_info.backend),
+            adapter: adapter_info.name,
+            attempted_backends: vec![candidate],
+            fallback_errors: Vec::new(),
+            timings: RendererStartupTimings {
+                instance_and_surface,
+                adapter_request,
+                device_request,
+                surface_configuration,
+                pipeline_creation,
+                total: startup_started.elapsed(),
+            },
+        };
 
         Ok(Self {
             surface,
@@ -7574,6 +8097,7 @@ impl GpuBackend {
             gpu_timing,
             transparent: options.transparent && alpha_mode != wgpu::CompositeAlphaMode::Opaque,
             background: options.background,
+            startup_diagnostics,
         })
     }
 
@@ -8262,26 +8786,8 @@ impl GpuBackend {
                 label: Some("panea-startup-background-encoder"),
             });
         let background = surface_background_color(self.transparent, self.background);
-        let clear = prepare_frame_clear_batch(
-            false,
-            &[],
-            self.config.width,
-            self.config.height,
-            background,
-        );
-        self.batches.damage_clear.upload(
-            &GpuUploadContext {
-                device: &self.device,
-                queue: &self.queue,
-                width: self.config.width,
-                height: self.config.height,
-            },
-            "startup-background",
-            &clear.vertices,
-            &clear.indices,
-        );
         {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("panea-startup-background-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
@@ -8298,8 +8804,6 @@ impl GpuBackend {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.clear_pipeline);
-            draw_buffers(&mut pass, &self.batches.damage_clear);
         }
         self.queue.submit(Some(encoder.finish()));
         output.present();
@@ -8670,6 +9174,96 @@ mod tests {
     const BLUE: RenderColor = RenderColor::rgb(0, 0, 255);
     const WHITE: RenderColor = RenderColor::rgb(255, 255, 255);
     const YELLOW: RenderColor = RenderColor::rgb(255, 255, 0);
+
+    #[test]
+    fn gpu_backend_preferences_map_to_portable_wgpu_backend_sets() {
+        assert_eq!(
+            instance_backends(GpuBackendPreference::Auto),
+            wgpu::Backends::all()
+        );
+        assert_eq!(
+            instance_backends(GpuBackendPreference::Vulkan),
+            wgpu::Backends::VULKAN
+        );
+        assert_eq!(
+            instance_backends(GpuBackendPreference::Metal),
+            wgpu::Backends::METAL
+        );
+        assert_eq!(
+            instance_backends(GpuBackendPreference::Dx12),
+            wgpu::Backends::DX12
+        );
+        assert_eq!(
+            instance_backends(GpuBackendPreference::Gl),
+            wgpu::Backends::GL
+        );
+    }
+
+    #[test]
+    fn auto_backend_candidates_are_platform_and_transparency_aware() {
+        assert_eq!(
+            backend_candidates_for(
+                NativeBackendFamily::Windows,
+                GpuBackendPreference::Auto,
+                false,
+            ),
+            vec![
+                GpuBackendPreference::Dx12,
+                GpuBackendPreference::Vulkan,
+                GpuBackendPreference::Gl,
+            ]
+        );
+        assert_eq!(
+            backend_candidates_for(
+                NativeBackendFamily::Windows,
+                GpuBackendPreference::Auto,
+                true,
+            ),
+            vec![
+                GpuBackendPreference::Vulkan,
+                GpuBackendPreference::Dx12,
+                GpuBackendPreference::Gl,
+            ]
+        );
+        assert_eq!(
+            backend_candidates_for(NativeBackendFamily::Apple, GpuBackendPreference::Auto, true,),
+            vec![
+                GpuBackendPreference::Metal,
+                GpuBackendPreference::Vulkan,
+                GpuBackendPreference::Gl,
+            ]
+        );
+        assert_eq!(
+            backend_candidates_for(NativeBackendFamily::Unix, GpuBackendPreference::Auto, false,),
+            vec![GpuBackendPreference::Vulkan, GpuBackendPreference::Gl]
+        );
+    }
+
+    #[test]
+    fn explicit_backend_selection_never_silently_falls_back() {
+        assert_eq!(
+            backend_candidates_for(
+                NativeBackendFamily::Windows,
+                GpuBackendPreference::Metal,
+                false,
+            ),
+            vec![GpuBackendPreference::Metal]
+        );
+    }
+
+    #[test]
+    fn renderer_startup_timings_report_all_initialization_phases() {
+        let timings = RendererStartupTimings {
+            instance_and_surface: Duration::from_millis(1),
+            adapter_request: Duration::from_millis(2),
+            device_request: Duration::from_millis(3),
+            surface_configuration: Duration::from_millis(4),
+            pipeline_creation: Duration::from_millis(5),
+            total: Duration::from_millis(15),
+        };
+
+        assert_eq!(timings.accounted(), timings.total);
+    }
 
     fn damage_covers(regions: &[DamageRegion], expected: RenderRect) -> bool {
         regions.iter().any(|region| {
@@ -9345,6 +9939,54 @@ mod tests {
     }
 
     #[test]
+    fn pane_border_decorations_render_behind_terminal_glyphs() {
+        assert!(overlay_draws_behind_terminal_text(OverlayKind::Decoration));
+    }
+
+    #[test]
+    fn clipped_glyph_quad_preserves_atlas_uvs_at_pane_boundary() {
+        let mut batch = GlyphBatch {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            glyph_count: 0,
+        };
+        push_clipped_glyph_quad(
+            &mut batch,
+            RenderRect {
+                x: 10,
+                y: 20,
+                width: 10,
+                height: 10,
+            },
+            AtlasEntry {
+                x: 20,
+                y: 40,
+                width: 10,
+                height: 10,
+            },
+            (100, 100),
+            RenderColor::rgb(255, 255, 255),
+            false,
+            Some(RenderRect {
+                x: 12,
+                y: 22,
+                width: 4,
+                height: 5,
+            }),
+        );
+
+        assert_eq!(batch.glyph_count, 1);
+        assert_eq!(batch.vertices[0].position_px, [12.0, 22.0]);
+        assert_eq!(batch.vertices[2].position_px, [16.0, 27.0]);
+        for (actual, expected) in batch.vertices[0].uv.into_iter().zip([0.22, 0.42]) {
+            assert!((actual - expected).abs() < 0.000_001);
+        }
+        for (actual, expected) in batch.vertices[2].uv.into_iter().zip([0.26, 0.47]) {
+            assert!((actual - expected).abs() < 0.000_001);
+        }
+    }
+
+    #[test]
     fn full_frame_rendering_never_loads_stale_retained_pixels() {
         for (damage_tracking_enabled, retained_damage_supported) in
             [(false, false), (false, true), (true, false)]
@@ -9422,12 +10064,13 @@ mod tests {
             &damage,
             metrics(),
             render_core::RenderOffset::default(),
+            &[],
         );
 
         assert_eq!(selected.source_cells, 80);
         assert_eq!(selected.runs.len(), 1);
-        assert_eq!(selected.runs[0].position.row, 17);
-        assert_eq!(selected.runs[0].text.len(), 80);
+        assert_eq!(selected.runs[0].cell.position.row, 17);
+        assert_eq!(selected.runs[0].cell.text.len(), 80);
     }
 
     #[test]
@@ -9448,6 +10091,43 @@ mod tests {
         };
         draw_glyph(&mut frame, 0, 0, &bitmap, RenderColor::rgb(0, 255, 0));
         assert_eq!(&frame.pixels[..3], &[240, 20, 80]);
+    }
+
+    #[test]
+    fn cpu_glyph_rasterization_respects_pane_clip() {
+        let mut frame = CpuFrame {
+            width: 4,
+            height: 1,
+            pixels: vec![0; 4 * 4],
+        };
+        let bitmap = GlyphBitmap {
+            width: 4,
+            height: 1,
+            offset_x: 0,
+            offset_y: 0,
+            advance_width: 4.0,
+            pixels: vec![255; 4],
+            format: GlyphBitmapFormat::Alpha,
+        };
+
+        draw_glyph_clipped(
+            &mut frame,
+            0,
+            0,
+            &bitmap,
+            RenderColor::rgb(255, 255, 255),
+            Some(RenderRect {
+                x: 1,
+                y: 0,
+                width: 2,
+                height: 1,
+            }),
+        );
+
+        assert_eq!(&frame.pixels[0..3], &[0, 0, 0]);
+        assert_eq!(&frame.pixels[4..7], &[255, 255, 255]);
+        assert_eq!(&frame.pixels[8..11], &[255, 255, 255]);
+        assert_eq!(&frame.pixels[12..15], &[0, 0, 0]);
     }
 
     fn scene_without_cursor(cells: Vec<RenderCell>) -> RenderScene {

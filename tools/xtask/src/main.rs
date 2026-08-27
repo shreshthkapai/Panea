@@ -6,7 +6,7 @@ use std::{
     process::{Command, ExitCode, Stdio},
     sync::mpsc,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use image::{
@@ -5111,6 +5111,18 @@ fn config_source_text(source: &config_toml::ConfigSource) -> String {
 
 fn run_bench() -> ExitCode {
     let args = std::env::args().skip(2).collect::<Vec<_>>();
+    match args.first().map(String::as_str) {
+        Some("gui-startup") => {
+            return run_gui_benchmark(GuiBenchmarkMode::FirstFrame, &args[1..]);
+        }
+        Some("gui-prompt") => {
+            return run_gui_benchmark(GuiBenchmarkMode::PromptReady, &args[1..]);
+        }
+        Some("gui-input") => {
+            return run_gui_benchmark(GuiBenchmarkMode::InputEcho, &args[1..]);
+        }
+        _ => {}
+    }
     let mut cargo_args = vec![
         "run".to_owned(),
         "--release".to_owned(),
@@ -5121,6 +5133,422 @@ fn run_bench() -> ExitCode {
     cargo_args.extend(args);
     let refs = cargo_args.iter().map(String::as_str).collect::<Vec<_>>();
     run("cargo", &refs)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuiBenchmarkMode {
+    FirstFrame,
+    PromptReady,
+    InputEcho,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuiBenchmarkConfig {
+    User,
+    Default,
+}
+
+impl GuiBenchmarkConfig {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Default => "default",
+        }
+    }
+}
+
+impl GuiBenchmarkMode {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::FirstFrame => "gui-startup",
+            Self::PromptReady => "gui-prompt",
+            Self::InputEcho => "gui-input",
+        }
+    }
+
+    const fn metric(self) -> &'static str {
+        match self {
+            Self::FirstFrame => "process_to_first_present_us",
+            Self::PromptReady => "process_to_prompt_observed_us",
+            Self::InputEcho => "input_to_present_us",
+        }
+    }
+
+    const fn smoke_flag(self) -> Option<&'static str> {
+        match self {
+            Self::FirstFrame => None,
+            Self::PromptReady => Some("--startup"),
+            Self::InputEcho => Some("--input-echo"),
+        }
+    }
+
+    fn metric_value(self, report: &serde_json::Value) -> Option<u64> {
+        match self {
+            Self::FirstFrame => report["success_frame_presented_us"].as_u64(),
+            Self::PromptReady => report["prompt_observed_us"].as_u64(),
+            Self::InputEcho => report["input_to_present_us"].as_u64(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GuiBenchmarkOptions {
+    samples: usize,
+    backend: String,
+    config: GuiBenchmarkConfig,
+    timeout: Duration,
+    skip_build: bool,
+    json: bool,
+}
+
+impl Default for GuiBenchmarkOptions {
+    fn default() -> Self {
+        Self {
+            samples: 5,
+            backend: "auto".to_owned(),
+            config: GuiBenchmarkConfig::User,
+            timeout: Duration::from_secs(10),
+            skip_build: false,
+            json: false,
+        }
+    }
+}
+
+impl GuiBenchmarkOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut options = Self::default();
+        let mut index = 0;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--samples" => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .ok_or_else(|| "--samples requires a value".to_owned())?;
+                    options.samples = value
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid --samples value: {value}"))?;
+                    if !(1..=50).contains(&options.samples) {
+                        return Err("--samples must be between 1 and 50".to_owned());
+                    }
+                }
+                "--backend" => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .ok_or_else(|| "--backend requires a value".to_owned())?;
+                    if !matches!(value.as_str(), "auto" | "vulkan" | "metal" | "dx12" | "gl") {
+                        return Err(format!("invalid --backend value: {value}"));
+                    }
+                    options.backend.clone_from(value);
+                }
+                "--config" => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .ok_or_else(|| "--config requires a value".to_owned())?;
+                    options.config = match value.as_str() {
+                        "user" => GuiBenchmarkConfig::User,
+                        "default" => GuiBenchmarkConfig::Default,
+                        _ => return Err(format!("invalid --config value: {value}")),
+                    };
+                }
+                "--timeout-ms" => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .ok_or_else(|| "--timeout-ms requires a value".to_owned())?;
+                    let millis = value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid --timeout-ms value: {value}"))?;
+                    if !(1_000..=60_000).contains(&millis) {
+                        return Err("--timeout-ms must be between 1000 and 60000".to_owned());
+                    }
+                    options.timeout = Duration::from_millis(millis);
+                }
+                "--skip-build" => options.skip_build = true,
+                "--json" => options.json = true,
+                other => return Err(format!("unknown GUI benchmark option: {other}")),
+            }
+            index += 1;
+        }
+        Ok(options)
+    }
+}
+
+fn run_gui_benchmark(mode: GuiBenchmarkMode, args: &[String]) -> ExitCode {
+    let options = match GuiBenchmarkOptions::parse(args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("{error}");
+            eprintln!(
+                "usage: cargo xtask bench {} [--samples <1..50>] [--backend <auto|vulkan|metal|dx12|gl>] [--config <user|default>] [--timeout-ms <ms>] [--skip-build] [--json]",
+                mode.name()
+            );
+            return ExitCode::from(2);
+        }
+    };
+
+    if !options.skip_build {
+        let status = Command::new("cargo")
+            .args([
+                "build",
+                "--release",
+                "-p",
+                "panea-desktop",
+                "--bin",
+                "panea",
+            ])
+            .status();
+        match status {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                eprintln!("release benchmark build exited with {status}");
+                return ExitCode::from(1);
+            }
+            Err(error) => {
+                eprintln!("failed to start release benchmark build: {error}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    let binary = release_panea_binary();
+    if !binary.is_file() {
+        eprintln!(
+            "benchmark binary is missing at {}; run without --skip-build",
+            binary.display()
+        );
+        return ExitCode::from(1);
+    }
+
+    let default_config = if options.config == GuiBenchmarkConfig::Default {
+        match TemporaryBenchmarkConfig::create() {
+            Ok(config) => Some(config),
+            Err(error) => {
+                eprintln!("failed to create default benchmark config: {error}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        None
+    };
+    let config_path = default_config.as_ref().map(TemporaryBenchmarkConfig::path);
+    let mut reports = Vec::with_capacity(options.samples);
+    for sample in 1..=options.samples {
+        match run_gui_benchmark_sample(&binary, mode, &options, config_path) {
+            Ok(report) => {
+                let Some(metric) = mode.metric_value(&report) else {
+                    eprintln!(
+                        "sample {sample} did not report required metric {}: {report}",
+                        mode.metric()
+                    );
+                    return ExitCode::from(1);
+                };
+                if !options.json {
+                    println!(
+                        "bench={} sample={sample}/{} {}={metric}",
+                        mode.name(),
+                        options.samples,
+                        mode.metric()
+                    );
+                }
+                reports.push(report);
+            }
+            Err(error) => {
+                eprintln!("{} sample {sample} failed: {error}", mode.name());
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    let summary = gui_benchmark_summary(mode, &options, &reports);
+    if options.json {
+        println!("{summary}");
+    } else {
+        println!(
+            "bench={} samples={} metric={} p50_us={} p95_us={} p99_us={} min_us={} max_us={} backend={} adapter={}",
+            mode.name(),
+            options.samples,
+            mode.metric(),
+            summary["p50_us"],
+            summary["p95_us"],
+            summary["p99_us"],
+            summary["min_us"],
+            summary["max_us"],
+            summary["effective_backend"].as_str().unwrap_or("unknown"),
+            summary["adapter"].as_str().unwrap_or("unknown"),
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+fn release_panea_binary() -> PathBuf {
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target"));
+    target
+        .join("release")
+        .join(if cfg!(windows) { "panea.exe" } else { "panea" })
+}
+
+struct TemporaryBenchmarkConfig {
+    path: PathBuf,
+}
+
+impl TemporaryBenchmarkConfig {
+    fn create() -> Result<Self, String> {
+        let sample_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "panea-default-benchmark-{}-{sample_id}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, "")
+            .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TemporaryBenchmarkConfig {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn run_gui_benchmark_sample(
+    binary: &Path,
+    mode: GuiBenchmarkMode,
+    options: &GuiBenchmarkOptions,
+    config_path: Option<&Path>,
+) -> Result<serde_json::Value, String> {
+    let timeout_ms = options.timeout.as_millis().to_string();
+    let sample_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let output_prefix = format!("panea-{}-{}-{sample_id}", mode.name(), std::process::id());
+    let stdout_path = std::env::temp_dir().join(format!("{output_prefix}.stdout"));
+    let stderr_path = std::env::temp_dir().join(format!("{output_prefix}.stderr"));
+    let stdout_file = fs::File::create(&stdout_path)
+        .map_err(|error| format!("failed to create {}: {error}", stdout_path.display()))?;
+    let stderr_file = fs::File::create(&stderr_path)
+        .map_err(|error| format!("failed to create {}: {error}", stderr_path.display()))?;
+    let mut command = Command::new(binary);
+    command.args([
+        "gui-smoke",
+        "--json",
+        "--timeout-ms",
+        &timeout_ms,
+        "--backend",
+        &options.backend,
+    ]);
+    if let Some(flag) = mode.smoke_flag() {
+        command.arg(flag);
+    }
+    if let Some(config_path) = config_path {
+        command.env("PANEA_CONFIG", config_path);
+    }
+    let mut child = command
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .map_err(|error| format!("failed to spawn {}: {error}", binary.display()))?;
+
+    let outer_deadline = Instant::now() + options.timeout + Duration::from_secs(3);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < outer_deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+                let _ = fs::remove_file(&stdout_path);
+                let _ = fs::remove_file(&stderr_path);
+                return Err(format!(
+                    "outer timeout after {} ms; child was terminated; stderr={}",
+                    (options.timeout + Duration::from_secs(3)).as_millis(),
+                    stderr.trim()
+                ));
+            }
+            Err(error) => return Err(format!("failed while waiting for GUI smoke: {error}")),
+        }
+    };
+
+    let stdout = fs::read_to_string(&stdout_path)
+        .map_err(|error| format!("failed to read {}: {error}", stdout_path.display()))?;
+    let stderr = fs::read_to_string(&stderr_path)
+        .map_err(|error| format!("failed to read {}: {error}", stderr_path.display()))?;
+    let _ = fs::remove_file(&stdout_path);
+    let _ = fs::remove_file(&stderr_path);
+    if !status.success() {
+        return Err(format!(
+            "exited {:?}; stdout={} stderr={}",
+            status.code(),
+            stdout.trim(),
+            stderr.trim()
+        ));
+    }
+    let line = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .ok_or_else(|| format!("GUI smoke emitted no JSON report; stderr={}", stderr.trim()))?;
+    let report: serde_json::Value = serde_json::from_str(line)
+        .map_err(|error| format!("invalid GUI smoke JSON: {error}; stdout={}", stdout.trim()))?;
+    if report["status"] != "passed" {
+        return Err(format!(
+            "GUI smoke did not pass: {report}; stderr={}",
+            stderr.trim()
+        ));
+    }
+    Ok(report)
+}
+
+fn gui_benchmark_summary(
+    mode: GuiBenchmarkMode,
+    options: &GuiBenchmarkOptions,
+    reports: &[serde_json::Value],
+) -> serde_json::Value {
+    let mut metrics = reports
+        .iter()
+        .filter_map(|report| mode.metric_value(report))
+        .collect::<Vec<_>>();
+    metrics.sort_unstable();
+    let first = reports.first().cloned().unwrap_or_default();
+    serde_json::json!({
+        "name": mode.name(),
+        "platform": std::env::consts::OS,
+        "samples": metrics.len(),
+        "metric": mode.metric(),
+        "requested_backend": options.backend,
+        "config": options.config.as_str(),
+        "effective_backend": first["renderer"]["effective_backend"],
+        "adapter": first["renderer"]["adapter"],
+        "power_source": first["power_source"],
+        "charge_percent": first["charge_percent"],
+        "p50_us": nearest_rank_percentile(&metrics, 50),
+        "p95_us": nearest_rank_percentile(&metrics, 95),
+        "p99_us": nearest_rank_percentile(&metrics, 99),
+        "min_us": metrics.first().copied().unwrap_or_default(),
+        "max_us": metrics.last().copied().unwrap_or_default(),
+        "samples_raw": reports,
+    })
+}
+
+fn nearest_rank_percentile(sorted: &[u64], percentile: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = sorted.len().saturating_mul(percentile).saturating_add(99) / 100;
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
 
 fn run_screenshot() -> ExitCode {
@@ -6451,5 +6879,38 @@ mod tests {
             config_toml::parse_str(asset.contents, None, config_core::ConfigPlatform::Unknown)
                 .unwrap_or_else(|error| panic!("{} must parse: {error}", asset.name));
         }
+    }
+
+    #[test]
+    fn gui_benchmark_percentiles_use_nearest_rank() {
+        let samples = [10_u64, 20, 30, 40, 50];
+        assert_eq!(nearest_rank_percentile(&samples, 50), 30);
+        assert_eq!(nearest_rank_percentile(&samples, 95), 50);
+        assert_eq!(nearest_rank_percentile(&samples, 99), 50);
+    }
+
+    #[test]
+    fn gui_benchmark_options_are_bounded_and_portable() {
+        let args = vec![
+            "--samples".to_owned(),
+            "7".to_owned(),
+            "--backend".to_owned(),
+            "vulkan".to_owned(),
+            "--config".to_owned(),
+            "default".to_owned(),
+            "--skip-build".to_owned(),
+        ];
+        let options = GuiBenchmarkOptions::parse(&args).expect("valid GUI benchmark options");
+
+        assert_eq!(options.samples, 7);
+        assert_eq!(options.backend, "vulkan");
+        assert_eq!(options.config, GuiBenchmarkConfig::Default);
+        assert!(options.skip_build);
+        assert!(GuiBenchmarkOptions::parse(&["--samples".to_owned(), "0".to_owned()]).is_err());
+        assert!(GuiBenchmarkOptions::parse(&["--backend".to_owned(), "cuda".to_owned()]).is_err());
+        assert!(
+            GuiBenchmarkOptions::parse(&["--config".to_owned(), "portable-ish".to_owned()])
+                .is_err()
+        );
     }
 }

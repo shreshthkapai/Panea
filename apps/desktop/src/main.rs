@@ -30,9 +30,9 @@ use fullscreen_chrome::{
     FullscreenChromeController,
 };
 use mux::{
-    LogicalRect, MuxAction, MuxModel, PaneId, PaneLayout, PaneRestore, RestoreSnapshot,
-    SessionSpec, SessionStatus, SessionTransportKind, SplitAxis, SplitTree, TabId, TabRestore,
-    TerminalGridSize, WindowRestore, WorkspaceRestore,
+    LogicalRect, MuxAction, MuxModel, PaneExitDisposition, PaneId, PaneLayout, PaneRestore,
+    RestoreSnapshot, SessionSpec, SessionStatus, SessionTransportKind, SplitAxis, SplitTree, TabId,
+    TabRestore, TerminalGridSize, WindowRestore, WorkspaceRestore,
 };
 use platform_core::{
     DecorationMode, InputEvent, KeyEvent, KeyModifiers, KeyState, LinuxWindowBackend, MouseButton,
@@ -47,17 +47,17 @@ use platform_winit::{
 };
 use render_core::{
     CellPosition, CursorVisual, FrameRequestReason, OverlayKind, OverlayPrimitive, RenderCell,
-    RenderCellStyle, RenderColor, RenderCursorShape, RenderGrid, RenderInstrumentation,
-    RenderOffset, RenderRect, RenderScene, SelectionVisual, WindowChromeControlKind,
-    WindowChromeControlVisual, WindowChromeVisual,
+    RenderCellStyle, RenderColor, RenderContentClip, RenderCursorShape, RenderGrid,
+    RenderInstrumentation, RenderItemRange, RenderOffset, RenderRect, RenderScene, SelectionVisual,
+    WindowChromeControlKind, WindowChromeControlVisual, WindowChromeVisual,
 };
 use render_wgpu::{
     AnimatedCursorImageCache, AnimatedCursorImageRequest, AnimatedCursorImageRuntime,
     AnimatedCursorImageStatus, AnimationFramePacer, AnimationFramePacerDecision,
     CursorAnimationRuntime, CursorAnimationSettings, CursorBlinkRuntime, CursorOverlayFrame,
     CursorVectorCache, CursorVectorRequest, CursorVectorRuntime, CursorVectorStatus, DamageTracker,
-    FrameDecision, FrameScheduler, GpuTerminalRenderer, PresentMode, RendererError,
-    RendererOptions, RetainedDamageStatus,
+    FrameDecision, FrameScheduler, GpuBackendPreference, GpuTerminalRenderer, PresentMode,
+    RendererError, RendererOptions, RetainedDamageStatus,
 };
 use security::{
     HostKeyTrustAction, HostKeyTrustReason, HostKeyTrustRequest, HostTrustProvider,
@@ -136,7 +136,7 @@ fn print_cli_help() {
     );
     eprintln!("usage: panea shell-smoke [--json] [--timeout-ms <ms>]");
     eprintln!(
-        "usage: panea gui-smoke [--startup|--terminal-io] [--hold-ms <ms>] [--json] [--timeout-ms <ms>]"
+        "usage: panea gui-smoke [--startup|--input-echo|--terminal-io] [--backend <auto|vulkan|metal|dx12|gl>] [--hold-ms <ms>] [--json] [--timeout-ms <ms>]"
     );
     eprintln!(
         "usage: panea shell-integration export --shell <bash|zsh|fish|powershell> --output <path>"
@@ -150,16 +150,41 @@ struct GuiSmokeOptions {
     completed: Arc<AtomicBool>,
     mode: GuiSmokeMode,
     hold_after_success: Duration,
+    renderer_backend_override: Option<config_core::RendererBackendPreference>,
+    report: Arc<Mutex<GuiSmokeReport>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GuiSmokeReport {
+    power_source: Option<&'static str>,
+    charge_percent: Option<u8>,
+    config_loaded: Option<Duration>,
+    window_created: Option<Duration>,
+    fonts_ready: Option<Duration>,
+    session_created: Option<Duration>,
+    renderer_initialized: Option<Duration>,
+    startup_background_presented: Option<Duration>,
+    renderer_created: Option<Duration>,
+    first_scene_preparation: Option<Duration>,
+    first_render_submission: Option<Duration>,
+    prompt_observed: Option<Duration>,
+    input_sent: Option<Duration>,
+    input_observed: Option<Duration>,
+    success_frame_presented: Option<Duration>,
+    renderer: Option<render_wgpu::RendererStartupDiagnostics>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GuiSmokeMode {
     FirstFrame,
     Startup,
+    InputEcho,
     TerminalIo,
 }
 
 const GUI_SMOKE_MARKER: &str = "PANEAE2E_OUTPUT";
+const GUI_INPUT_ECHO_MARKER: &str = "PANEAE2E_INPUT";
+const GUI_INPUT_SETTLE_DELAY: Duration = Duration::from_millis(100);
 
 fn run_gui_smoke_cli() -> i32 {
     let args = std::env::args().skip(2).collect::<Vec<_>>();
@@ -167,12 +192,26 @@ fn run_gui_smoke_cli() -> i32 {
     let mut timeout = Duration::from_secs(10);
     let mut mode = GuiSmokeMode::FirstFrame;
     let mut hold_after_success = Duration::ZERO;
+    let mut renderer_backend_override = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--json" => {}
             "--startup" => mode = GuiSmokeMode::Startup,
+            "--input-echo" => mode = GuiSmokeMode::InputEcho,
             "--terminal-io" => mode = GuiSmokeMode::TerminalIo,
+            "--backend" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    eprintln!("--backend requires a value");
+                    return 2;
+                };
+                let Some(backend) = parse_gui_smoke_backend(value) else {
+                    eprintln!("invalid --backend value: {value}");
+                    return 2;
+                };
+                renderer_backend_override = Some(backend);
+            }
             "--hold-ms" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -214,24 +253,24 @@ fn run_gui_smoke_cli() -> i32 {
     }
 
     let completed = Arc::new(AtomicBool::new(false));
+    let report = Arc::new(Mutex::new(GuiSmokeReport::default()));
     let started = Instant::now();
     let result = run(Some(GuiSmokeOptions {
         timeout,
         completed: Arc::clone(&completed),
         mode,
         hold_after_success,
+        renderer_backend_override,
+        report: Arc::clone(&report),
     }));
     let passed = result.is_ok() && completed.load(Ordering::Acquire);
     if json {
+        let report = report
+            .lock()
+            .map_or_else(|_| GuiSmokeReport::default(), |report| report.clone());
         println!(
-            "{{\"name\":\"gui-smoke\",\"status\":\"{}\",\"duration_ms\":{},\"milestone\":\"{}\"}}",
-            if passed { "passed" } else { "failed" },
-            started.elapsed().as_millis(),
-            match mode {
-                GuiSmokeMode::FirstFrame => "window_renderer_session_first_frame",
-                GuiSmokeMode::Startup => "single_shell_prompt_rendered_without_input",
-                GuiSmokeMode::TerminalIo => "shell_prompt_input_output_rendered",
-            }
+            "{}",
+            gui_smoke_json(passed, mode, started.elapsed(), &report)
         );
     }
     if let Err(error) = result {
@@ -240,6 +279,95 @@ fn run_gui_smoke_cli() -> i32 {
         eprintln!("gui smoke timed out before its required render milestone");
     }
     i32::from(!passed)
+}
+
+fn parse_gui_smoke_backend(value: &str) -> Option<config_core::RendererBackendPreference> {
+    match value {
+        "auto" => Some(config_core::RendererBackendPreference::Auto),
+        "vulkan" => Some(config_core::RendererBackendPreference::Vulkan),
+        "metal" => Some(config_core::RendererBackendPreference::Metal),
+        "dx12" => Some(config_core::RendererBackendPreference::Dx12),
+        "gl" => Some(config_core::RendererBackendPreference::Gl),
+        _ => None,
+    }
+}
+
+fn gui_smoke_json(
+    passed: bool,
+    mode: GuiSmokeMode,
+    duration: Duration,
+    report: &GuiSmokeReport,
+) -> serde_json::Value {
+    let renderer = report.renderer.as_ref().map(|renderer| {
+        let timings = renderer.timings;
+        serde_json::json!({
+            "requested_backend": renderer.requested_backend.as_str(),
+            "effective_backend": renderer.effective_backend,
+            "adapter": renderer.adapter,
+            "instance_and_surface_us": duration_micros(timings.instance_and_surface),
+            "adapter_request_us": duration_micros(timings.adapter_request),
+            "device_request_us": duration_micros(timings.device_request),
+            "surface_configuration_us": duration_micros(timings.surface_configuration),
+            "pipeline_creation_us": duration_micros(timings.pipeline_creation),
+            "accounted_us": duration_micros(timings.accounted()),
+            "total_us": duration_micros(timings.total),
+        })
+    });
+    serde_json::json!({
+        "name": "gui-smoke",
+        "status": if passed { "passed" } else { "failed" },
+        "power_source": report.power_source,
+        "charge_percent": report.charge_percent,
+        "duration_ms": duration_millis(duration),
+        "milestone": match mode {
+            GuiSmokeMode::FirstFrame => "window_renderer_session_first_frame",
+            GuiSmokeMode::Startup => "single_shell_prompt_rendered_without_input",
+            GuiSmokeMode::InputEcho => "prompt_input_echo_presented",
+            GuiSmokeMode::TerminalIo => "shell_prompt_input_output_rendered",
+        },
+        "window_created_us": report.window_created.map(duration_micros),
+        "config_loaded_us": report.config_loaded.map(duration_micros),
+        "fonts_ready_us": report.fonts_ready.map(duration_micros),
+        "session_created_us": report.session_created.map(duration_micros),
+        "renderer_initialized_us": report.renderer_initialized.map(duration_micros),
+        "startup_background_presented_us": report
+            .startup_background_presented
+            .map(duration_micros),
+        "startup_background_present_us": report
+            .renderer_initialized
+            .zip(report.startup_background_presented)
+            .map(|(initialized, presented)| {
+                duration_micros(presented.saturating_sub(initialized))
+            }),
+        "renderer_created_us": report.renderer_created.map(duration_micros),
+        "first_scene_preparation_us": report.first_scene_preparation.map(duration_micros),
+        "first_render_submission_us": report.first_render_submission.map(duration_micros),
+        "prompt_observed_us": report.prompt_observed.map(duration_micros),
+        "input_sent_us": report.input_sent.map(duration_micros),
+        "input_observed_us": report.input_observed.map(duration_micros),
+        "success_frame_presented_us": report.success_frame_presented.map(duration_micros),
+        "input_to_output_us": report
+            .input_sent
+            .zip(report.input_observed)
+            .map(|(sent, observed)| duration_micros(observed.saturating_sub(sent))),
+        "output_to_present_us": report
+            .input_observed
+            .zip(report.success_frame_presented)
+            .map(|(observed, presented)| duration_micros(presented.saturating_sub(observed))),
+        "input_to_present_us": report
+            .input_sent
+            .zip(report.success_frame_presented)
+            .map(|(sent, presented)| duration_micros(presented.saturating_sub(sent))),
+        "renderer": renderer,
+    })
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn run_shell_integration_cli(args: &[String]) -> i32 {
@@ -1097,12 +1225,34 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
         eprintln!("gui-smoke milestone=config-load-start");
     }
     let loaded_config = load_desktop_config()?;
+    if let Some(gui_smoke) = gui_smoke.as_ref() {
+        let elapsed = startup_probe_started.map_or(Duration::ZERO, |started| started.elapsed());
+        if let Ok(mut report) = gui_smoke.report.lock() {
+            report.config_loaded = Some(elapsed);
+        }
+        eprintln!(
+            "gui-smoke milestone=config-loaded elapsed_ms={}",
+            elapsed.as_millis()
+        );
+    }
     log_config_diagnostics(&loaded_config.diagnostics);
     let mut config = loaded_config.config;
+    if let Some(backend) = gui_smoke
+        .as_ref()
+        .and_then(|options| options.renderer_backend_override)
+    {
+        config.renderer.backend = backend;
+    }
     let mut configured_performance = config.performance.clone();
     let mut power_monitor =
         DesktopPowerMonitor::with_enabled(config.performance.disable_expensive_effects_on_battery);
     let startup_power_state = power_monitor.power_state();
+    if let Some(gui_smoke) = gui_smoke.as_ref()
+        && let Ok(mut report) = gui_smoke.report.lock()
+    {
+        report.power_source = Some(power_source_label(startup_power_state.state.source));
+        report.charge_percent = startup_power_state.state.charge_percent;
+    }
     apply_power_policy(
         &mut config.performance,
         &configured_performance,
@@ -1127,10 +1277,14 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
         }
     });
     let desktop_window = DesktopWindow::create(&event_loop, &settings)?;
-    if gui_smoke.is_some() {
+    if let Some(gui_smoke) = gui_smoke.as_ref() {
+        let elapsed = startup_probe_started.map_or(Duration::ZERO, |started| started.elapsed());
+        if let Ok(mut report) = gui_smoke.report.lock() {
+            report.window_created = Some(elapsed);
+        }
         eprintln!(
             "gui-smoke milestone=window-created elapsed_ms={}",
-            startup_probe_started.map_or(0, |started| started.elapsed().as_millis())
+            elapsed.as_millis()
         );
     }
     if let Some(fallback) = desktop_window.diagnostics().window_mode.fallback.as_ref() {
@@ -1173,6 +1327,16 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
     let mut dpi_scale_factor = window.scale_factor();
     let mut fonts = FontSystem::new_with_scale_factor(font_config(&config.font), dpi_scale_factor);
     let metrics = fonts.cell_metrics()?;
+    if let Some(gui_smoke) = gui_smoke.as_ref() {
+        let elapsed = startup_probe_started.map_or(Duration::ZERO, |started| started.elapsed());
+        if let Ok(mut report) = gui_smoke.report.lock() {
+            report.fonts_ready = Some(elapsed);
+        }
+        eprintln!(
+            "gui-smoke milestone=fonts-ready elapsed_ms={}",
+            elapsed.as_millis()
+        );
+    }
     // Start the transport as soon as cell metrics are available. PTY startup
     // and initial shell output can then overlap GPU adapter/device creation.
     let mut surface_size = window.inner_size();
@@ -1183,21 +1347,40 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
         surface_size.height,
         transport_waker,
     );
-    if gui_smoke.is_some() {
+    if let Some(gui_smoke) = gui_smoke.as_ref() {
+        let elapsed = startup_probe_started.map_or(Duration::ZERO, |started| started.elapsed());
+        if let Ok(mut report) = gui_smoke.report.lock() {
+            report.session_created = Some(elapsed);
+        }
         eprintln!(
             "gui-smoke milestone=session-created elapsed_ms={}",
-            startup_probe_started.map_or(0, |started| started.elapsed().as_millis())
+            elapsed.as_millis()
         );
     }
     let mut renderer = pollster::block_on(GpuTerminalRenderer::new(
         Arc::clone(&window),
         renderer_options(&config),
     ))?;
-    if let Err(error) = renderer.present_startup_background() {
+    if let Some(gui_smoke) = gui_smoke.as_ref() {
+        let elapsed = startup_probe_started.map_or(Duration::ZERO, |started| started.elapsed());
+        if let Ok(mut report) = gui_smoke.report.lock() {
+            report.renderer_initialized = Some(elapsed);
+            report.renderer = renderer.startup_diagnostics().cloned();
+        }
         eprintln!(
-            "renderer startup background fallback: {error}; revealing the window for normal first-frame rendering"
+            "gui-smoke milestone=renderer-initialized elapsed_ms={}",
+            elapsed.as_millis()
         );
     }
+    let startup_background_presented = match renderer.present_startup_background() {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!(
+                "renderer startup background fallback: {error}; revealing the window for normal first-frame rendering"
+            );
+            false
+        }
+    };
     if config.renderer.damage_tracking {
         let retained_status = renderer.retained_damage_status();
         if retained_status != RetainedDamageStatus::Enabled {
@@ -1206,10 +1389,18 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
             );
         }
     }
-    if gui_smoke.is_some() {
+    if let Some(gui_smoke) = gui_smoke.as_ref() {
+        let elapsed = startup_probe_started.map_or(Duration::ZERO, |started| started.elapsed());
+        if let Ok(mut report) = gui_smoke.report.lock() {
+            if startup_background_presented {
+                report.startup_background_presented = Some(elapsed);
+            }
+            report.renderer_created = Some(elapsed);
+            report.renderer = renderer.startup_diagnostics().cloned();
+        }
         eprintln!(
             "gui-smoke milestone=renderer-created elapsed_ms={}",
-            startup_probe_started.map_or(0, |started| started.elapsed().as_millis())
+            elapsed.as_millis()
         );
     }
     if config.window.opacity < 1.0 && !renderer.transparency_active() {
@@ -1272,9 +1463,11 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
     let gui_smoke_hold = gui_smoke
         .as_ref()
         .map_or(Duration::ZERO, |smoke| smoke.hold_after_success);
+    let gui_smoke_report = gui_smoke.as_ref().map(|smoke| Arc::clone(&smoke.report));
     let gui_smoke_completed = gui_smoke.map(|smoke| smoke.completed);
     let gui_smoke_result = gui_smoke_completed.clone();
     let mut gui_smoke_command_sent = false;
+    let mut gui_smoke_input_prompt_observed_at = None;
     let mut gui_smoke_startup_prompt_observed_at = None;
     let mut gui_smoke_startup_validated = false;
     let mut gui_smoke_success_presented = false;
@@ -1289,6 +1482,8 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
         match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
                 WindowEvent::RedrawRequested => {
+                    let scene_preparation_started =
+                        gui_smoke_report.as_ref().map(|_| Instant::now());
                     let frame_reason = match scheduler.next_frame() {
                         FrameDecision::FrameNeeded(reason) => reason,
                         FrameDecision::NoFrameNeeded => FrameRequestReason::Explicit,
@@ -1373,7 +1568,11 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                             damage_tracker.update(&scene, metrics)
                         };
                     }
+                    let first_scene_preparation =
+                        scene_preparation_started.map(|started| started.elapsed());
                     let idle_wakeups = scheduler.take_idle_wakeups();
+                    let render_submission_started =
+                        gui_smoke_report.as_ref().map(|_| Instant::now());
                     let render_result = catch_unwind(AssertUnwindSafe(|| {
                         if reuse_cursor_scene
                             && let Some(metrics) = metrics
@@ -1386,6 +1585,8 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                         }
                         renderer.render_scene(&scene, &mut fonts)
                     }));
+                    let first_render_submission =
+                        render_submission_started.map(|started| started.elapsed());
                     match render_result {
                         Ok(Ok(())) => {
                             let mut instrumentation = renderer.last_instrumentation();
@@ -1420,11 +1621,40 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                                                 .count()
                                                 >= 2
                                     }
+                                    Some(GuiSmokeMode::InputEcho) => {
+                                        gui_smoke_command_sent
+                                            && mux_runtime
+                                                .active_visible_text()
+                                                .contains(GUI_INPUT_ECHO_MARKER)
+                                    }
                                     Some(GuiSmokeMode::FirstFrame) | None => true,
                                 };
                                 if milestone_reached && !gui_smoke_success_presented {
                                     eprintln!("gui-smoke milestone=frame-presented");
                                     gui_smoke_success_presented = true;
+                                    if let Some(report) = &gui_smoke_report
+                                        && let Ok(mut report) = report.lock()
+                                    {
+                                        if report.first_scene_preparation.is_none() {
+                                            report.first_scene_preparation = first_scene_preparation;
+                                        }
+                                        if report.first_render_submission.is_none() {
+                                            report.first_render_submission = first_render_submission;
+                                        }
+                                        let presented = startup_probe_started
+                                            .map(|started| started.elapsed());
+                                        if matches!(
+                                            gui_smoke_mode,
+                                            Some(
+                                                GuiSmokeMode::InputEcho
+                                                    | GuiSmokeMode::TerminalIo
+                                            )
+                                        ) && report.input_observed.is_none()
+                                        {
+                                            report.input_observed = presented;
+                                        }
+                                        report.success_frame_presented = presented;
+                                    }
                                     if gui_smoke_hold.is_zero() {
                                         completed.store(true, Ordering::Release);
                                         mux_runtime.shutdown_all();
@@ -1482,14 +1712,31 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                     // example, CPR/DSR used by PowerShell's line editor). Apply
                     // pending output and send terminal responses before a host
                     // input or resize event is allowed to overtake it.
-                    if mux_runtime.poll_outputs(
+                    let poll = mux_runtime.poll_outputs(
                         &mut clipboard,
-                        &osc52_policy,
-                        &clipboard_config,
                         &mut notification_provider,
-                        &config.notifications,
-                        window_focused,
-                    ) {
+                        MuxPollContext {
+                            osc52_policy: &osc52_policy,
+                            clipboard_config: &clipboard_config,
+                            notification_config: &config.notifications,
+                            window_focused,
+                            metrics,
+                            config: &config,
+                        },
+                    );
+                    if poll.exit_application {
+                        mux_runtime.shutdown_all();
+                        target.exit();
+                        return;
+                    }
+                    if poll.content_changed {
+                        record_gui_smoke_input_observed(
+                            gui_smoke_mode,
+                            gui_smoke_command_sent,
+                            &mux_runtime,
+                            gui_smoke_report.as_ref(),
+                            startup_probe_started,
+                        );
                         scheduler.terminal_content_changed();
                         window.request_redraw();
                     }
@@ -2146,14 +2393,31 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                 // available. Process that wake immediately instead of waiting
                 // for AboutToWait, where queued keyboard events could otherwise
                 // be handled first.
-                if mux_runtime.poll_outputs(
+                let poll = mux_runtime.poll_outputs(
                     &mut clipboard,
-                    &osc52_policy,
-                    &clipboard_config,
                     &mut notification_provider,
-                    &config.notifications,
-                    window_focused,
-                ) {
+                    MuxPollContext {
+                        osc52_policy: &osc52_policy,
+                        clipboard_config: &clipboard_config,
+                        notification_config: &config.notifications,
+                        window_focused,
+                        metrics,
+                        config: &config,
+                    },
+                );
+                if poll.exit_application {
+                    mux_runtime.shutdown_all();
+                    target.exit();
+                    return;
+                }
+                if poll.content_changed {
+                    record_gui_smoke_input_observed(
+                        gui_smoke_mode,
+                        gui_smoke_command_sent,
+                        &mux_runtime,
+                        gui_smoke_report.as_ref(),
+                        startup_probe_started,
+                    );
                     scheduler.terminal_content_changed();
                     window.request_redraw();
                 }
@@ -2191,7 +2455,11 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                     eprintln!("gui-smoke milestone=timeout");
                     if matches!(
                         gui_smoke_mode,
-                        Some(GuiSmokeMode::Startup | GuiSmokeMode::TerminalIo)
+                        Some(
+                            GuiSmokeMode::Startup
+                                | GuiSmokeMode::InputEcho
+                                | GuiSmokeMode::TerminalIo
+                        )
                     ) {
                         let preview = mux_runtime.active_visible_text();
                         eprintln!(
@@ -2370,26 +2638,72 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                     window.request_redraw();
                 }
 
-                if mux_runtime.poll_outputs(
+                let poll = mux_runtime.poll_outputs(
                     &mut clipboard,
-                    &osc52_policy,
-                    &clipboard_config,
                     &mut notification_provider,
-                    &config.notifications,
-                    window_focused,
-                ) {
+                    MuxPollContext {
+                        osc52_policy: &osc52_policy,
+                        clipboard_config: &clipboard_config,
+                        notification_config: &config.notifications,
+                        window_focused,
+                        metrics,
+                        config: &config,
+                    },
+                );
+                if poll.exit_application {
+                    mux_runtime.shutdown_all();
+                    target.exit();
+                    return;
+                }
+                if poll.content_changed {
+                    record_gui_smoke_input_observed(
+                        gui_smoke_mode,
+                        gui_smoke_command_sent,
+                        &mux_runtime,
+                        gui_smoke_report.as_ref(),
+                        startup_probe_started,
+                    );
                     scheduler.terminal_content_changed();
                 }
 
-                if gui_smoke_mode == Some(GuiSmokeMode::TerminalIo)
+                if matches!(
+                    gui_smoke_mode,
+                    Some(GuiSmokeMode::InputEcho | GuiSmokeMode::TerminalIo)
+                )
                     && !gui_smoke_command_sent
                     && shell_prompt_visible(&mux_runtime.active_visible_text())
                 {
-                    mux_runtime.write_active(
-                        format!("echo {GUI_SMOKE_MARKER}\r").as_bytes(),
-                    );
-                    gui_smoke_command_sent = true;
-                    eprintln!("gui-smoke milestone=prompt-observed-input-sent");
+                    if let Some(report) = &gui_smoke_report
+                        && let Ok(mut report) = report.lock()
+                        && report.prompt_observed.is_none()
+                    {
+                        report.prompt_observed =
+                            startup_probe_started.map(|started| started.elapsed());
+                    }
+                    if gui_smoke_input_settled(
+                        &mut gui_smoke_input_prompt_observed_at,
+                        Instant::now(),
+                    ) {
+                        match gui_smoke_mode {
+                            Some(GuiSmokeMode::InputEcho) => {
+                                mux_runtime.write_active(GUI_INPUT_ECHO_MARKER.as_bytes());
+                            }
+                            Some(GuiSmokeMode::TerminalIo) => {
+                                mux_runtime.write_active(
+                                    format!("echo {GUI_SMOKE_MARKER}\r").as_bytes(),
+                                );
+                            }
+                            _ => unreachable!("input smoke mode was checked"),
+                        }
+                        gui_smoke_command_sent = true;
+                        if let Some(report) = &gui_smoke_report
+                            && let Ok(mut report) = report.lock()
+                        {
+                            report.input_sent =
+                                startup_probe_started.map(|started| started.elapsed());
+                        }
+                        eprintln!("gui-smoke milestone=settled-prompt-input-sent");
+                    }
                 }
 
                 if gui_smoke_mode == Some(GuiSmokeMode::Startup)
@@ -2397,6 +2711,13 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                 {
                     let visible = mux_runtime.active_visible_text();
                     if shell_prompt_visible(&visible) {
+                        if let Some(report) = &gui_smoke_report
+                            && let Ok(mut report) = report.lock()
+                            && report.prompt_observed.is_none()
+                        {
+                            report.prompt_observed =
+                                startup_probe_started.map(|started| started.elapsed());
+                        }
                         let observed_at = gui_smoke_startup_prompt_observed_at
                             .get_or_insert_with(Instant::now);
                         let settled_at = *observed_at + Duration::from_millis(500);
@@ -2529,6 +2850,17 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
                     retain_earliest_deadline(
                         &mut next_wake,
                         observed_at + Duration::from_millis(500),
+                    );
+                }
+                if matches!(
+                    gui_smoke_mode,
+                    Some(GuiSmokeMode::InputEcho | GuiSmokeMode::TerminalIo)
+                ) && !gui_smoke_command_sent
+                    && let Some(observed_at) = gui_smoke_input_prompt_observed_at
+                {
+                    retain_earliest_deadline(
+                        &mut next_wake,
+                        observed_at + GUI_INPUT_SETTLE_DELAY,
                     );
                 }
                 if let Some(deadline) = gui_smoke_deadline {
@@ -3082,6 +3414,13 @@ const fn power_source_label(source: PowerSource) -> &'static str {
 
 fn renderer_options(config: &AppConfig) -> RendererOptions {
     RendererOptions {
+        backend: match config.renderer.backend {
+            config_core::RendererBackendPreference::Auto => GpuBackendPreference::Auto,
+            config_core::RendererBackendPreference::Vulkan => GpuBackendPreference::Vulkan,
+            config_core::RendererBackendPreference::Metal => GpuBackendPreference::Metal,
+            config_core::RendererBackendPreference::Dx12 => GpuBackendPreference::Dx12,
+            config_core::RendererBackendPreference::Gl => GpuBackendPreference::Gl,
+        },
         present_mode: match config.renderer.present_mode {
             PresentModePreference::Immediate => PresentMode::Immediate,
             PresentModePreference::Fifo => PresentMode::Fifo,
@@ -4983,6 +5322,22 @@ struct MuxRuntime {
     output_waker: TransportWakeHandle,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct MuxPollOutcome {
+    content_changed: bool,
+    exit_application: bool,
+}
+
+#[derive(Clone, Copy)]
+struct MuxPollContext<'a> {
+    osc52_policy: &'a Osc52ClipboardPolicy,
+    clipboard_config: &'a ClipboardConfig,
+    notification_config: &'a NotificationConfig,
+    window_focused: bool,
+    metrics: CellMetrics,
+    config: &'a AppConfig,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MuxDragState {
     Tab { source: TabId, target: TabId },
@@ -5430,8 +5785,8 @@ impl MuxRuntime {
 
     fn input_bytes(&self, event: &KeyEvent) -> Option<Vec<u8>> {
         let key = terminal_key(event)?;
-        let modes = self.active_pane()?.terminal.modes();
-        encode_terminal_key(&key, terminal_modifiers(event.modifiers), &modes)
+        let modes = self.active_pane()?.terminal.modes_ref();
+        encode_terminal_key(&key, terminal_modifiers(event.modifiers), modes)
     }
 
     fn start_search(&mut self) {
@@ -5500,7 +5855,7 @@ impl MuxRuntime {
         let Some(pane) = self.active_pane_mut() else {
             return false;
         };
-        let rows = i64::from(pane.terminal.visible_grid().viewport.size.rows).max(1);
+        let rows = i64::from(pane.terminal.state().viewport().size.rows).max(1);
         pane.terminal
             .state_mut()
             .scroll_viewport(if toward_older { rows } else { -rows })
@@ -5510,7 +5865,7 @@ impl MuxRuntime {
         let Some(pane) = self.active_pane_mut() else {
             return false;
         };
-        let lines = i64::try_from(pane.terminal.scrollback().lines.len()).unwrap_or(i64::MAX);
+        let lines = i64::try_from(pane.terminal.scrollback_lines().len()).unwrap_or(i64::MAX);
         pane.terminal.state_mut().scroll_viewport(lines)
     }
 
@@ -5531,7 +5886,7 @@ impl MuxRuntime {
                 clipboard,
                 paste_config,
                 pane.terminal
-                    .modes()
+                    .modes_ref()
                     .contains(&TerminalMode::BracketedPaste),
             );
             pane.write_input(&bytes);
@@ -5540,7 +5895,7 @@ impl MuxRuntime {
 
     fn send_focus_event(&mut self, focused: bool) {
         if let Some(pane) = self.active_pane_mut()
-            && let Some(bytes) = focus_report_bytes(focused, &pane.terminal.modes())
+            && let Some(bytes) = focus_report_bytes(focused, pane.terminal.modes_ref())
         {
             pane.write_input(bytes);
         }
@@ -5634,11 +5989,11 @@ impl MuxRuntime {
                     .flatten(),
             };
         }
-        let modes = pane.terminal.modes();
+        let modes = pane.terminal.modes_ref();
         if !local_mouse.modifiers.shift
             && let Some(bytes) = pane
                 .mouse_protocol
-                .report_bytes(local_mouse, metrics, &modes)
+                .report_bytes(local_mouse, metrics, modes)
         {
             pane.write_input(&bytes);
             return MouseHandling::default();
@@ -5674,7 +6029,7 @@ impl MuxRuntime {
             local_mouse.modifiers.alt = true;
         } else if binding_action.as_deref() == Some("select") {
             local_mouse.modifiers.alt = false;
-        } else if should_middle_click_paste(&local_mouse, &modes, clipboard_config)
+        } else if should_middle_click_paste(&local_mouse, modes, clipboard_config)
             && let Ok(text) = paste_for_middle_click(clipboard, clipboard_config)
         {
             let bytes = paste_bytes(&text, clipboard_config, paste_config, false);
@@ -5841,26 +6196,27 @@ impl MuxRuntime {
     fn poll_outputs(
         &mut self,
         clipboard: &mut ClipboardBridge,
-        policy: &Osc52ClipboardPolicy,
-        clipboard_config: &ClipboardConfig,
         notification_provider: &mut dyn NotificationProvider,
-        notification_config: &NotificationConfig,
-        window_focused: bool,
-    ) -> bool {
+        context: MuxPollContext<'_>,
+    ) -> MuxPollOutcome {
         let mut content_changed = false;
+        let mut clean_exits = Vec::new();
         let mut status_updates = Vec::new();
         let mut metadata_updates = Vec::new();
         for (pane_id, pane) in &mut self.panes {
-            let poll = pane.poll_output(clipboard, policy, clipboard_config);
+            let poll = pane.poll_output(clipboard, context.osc52_policy, context.clipboard_config);
             self.performance.record_pty_bytes(poll.pty_bytes);
             self.performance.record_parser_bytes(poll.parser_bytes);
             if poll.content_changed {
                 content_changed = true;
             }
+            if poll.clean_exit {
+                clean_exits.push(*pane_id);
+            }
             notify_for_pane_transition(
                 notification_provider,
-                notification_config,
-                window_focused,
+                context.notification_config,
+                context.window_focused,
                 pane,
                 poll,
             );
@@ -5893,7 +6249,53 @@ impl MuxRuntime {
                 session.current_working_directory = directory;
             }
         }
-        content_changed
+        let exit_application =
+            self.close_cleanly_exited_panes(&clean_exits, context.metrics, context.config);
+        MuxPollOutcome {
+            content_changed: content_changed || !clean_exits.is_empty(),
+            exit_application,
+        }
+    }
+
+    fn close_cleanly_exited_panes(
+        &mut self,
+        pane_ids: &[PaneId],
+        metrics: CellMetrics,
+        config: &AppConfig,
+    ) -> bool {
+        let mut layout_changed = false;
+        for pane_id in pane_ids.iter().copied() {
+            match self.model.close_exited_pane(pane_id) {
+                Ok(PaneExitDisposition::ExitApplication) => {
+                    if let Some(pane) = self.panes.get_mut(&pane_id) {
+                        pane.transport.take();
+                    }
+                    return true;
+                }
+                Ok(
+                    PaneExitDisposition::PaneClosed
+                    | PaneExitDisposition::TabClosed
+                    | PaneExitDisposition::WindowClosed
+                    | PaneExitDisposition::WorkspaceClosed,
+                ) => {
+                    self.panes.remove(&pane_id);
+                    if self.drag.is_some_and(|drag| match drag {
+                        MuxDragState::Pane { source, target } => {
+                            source == pane_id || target == pane_id
+                        }
+                        MuxDragState::Tab { .. } => false,
+                    }) {
+                        self.drag = None;
+                    }
+                    layout_changed = true;
+                }
+                Err(error) => eprintln!("mux clean-exit handling failed: {error}"),
+            }
+        }
+        if layout_changed {
+            self.resize_active_tab(metrics, config);
+        }
+        false
     }
 
     fn requires_periodic_transport_poll(&self) -> bool {
@@ -6027,6 +6429,42 @@ fn shell_prompt_visible(text: &str) -> bool {
     shell_prompt_line_count(text) > 0
 }
 
+fn gui_smoke_input_settled(observed_at: &mut Option<Instant>, now: Instant) -> bool {
+    let observed_at = *observed_at.get_or_insert(now);
+    now.saturating_duration_since(observed_at) >= GUI_INPUT_SETTLE_DELAY
+}
+
+fn record_gui_smoke_input_observed(
+    mode: Option<GuiSmokeMode>,
+    input_sent: bool,
+    runtime: &MuxRuntime,
+    report: Option<&Arc<Mutex<GuiSmokeReport>>>,
+    started: Option<Instant>,
+) {
+    if !input_sent
+        || !matches!(
+            mode,
+            Some(GuiSmokeMode::InputEcho | GuiSmokeMode::TerminalIo)
+        )
+    {
+        return;
+    }
+
+    let visible = runtime.active_visible_text();
+    let observed = match mode {
+        Some(GuiSmokeMode::InputEcho) => visible.contains(GUI_INPUT_ECHO_MARKER),
+        Some(GuiSmokeMode::TerminalIo) => visible.matches(GUI_SMOKE_MARKER).count() >= 2,
+        _ => false,
+    };
+    if observed
+        && let Some(report) = report
+        && let Ok(mut report) = report.lock()
+        && report.input_observed.is_none()
+    {
+        report.input_observed = started.map(|started| started.elapsed());
+    }
+}
+
 fn shell_prompt_line_count(text: &str) -> usize {
     text.lines()
         .rev()
@@ -6037,6 +6475,7 @@ fn shell_prompt_line_count(text: &str) -> usize {
                 || line.ends_with('$')
                 || line.ends_with('#')
                 || line.ends_with('%')
+                || line.trim_start().starts_with('\u{276f}')
                 || (cfg!(windows) && line.ends_with('>'))
         })
         .count()
@@ -6051,7 +6490,9 @@ fn session_status_for_pane(pane: &PaneRuntime) -> SessionStatus {
                 message: message.clone(),
             }
         }
-        PaneConnectionState::Disconnected(_) => SessionStatus::Exited { exit_code: None },
+        PaneConnectionState::Disconnected(_) => SessionStatus::Exited {
+            exit_code: pane.exit_code,
+        },
     }
 }
 
@@ -6127,6 +6568,7 @@ struct PaneRuntime {
     session_spec: SessionSpec,
     last_size: TerminalGridSize,
     connection_state: PaneConnectionState,
+    exit_code: Option<i32>,
     disconnect_notified: bool,
     ssh_prompt: Option<SshPromptState>,
     osc52_prompt: Option<Osc52PromptState>,
@@ -6329,6 +6771,7 @@ struct PanePollStats {
     pty_bytes: u64,
     parser_bytes: u64,
     closed: bool,
+    clean_exit: bool,
     error: bool,
 }
 
@@ -6447,6 +6890,7 @@ impl PaneRuntime {
             } else {
                 PaneConnectionState::Disconnected("transport failed to start".to_owned())
             },
+            exit_code: None,
             disconnect_notified: false,
             ssh_prompt: None,
             osc52_prompt: None,
@@ -6703,14 +7147,9 @@ impl PaneRuntime {
             return false;
         };
         let max_row = self.terminal.state().buffer_line_count().saturating_sub(1) as i64;
-        let max_col = self
-            .terminal
-            .visible_grid()
-            .viewport
-            .size
-            .cols
-            .saturating_sub(1);
-        let page = i64::from(self.terminal.visible_grid().viewport.size.rows).max(1);
+        let viewport = self.terminal.state().viewport();
+        let max_col = viewport.size.cols.saturating_sub(1);
+        let page = i64::from(viewport.size.rows).max(1);
         match event.logical_key.as_str() {
             "ArrowLeft" => selection.focus.col = selection.focus.col.saturating_sub(1),
             "ArrowRight" => {
@@ -6735,7 +7174,7 @@ impl PaneRuntime {
     }
 
     fn url_at_mouse(&self, mouse: MouseEvent, metrics: CellMetrics) -> Option<String> {
-        let viewport = self.terminal.visible_grid().viewport;
+        let viewport = self.terminal.state().viewport();
         let row = ((mouse.y / f64::from(metrics.cell_height)).floor() as u16)
             .min(viewport.size.rows.saturating_sub(1));
         let col = ((mouse.x / f64::from(metrics.cell_width)).floor() as u16)
@@ -6756,7 +7195,7 @@ impl PaneRuntime {
             return self.terminal.state_mut().scroll_viewport(lines);
         }
 
-        let visible = self.terminal.visible_grid().viewport;
+        let visible = self.terminal.state().viewport();
         let row = ((mouse.y / f64::from(metrics.cell_height)).floor() as u16)
             .min(visible.size.rows.saturating_sub(1));
         let col = ((mouse.x / f64::from(metrics.cell_width)).floor() as u16)
@@ -6836,7 +7275,7 @@ impl PaneRuntime {
                 bytes,
                 BufferPosition::new(cursor.row, cursor.col),
                 self.terminal
-                    .modes()
+                    .modes_ref()
                     .contains(&TerminalMode::AlternateScreen),
                 Instant::now(),
             );
@@ -6885,6 +7324,11 @@ impl PaneRuntime {
             if transport.is_connected() {
                 self.connection_state = PaneConnectionState::Connected;
                 self.disconnect_notified = false;
+            }
+            for lifecycle in &output.lifecycle {
+                if let transport_core::TransportLifecycleEvent::Exited { exit_code } = lifecycle {
+                    self.exit_code = *exit_code;
+                }
             }
             if output.bytes.is_empty() && output.lifecycle.is_empty() && !output.closed {
                 break;
@@ -6957,6 +7401,7 @@ impl PaneRuntime {
                 });
                 stats.content_changed = true;
                 stats.closed = !self.disconnect_notified;
+                stats.clean_exit = !self.remote_session && self.exit_code == Some(0);
                 self.disconnect_notified = true;
                 break;
             }
@@ -6972,6 +7417,7 @@ impl PaneRuntime {
         self.ssh_prompt = None;
         self.osc52_prompt = None;
         self.semantic_parser = SemanticEscapeParser::new();
+        self.exit_code = None;
         let transport_size = terminal_transport_size(self.last_size, metrics);
         match spawn_session_transport(
             config,
@@ -7036,8 +7482,7 @@ impl PaneRuntime {
 
     fn scrollback_memory_bytes(&self) -> u64 {
         self.terminal
-            .scrollback()
-            .lines
+            .scrollback_lines()
             .iter()
             .flat_map(|line| line.cells.iter())
             .map(|cell| {
@@ -7195,7 +7640,7 @@ fn scene_from_mux(
     }
 
     if let Some(metrics) = metrics {
-        append_pane_borders(&mut scene, runtime, tab_bar_rows, metrics, config);
+        append_pane_borders(&mut scene, runtime, metrics, config);
         append_mux_drag_overlay(&mut scene, runtime, metrics, config);
         if let Some(cursor_animator) = cursor_animator {
             cursor_animator.populate_scene(&mut scene, metrics, cursor_animation_settings(config));
@@ -7207,7 +7652,7 @@ fn scene_from_mux(
             cursor_vector_runtime.populate_scene(&mut scene, metrics);
         }
         append_active_ime_overlay(&mut scene, runtime, metrics);
-        append_ssh_product_overlay(&mut scene, runtime, metrics);
+        append_session_product_overlay(&mut scene, runtime, metrics);
     }
 
     scene
@@ -7335,7 +7780,11 @@ fn append_active_ime_overlay(scene: &mut RenderScene, runtime: &MuxRuntime, metr
     });
 }
 
-fn append_ssh_product_overlay(scene: &mut RenderScene, runtime: &MuxRuntime, metrics: CellMetrics) {
+fn append_session_product_overlay(
+    scene: &mut RenderScene,
+    runtime: &MuxRuntime,
+    metrics: CellMetrics,
+) {
     let Some(pane) = runtime.active_pane() else {
         return;
     };
@@ -7376,7 +7825,13 @@ fn append_ssh_product_overlay(scene: &mut RenderScene, runtime: &MuxRuntime, met
         PaneConnectionState::Disconnected(message) if pane.remote_session => {
             Some(format!("SSH disconnected: {message}"))
         }
-        PaneConnectionState::Connected | PaneConnectionState::Disconnected(_) => None,
+        PaneConnectionState::Disconnected(message) => Some(match pane.exit_code {
+            Some(code) => {
+                format!("Local session exited with code {code}. Ctrl+Alt+R to restart")
+            }
+            None => format!("Local session unavailable: {message}. Ctrl+Alt+R to retry"),
+        }),
+        PaneConnectionState::Connected => None,
     };
     let Some(label) = label else {
         return;
@@ -7545,6 +8000,10 @@ fn append_pane_scene(
     config: &AppConfig,
     cursor: CursorPresentation,
 ) {
+    let cell_start = target.grid.cells.len();
+    let search_start = target.search_highlights.len();
+    let semantic_start = target.semantic_overlays.len();
+    let selection_start = target.selections.len();
     let mut pane_scene = scene_from_terminal(
         &pane.terminal,
         &pane.semantic_timeline,
@@ -7585,6 +8044,16 @@ fn append_pane_scene(
         cursor.position.row += row_offset;
         cursor.position.col = cursor.position.col.saturating_add(col_offset);
         target.cursor = Some(cursor);
+    }
+
+    if let Some(metrics) = metrics {
+        target.content_clips.push(RenderContentClip {
+            bounds: rect_from_layout(layout.rect, metrics),
+            cells: RenderItemRange::new(cell_start, target.grid.cells.len()),
+            search_highlights: RenderItemRange::new(search_start, target.search_highlights.len()),
+            semantic_overlays: RenderItemRange::new(semantic_start, target.semantic_overlays.len()),
+            selections: RenderItemRange::new(selection_start, target.selections.len()),
+        });
     }
 }
 
@@ -7640,44 +8109,100 @@ fn append_tab_bar_cells(scene: &mut RenderScene, runtime: &MuxRuntime, config: &
 fn append_pane_borders(
     scene: &mut RenderScene,
     runtime: &MuxRuntime,
-    tab_bar_rows: u16,
     metrics: CellMetrics,
     config: &AppConfig,
 ) {
+    let width = u32::from(config.mux.appearance.pane_border_width);
+    if width == 0 {
+        return;
+    }
+
     let active = runtime.model.active_tab().active_pane;
-    let layouts = runtime.active_layouts(config);
-    let show_borders = layouts.len() > 1 || tab_bar_rows > 0;
-    for layout in layouts {
-        let rect = rect_from_layout(layout.rect, metrics);
-        let border = if layout.pane_id == active {
-            render_color(config.mux.appearance.active_pane_border)
-        } else {
-            render_color(config.mux.appearance.inactive_pane_border)
-        };
-        if show_borders && config.mux.appearance.pane_border_width > 0 {
-            for inset in 0..u32::from(config.mux.appearance.pane_border_width) {
-                let double = inset.saturating_mul(2);
-                if rect.width <= double || rect.height <= double {
-                    break;
-                }
-                scene.decorations.push(render_core::RenderDecoration {
-                    bounds: RenderRect {
-                        x: rect.x.saturating_add(inset as i32),
-                        y: rect.y.saturating_add(inset as i32),
-                        width: rect.width - double,
-                        height: rect.height - double,
-                    },
-                    color: RenderColor {
-                        red: 0,
-                        green: 0,
-                        blue: 0,
-                        alpha: 0,
-                    },
-                    border_color: Some(border),
-                });
-            }
+    let layouts = runtime
+        .active_layouts(config)
+        .into_iter()
+        .map(|layout| (layout.pane_id, rect_from_layout(layout.rect, metrics)))
+        .collect::<Vec<_>>();
+
+    for left_index in 0..layouts.len() {
+        for right_index in left_index + 1..layouts.len() {
+            let (left_id, left) = layouts[left_index];
+            let (right_id, right) = layouts[right_index];
+            let Some(bounds) = shared_pane_separator(left, right, width) else {
+                continue;
+            };
+            let color = if left_id == active || right_id == active {
+                render_color(config.mux.appearance.active_pane_border)
+            } else {
+                render_color(config.mux.appearance.inactive_pane_border)
+            };
+            scene.semantic_overlays.push(OverlayPrimitive {
+                kind: OverlayKind::Decoration,
+                bounds,
+                color,
+                border_color: None,
+                border_width_px: 0,
+                corner_radius_px: 0,
+                z_index: -100,
+                label: None,
+                label_color: None,
+            });
         }
     }
+}
+
+fn shared_pane_separator(left: RenderRect, right: RenderRect, width: u32) -> Option<RenderRect> {
+    let left_x0 = i64::from(left.x);
+    let left_y0 = i64::from(left.y);
+    let left_x1 = left_x0 + i64::from(left.width);
+    let left_y1 = left_y0 + i64::from(left.height);
+    let right_x0 = i64::from(right.x);
+    let right_y0 = i64::from(right.y);
+    let right_x1 = right_x0 + i64::from(right.width);
+    let right_y1 = right_y0 + i64::from(right.height);
+    let half_width = i64::from(width / 2);
+
+    let vertical_edge = if (left_x1 - right_x0).abs() <= 1 {
+        Some((left_x1 + right_x0) / 2)
+    } else if (right_x1 - left_x0).abs() <= 1 {
+        Some((right_x1 + left_x0) / 2)
+    } else {
+        None
+    };
+    let overlap_y0 = left_y0.max(right_y0);
+    let overlap_y1 = left_y1.min(right_y1);
+    if let Some(edge) = vertical_edge
+        && overlap_y1 > overlap_y0
+    {
+        return Some(RenderRect {
+            x: i32::try_from(edge - half_width).ok()?,
+            y: i32::try_from(overlap_y0).ok()?,
+            width,
+            height: u32::try_from(overlap_y1 - overlap_y0).ok()?,
+        });
+    }
+
+    let horizontal_edge = if (left_y1 - right_y0).abs() <= 1 {
+        Some((left_y1 + right_y0) / 2)
+    } else if (right_y1 - left_y0).abs() <= 1 {
+        Some((right_y1 + left_y0) / 2)
+    } else {
+        None
+    };
+    let overlap_x0 = left_x0.max(right_x0);
+    let overlap_x1 = left_x1.min(right_x1);
+    if let Some(edge) = horizontal_edge
+        && overlap_x1 > overlap_x0
+    {
+        return Some(RenderRect {
+            x: i32::try_from(overlap_x0).ok()?,
+            y: i32::try_from(edge - half_width).ok()?,
+            width: u32::try_from(overlap_x1 - overlap_x0).ok()?,
+            height: width,
+        });
+    }
+
+    None
 }
 
 fn append_performance_overlay(
@@ -7911,9 +8436,9 @@ fn scene_from_terminal(
 ) -> RenderScene {
     let viewport = terminal.state().viewport();
     let cursor = terminal.cursor_state();
-    let modes = terminal.modes();
+    let modes = terminal.modes_ref();
     let configured_cursor_shape =
-        resolved_cursor_shape(config, cursor.shape, &modes, presentation.window_focused);
+        resolved_cursor_shape(config, cursor.shape, modes, presentation.window_focused);
     let cursor_visible = cursor.visible
         && terminal.state().viewport_offset() == 0
         && (!presentation.window_focused || presentation.blink_visible);
@@ -7954,7 +8479,7 @@ fn scene_from_terminal(
         semantic_visual_overlays(
             semantic_timeline,
             command_output_collapsed,
-            terminal.modes().contains(&TerminalMode::AlternateScreen),
+            modes.contains(&TerminalMode::AlternateScreen),
             SemanticOverlayViewport {
                 origin_row: viewport.origin_row,
                 rows: viewport.size.rows,
@@ -9222,6 +9747,10 @@ mod tests {
         bytes: Option<Vec<u8>>,
     }
 
+    struct CleanExitTransport {
+        emitted: bool,
+    }
+
     impl TerminalTransport for BurstOutputTransport {
         fn write_input(&mut self, _bytes: &[u8]) -> TransportResult<()> {
             Ok(())
@@ -9254,6 +9783,54 @@ mod tests {
 
         fn state(&self) -> TransportState {
             TransportState::Running
+        }
+    }
+
+    impl TerminalTransport for CleanExitTransport {
+        fn write_input(&mut self, _bytes: &[u8]) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _size: TransportSize) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn poll_output(&mut self) -> TransportResult<TransportOutput> {
+            if self.emitted {
+                return Ok(TransportOutput::bytes(Vec::new()));
+            }
+            self.emitted = true;
+            Ok(TransportOutput {
+                bytes: Vec::new(),
+                closed: true,
+                lifecycle: vec![
+                    transport_core::TransportLifecycleEvent::Exited { exit_code: Some(0) },
+                    transport_core::TransportLifecycleEvent::Closed,
+                ],
+            })
+        }
+
+        fn shutdown(&mut self) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn session_metadata(&self) -> transport_core::SessionMetadata {
+            transport_core::SessionMetadata {
+                id: "clean-exit-test".to_owned(),
+                kind: transport_core::TransportKind::LocalPty,
+                title: None,
+                shell: None,
+                current_working_directory: None,
+                remote_host: None,
+            }
+        }
+
+        fn state(&self) -> TransportState {
+            if self.emitted {
+                TransportState::Closed { exit_code: Some(0) }
+            } else {
+                TransportState::Running
+            }
         }
     }
 
@@ -9352,6 +9929,30 @@ mod tests {
     }
 
     #[test]
+    fn pane_runtime_reports_a_clean_local_process_exit() {
+        let mut pane = test_pane(80, 24);
+        pane.connection_state = PaneConnectionState::Connected;
+        pane.transport = Some(PaneTransport::Local(PaneTransportLoop::new(
+            CleanExitTransport { emitted: false },
+            test_transport_waker(),
+        )));
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let mut clipboard = ClipboardBridge::new();
+        let policy = Osc52ClipboardPolicy::default();
+
+        loop {
+            let stats = pane.poll_output(&mut clipboard, &policy, &ClipboardConfig::default());
+            if stats.closed {
+                assert!(stats.clean_exit);
+                assert_eq!(pane.exit_code, Some(0));
+                break;
+            }
+            assert!(Instant::now() < deadline, "clean exit was not delivered");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
     fn desktop_startup_uses_configured_background_before_window_reveal() {
         let mut config = AppConfig::default();
         config.colors.background = config_core::RgbaColor {
@@ -9368,6 +9969,157 @@ mod tests {
             renderer_options(&config).background,
             RenderColor::rgb(17, 34, 51)
         );
+    }
+
+    #[test]
+    fn renderer_backend_preference_reaches_the_gpu_layer() {
+        let mut config = AppConfig::default();
+        let cases = [
+            (
+                config_core::RendererBackendPreference::Auto,
+                render_wgpu::GpuBackendPreference::Auto,
+            ),
+            (
+                config_core::RendererBackendPreference::Vulkan,
+                render_wgpu::GpuBackendPreference::Vulkan,
+            ),
+            (
+                config_core::RendererBackendPreference::Metal,
+                render_wgpu::GpuBackendPreference::Metal,
+            ),
+            (
+                config_core::RendererBackendPreference::Dx12,
+                render_wgpu::GpuBackendPreference::Dx12,
+            ),
+            (
+                config_core::RendererBackendPreference::Gl,
+                render_wgpu::GpuBackendPreference::Gl,
+            ),
+        ];
+
+        for (configured, expected) in cases {
+            config.renderer.backend = configured;
+            assert_eq!(renderer_options(&config).backend, expected);
+        }
+    }
+
+    #[test]
+    fn gui_smoke_backend_override_parser_is_portable() {
+        assert_eq!(
+            parse_gui_smoke_backend("auto"),
+            Some(config_core::RendererBackendPreference::Auto)
+        );
+        assert_eq!(
+            parse_gui_smoke_backend("vulkan"),
+            Some(config_core::RendererBackendPreference::Vulkan)
+        );
+        assert_eq!(
+            parse_gui_smoke_backend("metal"),
+            Some(config_core::RendererBackendPreference::Metal)
+        );
+        assert_eq!(
+            parse_gui_smoke_backend("dx12"),
+            Some(config_core::RendererBackendPreference::Dx12)
+        );
+        assert_eq!(
+            parse_gui_smoke_backend("gl"),
+            Some(config_core::RendererBackendPreference::Gl)
+        );
+        assert_eq!(parse_gui_smoke_backend("direct3d"), None);
+    }
+
+    #[test]
+    fn gui_smoke_json_exposes_renderer_startup_phases() {
+        let report = GuiSmokeReport {
+            power_source: Some("battery"),
+            charge_percent: Some(64),
+            config_loaded: Some(Duration::from_millis(5)),
+            window_created: Some(Duration::from_millis(10)),
+            fonts_ready: Some(Duration::from_millis(15)),
+            session_created: Some(Duration::from_millis(20)),
+            renderer_initialized: Some(Duration::from_millis(25)),
+            startup_background_presented: Some(Duration::from_millis(29)),
+            renderer_created: Some(Duration::from_millis(30)),
+            first_scene_preparation: Some(Duration::from_micros(700)),
+            first_render_submission: Some(Duration::from_micros(900)),
+            prompt_observed: None,
+            input_sent: None,
+            input_observed: None,
+            success_frame_presented: Some(Duration::from_millis(40)),
+            renderer: Some(render_wgpu::RendererStartupDiagnostics {
+                requested_backend: GpuBackendPreference::Dx12,
+                effective_backend: "Dx12".to_owned(),
+                adapter: "test-adapter".to_owned(),
+                attempted_backends: vec![GpuBackendPreference::Dx12],
+                fallback_errors: Vec::new(),
+                timings: render_wgpu::RendererStartupTimings {
+                    instance_and_surface: Duration::from_micros(100),
+                    adapter_request: Duration::from_micros(200),
+                    device_request: Duration::from_micros(300),
+                    surface_configuration: Duration::from_micros(400),
+                    pipeline_creation: Duration::from_micros(500),
+                    total: Duration::from_micros(1_500),
+                },
+            }),
+        };
+
+        let json = gui_smoke_json(
+            true,
+            GuiSmokeMode::FirstFrame,
+            Duration::from_millis(40),
+            &report,
+        );
+
+        assert_eq!(json["renderer"]["requested_backend"], "dx12");
+        assert_eq!(json["power_source"], "battery");
+        assert_eq!(json["charge_percent"], 64);
+        assert_eq!(json["renderer"]["effective_backend"], "Dx12");
+        assert_eq!(json["renderer"]["pipeline_creation_us"], 500);
+        assert_eq!(json["config_loaded_us"], 5_000);
+        assert_eq!(json["fonts_ready_us"], 15_000);
+        assert_eq!(json["renderer_initialized_us"], 25_000);
+        assert_eq!(json["startup_background_present_us"], 4_000);
+        assert_eq!(json["first_scene_preparation_us"], 700);
+        assert_eq!(json["first_render_submission_us"], 900);
+        assert_eq!(json["renderer_created_us"], 30_000);
+    }
+
+    #[test]
+    fn gui_smoke_json_reports_end_to_end_input_echo_latency() {
+        let report = GuiSmokeReport {
+            input_sent: Some(Duration::from_micros(120_000)),
+            input_observed: Some(Duration::from_micros(121_250)),
+            success_frame_presented: Some(Duration::from_micros(123_500)),
+            ..GuiSmokeReport::default()
+        };
+
+        let json = gui_smoke_json(
+            true,
+            GuiSmokeMode::InputEcho,
+            Duration::from_millis(124),
+            &report,
+        );
+
+        assert_eq!(json["milestone"], "prompt_input_echo_presented");
+        assert_eq!(json["input_to_output_us"], 1_250);
+        assert_eq!(json["output_to_present_us"], 2_250);
+        assert_eq!(json["input_to_present_us"], 3_500);
+    }
+
+    #[test]
+    fn gui_input_smoke_excludes_prompt_startup_from_latency_sample() {
+        let observed = Instant::now();
+        let mut observed_at = None;
+
+        assert!(!gui_smoke_input_settled(&mut observed_at, observed));
+        assert!(!gui_smoke_input_settled(
+            &mut observed_at,
+            observed + GUI_INPUT_SETTLE_DELAY - Duration::from_millis(1)
+        ));
+        assert!(gui_smoke_input_settled(
+            &mut observed_at,
+            observed + GUI_INPUT_SETTLE_DELAY
+        ));
     }
 
     #[test]
@@ -9725,6 +10477,9 @@ mod tests {
         assert!(shell_prompt_visible("panea@host:~$"));
         assert!(shell_prompt_visible("root@host:/#"));
         assert!(shell_prompt_visible("host%"));
+        assert!(shell_prompt_visible(
+            "\u{e0b0}~ \u{e0b0}\n\u{276f}                         \u{e0b2} 8ms \u{e0b2} shres \u{e0b2} pwsh \u{e0b4}"
+        ));
         assert!(!shell_prompt_visible(
             "Copyright (C) Microsoft Corporation."
         ));
@@ -9741,6 +10496,7 @@ mod tests {
             session_spec: SessionSpec::local("default"),
             last_size: TerminalGridSize::new(cols, rows),
             connection_state: PaneConnectionState::Disconnected("test".to_owned()),
+            exit_code: None,
             disconnect_notified: false,
             ssh_prompt: None,
             osc52_prompt: None,
@@ -10219,6 +10975,162 @@ mod tests {
         let layout = runtime.active_layouts(&config);
         assert_eq!(layout[0].rect.y, 0.0);
         assert_eq!(layout[0].terminal_size.rows, 30);
+    }
+
+    #[test]
+    fn mux_scene_retains_a_disjoint_content_clip_for_each_pane() {
+        let mut config = AppConfig::default();
+        config.mux.show_tab_bar = false;
+        let mut model = MuxModel::new(SessionSpec::local("default"));
+        let first = model.active_tab().active_pane;
+        let second = model
+            .split_active_pane(SplitAxis::Horizontal, SessionSpec::local("default"))
+            .expect("split pane");
+        let mut first_pane = test_pane(40, 24);
+        first_pane.terminal.apply_bytes(b"left").expect("left text");
+        let mut second_pane = test_pane(40, 24);
+        second_pane
+            .terminal
+            .apply_bytes(b"right")
+            .expect("right text");
+        let runtime = MuxRuntime {
+            model,
+            panes: HashMap::from([(first, first_pane), (second, second_pane)]),
+            surface_cols: 80,
+            surface_rows: 24,
+            performance: RuntimePerformanceCounters::new(),
+            restore_sessions: false,
+            state_path: std::env::temp_dir().join("panea-test-mux-state.json"),
+            drag: None,
+            output_waker: test_transport_waker(),
+        };
+
+        let scene = scene_from_mux(
+            &runtime,
+            Some(test_metrics()),
+            &config,
+            None,
+            None,
+            None,
+            CursorPresentation {
+                blink_visible: true,
+                window_focused: true,
+            },
+        );
+
+        assert_eq!(scene.content_clips.len(), 2);
+        let left = scene.content_clips[0];
+        let right = scene.content_clips[1];
+        assert!(left.bounds.x + left.bounds.width as i32 <= right.bounds.x);
+        assert_eq!(left.cells.end, right.cells.start);
+        assert_eq!(right.cells.end, scene.grid.cells.len());
+        assert!(
+            scene.decorations.is_empty(),
+            "pane outlines must not render over terminal glyphs"
+        );
+        assert_eq!(
+            scene
+                .semantic_overlays
+                .iter()
+                .filter(|overlay| overlay.kind == OverlayKind::Decoration)
+                .count(),
+            1,
+            "a two-pane split should render one shared separator"
+        );
+        let separator = scene
+            .semantic_overlays
+            .iter()
+            .find(|overlay| overlay.kind == OverlayKind::Decoration)
+            .expect("split separator");
+        assert!(
+            separator.bounds.x > 0,
+            "separator must not outline the left edge"
+        );
+        assert_eq!(separator.bounds.y, 0);
+        assert_eq!(separator.bounds.height, left.bounds.height);
+    }
+
+    #[test]
+    fn mux_runtime_removes_a_cleanly_exited_split_pane() {
+        let config = AppConfig::default();
+        let mut model = MuxModel::new(SessionSpec::local("default"));
+        let first = model.active_tab().active_pane;
+        let exited = model
+            .split_active_pane(SplitAxis::Horizontal, SessionSpec::local("default"))
+            .expect("split pane");
+        let mut runtime = MuxRuntime {
+            model,
+            panes: HashMap::from([(first, test_pane(40, 24)), (exited, test_pane(40, 24))]),
+            surface_cols: 80,
+            surface_rows: 24,
+            performance: RuntimePerformanceCounters::new(),
+            restore_sessions: false,
+            state_path: std::env::temp_dir().join("panea-test-mux-state.json"),
+            drag: None,
+            output_waker: test_transport_waker(),
+        };
+
+        assert!(!runtime.close_cleanly_exited_panes(&[exited], test_metrics(), &config));
+        assert!(!runtime.panes.contains_key(&exited));
+        assert_eq!(runtime.model.active_tab().active_pane, first);
+    }
+
+    #[test]
+    fn mux_runtime_requests_window_exit_for_the_final_clean_session() {
+        let config = AppConfig::default();
+        let model = MuxModel::new(SessionSpec::local("default"));
+        let exited = model.active_tab().active_pane;
+        let mut runtime = MuxRuntime {
+            model,
+            panes: HashMap::from([(exited, test_pane(80, 24))]),
+            surface_cols: 80,
+            surface_rows: 24,
+            performance: RuntimePerformanceCounters::new(),
+            restore_sessions: false,
+            state_path: std::env::temp_dir().join("panea-test-mux-state.json"),
+            drag: None,
+            output_waker: test_transport_waker(),
+        };
+
+        assert!(runtime.close_cleanly_exited_panes(&[exited], test_metrics(), &config));
+        assert!(runtime.panes.contains_key(&exited));
+    }
+
+    #[test]
+    fn abnormal_local_exit_renders_an_actionable_session_overlay() {
+        let model = MuxModel::new(SessionSpec::local("default"));
+        let pane_id = model.active_tab().active_pane;
+        let mut pane = test_pane(80, 24);
+        pane.exit_code = Some(7);
+        pane.connection_state = PaneConnectionState::Disconnected("session exited".to_owned());
+        let runtime = MuxRuntime {
+            model,
+            panes: HashMap::from([(pane_id, pane)]),
+            surface_cols: 80,
+            surface_rows: 24,
+            performance: RuntimePerformanceCounters::new(),
+            restore_sessions: false,
+            state_path: std::env::temp_dir().join("panea-test-mux-state.json"),
+            drag: None,
+            output_waker: test_transport_waker(),
+        };
+        let mut scene = RenderScene {
+            grid: RenderGrid {
+                columns: 80,
+                rows: 24,
+                cells: Vec::new(),
+            },
+            ..RenderScene::default()
+        };
+
+        append_session_product_overlay(&mut scene, &runtime, test_metrics());
+
+        let label = scene.semantic_overlays[0]
+            .label
+            .as_deref()
+            .expect("session overlay label");
+        assert!(label.contains("code 7"));
+        assert!(label.contains("Ctrl+Alt+R"));
     }
 
     #[test]

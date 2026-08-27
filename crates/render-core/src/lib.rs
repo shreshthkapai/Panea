@@ -138,6 +138,36 @@ pub struct RenderRect {
 pub type DamageRegion = RenderRect;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RenderItemRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl RenderItemRange {
+    #[must_use]
+    pub const fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+
+    #[must_use]
+    pub const fn contains(self, index: usize) -> bool {
+        index >= self.start && index < self.end
+    }
+}
+
+/// Associates contiguous scene primitives with one pane viewport. The ranges
+/// preserve shared renderer batches without allowing shaped glyphs or visual
+/// overlays to bleed across pane boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderContentClip {
+    pub bounds: RenderRect,
+    pub cells: RenderItemRange,
+    pub search_highlights: RenderItemRange,
+    pub semantic_overlays: RenderItemRange,
+    pub selections: RenderItemRange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RenderOffset {
     pub x: i32,
     pub y: i32,
@@ -391,6 +421,9 @@ pub struct RenderScene {
     pub selections: Vec<SelectionVisual>,
     pub search_highlights: Vec<OverlayPrimitive>,
     pub semantic_overlays: Vec<OverlayPrimitive>,
+    /// Batched pane ownership ranges used to clip terminal content without
+    /// storing a rectangle on every cell.
+    pub content_clips: Vec<RenderContentClip>,
     /// App chrome positioned in physical surface pixels rather than terminal-content pixels.
     pub surface_overlays: Vec<OverlayPrimitive>,
     /// Fullscreen app chrome in physical surface pixels. This is presentation-only state.

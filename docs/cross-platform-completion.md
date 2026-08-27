@@ -1,5 +1,23 @@
 # Cross-Platform Runtime Completion
 
+## Transparent Window Transitions
+
+```text
+Feature name: transparent window transition finalization
+Layer: platform-winit
+User-facing behavior: transparent windows do not retain a previous decorated frame across windowed, maximized, and fullscreen transitions
+Config keys: window.opacity, window.mode, window.decoration_strategy
+macOS behavior: Cocoa fullscreen remains asynchronous through winit; Windows compositor operations are never applied
+Windows behavior: transparent borderless fullscreen and native maximize transitions are coalesced and re-presented once after the resize event batch with DWM synchronization
+Linux X11 behavior: fullscreen and maximize remain EWMH/window-manager requests through winit; compositor bypass and Windows refresh logic are not applied
+Linux Wayland behavior: fullscreen and maximize remain compositor-negotiated xdg-shell states through winit; client geometry is not forced
+Fallback behavior: a failed Windows composition refresh leaves the effective window mode unchanged and reports the failure
+Diagnostics: transparent_window_composition names the requested transition, retained effective mode, and DWM error
+Performance cost when disabled: zero; opaque windows never queue transition work
+Performance cost when enabled: one coalesced platform operation per affected transition, with no render-frame, input, or PTY hot-path work
+Tests: policy tests cover Windows coalescing/rearming, opaque windows, and macOS/X11/Wayland isolation; native Windows verification covers borderless fullscreen to windowed to system maximize
+```
+
 ## Feature Design Note
 
 ```text

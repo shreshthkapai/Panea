@@ -467,10 +467,7 @@ impl DesktopWindow {
         settings: &WindowSettings,
     ) -> Result<Self, winit::error::OsError> {
         let decoration = resolve_decoration_mode(settings.decoration_mode, detected_platform());
-        let decorations = !matches!(
-            settings.mode,
-            WindowMode::FramelessWindowed | WindowMode::FramelessFullscreen
-        ) && !matches!(decoration.effective, DecorationMode::None);
+        let decorations = window_mode_decorations_visible(settings.mode, decoration.effective);
 
         let attributes = Window::default_attributes()
             .with_title(settings.title.clone())
@@ -482,7 +479,17 @@ impl DesktopWindow {
             .with_visible(settings.visible_on_create)
             .with_decorations(decorations)
             .with_transparent(settings.opacity < 1.0)
-            .with_maximized(matches!(settings.mode, WindowMode::Maximized));
+            .with_maximized(matches!(settings.mode, WindowMode::Maximized))
+            .with_fullscreen(initial_winit_fullscreen(settings.mode));
+        #[cfg(target_os = "windows")]
+        let attributes = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+
+            attributes.with_no_redirection_bitmap(no_redirection_bitmap_required(
+                DesktopPlatform::Windows,
+                settings.opacity,
+            ))
+        };
         #[allow(deprecated)]
         let window = event_loop.create_window(attributes)?;
 
@@ -519,6 +526,18 @@ impl DesktopWindow {
     pub fn diagnostics(&self) -> &DesktopWindowDiagnostics {
         &self.diagnostics
     }
+}
+
+fn initial_winit_fullscreen(mode: WindowMode) -> Option<Fullscreen> {
+    matches!(
+        mode,
+        WindowMode::Fullscreen | WindowMode::BorderlessFullscreen | WindowMode::FramelessFullscreen
+    )
+    .then(|| Fullscreen::Borderless(None))
+}
+
+const fn no_redirection_bitmap_required(platform: DesktopPlatform, opacity: f64) -> bool {
+    matches!(platform, DesktopPlatform::Windows) && opacity < 1.0
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1025,7 +1044,7 @@ pub fn apply_window_mode_with_decoration(
 ) -> WindowModeDiagnostic {
     let mut effective = requested;
     let mut fallback = None;
-    let decorated = !matches!(decoration, DecorationMode::None);
+    let decorated = window_mode_decorations_visible(requested, decoration);
 
     match requested {
         WindowMode::Windowed => {
@@ -1055,9 +1074,10 @@ pub fn apply_window_mode_with_decoration(
         }
         WindowMode::BorderlessFullscreen => {
             window.set_maximized(false);
-            // Borderless fullscreen already suppresses native decorations.
-            // Preserve the windowed decoration state so leaving fullscreen is
-            // one mode transition instead of an intermediate frameless window.
+            // Remove the non-client frame before expanding a transparent
+            // surface. Windows DWM can otherwise retain the old decorated
+            // frame beneath the borderless fullscreen client.
+            window.set_decorations(decorated);
             window.set_fullscreen(Some(Fullscreen::Borderless(window.current_monitor())));
         }
         WindowMode::FramelessWindowed => {
@@ -1077,6 +1097,16 @@ pub fn apply_window_mode_with_decoration(
         effective,
         fallback,
     }
+}
+
+const fn window_mode_decorations_visible(mode: WindowMode, decoration: DecorationMode) -> bool {
+    !matches!(decoration, DecorationMode::None)
+        && !matches!(
+            mode,
+            WindowMode::BorderlessFullscreen
+                | WindowMode::FramelessWindowed
+                | WindowMode::FramelessFullscreen
+        )
 }
 
 fn preferred_video_mode(window: &Window) -> Option<winit::monitor::VideoModeHandle> {
@@ -1604,6 +1634,64 @@ mod tests {
                 .contains(&platform_core::ClipboardCapability::PrimarySelection),
             cfg!(target_os = "linux")
         );
+    }
+
+    #[test]
+    fn borderless_fullscreen_suppresses_native_decorations_and_windowed_restores_them() {
+        assert!(!window_mode_decorations_visible(
+            WindowMode::BorderlessFullscreen,
+            DecorationMode::Native,
+        ));
+        assert!(!window_mode_decorations_visible(
+            WindowMode::FramelessFullscreen,
+            DecorationMode::Native,
+        ));
+        assert!(window_mode_decorations_visible(
+            WindowMode::Windowed,
+            DecorationMode::Native,
+        ));
+    }
+
+    #[test]
+    fn fullscreen_modes_are_created_fullscreen_before_the_window_is_revealed() {
+        assert!(initial_winit_fullscreen(WindowMode::Windowed).is_none());
+        for mode in [
+            WindowMode::Fullscreen,
+            WindowMode::BorderlessFullscreen,
+            WindowMode::FramelessFullscreen,
+        ] {
+            assert!(
+                matches!(
+                    initial_winit_fullscreen(mode),
+                    Some(Fullscreen::Borderless(None))
+                ),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_transparent_windows_disable_the_dwm_redirection_bitmap() {
+        assert!(no_redirection_bitmap_required(
+            DesktopPlatform::Windows,
+            0.92,
+        ));
+        assert!(!no_redirection_bitmap_required(
+            DesktopPlatform::Windows,
+            1.0,
+        ));
+        assert!(!no_redirection_bitmap_required(
+            DesktopPlatform::MacOs,
+            0.92,
+        ));
+        assert!(!no_redirection_bitmap_required(
+            DesktopPlatform::LinuxX11,
+            0.92,
+        ));
+        assert!(!no_redirection_bitmap_required(
+            DesktopPlatform::LinuxWayland,
+            0.92,
+        ));
     }
 
     #[test]

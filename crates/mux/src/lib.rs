@@ -313,6 +313,103 @@ impl MuxModel {
         self.active_tab_mut().close_pane(pane_id)
     }
 
+    /// Removes a cleanly exited pane while preserving the mux invariant that
+    /// every retained window has at least one workspace, tab, and pane.
+    /// The final session is left in place so the application can perform its
+    /// own bounded shutdown before closing the native window.
+    pub fn close_exited_pane(&mut self, pane_id: PaneId) -> MuxResult<PaneExitDisposition> {
+        let location = self
+            .workspaces
+            .iter()
+            .find_map(|(workspace_id, workspace)| {
+                workspace.windows.iter().find_map(|window| {
+                    window.tabs.iter().find_map(|tab| {
+                        tab.panes.contains_key(&pane_id).then_some((
+                            *workspace_id,
+                            window.id,
+                            tab.id,
+                            tab.panes.len(),
+                            window.tabs.len(),
+                            workspace.windows.len(),
+                        ))
+                    })
+                })
+            })
+            .ok_or(MuxError::PaneNotFound(pane_id))?;
+        let (workspace_id, window_id, tab_id, pane_count, tab_count, window_count) = location;
+
+        if pane_count > 1 {
+            let workspace = self
+                .workspaces
+                .get_mut(&workspace_id)
+                .ok_or(MuxError::WorkspaceNotFound(workspace_id))?;
+            let window = workspace
+                .windows
+                .iter_mut()
+                .find(|window| window.id == window_id)
+                .ok_or(MuxError::WindowNotFound(window_id))?;
+            window.tab_mut(tab_id)?.close_pane(pane_id)?;
+            return Ok(PaneExitDisposition::PaneClosed);
+        }
+
+        if tab_count > 1 {
+            let workspace = self
+                .workspaces
+                .get_mut(&workspace_id)
+                .ok_or(MuxError::WorkspaceNotFound(workspace_id))?;
+            let window = workspace
+                .windows
+                .iter_mut()
+                .find(|window| window.id == window_id)
+                .ok_or(MuxError::WindowNotFound(window_id))?;
+            let index = window
+                .tabs
+                .iter()
+                .position(|tab| tab.id == tab_id)
+                .ok_or(MuxError::TabNotFound(tab_id))?;
+            window.tabs.remove(index);
+            if window.active_tab == tab_id {
+                window.active_tab =
+                    window.tabs[index.saturating_sub(1).min(window.tabs.len() - 1)].id;
+            }
+            return Ok(PaneExitDisposition::TabClosed);
+        }
+
+        if window_count > 1 {
+            let workspace = self
+                .workspaces
+                .get_mut(&workspace_id)
+                .ok_or(MuxError::WorkspaceNotFound(workspace_id))?;
+            let index = workspace
+                .windows
+                .iter()
+                .position(|window| window.id == window_id)
+                .ok_or(MuxError::WindowNotFound(window_id))?;
+            workspace.windows.remove(index);
+            if workspace.active_window == window_id {
+                workspace.active_window =
+                    workspace.windows[index.saturating_sub(1).min(workspace.windows.len() - 1)].id;
+            }
+            return Ok(PaneExitDisposition::WindowClosed);
+        }
+
+        if self.workspaces.len() > 1 {
+            self.workspaces
+                .remove(&workspace_id)
+                .ok_or(MuxError::WorkspaceNotFound(workspace_id))?;
+            if self.active_workspace == workspace_id {
+                self.active_workspace = *self
+                    .workspaces
+                    .keys()
+                    .next()
+                    .expect("closing one of multiple workspaces leaves a workspace");
+            }
+            return Ok(PaneExitDisposition::WorkspaceClosed);
+        }
+
+        Ok(PaneExitDisposition::ExitApplication)
+    }
+
     pub fn focus_pane(&mut self, pane_id: PaneId) -> MuxResult<()> {
         let tab = self.active_tab_mut();
         if !tab.panes.contains_key(&pane_id) {
@@ -693,6 +790,15 @@ pub enum SessionStatus {
     Exited { exit_code: Option<i32> },
     Failed { message: String },
     Detached,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneExitDisposition {
+    PaneClosed,
+    TabClosed,
+    WindowClosed,
+    WorkspaceClosed,
+    ExitApplication,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1699,6 +1805,50 @@ mod tests {
                 .values()
                 .all(|session| session.spec.profile_name == "default")
         );
+    }
+
+    #[test]
+    fn clean_exit_removes_only_the_exited_pane_from_a_split() {
+        let mut model = model();
+        let original = model.active_tab().active_pane;
+        let exited = model
+            .split_active_pane(SplitAxis::Horizontal, SessionSpec::local("default"))
+            .expect("split pane");
+
+        let disposition = model.close_exited_pane(exited).expect("close exited pane");
+
+        assert_eq!(disposition, PaneExitDisposition::PaneClosed);
+        assert_eq!(model.active_tab().panes.len(), 1);
+        assert_eq!(model.active_tab().active_pane, original);
+    }
+
+    #[test]
+    fn clean_exit_removes_a_single_pane_tab_when_another_tab_exists() {
+        let mut model = model();
+        let first_tab = model.active_tab().id;
+        model
+            .new_tab("2", SessionSpec::local("default"))
+            .expect("new tab");
+        let exited = model.active_tab().active_pane;
+
+        let disposition = model.close_exited_pane(exited).expect("close exited tab");
+
+        assert_eq!(disposition, PaneExitDisposition::TabClosed);
+        assert_eq!(model.active_tab().id, first_tab);
+        assert_eq!(model.active_workspace().active_window().tabs.len(), 1);
+    }
+
+    #[test]
+    fn clean_exit_of_the_final_session_requests_application_exit() {
+        let mut model = model();
+        let exited = model.active_tab().active_pane;
+
+        let disposition = model
+            .close_exited_pane(exited)
+            .expect("classify final exit");
+
+        assert_eq!(disposition, PaneExitDisposition::ExitApplication);
+        assert_eq!(model.active_tab().active_pane, exited);
     }
 
     #[test]
