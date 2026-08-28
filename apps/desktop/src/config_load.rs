@@ -596,5 +596,3 @@ fn store_font_files(path: &Path, signature: &str, files: &[PathBuf]) {
     }
     let _ = fs::write(path, contents);
 }
-
-

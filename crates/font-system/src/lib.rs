@@ -319,7 +319,7 @@ impl FontCatalog {
     }
 
     /// Remembers a file a face was resolved from, so the next run can start
-        // from it instead of scanning.
+    /// from it instead of scanning.
     fn record_resolved_file(&self, path: &Path) {
         if let Ok(mut resolved) = self.resolved_files.lock() {
             resolved.insert(path.to_path_buf());
@@ -357,9 +357,7 @@ impl FontCatalog {
             ..fontdb::Query::default()
         };
         self.with_face(&query, |face| match &face.source {
-            fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => {
-                Some(path.clone())
-            }
+            fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => Some(path.clone()),
             fontdb::Source::Binary(_) => None,
         })
         .flatten()
