@@ -110,7 +110,17 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
     let mut osc52_policy = osc52_policy(&clipboard_config);
 
     let mut dpi_scale_factor = window.scale_factor();
-    let mut fonts = FontSystem::new_with_scale_factor(font_config(&config.font), dpi_scale_factor);
+    // Start font discovery from the files that satisfied the last launch. A full
+    // system scan parses every installed font, which is seconds on a cold file
+    // cache; the catalog falls back to that scan by itself the first time a query
+    // misses, so a stale or absent cache costs correctness nothing.
+    let font_cache = font_cache_path();
+    let font_signature = font_directory_signature();
+    let mut fonts = FontSystem::with_font_files(
+        font_config(&config.font),
+        dpi_scale_factor,
+        &cached_font_files(&font_cache, &font_signature),
+    );
     // Fallback faces load off the UI thread, so the frame that first prints a
     // CJK or emoji character draws without them. This wake brings us back to
     // redraw it once the real face is resident.
@@ -121,6 +131,8 @@ fn run(gui_smoke: Option<GuiSmokeOptions>) -> Result<(), Box<dyn Error>> {
         }
     }));
     let mut metrics = fonts.cell_metrics()?;
+    // Cell metrics force the primary face, so by here we know what was used.
+    store_font_files(&font_cache, &font_signature, &fonts.resolved_font_files());
     if let Some(gui_smoke) = gui_smoke.as_ref() {
         let elapsed = startup_probe_started.map_or(Duration::ZERO, |started| started.elapsed());
         if let Ok(mut report) = gui_smoke.report.lock() {

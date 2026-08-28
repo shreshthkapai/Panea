@@ -478,3 +478,123 @@ fn format_font_diagnostic(role: &str, family: &str, resolved: bool, source: &Fon
     };
     format!("{role}:{family}={source}{fallback}")
 }
+
+/// Where the resolved-font-file cache lives, beside the other desktop state.
+fn font_cache_path() -> PathBuf {
+    mux_state_path()
+        .parent()
+        .map_or_else(std::env::temp_dir, Path::to_path_buf)
+        .join("font-cache.txt")
+}
+
+/// A cheap signature of the font directories.
+///
+/// Installing or removing a font changes the containing directory\'s modified
+/// time and entry count, so comparing this against the stored signature keeps a
+/// newly installed face from being masked by a cache that predates it. Only one
+/// level is walked: listing a directory is milliseconds, parsing every font in
+/// it is seconds, and the latter is what this exists to avoid.
+fn font_directory_signature() -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for directory in system_font_directories() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        let mut count = 0usize;
+        let mut newest = 0u64;
+        for entry in entries.flatten() {
+            count += 1;
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let stamp = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |since| since.as_secs());
+            newest = newest.max(stamp);
+            if metadata.is_dir()
+                && let Ok(nested) = fs::read_dir(entry.path())
+            {
+                count += nested.flatten().count();
+            }
+        }
+        parts.push(format!("{}|{count}|{newest}", directory.display()));
+    }
+    parts.sort();
+    parts.join(";")
+}
+
+/// The directories the platform keeps installed fonts in.
+fn system_font_directories() -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    if cfg!(target_os = "windows") {
+        if let Some(windir) = std::env::var_os("WINDIR") {
+            directories.push(PathBuf::from(windir).join("Fonts"));
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            directories.push(
+                PathBuf::from(local)
+                    .join("Microsoft")
+                    .join("Windows")
+                    .join("Fonts"),
+            );
+        }
+        return directories;
+    }
+    if cfg!(target_os = "macos") {
+        directories.push(PathBuf::from("/System/Library/Fonts"));
+        directories.push(PathBuf::from("/Library/Fonts"));
+        if let Some(home) = std::env::var_os("HOME") {
+            directories.push(PathBuf::from(home).join("Library").join("Fonts"));
+        }
+        return directories;
+    }
+    directories.push(PathBuf::from("/usr/share/fonts"));
+    directories.push(PathBuf::from("/usr/local/share/fonts"));
+    if let Some(home) = std::env::var_os("HOME") {
+        directories.push(PathBuf::from(&home).join(".local").join("share").join("fonts"));
+        directories.push(PathBuf::from(home).join(".fonts"));
+    }
+    directories
+}
+
+/// Reads the cached font files, or nothing when the cache cannot be trusted.
+///
+/// The first line is the directory signature the cache was written under. A
+/// mismatch, a missing file, or anything unparseable yields no paths, which
+/// simply means the catalog performs its normal full scan.
+fn cached_font_files(path: &Path, signature: &str) -> Vec<PathBuf> {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut lines = contents.lines();
+    if lines.next() != Some(signature) {
+        return Vec::new();
+    }
+    lines
+        .filter(|line| !line.trim().is_empty())
+        .map(PathBuf::from)
+        .filter(|candidate| candidate.is_file())
+        .collect()
+}
+
+/// Records the font files this run resolved, for the next launch to start from.
+fn store_font_files(path: &Path, signature: &str, files: &[PathBuf]) {
+    if files.is_empty() {
+        return;
+    }
+    let mut contents = String::with_capacity(signature.len() + files.len() * 64);
+    contents.push_str(signature);
+    contents.push('\n');
+    for file in files {
+        contents.push_str(&file.to_string_lossy());
+        contents.push('\n');
+    }
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, contents);
+}
+
+

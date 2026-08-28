@@ -44,3 +44,43 @@ smoke exercises hidden-window initialization, startup presentation, reveal,
 and normal terminal rendering. This path passes on Windows; real visual
 confirmation remains part of the macOS, Linux X11, and Linux Wayland packaged
 GUI smoke checklists.
+
+## Font Discovery Cost
+
+`fontdb::Database::load_system_fonts` parses the name tables of every installed
+font. Measured on a Windows host with 376 installed faces: **2.47s** on a cold
+file cache, and the terminal needs three or four of those faces. Querying is not
+the cost - fifteen family queries, nine of which resolve to nothing, take a
+combined **774us**.
+
+So the catalog is built from the font files that satisfied the previous launch,
+recorded in `font-cache.txt` beside the other desktop state. It promotes itself
+to a full system scan the first time a query misses, which makes a stale or
+absent cache a performance question rather than a correctness one.
+
+Two rules keep a partial catalog honest:
+
+- `fontdb` returns its closest match rather than nothing, so while the catalog
+  is still partial a match must genuinely satisfy the request: the face has to
+  carry the requested family name, and a bold or italic request has to be
+  answered by a bold or italic face. Otherwise a cache holding only a regular
+  file would answer every bold request with it and never look for the real one.
+- Generic families are never answered from a partial catalog. `monospace` has no
+  name to verify against, so a single cached file must not stand in for the
+  platform's real monospace choice. A config naming a concrete family gets the
+  fast path; one asking for `monospace` scans as before.
+
+The cache is also invalidated when the font directories change: installing or
+removing a font moves the containing directory's modified time and entry count,
+which the stored signature covers. Listing those directories is milliseconds;
+parsing what is in them is seconds.
+
+Measured effect on this host, isolating the font step between the
+`window-created` and `fonts-ready` startup milestones, with a warm file cache:
+
+| | font step |
+| --- | --- |
+| full scan every launch | 23-58ms |
+| cached font files | 3-5ms |
+
+The cold-cache case is the one that motivated this, and it is the 2.47s above.

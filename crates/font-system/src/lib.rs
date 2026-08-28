@@ -3,14 +3,15 @@
 pub const LAYER: &str = "render performance";
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     error::Error,
     fmt, fs,
     hash::{Hash, Hasher},
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, OnceLock, RwLock,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread::{self, JoinHandle},
@@ -202,8 +203,17 @@ impl fmt::Display for FontError {
 
 impl Error for FontError {}
 
+/// System font discovery, with the scan deferred as long as possible.
+///
+/// `fontdb::Database::load_system_fonts` parses the name tables of every
+/// installed font. On a cold file cache that is seconds of startup, and a
+/// terminal needs three or four faces out of several hundred. So a catalog can
+/// also be built from the handful of files that satisfied the last run, and it
+/// promotes itself to a full scan the first time a query misses.
 struct FontCatalog {
-    database: fontdb::Database,
+    database: RwLock<fontdb::Database>,
+    fully_scanned: AtomicBool,
+    resolved_files: Mutex<BTreeSet<PathBuf>>,
     file_bytes: Mutex<HashMap<FontDataKey, Arc<[u8]>>>,
     parsed_faces: Mutex<HashMap<ParsedFaceKey, Arc<OwnedFontFaces>>>,
 }
@@ -226,11 +236,133 @@ impl FontCatalog {
     fn discover() -> Self {
         let mut database = fontdb::Database::new();
         database.load_system_fonts();
+        Self::with_database(database, true)
+    }
+
+    /// Builds a catalog holding only the given font files.
+    ///
+    /// Files that no longer exist or no longer parse are skipped, which is what
+    /// makes a stale cache harmless: the entries that survive still answer, and
+    /// anything missing turns into a miss, and a miss triggers the full scan.
+    fn from_font_files(paths: &[PathBuf]) -> Self {
+        let mut database = fontdb::Database::new();
+        for path in paths {
+            let _ = database.load_font_file(path);
+        }
+        Self::with_database(database, false)
+    }
+
+    fn with_database(database: fontdb::Database, fully_scanned: bool) -> Self {
         Self {
-            database,
+            database: RwLock::new(database),
+            fully_scanned: AtomicBool::new(fully_scanned),
+            resolved_files: Mutex::new(BTreeSet::new()),
             file_bytes: Mutex::new(HashMap::new()),
             parsed_faces: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn is_fully_scanned(&self) -> bool {
+        self.fully_scanned.load(Ordering::Acquire)
+    }
+
+    /// Loads every installed font, once, however many queries race here.
+    fn ensure_fully_scanned(&self) {
+        if self.is_fully_scanned() {
+            return;
+        }
+        let Ok(mut database) = self.database.write() else {
+            return;
+        };
+        if self.is_fully_scanned() {
+            return;
+        }
+        database.load_system_fonts();
+        self.fully_scanned.store(true, Ordering::Release);
+    }
+
+    /// Answers a face query, scanning the system only if the query misses.
+    ///
+    /// `fontdb::query` returns its best match rather than nothing, so a database
+    /// holding only last run's files would happily answer a bold request with a
+    /// regular face and never scan for the real one. While the catalog is still
+    /// partial, a match therefore has to genuinely satisfy the request; anything
+    /// weaker counts as a miss and promotes to the full scan.
+    fn with_face<T>(
+        &self,
+        query: &fontdb::Query<'_>,
+        extract: impl Fn(&fontdb::FaceInfo) -> T,
+    ) -> Option<T> {
+        if let Some(found) = self.lookup(query, &extract, !self.is_fully_scanned()) {
+            return Some(found);
+        }
+        if self.is_fully_scanned() {
+            return None;
+        }
+        self.ensure_fully_scanned();
+        self.lookup(query, &extract, false)
+    }
+
+    fn lookup<T>(
+        &self,
+        query: &fontdb::Query<'_>,
+        extract: &impl Fn(&fontdb::FaceInfo) -> T,
+        require_exact: bool,
+    ) -> Option<T> {
+        let database = self.database.read().ok()?;
+        let id = database.query(query)?;
+        let face = database.face(id)?;
+        if require_exact && !face_satisfies(face, query) {
+            return None;
+        }
+        Some(extract(face))
+    }
+
+    /// Remembers a file a face was resolved from, so the next run can start
+        // from it instead of scanning.
+    fn record_resolved_file(&self, path: &Path) {
+        if let Ok(mut resolved) = self.resolved_files.lock() {
+            resolved.insert(path.to_path_buf());
+        }
+    }
+
+    fn resolved_files(&self) -> Vec<PathBuf> {
+        self.resolved_files
+            .lock()
+            .map(|resolved| resolved.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The first family name a loaded font file reports, for tests.
+    #[cfg(test)]
+    fn first_family_name(&self, path: &Path) -> Option<String> {
+        let database = self.database.read().ok()?;
+        database.faces().find_map(|face| {
+            let matches = match &face.source {
+                fontdb::Source::File(candidate) | fontdb::Source::SharedFile(candidate, _) => {
+                    candidate == path
+                }
+                fontdb::Source::Binary(_) => false,
+            };
+            matches.then(|| face.families.first().map(|(name, _)| name.clone()))?
+        })
+    }
+
+    /// The file backing a family    /// The file backing a family's regular face, for tests and diagnostics.
+    #[cfg(test)]
+    fn face_source_path(&self, family: &str) -> Option<PathBuf> {
+        let families = family_query(family);
+        let query = fontdb::Query {
+            families: &families,
+            ..fontdb::Query::default()
+        };
+        self.with_face(&query, |face| match &face.source {
+            fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => {
+                Some(path.clone())
+            }
+            fontdb::Source::Binary(_) => None,
+        })
+        .flatten()
     }
 
     fn bytes_for_face(&self, face: &ResolvedFace) -> Result<Arc<[u8]>, String> {
@@ -456,6 +588,25 @@ impl FontSystem {
             pending_faces: HashSet::new(),
             load_generation: 0,
         }
+    }
+
+    /// The font files this view actually resolved a face from.
+    ///
+    /// Persisting these lets the next launch build its catalog from them and
+    /// skip the system scan entirely.
+    #[must_use]
+    pub fn resolved_font_files(&self) -> Vec<PathBuf> {
+        self.catalog.resolved_files()
+    }
+
+    /// Builds a view whose catalog starts from previously resolved font files.
+    #[must_use]
+    pub fn with_font_files(config: FontConfig, scale_factor: f64, files: &[PathBuf]) -> Self {
+        Self::with_catalog(
+            config,
+            scale_factor,
+            Arc::new(FontCatalog::from_font_files(files)),
+        )
     }
 
     /// Builds a new configured font view while reusing the expensive system
@@ -706,14 +857,10 @@ impl FontSystem {
             families: &families,
             ..fontdb::Query::default()
         };
-        let Some(id) = self.catalog.database.query(&query) else {
-            return FontDescriptor {
-                family: family.to_owned(),
-                source: FontSource::Unresolved,
-            };
-        };
-
-        let Some(face) = self.catalog.database.face(id) else {
+        let Some(source) = self
+            .catalog
+            .with_face(&query, |face| source_kind(&face.source))
+        else {
             return FontDescriptor {
                 family: family.to_owned(),
                 source: FontSource::Unresolved,
@@ -722,7 +869,7 @@ impl FontSystem {
 
         FontDescriptor {
             family: family.to_owned(),
-            source: source_kind(&face.source),
+            source,
         }
     }
 
@@ -743,14 +890,26 @@ impl FontSystem {
             },
             ..fontdb::Query::default()
         };
-        let id = self.catalog.database.query(&query)?;
-        let face = self.catalog.database.face(id)?;
-        let (path, binary) = match &face.source {
-            fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => {
-                (Some(path.clone()), None)
-            }
-            fontdb::Source::Binary(bytes) => (None, Some(Arc::clone(bytes))),
-        };
+        let (face_index, face_source, face_weight, face_style, path, binary) =
+            self.catalog.with_face(&query, |face| {
+                let (path, binary) = match &face.source {
+                    fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => {
+                        (Some(path.clone()), None)
+                    }
+                    fontdb::Source::Binary(bytes) => (None, Some(Arc::clone(bytes))),
+                };
+                (
+                    face.index,
+                    source_kind(&face.source),
+                    face.weight,
+                    face.style,
+                    path,
+                    binary,
+                )
+            })?;
+        if let Some(path) = path.as_deref() {
+            self.catalog.record_resolved_file(path);
+        }
         let data_key = match (&path, &binary) {
             (Some(path), _) => FontDataKey::File(path.clone()),
             (_, Some(bytes)) => {
@@ -763,10 +922,10 @@ impl FontSystem {
             _ => return None,
         };
         Some(ResolvedFace {
-            face_index: face.index,
-            source: source_kind(&face.source),
-            bold: face.weight >= fontdb::Weight::SEMIBOLD,
-            italic: face.style != fontdb::Style::Normal,
+            face_index,
+            source: face_source,
+            bold: face_weight >= fontdb::Weight::SEMIBOLD,
+            italic: face_style != fontdb::Style::Normal,
             path,
             binary,
             data_key,
@@ -1032,6 +1191,32 @@ fn points_to_physical_pixels(points: f32, scale_factor: f32) -> f32 {
     const CSS_PIXELS_PER_INCH: f32 = 96.0;
     const POINTS_PER_INCH: f32 = 72.0;
     (points * CSS_PIXELS_PER_INCH / POINTS_PER_INCH * scale_factor).max(1.0)
+}
+
+/// Whether a face actually satisfies a query, rather than merely being the
+/// closest thing a small database happened to hold.
+///
+/// Generic families are never accepted from a partial database: there is no
+/// name to check them against, so `monospace` would match whatever single font
+/// was loaded.
+fn face_satisfies(face: &fontdb::FaceInfo, query: &fontdb::Query<'_>) -> bool {
+    let named = query.families.iter().any(|family| match family {
+        fontdb::Family::Name(name) => face
+            .families
+            .iter()
+            .any(|(candidate, _)| candidate.eq_ignore_ascii_case(name)),
+        _ => false,
+    });
+    if !named {
+        return false;
+    }
+    if query.weight >= fontdb::Weight::BOLD && face.weight < fontdb::Weight::SEMIBOLD {
+        return false;
+    }
+    if query.style != fontdb::Style::Normal && face.style == fontdb::Style::Normal {
+        return false;
+    }
+    true
 }
 
 fn family_query(family: &str) -> Vec<fontdb::Family<'_>> {
@@ -1894,6 +2079,138 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_partial_catalog_resolves_a_cached_face_without_scanning_the_system() {
+        // Whatever this host resolves for the generic monospace family is a real
+        // font file; feeding that one path back in must be enough to resolve it
+        // again, with no system scan.
+        let full = FontCatalog::discover();
+        let Some(seed) = full.face_source_path("monospace") else {
+            eprintln!("no resolvable monospace face on this host");
+            return;
+        };
+        // A named family, because a generic one deliberately always promotes.
+        let Some(family) = full.first_family_name(&seed) else {
+            eprintln!("resolved face reports no family name");
+            return;
+        };
+
+        let partial = FontCatalog::from_font_files(std::slice::from_ref(&seed));
+        assert!(
+            !partial.is_fully_scanned(),
+            "a catalog built from cached paths must start unscanned"
+        );
+        let resolved = partial.face_source_path(&family);
+        assert_eq!(
+            resolved.as_ref(),
+            Some(&seed),
+            "the cached face must resolve from the partial database"
+        );
+        assert!(
+            !partial.is_fully_scanned(),
+            "resolving a cached face must not trigger a system scan"
+        );
+    }
+
+    #[test]
+    fn a_miss_on_a_partial_catalog_promotes_it_to_a_full_scan() {
+        let partial = FontCatalog::from_font_files(&[]);
+        assert!(!partial.is_fully_scanned());
+
+        // An empty database cannot answer this, so the catalog has to scan.
+        let resolved = partial.face_source_path("monospace");
+        assert!(
+            partial.is_fully_scanned(),
+            "a miss must promote the catalog to a full system scan"
+        );
+        let full = FontCatalog::discover();
+        assert_eq!(
+            resolved,
+            full.face_source_path("monospace"),
+            "after promotion the partial catalog must answer like a full one"
+        );
+    }
+
+    #[test]
+    fn the_catalog_reports_only_the_font_files_it_actually_resolved() {
+        let mut fonts = FontSystem::new(FontConfig::default());
+        if fonts.primary_font().is_err() {
+            eprintln!("no primary font on this host");
+            return;
+        }
+        let used = fonts.resolved_font_files();
+        assert!(
+            !used.is_empty(),
+            "resolving a primary font must record the file it came from"
+        );
+        assert!(
+            used.len() < 64,
+            "only the faces actually used should be recorded, got {}",
+            used.len()
+        );
+        for path in &used {
+            assert!(path.exists(), "recorded font file must exist: {path:?}");
+        }
+    }
+    #[test]
+    fn a_partial_catalog_will_not_answer_a_bold_request_with_a_regular_face() {
+        // The failure this guards: fontdb returns its closest match rather than
+        // nothing, so a catalog holding only a regular file would answer "give me
+        // bold" with that regular face and never scan for a real bold one.
+        let full = FontCatalog::discover();
+        let Some(regular) = full.face_source_path("monospace") else {
+            eprintln!("no resolvable monospace face on this host");
+            return;
+        };
+        let Some(family) = full.first_family_name(&regular) else {
+            eprintln!("resolved face reports no family name");
+            return;
+        };
+
+        let partial = FontCatalog::from_font_files(std::slice::from_ref(&regular));
+        let families = family_query(&family);
+        let bold = fontdb::Query {
+            families: &families,
+            weight: fontdb::Weight::BOLD,
+            ..fontdb::Query::default()
+        };
+        let resolved_weight = partial.with_face(&bold, |face| face.weight);
+        assert!(
+            partial.is_fully_scanned(),
+            "a bold request the cached file cannot satisfy must promote to a full scan"
+        );
+        if let Some(weight) = resolved_weight {
+            assert!(
+                weight >= fontdb::Weight::SEMIBOLD
+                    || full
+                        .with_face(&bold, |face| face.weight)
+                        .is_some_and(|full_weight| full_weight == weight),
+                "after scanning, the answer must match what a full catalog gives"
+            );
+        }
+    }
+
+    #[test]
+    fn a_partial_catalog_never_answers_a_generic_family_from_one_cached_file() {
+        // "monospace" has no name to verify against, so a single cached file must
+        // not be allowed to stand in for the platform's real monospace choice.
+        let full = FontCatalog::discover();
+        let Some(seed) = full.face_source_path("monospace") else {
+            eprintln!("no resolvable monospace face on this host");
+            return;
+        };
+        let partial = FontCatalog::from_font_files(std::slice::from_ref(&seed));
+        let families = family_query("monospace");
+        let query = fontdb::Query {
+            families: &families,
+            ..fontdb::Query::default()
+        };
+        let _ = partial.with_face(&query, |face| face.index);
+        assert!(
+            partial.is_fully_scanned(),
+            "a generic family must promote a partial catalog to a full scan"
+        );
+    }
     #[test]
     fn monochrome_outline_rasterization_uses_the_unweighted_outline_mask() {
         let mut fonts = FontSystem::new(FontConfig::default());
