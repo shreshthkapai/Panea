@@ -4383,10 +4383,13 @@ fn held_enter_prompt_redraws_never_leave_cursor_ink_outside_damage() {
     let cursor_cell = cell_region(current.cursor.expect("cursor").position, font_metrics);
     let drawn = batch_quad_bounds(&final_batches.cursor);
     assert!(
-        drawn.iter().any(|rect| rect_contains(cursor_cell, *rect))
-            || previous_ink
-                .iter()
-                .any(|rect| rect_contains(cursor_cell, *rect)),
-        "after settling, the cursor must be drawn inside its own cell {cursor_cell:?}; drawn={drawn:?} previous={previous_ink:?}"
+        !final_batches.cursor.vertices.is_empty(),
+        "once every cursor animation has expired, the settling frame must draw the static cursor: animations={} damage={:?}",
+        current.animations.len(),
+        final_batches.damage_regions
+    );
+    assert!(
+        drawn.iter().any(|rect| rect_contains(cursor_cell, *rect)),
+        "after settling, the cursor must be drawn inside its own cell {cursor_cell:?}; drawn={drawn:?}"
     );
 }
