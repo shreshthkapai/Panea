@@ -2,7 +2,16 @@
 
 pub const LAYER: &str = "semantic meaning";
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
+
+/// Upper bound on retained command blocks. A long-lived shell produces roughly
+/// five regions per prompt, so an append-only timeline grows for the entire life
+/// of the pane; the oldest blocks are dropped together with the regions only
+/// they referenced.
+pub const MAX_RETAINED_COMMAND_BLOCKS: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BufferPosition {
@@ -151,6 +160,12 @@ pub enum SemanticEvent {
         exit_status: CommandStatus,
         duration: Duration,
     },
+    /// A shell reported the command line itself rather than leaving it to be
+    /// read back off the screen (VS Code's `OSC 633;E`).
+    CommandLineRecorded {
+        position: BufferPosition,
+        command: String,
+    },
     CurrentWorkingDirectoryChanged {
         position: BufferPosition,
         directory: String,
@@ -245,13 +260,27 @@ pub enum SemanticActionResult {
     Noop,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SemanticPositionKey {
+    RegionStart(u64),
+    RegionEnd(u64),
+    CommandStart(u64),
+    CommandEnd(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SemanticPositionEntry {
+    pub key: SemanticPositionKey,
+    pub position: BufferPosition,
+}
+
 pub trait TerminalTextProvider {
     fn text_for_span(&self, span: SemanticSpan) -> Option<String>;
 }
 
 #[derive(Debug, Clone)]
 pub struct SemanticTimelineStore {
-    regions: Vec<SemanticRegion>,
+    regions: BTreeMap<u64, SemanticRegion>,
     command_blocks: Vec<CommandBlock>,
     metadata: SemanticMetadata,
     next_region_id: u64,
@@ -263,6 +292,7 @@ pub struct SemanticTimelineStore {
     last_event: Option<(SemanticEventKind, Instant)>,
     mode: IntegrationMode,
     remote_integration_active: bool,
+    revision: u64,
 }
 
 impl Default for SemanticTimelineStore {
@@ -275,7 +305,7 @@ impl SemanticTimelineStore {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            regions: Vec::new(),
+            regions: BTreeMap::new(),
             command_blocks: Vec::new(),
             metadata: SemanticMetadata::default(),
             next_region_id: 1,
@@ -287,17 +317,114 @@ impl SemanticTimelineStore {
             last_event: None,
             mode: IntegrationMode::EscapeSequences,
             remote_integration_active: false,
+            revision: 1,
         }
     }
 
+    /// Monotonic revision for render-facing semantic state.
     #[must_use]
-    pub fn regions(&self) -> &[SemanticRegion] {
-        &self.regions
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1).max(1);
+    }
+
+    pub fn regions(&self) -> impl DoubleEndedIterator<Item = &SemanticRegion> + '_ {
+        self.regions.values()
+    }
+
+    /// Looks up one region by id without scanning the timeline.
+    #[must_use]
+    pub fn region(&self, id: u64) -> Option<&SemanticRegion> {
+        self.regions.get(&id)
+    }
+
+    #[must_use]
+    pub fn region_count(&self) -> usize {
+        self.regions.len()
     }
 
     #[must_use]
     pub fn command_blocks(&self) -> &[CommandBlock] {
         &self.command_blocks
+    }
+
+    /// Exports every retained row-bearing position with a stable semantic key
+    /// so terminal resize can remap it without importing this crate.
+    #[must_use]
+    pub fn position_entries(&self) -> Vec<SemanticPositionEntry> {
+        let mut entries = Vec::with_capacity(
+            self.regions.len().saturating_mul(2) + self.command_blocks.len().saturating_mul(2),
+        );
+        for region in self.regions.values() {
+            entries.push(SemanticPositionEntry {
+                key: SemanticPositionKey::RegionStart(region.id),
+                position: region.start,
+            });
+            if let Some(position) = region.end {
+                entries.push(SemanticPositionEntry {
+                    key: SemanticPositionKey::RegionEnd(region.id),
+                    position,
+                });
+            }
+        }
+        for block in &self.command_blocks {
+            entries.push(SemanticPositionEntry {
+                key: SemanticPositionKey::CommandStart(block.region_id),
+                position: block.started_at,
+            });
+            if let Some(position) = block.ended_at {
+                entries.push(SemanticPositionEntry {
+                    key: SemanticPositionKey::CommandEnd(block.region_id),
+                    position,
+                });
+            }
+        }
+        entries
+    }
+
+    pub fn apply_position_entries(&mut self, entries: &[SemanticPositionEntry]) {
+        if entries.is_empty() {
+            return;
+        }
+        for entry in entries {
+            match entry.key {
+                SemanticPositionKey::RegionStart(id) => {
+                    if let Some(region) = self.regions.get_mut(&id) {
+                        region.start = entry.position;
+                    }
+                }
+                SemanticPositionKey::RegionEnd(id) => {
+                    if let Some(region) = self.regions.get_mut(&id)
+                        && region.end.is_some()
+                    {
+                        region.end = Some(entry.position);
+                    }
+                }
+                SemanticPositionKey::CommandStart(id) => {
+                    if let Some(block) = self
+                        .command_blocks
+                        .iter_mut()
+                        .find(|block| block.region_id == id)
+                    {
+                        block.started_at = entry.position;
+                    }
+                }
+                SemanticPositionKey::CommandEnd(id) => {
+                    if let Some(block) = self
+                        .command_blocks
+                        .iter_mut()
+                        .find(|block| block.region_id == id)
+                        && block.ended_at.is_some()
+                    {
+                        block.ended_at = Some(entry.position);
+                    }
+                }
+            }
+        }
+        self.bump_revision();
     }
 
     #[must_use]
@@ -306,7 +433,11 @@ impl SemanticTimelineStore {
     }
 
     pub fn set_integration_mode(&mut self, mode: IntegrationMode) {
+        if self.mode == mode {
+            return;
+        }
         self.mode = mode;
+        self.bump_revision();
     }
 
     #[must_use]
@@ -317,13 +448,21 @@ impl SemanticTimelineStore {
     /// Records transport-provided remote context without claiming that remote
     /// shell integration has emitted a semantic marker.
     pub fn set_remote_session_metadata(&mut self, metadata: RemoteMetadata) {
+        if self.metadata.remote.as_ref() == Some(&metadata) {
+            return;
+        }
         self.metadata.remote = Some(metadata);
+        self.bump_revision();
     }
 
     /// Marks that a semantic marker was actually observed in a remote byte
     /// stream. Transport metadata alone must not call this method.
     pub fn mark_remote_integration_active(&mut self) {
+        if self.remote_integration_active {
+            return;
+        }
         self.remote_integration_active = true;
+        self.bump_revision();
     }
 
     pub fn apply_event(&mut self, event: SemanticEvent) {
@@ -341,6 +480,9 @@ impl SemanticTimelineStore {
                 exit_status,
                 duration,
             } => self.command_finished(position, exit_status, duration),
+            SemanticEvent::CommandLineRecorded { position, command } => {
+                self.command_line_recorded(position, command);
+            }
             SemanticEvent::CurrentWorkingDirectoryChanged {
                 directory, remote, ..
             } => {
@@ -419,26 +561,18 @@ impl SemanticTimelineStore {
     #[must_use]
     pub fn output_span_for_command(&self, block: &CommandBlock) -> Option<SemanticSpan> {
         let region_id = block.output_region_id?;
-        self.regions
-            .iter()
-            .find(|region| region.id == region_id)
-            .and_then(SemanticRegion::span)
+        self.regions.get(&region_id).and_then(SemanticRegion::span)
     }
 
     #[must_use]
     pub fn command_span(&self, block: &CommandBlock) -> Option<SemanticSpan> {
-        let region = self
-            .regions
-            .iter()
-            .find(|region| region.id == block.region_id)?;
-        region.span()
+        self.regions.get(&block.region_id)?.span()
     }
 
     #[must_use]
     pub fn command_metadata(&self, block: &CommandBlock) -> Option<&SemanticMetadata> {
         self.regions
-            .iter()
-            .find(|region| region.id == block.region_id)
+            .get(&block.region_id)
             .map(|region| &region.metadata)
     }
 
@@ -454,8 +588,7 @@ impl SemanticTimelineStore {
         let region_id = block.input_region_id?;
         let span = self
             .regions
-            .iter()
-            .find(|region| region.id == region_id)
+            .get(&region_id)
             .and_then(SemanticRegion::span)?;
         provider.text_for_span(span)
     }
@@ -523,24 +656,217 @@ impl SemanticTimelineStore {
     ) -> u64 {
         let id = self.next_region_id;
         self.next_region_id += 1;
-        self.regions.push(SemanticRegion {
+        self.regions.insert(
             id,
-            kind,
-            start: position,
-            end: None,
-            metadata,
-        });
+            SemanticRegion {
+                id,
+                kind,
+                start: position,
+                end: None,
+                metadata,
+            },
+        );
         id
     }
 
     fn close_region(&mut self, id: u64, position: BufferPosition) {
-        if let Some(region) = self.regions.iter_mut().find(|region| region.id == id) {
+        if let Some(region) = self.regions.get_mut(&id) {
             region.end = Some(position);
         }
     }
 
+    fn is_open_region(&self, id: u64) -> bool {
+        [
+            self.open_prompt,
+            self.open_input,
+            self.open_output,
+            self.open_command,
+        ]
+        .contains(&Some(id))
+    }
+
+    /// Opens the command and input regions for a new command line.
+    ///
+    /// Idempotent: a shell that marks the end of its prompt *and* the start of
+    /// input (FinalTerm `B` followed by an explicit `I`, or Panea's own
+    /// `prompt_end` plus `input_start`) must produce one command block, not two.
+    fn begin_input(&mut self, position: BufferPosition) {
+        if self.open_input.is_some() {
+            return;
+        }
+        let command_region_id = match self.open_command {
+            Some(open) => open,
+            None => {
+                let id =
+                    self.open_region(SemanticRegionKind::Command, position, self.metadata.clone());
+                self.open_command = Some(id);
+                id
+            }
+        };
+        let input_region_id =
+            self.open_region(SemanticRegionKind::Input, position, self.metadata.clone());
+        self.open_input = Some(input_region_id);
+        self.active_command_started = Some(Instant::now());
+
+        // Reuse the block a prior marker already opened for this command rather
+        // than starting a second one for the same prompt.
+        if let Some(block) = self.command_blocks.last_mut()
+            && block.region_id == command_region_id
+        {
+            block.input_region_id = Some(input_region_id);
+            return;
+        }
+        self.command_blocks.push(CommandBlock {
+            region_id: command_region_id,
+            input_region_id: Some(input_region_id),
+            output_region_id: None,
+            command: String::new(),
+            status: CommandStatus::Running,
+            started_at: position,
+            ended_at: None,
+            duration: None,
+        });
+        self.prune_to_capacity();
+    }
+
+    /// Records the command line a shell reported out of band (VS Code's
+    /// `OSC 633;E`), so command blocks have text even when the input region is
+    /// never rendered.
+    fn command_line_recorded(&mut self, position: BufferPosition, command: String) {
+        self.begin_input(position);
+        if let Some(block) = self.command_blocks.last_mut()
+            && matches!(block.status, CommandStatus::Running)
+        {
+            block.command = command;
+        }
+    }
+
+    /// Drops the oldest command blocks, and every region only they referenced,
+    /// once the retained history exceeds [`MAX_RETAINED_COMMAND_BLOCKS`].
+    fn prune_to_capacity(&mut self) {
+        if self.command_blocks.len() <= MAX_RETAINED_COMMAND_BLOCKS {
+            return;
+        }
+        let excess = self.command_blocks.len() - MAX_RETAINED_COMMAND_BLOCKS;
+        self.command_blocks.drain(..excess);
+        self.drop_regions_before_retained_blocks();
+    }
+
+    /// Region ids increase monotonically, so everything below the lowest id a
+    /// retained block still references is unreachable.
+    fn drop_regions_before_retained_blocks(&mut self) {
+        let lowest_retained = self
+            .command_blocks
+            .iter()
+            .flat_map(|block| {
+                [
+                    Some(block.region_id),
+                    block.input_region_id,
+                    block.output_region_id,
+                ]
+            })
+            .flatten()
+            .min();
+        let Some(lowest_retained) = lowest_retained else {
+            let open = self.regions.keys().copied().collect::<Vec<_>>();
+            for id in open {
+                if !self.is_open_region(id) {
+                    self.regions.remove(&id);
+                }
+            }
+            return;
+        };
+        let unreachable = self
+            .regions
+            .range(..lowest_retained)
+            .map(|(id, _)| *id)
+            .filter(|id| !self.is_open_region(*id))
+            .collect::<Vec<_>>();
+        for id in unreachable {
+            self.regions.remove(&id);
+        }
+    }
+
+    /// The id the next region will be given.
+    ///
+    /// Callers snapshot it to mark a boundary, then pass it to
+    /// [`Self::discard_regions_from`] to drop everything recorded after it.
+    #[must_use]
+    pub const fn region_id_watermark(&self) -> u64 {
+        self.next_region_id
+    }
+
+    /// Drops every region and command block recorded at or after `id`.
+    pub fn discard_regions_from(&mut self, id: u64) {
+        self.regions.retain(|region_id, _| *region_id < id);
+        self.command_blocks.retain(|block| block.region_id < id);
+        for open in [
+            &mut self.open_prompt,
+            &mut self.open_input,
+            &mut self.open_output,
+            &mut self.open_command,
+        ] {
+            if open.is_some_and(|open| open >= id) {
+                *open = None;
+            }
+        }
+    }
+
+    /// Shifts every recorded row up by `lines`, matching a scrollback eviction
+    /// of the same size.
+    ///
+    /// Absolute buffer rows move down as lines leave the top of the buffer, so a
+    /// timeline that is not rebased ends up pointing at whatever text later
+    /// occupies its old coordinates. Call this with the terminal's eviction
+    /// delta (`TerminalState::scrollback_dropped` since the last call) before
+    /// [`Self::prune_before_row`], which assumes rows are already current.
+    pub fn rebase_rows(&mut self, lines: u64) {
+        if lines == 0 {
+            return;
+        }
+        let shift = i64::try_from(lines).unwrap_or(i64::MAX);
+        for region in self.regions.values_mut() {
+            region.start.row -= shift;
+            if let Some(end) = region.end.as_mut() {
+                end.row -= shift;
+            }
+        }
+        for block in &mut self.command_blocks {
+            block.started_at.row -= shift;
+            if let Some(ended_at) = block.ended_at.as_mut() {
+                ended_at.row -= shift;
+            }
+        }
+        self.bump_revision();
+    }
+
+    /// Drops history that has scrolled out of the retained buffer. Callers pass
+    /// the lowest buffer row still addressable after scrollback eviction; rows
+    /// below it can no longer be resolved to text, so keeping their regions only
+    /// costs memory and slows every lookup.
+    pub fn prune_before_row(&mut self, row: i64) {
+        self.command_blocks.retain(|block| match block.ended_at {
+            Some(ended_at) => ended_at.row >= row,
+            None => true,
+        });
+        let scrolled_out = self
+            .regions
+            .iter()
+            .filter(|(id, region)| {
+                !self.is_open_region(**id) && region.end.is_some_and(|end| end.row < row)
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for id in scrolled_out {
+            self.regions.remove(&id);
+        }
+        self.drop_regions_before_retained_blocks();
+        self.bump_revision();
+    }
+
     fn mark_event(&mut self, kind: SemanticEventKind) {
         self.last_event = Some((kind, Instant::now()));
+        self.bump_revision();
     }
 }
 
@@ -559,30 +885,16 @@ impl SemanticTimeline for SemanticTimelineStore {
         if let Some(region_id) = self.open_prompt.take() {
             self.close_region(region_id, position);
         }
+        // FinalTerm `OSC 133;B` marks the end of the prompt *and* the start of
+        // user input. Shells that emit it without a separate input marker (fish's
+        // built-in integration) otherwise never open an input region, which left
+        // their command blocks with no recoverable command text.
+        self.begin_input(position);
     }
 
     fn input_started(&mut self, position: BufferPosition) {
         self.mark_event(SemanticEventKind::InputStarted);
-        if let Some(region_id) = self.open_input.take() {
-            self.close_region(region_id, position);
-        }
-        let command_region_id =
-            self.open_region(SemanticRegionKind::Command, position, self.metadata.clone());
-        let input_region_id =
-            self.open_region(SemanticRegionKind::Input, position, self.metadata.clone());
-        self.open_command = Some(command_region_id);
-        self.open_input = Some(input_region_id);
-        self.active_command_started = Some(Instant::now());
-        self.command_blocks.push(CommandBlock {
-            region_id: command_region_id,
-            input_region_id: Some(input_region_id),
-            output_region_id: None,
-            command: String::new(),
-            status: CommandStatus::Running,
-            started_at: position,
-            ended_at: None,
-            duration: None,
-        });
+        self.begin_input(position);
     }
 
     fn input_ended(&mut self, position: BufferPosition) {
@@ -614,6 +926,7 @@ impl SemanticTimeline for SemanticTimelineStore {
                 ended_at: None,
                 duration: None,
             });
+            self.prune_to_capacity();
         }
         if let Some(region_id) = self.open_input.take() {
             self.close_region(region_id, position);
@@ -700,6 +1013,9 @@ impl SemanticEvent {
                 exit_status,
                 duration,
             },
+            Self::CommandLineRecorded { command, .. } => {
+                Self::CommandLineRecorded { position, command }
+            }
             Self::CurrentWorkingDirectoryChanged {
                 directory, remote, ..
             } => Self::CurrentWorkingDirectoryChanged {
@@ -726,6 +1042,9 @@ impl SemanticEvent {
             Self::OutputStarted { .. } => SemanticEventKind::OutputStarted,
             Self::OutputEnded { .. } => SemanticEventKind::OutputEnded,
             Self::CommandFinished { .. } => SemanticEventKind::CommandFinished,
+            // Reported alongside the start of input, and diagnostics track the
+            // boundary rather than the transport detail, so it shares that kind.
+            Self::CommandLineRecorded { .. } => SemanticEventKind::InputStarted,
             Self::CurrentWorkingDirectoryChanged { .. } => {
                 SemanticEventKind::CurrentWorkingDirectoryChanged
             }
@@ -863,6 +1182,219 @@ mod tests {
         assert_eq!(hints[0].start, BufferPosition::new(4, 5));
     }
 
+    fn run_one_command(timeline: &mut SemanticTimelineStore, row: i64) {
+        timeline.prompt_started(BufferPosition::new(row, 0), SemanticMetadata::default());
+        timeline.prompt_ended(BufferPosition::new(row, 2));
+        timeline.input_started(BufferPosition::new(row, 2));
+        timeline.input_ended(BufferPosition::new(row, 9));
+        timeline.output_started(BufferPosition::new(row + 1, 0));
+        timeline.command_finished(
+            BufferPosition::new(row + 2, 0),
+            CommandStatus::Code(0),
+            Duration::from_millis(1),
+        );
+    }
+
+    #[test]
+    fn long_lived_sessions_stop_accumulating_semantic_regions() {
+        let mut timeline = SemanticTimelineStore::new();
+        for index in 0..(MAX_RETAINED_COMMAND_BLOCKS as i64 + 200) {
+            run_one_command(&mut timeline, index * 3);
+        }
+
+        assert_eq!(
+            timeline.command_blocks().len(),
+            MAX_RETAINED_COMMAND_BLOCKS,
+            "retained command history must stay bounded"
+        );
+        // Four regions per command survive for retained blocks; an unbounded
+        // store would hold well over five thousand here.
+        assert!(
+            timeline.region_count() <= MAX_RETAINED_COMMAND_BLOCKS * 4 + 8,
+            "regions must be dropped with the blocks that referenced them, got {}",
+            timeline.region_count()
+        );
+        let newest = timeline
+            .command_blocks()
+            .last()
+            .expect("newest command block");
+        assert!(
+            timeline.command_span(newest).is_some(),
+            "pruning must never drop regions the retained blocks still reference"
+        );
+    }
+
+    struct StaticText(&'static str);
+
+    impl TerminalTextProvider for StaticText {
+        fn text_for_span(&self, _span: SemanticSpan) -> Option<String> {
+            Some(self.0.to_owned())
+        }
+    }
+
+    #[test]
+    fn a_prompt_end_marker_alone_opens_the_input_region() {
+        // fish's built-in integration emits OSC 133 A/B/C/D with no separate
+        // input marker, so B has to start input or the command block never has
+        // recoverable text.
+        // The exact sequence fish emits: A, B, C, D.
+        let mut timeline = SemanticTimelineStore::new();
+        timeline.prompt_started(BufferPosition::new(3, 0), SemanticMetadata::default());
+        timeline.prompt_ended(BufferPosition::new(3, 2));
+        timeline.output_started(BufferPosition::new(4, 0));
+        timeline.command_finished(
+            BufferPosition::new(5, 0),
+            CommandStatus::Code(0),
+            Duration::from_millis(4),
+        );
+
+        let block = timeline.command_blocks().first().expect("command block");
+        assert!(
+            block.input_region_id.is_some(),
+            "prompt end must open an input region"
+        );
+        assert_eq!(
+            timeline
+                .command_text(block, &StaticText("git status"))
+                .as_deref(),
+            Some("git status"),
+            "the input span must be resolvable once output starts"
+        );
+        assert!(
+            timeline.output_span_for_command(block).is_some(),
+            "output must still be attributed to the block"
+        );
+    }
+
+    #[test]
+    fn a_prompt_end_followed_by_an_input_marker_makes_one_command_block() {
+        let mut timeline = SemanticTimelineStore::new();
+        timeline.prompt_started(BufferPosition::new(0, 0), SemanticMetadata::default());
+        timeline.prompt_ended(BufferPosition::new(0, 2));
+        // Panea's own protocol sends both; two blocks for one prompt would
+        // double every command in the block list.
+        timeline.input_started(BufferPosition::new(0, 2));
+        timeline.input_ended(BufferPosition::new(0, 9));
+        timeline.output_started(BufferPosition::new(1, 0));
+
+        assert_eq!(timeline.command_blocks().len(), 1);
+    }
+
+    #[test]
+    fn a_recorded_command_line_lands_on_the_running_block() {
+        let mut timeline = SemanticTimelineStore::new();
+        timeline.prompt_started(BufferPosition::new(0, 0), SemanticMetadata::default());
+        timeline.apply_event(SemanticEvent::CommandLineRecorded {
+            position: BufferPosition::new(0, 2),
+            command: "cargo test".to_owned(),
+        });
+
+        let block = timeline.command_blocks().first().expect("command block");
+        assert_eq!(block.command, "cargo test");
+        // A reported command line wins over reading the screen back.
+        assert_eq!(
+            timeline
+                .command_text(block, &StaticText("something else"))
+                .as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(timeline.command_blocks().len(), 1);
+    }
+
+    #[test]
+    fn rebasing_rows_keeps_regions_on_their_text_after_eviction() {
+        let mut timeline = SemanticTimelineStore::new();
+        run_one_command(&mut timeline, 100);
+        let before = timeline
+            .command_blocks()
+            .first()
+            .expect("command block")
+            .started_at
+            .row;
+
+        timeline.rebase_rows(40);
+
+        let after = timeline
+            .command_blocks()
+            .first()
+            .expect("command block")
+            .started_at
+            .row;
+        assert_eq!(
+            after,
+            before - 40,
+            "recorded rows must follow their text when the buffer drops lines"
+        );
+        assert!(
+            timeline.regions().all(|region| region.start.row < before),
+            "every region row must be rebased, not just command blocks"
+        );
+    }
+
+    #[test]
+    fn semantic_position_entries_round_trip_through_external_reflow_mapping() {
+        let mut timeline = SemanticTimelineStore::new();
+        run_one_command(&mut timeline, 10);
+
+        let mut entries = timeline.position_entries();
+        for entry in &mut entries {
+            entry.position.row += 7;
+            entry.position.col += 1;
+        }
+        timeline.apply_position_entries(&entries);
+
+        assert!(
+            timeline
+                .regions()
+                .all(|region| region.start.row >= 17 && region.start.col >= 1)
+        );
+        assert!(
+            timeline
+                .command_blocks()
+                .iter()
+                .all(|block| block.started_at.row >= 17 && block.started_at.col >= 1)
+        );
+    }
+
+    #[test]
+    fn scrolled_out_history_is_pruned_and_open_regions_survive() {
+        let mut timeline = SemanticTimelineStore::new();
+        run_one_command(&mut timeline, 0);
+        run_one_command(&mut timeline, 100);
+        // An in-flight command: its prompt region is still open.
+        timeline.prompt_started(BufferPosition::new(200, 0), SemanticMetadata::default());
+        let regions_before = timeline.region_count();
+
+        timeline.prune_before_row(150);
+
+        assert_eq!(
+            timeline.command_blocks().len(),
+            0,
+            "commands whose rows left the retained buffer must be dropped"
+        );
+        assert!(timeline.region_count() < regions_before);
+        assert!(
+            timeline
+                .regions()
+                .any(|region| region.kind == SemanticRegionKind::Prompt && region.end.is_none()),
+            "an open region must survive pruning even when its row is below the watermark"
+        );
+    }
+
+    #[test]
+    fn regions_are_addressable_by_id_without_scanning() {
+        let mut timeline = SemanticTimelineStore::new();
+        run_one_command(&mut timeline, 4);
+        let block = &timeline.command_blocks()[0];
+
+        let region = timeline
+            .region(block.region_id)
+            .expect("command region by id");
+
+        assert_eq!(region.id, block.region_id);
+        assert!(timeline.region(u64::MAX).is_none());
+    }
+
     #[test]
     fn timeline_tracks_command_regions_without_mutating_text() {
         let mut timeline = SemanticTimelineStore::new();
@@ -976,5 +1508,23 @@ mod tests {
                 .and_then(|remote| remote.remote_host.as_deref()),
             Some("example.test")
         );
+    }
+
+    #[test]
+    fn revision_advances_for_semantic_and_position_mutations() {
+        let mut timeline = SemanticTimelineStore::new();
+        let initial = timeline.revision();
+
+        timeline.apply_event(SemanticEvent::PromptStarted {
+            position: BufferPosition::new(4, 0),
+            metadata: SemanticMetadata::default(),
+        });
+        let event_revision = timeline.revision();
+        assert!(event_revision > initial);
+
+        let mut positions = timeline.position_entries();
+        positions[0].position.row = 9;
+        timeline.apply_position_entries(&positions);
+        assert!(timeline.revision() > event_revision);
     }
 }

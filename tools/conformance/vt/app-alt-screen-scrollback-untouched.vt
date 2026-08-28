@@ -1,0 +1,12 @@
+# Alternate-screen output must never reach the primary screen's scrollback:
+# that is what keeps a full-screen program from polluting shell history.
+size: 12x3
+description: alternate-screen output does not enter the primary scrollback
+
+--- input
+one\r\ntwo\r\nthree\r\n\e[?1049hALT\r\nALT2\r\nALT3\r\nALT4\e[?1049l
+
+--- expect-grid
+|two|
+|three|
+||

@@ -74,6 +74,50 @@ Renderer commands report cold cache population separately from timed warm
 iterations, so glyph discovery/rasterization cost is not confused with steady
 state batch preparation.
 
+## Lazy Scrollback Reflow
+
+Primary-screen history is stored as canonical logical lines. A column resize
+recalculates compact physical-row counts, moves and reflows the mutable visible
+tail, and leaves cold historical rows unmaterialized. Viewport access derives
+immutable physical rows on demand through a bounded 64-logical-line cache.
+Selections, desktop semantic positions, and search results are remapped or
+recomputed during the same resize operation.
+
+Each canonical logical line also retains a bounded four-width row-count
+summary. Repeated window, fullscreen, and pane-layout widths therefore rebuild
+the physical-row index without rescanning cold text. Changing to a new width
+performs one compact cell scan but still does not shape, allocate, or retain the
+derived historical rows.
+
+Run `cargo xtask bench resize-scrollback` to measure alternating-width resize
+latency over a deterministic large history. The report includes canonical line
+and cell counts, currently materialized lines and rows, cache hits/misses and
+evictions, and cells scanned for compact row-count metadata. The benchmark
+fails if the derived-row cache exceeds its configured bound or repeated width
+cycles rescan cold history beyond the bounded width-summary budget.
+
+## Retained Scene Construction
+
+Desktop rendering retains the previous renderer-independent scene instead of
+cloning the complete terminal grid for every frame. Terminal lines expose
+borrowed rows with generation counters; a terminal render revision provides a
+constant-time unchanged-pane check, and changed panes compare row generations
+before rewriting cells in place. Cursor-only changes retain every grid row.
+
+Mux layouts are keyed by a monotonic model layout revision plus surface size,
+cell metrics, and tab-bar height. Split, resize, zoom, move, tab, workspace, and
+pane topology changes invalidate the layout; terminal output and title-only
+updates do not. Visible tab-title changes rebuild tab chrome while reusing the
+cached pane layout. Search, selection, and semantic overlays use independent
+revisions so an update in one category does not reconstruct unrelated overlay
+data. Config reloads explicitly invalidate the complete scene.
+
+The performance instrumentation reports scene layout cache hits/builds and
+rows reused/rebuilt. Unit tests gate unchanged frames, one-row output changes,
+cursor-only updates, selection invalidation, config reload, surface resize,
+and tab-chrome updates. These counters establish retained-work behavior; they
+are not a cross-platform latency claim.
+
 ## Local Engineering Baseline
 
 This is a dated development baseline, not a cross-product or cross-platform

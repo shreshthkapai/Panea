@@ -47,6 +47,8 @@ pub struct RenderCellStyle {
     pub italic: bool,
     pub underline: bool,
     pub strikethrough: bool,
+    pub overline: bool,
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -372,6 +374,10 @@ pub struct RenderInstrumentation {
     pub parser_bytes_per_second: u64,
     pub memory_usage_bytes: Option<u64>,
     pub scrollback_memory_bytes: u64,
+    pub scene_layout_cache_hits: u64,
+    pub scene_layout_builds: u64,
+    pub scene_rows_rebuilt: u64,
+    pub scene_rows_reused: u64,
 }
 
 impl Default for RenderInstrumentation {
@@ -391,6 +397,10 @@ impl Default for RenderInstrumentation {
             parser_bytes_per_second: 0,
             memory_usage_bytes: None,
             scrollback_memory_bytes: 0,
+            scene_layout_cache_hits: 0,
+            scene_layout_builds: 0,
+            scene_rows_rebuilt: 0,
+            scene_rows_reused: 0,
         }
     }
 }

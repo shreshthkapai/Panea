@@ -5802,6 +5802,7 @@ const FUZZ_TARGETS: &[&str] = &[
     "unicode",
     "selection_ranges",
     "osc_dcs",
+    "osc7",
     "shell_markers",
 ];
 

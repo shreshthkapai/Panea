@@ -9,17 +9,23 @@ use std::{
     hash::{Hash, Hasher},
     path::PathBuf,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc, Mutex, OnceLock,
+        mpsc::{self, Receiver, SyncSender},
+    },
+    thread::{self, JoinHandle},
 };
 
-use ab_glyph::{Font, FontArc, FontVec, GlyphId, GlyphImageFormat, PxScale, ScaleFont, point};
+use ab_glyph::{Font, FontRef, GlyphId, GlyphImageFormat, PxScale, ScaleFont, point};
 use image::imageops::FilterType;
+use self_cell::self_cell;
 use swash::{
     FontRef as SwashFontRef,
     scale::{Render as SwashRender, ScaleContext, Source, StrikeWith, image::Content},
     zeno::Format,
 };
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FontConfig {
@@ -37,7 +43,7 @@ impl Default for FontConfig {
             fallback_families: Vec::new(),
             size: 13.0,
             line_height: 1.2,
-            ligatures: true,
+            ligatures: false,
         }
     }
 }
@@ -196,14 +202,230 @@ impl fmt::Display for FontError {
 
 impl Error for FontError {}
 
-#[derive(Debug)]
-pub struct FontSystem {
+struct FontCatalog {
     database: fontdb::Database,
+    file_bytes: Mutex<HashMap<FontDataKey, Arc<[u8]>>>,
+    parsed_faces: Mutex<HashMap<ParsedFaceKey, Arc<OwnedFontFaces>>>,
+}
+
+impl fmt::Debug for FontCatalog {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FontCatalog")
+            .field("database", &self.database)
+            .field("file_bytes", &self.file_bytes)
+            .field(
+                "parsed_face_count",
+                &self.parsed_faces.lock().map(|faces| faces.len()),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl FontCatalog {
+    fn discover() -> Self {
+        let mut database = fontdb::Database::new();
+        database.load_system_fonts();
+        Self {
+            database,
+            file_bytes: Mutex::new(HashMap::new()),
+            parsed_faces: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn bytes_for_face(&self, face: &ResolvedFace) -> Result<Arc<[u8]>, String> {
+        let mut file_bytes = self
+            .file_bytes
+            .lock()
+            .map_err(|_| "font byte cache lock was poisoned".to_owned())?;
+        if let Some(bytes) = file_bytes.get(&face.data_key) {
+            return Ok(Arc::clone(bytes));
+        }
+
+        let bytes: Arc<[u8]> = match (&face.path, &face.binary) {
+            (Some(path), _) => Arc::from(fs::read(path).map_err(|error| error.to_string())?),
+            (_, Some(bytes)) => Arc::from(bytes.as_ref().as_ref()),
+            _ => return Err("resolved font face has no readable source".to_owned()),
+        };
+        file_bytes.insert(face.data_key.clone(), Arc::clone(&bytes));
+        Ok(bytes)
+    }
+
+    /// Returns an already-parsed face without touching the filesystem.
+    ///
+    /// Used to decide whether a fallback can be finished inline or has to be
+    /// handed to the loader thread.
+    fn cached_parsed_faces(&self, face: &ResolvedFace) -> Option<Arc<OwnedFontFaces>> {
+        let key = ParsedFaceKey {
+            data: face.data_key.clone(),
+            face_index: face.face_index,
+        };
+        self.parsed_faces.lock().ok()?.get(&key).cloned()
+    }
+
+    fn parsed_faces_for(&self, face: &ResolvedFace) -> Result<Arc<OwnedFontFaces>, String> {
+        let key = ParsedFaceKey {
+            data: face.data_key.clone(),
+            face_index: face.face_index,
+        };
+        if let Some(parsed) = self
+            .parsed_faces
+            .lock()
+            .map_err(|_| "parsed font face cache lock was poisoned".to_owned())?
+            .get(&key)
+            .cloned()
+        {
+            return Ok(parsed);
+        }
+
+        let parsed = Arc::new(build_parsed_faces(
+            self.bytes_for_face(face)?,
+            face.face_index,
+        )?);
+        let mut parsed_faces = self
+            .parsed_faces
+            .lock()
+            .map_err(|_| "parsed font face cache lock was poisoned".to_owned())?;
+        Ok(Arc::clone(parsed_faces.entry(key).or_insert(parsed)))
+    }
+}
+
+/// In-flight fallback loads. Small: a terminal needs a handful of fallback
+/// families at most, and a full queue simply falls back to loading inline.
+const FONT_LOAD_QUEUE_DEPTH: usize = 8;
+
+/// Callback used to nudge a host event loop once a fallback font has finished
+/// loading, so the frame that fell back to tofu can be drawn again.
+#[derive(Clone)]
+pub struct FontLoadWaker(Arc<dyn Fn() + Send + Sync + 'static>);
+
+impl FontLoadWaker {
+    #[must_use]
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(wake))
+    }
+
+    fn wake(&self) {
+        (self.0)();
+    }
+}
+
+impl fmt::Debug for FontLoadWaker {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FontLoadWaker(..)")
+    }
+}
+
+struct FontLoadRequest {
+    family: Arc<str>,
+    face: ResolvedFace,
+    bold: bool,
+    italic: bool,
+}
+
+struct FontLoadResponse {
+    key: (Arc<str>, bool, bool),
+    font: Result<Arc<LoadedFont>, String>,
+}
+
+/// Reads and parses fallback faces off the UI thread.
+///
+/// A fallback family is only discovered when text needs it, and reading plus
+/// parsing a CJK or emoji font is tens of megabytes of work — a visible stall if
+/// it happens inside the frame that first prints such a character. Requests are
+/// served on a worker; the frame in flight falls back to the primary face and is
+/// redrawn when the real one arrives.
+#[derive(Debug)]
+struct FontLoader {
+    requests: Option<SyncSender<FontLoadRequest>>,
+    responses: Receiver<FontLoadResponse>,
+    worker: Option<JoinHandle<()>>,
+    waker: Arc<OnceLock<FontLoadWaker>>,
+}
+
+impl FontLoader {
+    fn spawn(catalog: Arc<FontCatalog>) -> Self {
+        let (request_tx, request_rx) = mpsc::sync_channel::<FontLoadRequest>(FONT_LOAD_QUEUE_DEPTH);
+        let (response_tx, response_rx) = mpsc::channel();
+        let waker: Arc<OnceLock<FontLoadWaker>> = Arc::new(OnceLock::new());
+        let worker_waker = Arc::clone(&waker);
+
+        let worker = thread::Builder::new()
+            .name("panea-font-loader".to_owned())
+            .spawn(move || {
+                while let Ok(request) = request_rx.recv() {
+                    let font = catalog.parsed_faces_for(&request.face).map(|faces| {
+                        Arc::new(LoadedFont::new(
+                            request.family.to_string(),
+                            faces,
+                            request.face.face_index,
+                            request.face.source.clone(),
+                            request.face.bold,
+                            request.face.italic,
+                        ))
+                    });
+                    let response = FontLoadResponse {
+                        key: (request.family, request.bold, request.italic),
+                        font,
+                    };
+                    if response_tx.send(response).is_err() {
+                        break;
+                    }
+                    if let Some(waker) = worker_waker.get() {
+                        waker.wake();
+                    }
+                }
+            })
+            .ok();
+
+        Self {
+            requests: worker.is_some().then_some(request_tx),
+            responses: response_rx,
+            worker,
+            waker,
+        }
+    }
+
+    /// Queues a load. Returns false when the worker is gone or its queue is
+    /// full, in which case the caller falls back to loading inline.
+    fn request(&self, request: FontLoadRequest) -> bool {
+        self.requests
+            .as_ref()
+            .is_some_and(|requests| requests.try_send(request).is_ok())
+    }
+}
+
+impl Drop for FontLoader {
+    fn drop(&mut self) {
+        self.requests.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+pub struct FontSystem {
+    catalog: Arc<FontCatalog>,
     config: FontConfig,
     scale_factor: f32,
-    primary: Option<LoadedFont>,
-    loaded: HashMap<u64, LoadedFont>,
-    attempted_faces: HashSet<(String, bool, bool)>,
+    primary: Option<Arc<LoadedFont>>,
+    loaded: HashMap<u64, Arc<LoadedFont>>,
+    attempted_faces: HashSet<(Arc<str>, bool, bool)>,
+    /// Resolved family search order. Rebuilding it allocated roughly fifteen
+    /// strings plus a set on every grapheme that needed font resolution.
+    families: Arc<[Arc<str>]>,
+    /// Common single-scalar graphemes resolve once per style. Multi-scalar
+    /// graphemes still validate the complete sequence before choosing a face.
+    character_fonts: HashMap<(char, bool, bool), u64>,
+    /// Metrics keyed by the physical size and line height they were measured
+    /// at; this is read every frame and on every mouse event.
+    metrics: Option<((u32, u32), CellMetrics)>,
+    loader: FontLoader,
+    /// Fallback faces handed to the loader and not yet collected.
+    pending_faces: HashSet<(Arc<str>, bool, bool)>,
+    /// Bumped whenever a fallback arrives, so glyph and shaped-run caches keyed
+    /// on the font generation are invalidated.
+    load_generation: u64,
 }
 
 impl FontSystem {
@@ -214,22 +436,57 @@ impl FontSystem {
 
     #[must_use]
     pub fn new_with_scale_factor(config: FontConfig, scale_factor: f64) -> Self {
-        let mut database = fontdb::Database::new();
-        database.load_system_fonts();
+        Self::with_catalog(config, scale_factor, Arc::new(FontCatalog::discover()))
+    }
 
+    fn with_catalog(config: FontConfig, scale_factor: f64, catalog: Arc<FontCatalog>) -> Self {
+        let families = requested_families(&config).into();
+        let catalog_for_loader = Arc::clone(&catalog);
         Self {
-            database,
+            catalog,
             config,
             scale_factor: normalized_scale_factor(scale_factor),
             primary: None,
             loaded: HashMap::new(),
             attempted_faces: HashSet::new(),
+            families,
+            character_fonts: HashMap::new(),
+            metrics: None,
+            loader: FontLoader::spawn(catalog_for_loader),
+            pending_faces: HashSet::new(),
+            load_generation: 0,
         }
     }
 
+    /// Builds a new configured font view while reusing the expensive system
+    /// discovery result and any font files already loaded by the old view.
+    #[must_use]
+    pub fn reconfigured(&self, config: FontConfig, scale_factor: f64) -> Self {
+        let scale_factor = normalized_scale_factor(scale_factor);
+        let same_families = self.config.family == config.family
+            && self.config.fallback_families == config.fallback_families;
+        let same_metrics = same_families
+            && self.config.size.to_bits() == config.size.to_bits()
+            && self.config.line_height.to_bits() == config.line_height.to_bits()
+            && self.scale_factor.to_bits() == scale_factor.to_bits();
+        let mut reconfigured =
+            Self::with_catalog(config, f64::from(scale_factor), Arc::clone(&self.catalog));
+        if same_families {
+            reconfigured.primary = self.primary.clone();
+            reconfigured.loaded = self.loaded.clone();
+            reconfigured.attempted_faces = self.attempted_faces.clone();
+            reconfigured.families = Arc::clone(&self.families);
+            reconfigured.character_fonts = self.character_fonts.clone();
+        }
+        if same_metrics {
+            reconfigured.metrics = self.metrics;
+        }
+        reconfigured
+    }
+
     pub fn resolve_fallback_chain(&self) -> FontFallbackChain {
-        let requested = self.requested_families();
-        let descriptors = requested
+        let descriptors = self
+            .families
             .iter()
             .map(|family| self.resolve_descriptor(family))
             .collect::<Vec<_>>();
@@ -257,6 +514,9 @@ impl FontSystem {
         self.config.line_height.to_bits().hash(&mut hasher);
         self.config.ligatures.hash(&mut hasher);
         self.scale_factor.to_bits().hash(&mut hasher);
+        // Fallbacks arrive after the frame that needed them, so the generation
+        // has to change or caches would keep serving the tofu they recorded.
+        self.load_generation.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -282,18 +542,33 @@ impl FontSystem {
     pub fn primary_font(&mut self) -> Result<&LoadedFont, FontError> {
         if self.primary.is_none() {
             let font = self.load_primary()?;
-            self.loaded.insert(font.id(), font.clone());
+            self.loaded.insert(font.id(), Arc::clone(&font));
             self.primary = Some(font);
         }
 
-        Ok(self.primary.as_ref().expect("primary font is initialized"))
+        Ok(self
+            .primary
+            .as_deref()
+            .expect("primary font is initialized"))
     }
 
     pub fn cell_metrics(&mut self) -> Result<CellMetrics, FontError> {
         let size = self.physical_font_size();
         let line_height = self.config.line_height;
-        self.primary_font()
-            .map(|font| font.metrics(size, line_height))
+        // Measuring walks the primary face's tables; this is called every frame
+        // and on every mouse event, so it is keyed and reused until the size or
+        // scale factor actually changes.
+        let key = (size.to_bits(), line_height.to_bits());
+        if let Some((cached_key, metrics)) = self.metrics
+            && cached_key == key
+        {
+            return Ok(metrics);
+        }
+        let metrics = self
+            .primary_font()
+            .map(|font| font.metrics(size, line_height))?;
+        self.metrics = Some((key, metrics));
+        Ok(metrics)
     }
 
     pub fn rasterize_glyph(&mut self, key: GlyphCacheKey) -> Result<GlyphBitmap, FontError> {
@@ -337,6 +612,7 @@ impl FontSystem {
         }
 
         let size = self.physical_font_size();
+        let cell_width = self.cell_metrics()?.cell_width;
         let mut glyphs = Vec::new();
         let mut advance_width = 0.0;
         let mut families_used = Vec::new();
@@ -345,7 +621,7 @@ impl FontSystem {
             if !families_used.contains(&font.family) {
                 families_used.push(font.family.clone());
             }
-            let shaped = font.shape(
+            let mut shaped = font.shape(
                 &segment,
                 size,
                 bold,
@@ -353,6 +629,7 @@ impl FontSystem {
                 byte_offset as u32,
                 self.config.ligatures,
             )?;
+            fit_shaped_segment_to_terminal_cells(&mut shaped, &segment, cell_width);
             advance_width += shaped.iter().map(|glyph| glyph.x_advance).sum::<f32>();
             glyphs.extend(shaped);
         }
@@ -391,17 +668,15 @@ impl FontSystem {
             ("italic-face", false, true),
             ("bold-italic-face", true, true),
         ] {
-            let loaded = self
-                .load_family(&self.config.family, bold, italic)
-                .and_then(Result::ok);
-            let resolved = loaded
+            let face = self.resolve_face(&self.config.family, bold, italic);
+            let resolved = face
                 .as_ref()
-                .is_some_and(|font| font.is_bold() == bold && font.is_italic() == italic);
+                .is_some_and(|font| font.bold == bold && font.italic == italic);
             diagnostics.push(FontDiagnostic {
                 family: self.config.family.clone(),
                 role,
                 resolved,
-                source: loaded
+                source: face
                     .map(|font| font.source)
                     .unwrap_or(FontSource::Unresolved),
             });
@@ -409,46 +684,20 @@ impl FontSystem {
         diagnostics
     }
 
-    fn load_primary(&self) -> Result<LoadedFont, FontError> {
-        let requested = self.requested_families();
-
-        for family in &requested {
+    fn load_primary(&mut self) -> Result<Arc<LoadedFont>, FontError> {
+        let requested = Arc::clone(&self.families);
+        for family in requested.iter() {
             if let Some(loaded) = self.load_family(family, false, false) {
                 return loaded.map_err(|reason| FontError::FontLoadFailed {
-                    family: family.clone(),
+                    family: family.to_string(),
                     reason,
                 });
             }
         }
 
-        Err(FontError::FontNotFound { requested })
-    }
-
-    fn requested_families(&self) -> Vec<String> {
-        let mut requested = Vec::new();
-        if !self.config.family.eq_ignore_ascii_case("monospace") {
-            requested.push(self.config.family.clone());
-        }
-        requested.extend(self.config.fallback_families.clone());
-        requested.extend([
-            "Cascadia Mono".to_owned(),
-            "Consolas".to_owned(),
-            "Menlo".to_owned(),
-            "DejaVu Sans Mono".to_owned(),
-            "Segoe UI Emoji".to_owned(),
-            "Apple Color Emoji".to_owned(),
-            "Noto Color Emoji".to_owned(),
-            "Noto Emoji".to_owned(),
-            "Microsoft YaHei UI".to_owned(),
-            "Yu Gothic UI".to_owned(),
-            "Hiragino Sans".to_owned(),
-            "Noto Sans Mono CJK JP".to_owned(),
-            "Noto Sans CJK JP".to_owned(),
-            "monospace".to_owned(),
-        ]);
-        let mut seen = HashSet::new();
-        requested.retain(|family| seen.insert(family.to_ascii_lowercase()));
-        requested
+        Err(FontError::FontNotFound {
+            requested: requested.iter().map(ToString::to_string).collect(),
+        })
     }
 
     fn resolve_descriptor(&self, family: &str) -> FontDescriptor {
@@ -457,14 +706,14 @@ impl FontSystem {
             families: &families,
             ..fontdb::Query::default()
         };
-        let Some(id) = self.database.query(&query) else {
+        let Some(id) = self.catalog.database.query(&query) else {
             return FontDescriptor {
                 family: family.to_owned(),
                 source: FontSource::Unresolved,
             };
         };
 
-        let Some(face) = self.database.face(id) else {
+        let Some(face) = self.catalog.database.face(id) else {
             return FontDescriptor {
                 family: family.to_owned(),
                 source: FontSource::Unresolved,
@@ -477,12 +726,8 @@ impl FontSystem {
         }
     }
 
-    fn load_family(
-        &self,
-        family: &str,
-        bold: bool,
-        italic: bool,
-    ) -> Option<Result<LoadedFont, String>> {
+    /// Resolves a family and style to a face without reading its bytes.
+    fn resolve_face(&self, family: &str, bold: bool, italic: bool) -> Option<ResolvedFace> {
         let families = family_query(family);
         let query = fontdb::Query {
             families: &families,
@@ -498,33 +743,151 @@ impl FontSystem {
             },
             ..fontdb::Query::default()
         };
-        let id = self.database.query(&query)?;
-        let face = self.database.face(id)?;
-        let face_index = face.index;
-        let source = source_kind(&face.source);
-        let actual_bold = face.weight >= fontdb::Weight::SEMIBOLD;
-        let actual_italic = face.style != fontdb::Style::Normal;
-        let bytes = match &face.source {
-            fontdb::Source::File(path) => fs::read(path).map_err(|err| err.to_string()),
-            fontdb::Source::SharedFile(path, _) => fs::read(path).map_err(|err| err.to_string()),
-            fontdb::Source::Binary(bytes) => Ok(bytes.as_ref().as_ref().to_vec()),
+        let id = self.catalog.database.query(&query)?;
+        let face = self.catalog.database.face(id)?;
+        let (path, binary) = match &face.source {
+            fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => {
+                (Some(path.clone()), None)
+            }
+            fontdb::Source::Binary(bytes) => (None, Some(Arc::clone(bytes))),
+        };
+        let data_key = match (&path, &binary) {
+            (Some(path), _) => FontDataKey::File(path.clone()),
+            (_, Some(bytes)) => {
+                let slice = bytes.as_ref().as_ref();
+                FontDataKey::Memory {
+                    address: slice.as_ptr() as usize,
+                    len: slice.len(),
+                }
+            }
+            _ => return None,
+        };
+        Some(ResolvedFace {
+            face_index: face.index,
+            source: source_kind(&face.source),
+            bold: face.weight >= fontdb::Weight::SEMIBOLD,
+            italic: face.style != fontdb::Style::Normal,
+            path,
+            binary,
+            data_key,
+        })
+    }
+
+    /// Makes a fallback face available, off-thread when it needs I/O.
+    ///
+    /// Returns `Ok(None)` when the face is being loaded in the background: the
+    /// caller moves on to the next family so the current frame is drawn with
+    /// what is already resident instead of stalling on a multi-megabyte read.
+    fn begin_family_load(
+        &mut self,
+        family: &Arc<str>,
+        bold: bool,
+        italic: bool,
+    ) -> Result<Option<Arc<LoadedFont>>, FontError> {
+        let Some(face) = self.resolve_face(family, bold, italic) else {
+            return Ok(None);
         };
 
-        Some(bytes.and_then(|bytes| {
-            let font = FontArc::new(
-                FontVec::try_from_vec_and_index(bytes.clone(), face_index)
-                    .map_err(|err| err.to_string())?,
-            );
-            Ok(LoadedFont::new(
-                family.to_owned(),
-                font,
-                Arc::new(bytes),
-                face_index,
-                source,
-                actual_bold,
-                actual_italic,
-            ))
-        }))
+        // Already parsed by an earlier request (often another style of the same
+        // file): finishing inline costs nothing.
+        if let Some(faces) = self.catalog.cached_parsed_faces(&face) {
+            return Ok(Some(Arc::new(LoadedFont::new(
+                family.to_string(),
+                faces,
+                face.face_index,
+                face.source.clone(),
+                face.bold,
+                face.italic,
+            ))));
+        }
+
+        let key = (Arc::clone(family), bold, italic);
+        if self.pending_faces.contains(&key) {
+            return Ok(None);
+        }
+        let queued = self.loader.request(FontLoadRequest {
+            family: Arc::clone(family),
+            face: face.clone(),
+            bold,
+            italic,
+        });
+        if queued {
+            self.pending_faces.insert(key);
+            return Ok(None);
+        }
+
+        // No worker available (or its queue is full): fall back to loading here
+        // rather than leaving the text unrenderable.
+        self.load_family(family, bold, italic)
+            .transpose()
+            .map_err(|reason| FontError::FontLoadFailed {
+                family: family.to_string(),
+                reason,
+            })
+    }
+
+    /// Collects fallback faces that finished loading in the background.
+    ///
+    /// Returns whether anything became available, in which case the caller
+    /// should re-shape and redraw: the frames drawn while a face was in flight
+    /// used the primary font in its place.
+    pub fn poll_loaded_fonts(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(response) = self.loader.responses.try_recv() {
+            self.pending_faces.remove(&response.key);
+            match response.font {
+                Ok(font) => {
+                    self.loaded.entry(font.id()).or_insert(font);
+                    changed = true;
+                }
+                Err(_) => {
+                    // Leave it in `attempted_faces` so a broken file is not
+                    // retried on every grapheme.
+                }
+            }
+        }
+        if changed {
+            self.load_generation = self.load_generation.wrapping_add(1);
+            // Characters that resolved to a substitute may now have a real face.
+            self.character_fonts.clear();
+        }
+        changed
+    }
+
+    /// Registers the callback used to request a redraw when a fallback arrives.
+    pub fn set_font_load_waker(&self, waker: FontLoadWaker) {
+        let _ = self.loader.waker.set(waker);
+    }
+
+    /// Whether any fallback face is still being loaded.
+    #[must_use]
+    pub fn has_pending_font_loads(&self) -> bool {
+        !self.pending_faces.is_empty()
+    }
+
+    fn load_family(
+        &mut self,
+        family: &str,
+        bold: bool,
+        italic: bool,
+    ) -> Option<Result<Arc<LoadedFont>, String>> {
+        let face = self.resolve_face(family, bold, italic)?;
+
+        Some(
+            self.catalog
+                .parsed_faces_for(&face)
+                .map(|faces| {
+                    LoadedFont::new(
+                        family.to_owned(),
+                        faces,
+                        face.face_index,
+                        face.source.clone(),
+                        face.bold,
+                        face.italic,
+                    )
+                })
+                .map(Arc::new),
+        )
     }
 
     fn resolve_font_for_text(
@@ -533,31 +896,46 @@ impl FontSystem {
         bold: bool,
         italic: bool,
     ) -> Result<u64, FontError> {
+        let scalar = single_scalar(text);
+        if let Some(ch) = scalar
+            && let Some(font_id) = self.character_fonts.get(&(ch, bold, italic)).copied()
+            && self.loaded.contains_key(&font_id)
+        {
+            return Ok(font_id);
+        }
+
         let mut style_fallback = None;
-        for family in self.requested_families() {
-            for font in self.loaded.values().filter(|font| font.family == family) {
+        let families = Arc::clone(&self.families);
+        for family in families.iter() {
+            for font in self
+                .loaded
+                .values()
+                .filter(|font| font.family == family.as_ref())
+            {
                 if font.supports_text(text) {
                     if font.is_bold() == bold && font.is_italic() == italic {
-                        return Ok(font.id());
+                        let id = font.id();
+                        cache_scalar_font(&mut self.character_fonts, scalar, bold, italic, id);
+                        return Ok(id);
                     }
                     style_fallback.get_or_insert(font.id());
                 }
             }
-            if !self.attempted_faces.insert((family.clone(), bold, italic)) {
+            if !self
+                .attempted_faces
+                .insert((Arc::clone(family), bold, italic))
+            {
                 continue;
             }
-            let Some(result) = self.load_family(&family, bold, italic) else {
+            let Some(font) = self.begin_family_load(family, bold, italic)? else {
                 continue;
             };
-            let font = result.map_err(|reason| FontError::FontLoadFailed {
-                family: family.clone(),
-                reason,
-            })?;
             if font.supports_text(text) {
                 let id = font.id();
                 self.loaded.entry(id).or_insert(font);
                 let loaded = self.loaded.get(&id).expect("font was inserted");
                 if loaded.is_bold() == bold && loaded.is_italic() == italic {
+                    cache_scalar_font(&mut self.character_fonts, scalar, bold, italic, id);
                     return Ok(id);
                 }
                 style_fallback.get_or_insert(id);
@@ -565,13 +943,80 @@ impl FontSystem {
         }
 
         if let Some(id) = style_fallback {
+            cache_scalar_font(&mut self.character_fonts, scalar, bold, italic, id);
             return Ok(id);
         }
 
-        let primary = self.primary_font()?.clone();
-        let id = primary.id();
-        self.loaded.entry(id).or_insert(primary);
+        let id = self.primary_font()?.id();
+        cache_scalar_font(&mut self.character_fonts, scalar, bold, italic, id);
         Ok(id)
+    }
+}
+
+fn requested_families(config: &FontConfig) -> Vec<Arc<str>> {
+    let mut requested: Vec<Arc<str>> = Vec::new();
+    if !config.family.eq_ignore_ascii_case("monospace") {
+        requested.push(Arc::from(config.family.as_str()));
+    }
+    requested.extend(
+        config
+            .fallback_families
+            .iter()
+            .map(|family| Arc::from(family.as_str())),
+    );
+    requested.extend([
+        Arc::from("Cascadia Mono"),
+        Arc::from("Consolas"),
+        Arc::from("Menlo"),
+        Arc::from("DejaVu Sans Mono"),
+        Arc::from("Segoe UI Emoji"),
+        Arc::from("Apple Color Emoji"),
+        Arc::from("Noto Color Emoji"),
+        Arc::from("Noto Emoji"),
+        Arc::from("Microsoft YaHei UI"),
+        Arc::from("Yu Gothic UI"),
+        Arc::from("Hiragino Sans"),
+        Arc::from("Noto Sans Mono CJK JP"),
+        Arc::from("Noto Sans CJK JP"),
+        Arc::from("monospace"),
+    ]);
+    let mut seen = HashSet::new();
+    requested.retain(|family| seen.insert(family.to_ascii_lowercase()));
+    requested
+}
+
+fn single_scalar(text: &str) -> Option<char> {
+    let mut chars = text.chars();
+    let ch = chars.next()?;
+    (chars.next().is_none() && !is_default_ignorable(ch)).then_some(ch)
+}
+
+fn cache_scalar_font(
+    cache: &mut HashMap<(char, bool, bool), u64>,
+    scalar: Option<char>,
+    bold: bool,
+    italic: bool,
+    font_id: u64,
+) {
+    if let Some(ch) = scalar {
+        cache.insert((ch, bold, italic), font_id);
+    }
+}
+
+fn fit_shaped_segment_to_terminal_cells(glyphs: &mut [ShapedGlyph], text: &str, cell_width: f32) {
+    let terminal_cells = UnicodeWidthStr::width(text).max(1) as f32;
+    let target_advance = terminal_cells * cell_width;
+    let shaped_advance = glyphs.iter().map(|glyph| glyph.x_advance).sum::<f32>();
+    if shaped_advance.abs() <= f32::EPSILON {
+        if let Some(glyph) = glyphs.last_mut() {
+            glyph.x_advance = target_advance;
+        }
+        return;
+    }
+    let scale = target_advance / shaped_advance;
+    for glyph in glyphs {
+        glyph.x_advance *= scale;
+        glyph.x_offset *= scale;
     }
 }
 
@@ -606,23 +1051,48 @@ fn source_kind(source: &fontdb::Source) -> FontSource {
     }
 }
 
-#[derive(Debug, Clone)]
+struct ParsedFontFaces<'a> {
+    ab_glyph: FontRef<'a>,
+    rustybuzz: rustybuzz::Face<'a>,
+}
+
+self_cell!(
+    struct OwnedFontFaces {
+        owner: Arc<[u8]>,
+
+        #[covariant]
+        dependent: ParsedFontFaces,
+    }
+);
+
 pub struct LoadedFont {
     id: u64,
     family: String,
-    font: FontArc,
-    bytes: Arc<Vec<u8>>,
+    faces: Arc<OwnedFontFaces>,
     face_index: u32,
     source: FontSource,
     bold: bool,
     italic: bool,
 }
 
+impl fmt::Debug for LoadedFont {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoadedFont")
+            .field("id", &self.id)
+            .field("family", &self.family)
+            .field("face_index", &self.face_index)
+            .field("source", &self.source)
+            .field("bold", &self.bold)
+            .field("italic", &self.italic)
+            .finish_non_exhaustive()
+    }
+}
+
 impl LoadedFont {
     fn new(
         family: String,
-        font: FontArc,
-        bytes: Arc<Vec<u8>>,
+        faces: Arc<OwnedFontFaces>,
         face_index: u32,
         source: FontSource,
         bold: bool,
@@ -638,13 +1108,30 @@ impl LoadedFont {
         Self {
             id: hasher.finish(),
             family,
-            font,
-            bytes,
+            faces,
             face_index,
             source,
             bold,
             italic,
         }
+    }
+
+    fn ab_glyph(&self) -> &FontRef<'_> {
+        &self.faces.borrow_dependent().ab_glyph
+    }
+
+    fn font_bytes(&self) -> &[u8] {
+        self.faces.borrow_owner()
+    }
+
+    fn glyph_id(&self, ch: char) -> GlyphId {
+        self.ab_glyph().glyph_id(ch)
+    }
+
+    fn units_per_em(&self) -> f32 {
+        let font = self.ab_glyph();
+        font.units_per_em()
+            .unwrap_or_else(|| font.height_unscaled())
     }
 
     #[must_use]
@@ -674,7 +1161,7 @@ impl LoadedFont {
 
     fn supports_text(&self, text: &str) -> bool {
         text.chars()
-            .all(|ch| is_default_ignorable(ch) || self.font.glyph_id(ch) != GlyphId(0))
+            .all(|ch| is_default_ignorable(ch) || self.glyph_id(ch) != GlyphId(0))
     }
 
     fn shape(
@@ -686,12 +1173,6 @@ impl LoadedFont {
         cluster_offset: u32,
         ligatures: bool,
     ) -> Result<Vec<ShapedGlyph>, FontError> {
-        let Some(face) = rustybuzz::Face::from_slice(&self.bytes, self.face_index) else {
-            return Err(FontError::FontLoadFailed {
-                family: self.family.clone(),
-                reason: "OpenType shaping face could not be created".to_owned(),
-            });
-        };
         // `size` is pixels per em. Rustybuzz reports positions in font design
         // units, so converting by units-per-em keeps shaping, Swash
         // rasterization, and typographic point sizes on one scale.
@@ -707,7 +1188,8 @@ impl LoadedFont {
                 .filter_map(|feature| rustybuzz::Feature::from_str(feature).ok())
                 .collect::<Vec<_>>()
         };
-        let glyph_buffer = rustybuzz::shape(&face, &features, buffer);
+        let glyph_buffer =
+            rustybuzz::shape(&self.faces.borrow_dependent().rustybuzz, &features, buffer);
 
         Ok(glyph_buffer
             .glyph_infos()
@@ -726,14 +1208,15 @@ impl LoadedFont {
 
     #[must_use]
     pub fn metrics(&self, size: f32, line_height: f32) -> CellMetrics {
-        let scaled = self.font.as_scaled(self.ab_glyph_scale(size));
+        let font = self.ab_glyph();
+        let scaled = font.as_scaled(self.ab_glyph_scale(size));
         let ascent = scaled.ascent();
         let descent = scaled.descent();
         let line_gap = scaled.line_gap();
         let cell_height = ((ascent - descent + line_gap) * line_height)
             .ceil()
             .max(1.0);
-        let zero_width = scaled.h_advance(self.font.glyph_id('0')).max(1.0);
+        let zero_width = terminal_cell_width(scaled.h_advance(font.glyph_id('0')));
         let baseline = ((cell_height - (ascent - descent)) * 0.5 + ascent).clamp(0.0, cell_height);
         let (underline_offset, strikeout_offset, stroke_size) = self.decoration_metrics(size);
         let decoration_thickness = stroke_size.abs().max(1.0).min(cell_height);
@@ -757,18 +1240,18 @@ impl LoadedFont {
 
     #[must_use]
     pub fn rasterize(&self, glyph_id: u16, size: f32) -> GlyphBitmap {
-        let scaled = self.font.as_scaled(self.ab_glyph_scale(size));
+        let font = self.ab_glyph();
+        let scaled = font.as_scaled(self.ab_glyph_scale(size));
         let glyph_id = GlyphId(glyph_id);
         let advance_width = scaled.h_advance(glyph_id).max(0.0);
         let ascent = scaled.ascent();
 
-        if let Some(font) = SwashFontRef::from_index(&self.bytes, self.face_index as usize) {
+        if let Some(font) = SwashFontRef::from_index(self.font_bytes(), self.face_index as usize) {
             let mut context = ScaleContext::new();
             let mut scaler = context.builder(font).size(size).hint(true).build();
             if let Some(image) = SwashRender::new(&[
                 Source::ColorOutline(0),
                 Source::ColorBitmap(StrikeWith::BestFit),
-                Source::Outline,
             ])
             .format(Format::Alpha)
             .render(&mut scaler, glyph_id.0)
@@ -803,9 +1286,8 @@ impl LoadedFont {
             }
         }
 
-        if let Some(image) = self
-            .font
-            .glyph_raster_image2(glyph_id, size.round().clamp(1.0, u16::MAX as f32) as u16)
+        if let Some(image) =
+            font.glyph_raster_image2(glyph_id, size.round().clamp(1.0, u16::MAX as f32) as u16)
             && let Some(bitmap) = raster_image_to_bitmap(&image, advance_width, size, ascent)
         {
             return bitmap;
@@ -813,7 +1295,7 @@ impl LoadedFont {
 
         let glyph = glyph_id.with_scale_and_position(self.ab_glyph_scale(size), point(0.0, 0.0));
 
-        let Some(outlined) = self.font.outline_glyph(glyph) else {
+        let Some(outlined) = font.outline_glyph(glyph) else {
             if glyph_id != GlyphId(0) {
                 return GlyphBitmap {
                     width: 1,
@@ -853,32 +1335,28 @@ impl LoadedFont {
     }
 
     fn ab_glyph_scale(&self, pixels_per_em: f32) -> PxScale {
-        let units_per_em = self
-            .font
+        let font = self.ab_glyph();
+        let units_per_em = font
             .units_per_em()
-            .unwrap_or_else(|| self.font.height_unscaled())
+            .unwrap_or_else(|| font.height_unscaled())
             .max(1.0);
-        PxScale::from(pixels_per_em * self.font.height_unscaled().max(1.0) / units_per_em)
+        PxScale::from(pixels_per_em * font.height_unscaled().max(1.0) / units_per_em)
     }
 
     fn design_unit_scale(&self, pixels_per_em: f32) -> f32 {
-        pixels_per_em
-            / self
-                .font
-                .units_per_em()
-                .unwrap_or_else(|| self.font.height_unscaled())
-                .max(1.0)
+        pixels_per_em / self.units_per_em().max(1.0)
     }
 
     fn decoration_metrics(&self, pixels_per_em: f32) -> (f32, f32, f32) {
         let fallback_stroke = (pixels_per_em / 14.0).max(1.0);
         let fallback_underline = -fallback_stroke;
         let fallback_strikeout = self
-            .font
+            .ab_glyph()
             .as_scaled(self.ab_glyph_scale(pixels_per_em))
             .ascent()
             * 0.35;
-        let Some(font) = SwashFontRef::from_index(&self.bytes, self.face_index as usize) else {
+        let Some(font) = SwashFontRef::from_index(self.font_bytes(), self.face_index as usize)
+        else {
             return (fallback_underline, fallback_strikeout, fallback_stroke);
         };
         let metrics = font
@@ -902,6 +1380,10 @@ impl LoadedFont {
             },
         )
     }
+}
+
+fn terminal_cell_width(advance: f32) -> f32 {
+    advance.round().max(1.0)
 }
 
 fn is_default_ignorable(ch: char) -> bool {
@@ -962,10 +1444,60 @@ fn unpremultiply_rgba(pixels: &mut [u8]) {
     }
 }
 
+/// A face resolved from the database, before its bytes are loaded.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FontDataKey {
+    File(PathBuf),
+    Memory { address: usize, len: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ParsedFaceKey {
+    data: FontDataKey,
+    face_index: u32,
+}
+
+#[derive(Clone)]
+struct ResolvedFace {
+    face_index: u32,
+    source: FontSource,
+    bold: bool,
+    italic: bool,
+    path: Option<PathBuf>,
+    binary: Option<Arc<dyn AsRef<[u8]> + Send + Sync>>,
+    data_key: FontDataKey,
+}
+
+fn build_parsed_faces(bytes: Arc<[u8]>, face_index: u32) -> Result<OwnedFontFaces, String> {
+    let faces = OwnedFontFaces::try_new(bytes, move |bytes| {
+        let ab_glyph = FontRef::try_from_slice_and_index(bytes, face_index)
+            .map_err(|error| error.to_string())?;
+        let rustybuzz = rustybuzz::Face::from_slice(bytes, face_index)
+            .ok_or_else(|| "OpenType shaping face could not be created".to_owned())?;
+        Ok::<_, String>(ParsedFontFaces {
+            ab_glyph,
+            rustybuzz,
+        })
+    })?;
+    Ok(faces)
+}
+
+#[derive(Debug)]
+struct CachedGlyph {
+    bitmap: Arc<GlyphBitmap>,
+    /// Set on every hit and cleared when the sweep passes over the entry, so a
+    /// glyph that is still in use survives one eviction round.
+    referenced: bool,
+}
+
+/// Second-chance (CLOCK) cache. Strict insertion-order eviction let a burst of
+/// unique glyphs — a screen of CJK, or a scroll through mixed scripts — evict
+/// the ASCII set that every frame needs, which then had to be re-rasterized.
+/// Hits stay O(1): they set a flag rather than reordering the queue.
 #[derive(Debug)]
 pub struct GlyphCache {
     capacity: usize,
-    entries: HashMap<GlyphCacheKey, Arc<GlyphBitmap>>,
+    entries: HashMap<GlyphCacheKey, CachedGlyph>,
     order: VecDeque<GlyphCacheKey>,
 }
 
@@ -992,18 +1524,36 @@ impl GlyphCache {
         key: GlyphCacheKey,
         make: impl FnOnce() -> GlyphBitmap,
     ) -> (Arc<GlyphBitmap>, bool) {
-        if let Some(bitmap) = self.entries.get(&key).cloned() {
-            return (bitmap, true);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.referenced = true;
+            return (Arc::clone(&entry.bitmap), true);
         }
 
         while self.entries.len() >= self.capacity {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
+            let Some(candidate) = self.order.pop_front() else {
+                break;
+            };
+            match self.entries.get_mut(&candidate) {
+                // Used since the last sweep: clear the flag and give it another
+                // lap instead of evicting a glyph the current frame needs.
+                Some(entry) if entry.referenced => {
+                    entry.referenced = false;
+                    self.order.push_back(candidate);
+                }
+                _ => {
+                    self.entries.remove(&candidate);
+                }
             }
         }
 
         let bitmap = Arc::new(make());
-        self.entries.insert(key, Arc::clone(&bitmap));
+        self.entries.insert(
+            key,
+            CachedGlyph {
+                bitmap: Arc::clone(&bitmap),
+                referenced: false,
+            },
+        );
         self.order.push_back(key);
         (bitmap, false)
     }
@@ -1059,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn glyph_cache_hits_do_not_scan_or_reorder_the_eviction_queue() {
+    fn glyph_cache_hits_survive_one_eviction_round_without_reordering() {
         let mut cache = GlyphCache::new(2);
         let key_a = GlyphCacheKey::new(1, u16::from(b'a'), 13.0, false, false);
         let key_b = GlyphCacheKey::new(1, u16::from(b'b'), 13.0, false, false);
@@ -1067,12 +1617,204 @@ mod tests {
 
         cache.get_or_insert_with(key_a, || GlyphBitmap::missing(8.0, 12));
         cache.get_or_insert_with(key_b, || GlyphBitmap::missing(8.0, 12));
+        // A hit only flags the entry — the queue is never scanned or reordered.
         cache.get_or_insert_with(key_a, || panic!("cache hit must not rasterize"));
         cache.get_or_insert_with(key_c, || GlyphBitmap::missing(8.0, 12));
 
-        assert!(!cache.entries.contains_key(&key_a));
-        assert!(cache.entries.contains_key(&key_b));
+        assert_eq!(cache.len(), 2);
+        assert!(
+            cache.entries.contains_key(&key_a),
+            "a glyph used since the last sweep must not be evicted ahead of an unused one"
+        );
+        assert!(!cache.entries.contains_key(&key_b));
         assert!(cache.entries.contains_key(&key_c));
+    }
+
+    #[test]
+    fn a_unique_glyph_burst_does_not_evict_the_working_set() {
+        // A screen of CJK used to evict the ASCII glyphs every frame needs,
+        // which then had to be re-rasterized on the next frame.
+        let mut cache = GlyphCache::new(8);
+        let hot = (0..4)
+            .map(|index| GlyphCacheKey::new(1, index, 13.0, false, false))
+            .collect::<Vec<_>>();
+        for key in &hot {
+            cache.get_or_insert_with(*key, || GlyphBitmap::missing(8.0, 12));
+        }
+
+        for round in 0..8 {
+            for key in &hot {
+                cache.get_or_insert_with(*key, || panic!("working set must stay cached"));
+            }
+            for index in 0..4 {
+                let unique = GlyphCacheKey::new(1, 100 + round * 4 + index, 13.0, false, false);
+                cache.get_or_insert_with(unique, || GlyphBitmap::missing(8.0, 12));
+            }
+        }
+
+        for key in &hot {
+            assert!(
+                cache.contains_key(*key),
+                "repeatedly used glyphs must survive a burst of unique ones"
+            );
+        }
+    }
+
+    #[test]
+    fn font_file_bytes_are_read_once_and_shared_across_faces() {
+        let mut fonts = FontSystem::new(FontConfig::default());
+        let families = Arc::clone(&fonts.families);
+        let Some(family) = families.first().cloned() else {
+            return;
+        };
+        let Some(Ok(first)) = fonts.load_family(&family, false, false) else {
+            return;
+        };
+        if first.source == FontSource::Memory {
+            return;
+        }
+
+        assert_eq!(fonts.catalog.file_bytes.lock().unwrap().len(), 1);
+        let Some(Ok(second)) = fonts.load_family(&family, false, false) else {
+            return;
+        };
+
+        assert!(
+            Arc::ptr_eq(first.faces.borrow_owner(), second.faces.borrow_owner()),
+            "loading a face again must share the cached file bytes instead of re-reading"
+        );
+        assert!(
+            Arc::ptr_eq(&first.faces, &second.faces),
+            "loading the same face again must reuse its parsed face cache"
+        );
+        assert_eq!(
+            fonts.catalog.file_bytes.lock().unwrap().len(),
+            1,
+            "the same font file must not be held more than once"
+        );
+    }
+
+    #[test]
+    fn parsed_faces_borrow_the_shared_font_file_storage() {
+        let mut fonts = FontSystem::new(FontConfig::default());
+        let Ok(font) = fonts.primary_font() else {
+            return;
+        };
+
+        let shared_bytes = font.faces.borrow_owner();
+        let parsed = font.faces.borrow_dependent();
+
+        assert_eq!(parsed.ab_glyph.glyph_id('0'), font.glyph_id('0'));
+        assert_eq!(parsed.rustybuzz.units_per_em(), font.units_per_em() as i32);
+        assert!(!shared_bytes.is_empty());
+    }
+
+    #[test]
+    fn scalar_font_resolution_is_cached_by_character_and_style() {
+        let mut fonts = FontSystem::new(FontConfig::default());
+        let Ok(run) = fonts.shape_text("A", true, false) else {
+            return;
+        };
+        let Some(glyph) = run.glyphs.first() else {
+            return;
+        };
+
+        assert_eq!(
+            fonts.character_fonts.get(&('A', true, false)),
+            Some(&glyph.key.font_id)
+        );
+    }
+
+    #[test]
+    fn ligature_only_reload_reuses_loaded_faces_and_metrics() {
+        let config = FontConfig::default();
+        let mut fonts = FontSystem::new(config.clone());
+        let Ok(first_metrics) = fonts.cell_metrics() else {
+            return;
+        };
+        let first_font = Arc::clone(fonts.primary.as_ref().expect("primary font"));
+        let mut next_config = config;
+        next_config.ligatures = !next_config.ligatures;
+        let mut reloaded = fonts.reconfigured(next_config, 1.0);
+
+        assert!(Arc::ptr_eq(&fonts.catalog, &reloaded.catalog));
+        assert!(Arc::ptr_eq(
+            &first_font,
+            reloaded.primary.as_ref().expect("reused primary font")
+        ));
+        assert_eq!(
+            reloaded.metrics.map(|(_, metrics)| metrics),
+            Some(first_metrics)
+        );
+        assert_eq!(reloaded.cell_metrics().unwrap(), first_metrics);
+    }
+
+    #[test]
+    fn size_change_invalidates_reconfigured_metrics() {
+        let mut fonts = FontSystem::new(FontConfig::default());
+        if fonts.cell_metrics().is_err() {
+            return;
+        }
+        let mut resized = FontConfig::default();
+        resized.size += 1.0;
+
+        let reloaded = fonts.reconfigured(resized, 1.0);
+
+        assert!(reloaded.metrics.is_none());
+    }
+
+    #[test]
+    fn terminal_cell_width_is_rounded_to_a_physical_pixel() {
+        assert_eq!(terminal_cell_width(0.4), 1.0);
+        assert_eq!(terminal_cell_width(7.49), 7.0);
+        assert_eq!(terminal_cell_width(7.5), 8.0);
+    }
+
+    #[test]
+    fn zero_advance_segment_still_consumes_its_terminal_cell() {
+        let mut glyphs = vec![ShapedGlyph {
+            key: GlyphCacheKey::new(1, 1, 13.0, false, false),
+            cluster: 0,
+            x_advance: 0.0,
+            y_advance: 0.0,
+            x_offset: 0.0,
+            y_offset: 0.0,
+        }];
+
+        fit_shaped_segment_to_terminal_cells(&mut glyphs, "\u{301}", 8.0);
+
+        assert_eq!(glyphs[0].x_advance, 8.0);
+    }
+
+    #[test]
+    fn ligatures_are_opt_in_by_default() {
+        assert!(!FontConfig::default().ligatures);
+    }
+
+    #[test]
+    fn cell_metrics_are_cached_until_the_scale_factor_changes() {
+        let mut fonts = FontSystem::new(FontConfig::default());
+        let Ok(first) = fonts.cell_metrics() else {
+            return;
+        };
+        let Ok(second) = fonts.cell_metrics() else {
+            return;
+        };
+
+        assert_eq!(first, second);
+        assert!(
+            fonts.metrics.is_some(),
+            "metrics must be cached after a read"
+        );
+
+        assert!(fonts.set_scale_factor(2.0));
+        let Ok(scaled) = fonts.cell_metrics() else {
+            return;
+        };
+        assert!(
+            scaled.font_size > first.font_size,
+            "a scale factor change must invalidate the cached metrics"
+        );
     }
 
     #[test]
@@ -1096,9 +1838,10 @@ mod tests {
         let pixels_per_em = fonts.physical_font_size();
         let expected_ascent = {
             let font = fonts.primary_font().expect("primary font");
-            let units_per_em = font.font.units_per_em().expect("units per em");
-            let scale = PxScale::from(pixels_per_em * font.font.height_unscaled() / units_per_em);
-            font.font.as_scaled(scale).ascent()
+            let face = font.ab_glyph();
+            let units_per_em = face.units_per_em().expect("units per em");
+            let scale = PxScale::from(pixels_per_em * face.height_unscaled() / units_per_em);
+            face.as_scaled(scale).ascent()
         };
         let metrics = fonts.cell_metrics().expect("cell metrics");
 
@@ -1152,6 +1895,34 @@ mod tests {
     }
 
     #[test]
+    fn monochrome_outline_rasterization_uses_the_unweighted_outline_mask() {
+        let mut fonts = FontSystem::new(FontConfig::default());
+        let size = fonts.physical_font_size();
+        if fonts.primary_font().is_err() {
+            return;
+        }
+        let font = Arc::clone(fonts.primary.as_ref().expect("primary font"));
+        let glyph_id = font.glyph_id('h');
+        let glyph = glyph_id.with_scale_and_position(font.ab_glyph_scale(size), point(0.0, 0.0));
+        let Some(outlined) = font.ab_glyph().outline_glyph(glyph) else {
+            return;
+        };
+        let bounds = outlined.px_bounds();
+        let width = bounds.width().ceil().max(1.0) as u32;
+        let height = bounds.height().ceil().max(1.0) as u32;
+        let mut expected = vec![0; (width * height) as usize];
+        outlined.draw(|x, y, coverage| {
+            expected[(y * width + x) as usize] = (coverage * 255.0).round() as u8;
+        });
+
+        let actual = font.rasterize(glyph_id.0, size);
+
+        assert_eq!(actual.format, GlyphBitmapFormat::Alpha);
+        assert_eq!((actual.width, actual.height), (width, height));
+        assert_eq!(actual.pixels, expected);
+    }
+
+    #[test]
     fn point_sizes_scale_to_physical_pixels() {
         let config = FontConfig {
             size: 12.0,
@@ -1183,10 +1954,10 @@ mod tests {
     #[test]
     fn generic_monospace_uses_portable_preferred_families_first() {
         let fonts = FontSystem::new(FontConfig::default());
-        let requested = fonts.requested_families();
+        let requested = &fonts.families;
 
-        assert_eq!(requested.first().map(String::as_str), Some("Cascadia Mono"));
-        assert_eq!(requested.last().map(String::as_str), Some("monospace"));
+        assert_eq!(requested.first().map(AsRef::as_ref), Some("Cascadia Mono"));
+        assert_eq!(requested.last().map(AsRef::as_ref), Some("monospace"));
     }
 
     #[test]
@@ -1303,11 +2074,87 @@ mod tests {
         assert_eq!(&pixels[4..], &[0, 0, 0, 0]);
     }
 
+    #[test]
+    fn a_fallback_face_loads_off_thread_and_reports_its_arrival() {
+        let mut fonts = FontSystem::new(FontConfig::default());
+        // The primary face must still be resolved synchronously; nothing can be
+        // drawn without it.
+        if fonts.cell_metrics().is_err() {
+            return;
+        }
+
+        // Register the waker before anything is queued so its firing cannot be
+        // missed by a load that finishes quickly.
+        let waker_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&waker_fired);
+        fonts.set_font_load_waker(FontLoadWaker::new(move || {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+
+        // First sight of a script the primary face lacks must not block on a
+        // multi-megabyte read: it hands the load to the worker and returns.
+        let first = fonts.shape_text("日本語", false, false);
+        assert!(
+            first.is_ok(),
+            "shaping must not fail while a fallback loads"
+        );
+        if !fonts.has_pending_font_loads() {
+            // Either no fallback was needed on this host or it was already
+            // cached; both are fine, there is nothing async left to observe.
+            return;
+        }
+
+        let generation_before = fonts.generation_id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while fonts.has_pending_font_loads() && std::time::Instant::now() < deadline {
+            if !fonts.poll_loaded_fonts() {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+
+        assert!(
+            !fonts.has_pending_font_loads(),
+            "the loader must finish its queued work"
+        );
+        assert_ne!(
+            fonts.generation_id(),
+            generation_before,
+            "an arrived fallback must change the generation so glyph caches invalidate"
+        );
+        assert!(
+            waker_fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the host must be woken so the tofu frame is redrawn"
+        );
+
+        // The face is resident now, so the same text resolves to it.
+        let resolved = fonts.shape_text("日本語", false, false).expect("reshape");
+        assert!(!resolved.glyphs.is_empty());
+    }
+
+    /// Shapes until a fallback that had to be loaded in the background is
+    /// resident, mirroring what a host does: draw the frame with what is
+    /// available, then redraw when `poll_loaded_fonts` reports an arrival.
+    fn shape_after_fallback_loads(fonts: &mut FontSystem, text: &str) -> ShapedRun {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let run = fonts.shape_text(text, false, false).expect("shape text");
+            if !fonts.has_pending_font_loads() {
+                return run;
+            }
+            if std::time::Instant::now() >= deadline {
+                return run;
+            }
+            if !fonts.poll_loaded_fonts() {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_color_emoji_fallback_rasterizes_rgba() {
         let mut fonts = FontSystem::new(FontConfig::default());
-        let run = fonts.shape_text("😀", false, false).unwrap();
+        let run = shape_after_fallback_loads(&mut fonts, "😀");
         assert!(
             run.families_used
                 .iter()

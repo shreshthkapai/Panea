@@ -11,5 +11,7 @@ fuzz_target!(|data: &[u8]| {
     for chunk in data.chunks(31) {
         terminal.apply_bytes(chunk).unwrap();
         support::assert_terminal_invariants(terminal.state());
+        support::assert_pending_output_invariants(terminal.state_mut());
     }
+    support::assert_alt_screen_saved_cursor_round_trip(data);
 });

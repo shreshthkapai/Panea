@@ -119,7 +119,12 @@ impl ConfigWatcher {
         }
         self.last_poll = Some(now);
 
-        let fingerprint = match current_fingerprint(&self.options) {
+        let previous = self
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.fingerprint.as_ref())
+            .or(self.last_seen.as_ref());
+        let fingerprint = match current_fingerprint_if_changed(&self.options, previous) {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
                 return ConfigWatchEvent::Failed { path: None, error };
@@ -234,13 +239,21 @@ impl Error for ConfigTomlError {}
 fn current_fingerprint(
     options: &ConfigLoadOptions,
 ) -> Result<Option<FileFingerprint>, ConfigTomlError> {
+    current_fingerprint_if_changed(options, None)
+}
+
+fn current_fingerprint_if_changed(
+    options: &ConfigLoadOptions,
+    previous: Option<&FileFingerprint>,
+) -> Result<Option<FileFingerprint>, ConfigTomlError> {
     if let Some(path) = &options.explicit_path {
-        return fingerprint_for_path(path).map(Some);
+        return fingerprint_for_path_if_changed(path, previous, |path| fs::read(path)).map(Some);
     }
 
     for path in candidate_paths_from_platform(options.platform) {
         if path.exists() {
-            return fingerprint_for_path(&path).map(Some);
+            return fingerprint_for_path_if_changed(&path, previous, |path| fs::read(path))
+                .map(Some);
         }
     }
 
@@ -251,17 +264,25 @@ fn candidate_paths_from_platform(platform: ConfigPlatform) -> Vec<PathBuf> {
     candidate_paths_from_env(platform, |key| std::env::var_os(key))
 }
 
-fn fingerprint_for_path(path: &Path) -> Result<FileFingerprint, ConfigTomlError> {
+fn fingerprint_for_path_if_changed(
+    path: &Path,
+    previous: Option<&FileFingerprint>,
+    read: impl FnOnce(&Path) -> io::Result<Vec<u8>>,
+) -> Result<FileFingerprint, ConfigTomlError> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(FileFingerprint {
+            let missing = FileFingerprint {
                 path: path.to_path_buf(),
                 exists: false,
                 modified: None,
                 len: 0,
                 content_hash: None,
-            });
+            };
+            return Ok(previous
+                .filter(|prior| **prior == missing)
+                .unwrap_or(&missing)
+                .clone());
         }
         Err(error) => {
             return Err(ConfigTomlError::Io {
@@ -271,7 +292,18 @@ fn fingerprint_for_path(path: &Path) -> Result<FileFingerprint, ConfigTomlError>
         }
     };
 
-    let contents = fs::read(path).map_err(|error| ConfigTomlError::Io {
+    let modified = metadata.modified().ok();
+    let len = metadata.len();
+    if let Some(previous) = previous
+        && previous.path == path
+        && previous.exists
+        && previous.modified == modified
+        && previous.len == len
+    {
+        return Ok(previous.clone());
+    }
+
+    let contents = read(path).map_err(|error| ConfigTomlError::Io {
         path: path.to_path_buf(),
         message: error.to_string(),
     })?;
@@ -281,8 +313,8 @@ fn fingerprint_for_path(path: &Path) -> Result<FileFingerprint, ConfigTomlError>
     Ok(FileFingerprint {
         path: path.to_path_buf(),
         exists: true,
-        modified: metadata.modified().ok(),
-        len: metadata.len(),
+        modified,
+        len,
         content_hash: Some(hasher.finish()),
     })
 }
@@ -702,6 +734,7 @@ fn known_paths() -> BTreeSet<&'static str> {
         "renderer.damage_tracking",
         "renderer.present_mode",
         "renderer.gpu_timestamps",
+        "renderer.text_gamma_adjustment",
         "font",
         "font.family",
         "font.size",
@@ -1424,6 +1457,28 @@ mod tests {
             panic!("expected reload, got {event:?}");
         };
         assert_eq!(loaded.config.window.title, "Reloaded");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn unchanged_file_stamp_skips_content_read() {
+        let path = temp_config_path("unchanged-file-stamp-skips-content-read");
+        fs::write(&path, "[window]\ntitle = \"Stable\"\n").expect("write stable config");
+        let reads = std::cell::Cell::new(0_u32);
+        let first = fingerprint_for_path_if_changed(&path, None, |path| {
+            reads.set(reads.get() + 1);
+            fs::read(path)
+        })
+        .expect("initial fingerprint");
+        let second = fingerprint_for_path_if_changed(&path, Some(&first), |path| {
+            reads.set(reads.get() + 1);
+            fs::read(path)
+        })
+        .expect("unchanged fingerprint");
+
+        assert_eq!(second, first);
+        assert_eq!(reads.get(), 1, "unchanged metadata must avoid another read");
 
         let _ = fs::remove_file(path);
     }

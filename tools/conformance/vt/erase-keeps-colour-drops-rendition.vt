@@ -1,0 +1,11 @@
+# Back-colour erase: the erased region keeps the current colours but not the
+# graphic rendition. `ESC[7m ESC[K` must clear to end of line, not paint an
+# inverse bar, and the same applies to underline.
+size: 8x2
+description: erasing honours colours but not inverse or underline
+
+--- input
+\e[7m\e[4m\e[44mAB\e[K
+
+--- expect-cell
+row=0 col=4 inverse=false underline=false has_background=true

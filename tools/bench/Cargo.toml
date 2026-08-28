@@ -18,7 +18,7 @@ config-core = { path = "../../crates/config-core" }
 diagnostics = { path = "../../crates/diagnostics" }
 font-system = { path = "../../crates/font-system" }
 render-core = { path = "../../crates/render-core" }
-render-wgpu = { path = "../../crates/render-wgpu" }
+render-wgpu = { path = "../../crates/render-wgpu", features = ["conformance"] }
 semantics = { path = "../../crates/semantics" }
 term-core = { path = "../../crates/term-core" }
 term-parser = { path = "../../crates/term-parser" }

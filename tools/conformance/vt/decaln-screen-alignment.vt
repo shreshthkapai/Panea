@@ -1,0 +1,16 @@
+# ESC # 8 (DECALN) fills the whole screen with 'E' and homes the cursor.
+# This is a two-byte escape with an intermediate; parsers that only consume the
+# intermediate print a stray '8' instead.
+size: 6x3
+description: DECALN fills the screen and homes the cursor
+
+--- input
+\e#8
+
+--- expect-grid
+|EEEEEE|
+|EEEEEE|
+|EEEEEE|
+
+--- expect-cursor
+row=0 col=0

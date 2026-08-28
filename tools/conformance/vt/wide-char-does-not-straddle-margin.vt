@@ -1,0 +1,11 @@
+# A double-width glyph that will not fit in the last column wraps whole rather
+# than being split across the margin.
+size: 5x3
+description: a wide glyph wraps instead of straddling the right margin
+
+--- input
+abcd\xe6\x97\xa5
+
+--- expect-cell
+row=1 col=0 wide_continuation=false
+row=1 col=1 wide_continuation=true

@@ -1,0 +1,16 @@
+# Autowrap at the right margin (DECAWM, on by default).
+# A glyph printed at the last column sets a pending wrap; the *next* glyph
+# moves to column 0 of the following row.
+size: 10x3
+description: printing past the right margin wraps to the next row
+
+--- input
+abcdefghijk
+
+--- expect-grid
+|abcdefghij|
+|k|
+||
+
+--- expect-cursor
+row=1 col=1

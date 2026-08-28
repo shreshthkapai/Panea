@@ -41,6 +41,12 @@ pub struct MuxModel {
     pub workspaces: BTreeMap<WorkspaceId, Workspace>,
     pub active_workspace: WorkspaceId,
     counters: IdCounters,
+    #[serde(skip, default = "initial_layout_revision")]
+    layout_revision: u64,
+}
+
+const fn initial_layout_revision() -> u64 {
+    1
 }
 
 impl MuxModel {
@@ -72,7 +78,17 @@ impl MuxModel {
             workspaces: BTreeMap::from([(workspace_id, workspace)]),
             active_workspace: workspace_id,
             counters,
+            layout_revision: initial_layout_revision(),
         }
+    }
+
+    #[must_use]
+    pub const fn layout_revision(&self) -> u64 {
+        self.layout_revision
+    }
+
+    fn bump_layout_revision(&mut self) {
+        self.layout_revision = self.layout_revision.wrapping_add(1).max(1);
     }
 
     #[must_use]
@@ -182,6 +198,7 @@ impl MuxModel {
         };
         self.workspaces.insert(workspace_id, workspace);
         self.active_workspace = workspace_id;
+        self.bump_layout_revision();
         workspace_id
     }
 
@@ -189,7 +206,10 @@ impl MuxModel {
         if !self.workspaces.contains_key(&workspace_id) {
             return Err(MuxError::WorkspaceNotFound(workspace_id));
         }
-        self.active_workspace = workspace_id;
+        if self.active_workspace != workspace_id {
+            self.active_workspace = workspace_id;
+            self.bump_layout_revision();
+        }
         Ok(())
     }
 
@@ -220,6 +240,7 @@ impl MuxModel {
                 .next()
                 .expect("closing one of multiple workspaces leaves a workspace");
         }
+        self.bump_layout_revision();
         Ok(())
     }
 
@@ -236,6 +257,7 @@ impl MuxModel {
         let window = self.active_workspace_mut().active_window_mut();
         window.active_tab = tab_id;
         window.tabs.push(tab);
+        self.bump_layout_revision();
         Ok(tab_id)
     }
 
@@ -256,6 +278,7 @@ impl MuxModel {
             let next_index = index.saturating_sub(1).min(window.tabs.len() - 1);
             window.active_tab = window.tabs[next_index].id;
         }
+        self.bump_layout_revision();
         Ok(())
     }
 
@@ -274,7 +297,10 @@ impl MuxModel {
         if !window.tabs.iter().any(|tab| tab.id == tab_id) {
             return Err(MuxError::TabNotFound(tab_id));
         }
-        window.active_tab = tab_id;
+        if window.active_tab != tab_id {
+            window.active_tab = tab_id;
+            self.bump_layout_revision();
+        }
         Ok(())
     }
 
@@ -287,6 +313,7 @@ impl MuxModel {
             .ok_or(MuxError::TabNotFound(tab_id))?;
         let tab = window.tabs.remove(index);
         window.tabs.insert(target_index.min(window.tabs.len()), tab);
+        self.bump_layout_revision();
         Ok(())
     }
 
@@ -306,11 +333,14 @@ impl MuxModel {
         tab.panes.insert(pane_id, pane);
         tab.root.split_leaf(active_pane, pane_id, axis)?;
         tab.active_pane = pane_id;
+        self.bump_layout_revision();
         Ok(pane_id)
     }
 
     pub fn close_pane(&mut self, pane_id: PaneId) -> MuxResult<()> {
-        self.active_tab_mut().close_pane(pane_id)
+        self.active_tab_mut().close_pane(pane_id)?;
+        self.bump_layout_revision();
+        Ok(())
     }
 
     /// Removes a cleanly exited pane while preserving the mux invariant that
@@ -349,6 +379,7 @@ impl MuxModel {
                 .find(|window| window.id == window_id)
                 .ok_or(MuxError::WindowNotFound(window_id))?;
             window.tab_mut(tab_id)?.close_pane(pane_id)?;
+            self.bump_layout_revision();
             return Ok(PaneExitDisposition::PaneClosed);
         }
 
@@ -372,6 +403,7 @@ impl MuxModel {
                 window.active_tab =
                     window.tabs[index.saturating_sub(1).min(window.tabs.len() - 1)].id;
             }
+            self.bump_layout_revision();
             return Ok(PaneExitDisposition::TabClosed);
         }
 
@@ -390,6 +422,7 @@ impl MuxModel {
                 workspace.active_window =
                     workspace.windows[index.saturating_sub(1).min(workspace.windows.len() - 1)].id;
             }
+            self.bump_layout_revision();
             return Ok(PaneExitDisposition::WindowClosed);
         }
 
@@ -404,6 +437,7 @@ impl MuxModel {
                     .next()
                     .expect("closing one of multiple workspaces leaves a workspace");
             }
+            self.bump_layout_revision();
             return Ok(PaneExitDisposition::WorkspaceClosed);
         }
 
@@ -424,7 +458,9 @@ impl MuxModel {
     }
 
     pub fn resize_active_pane(&mut self, direction: ResizeDirection, delta: f32) -> MuxResult<()> {
-        self.active_tab_mut().resize_active_pane(direction, delta)
+        self.active_tab_mut().resize_active_pane(direction, delta)?;
+        self.bump_layout_revision();
+        Ok(())
     }
 
     pub fn toggle_zoom_active_pane(&mut self) -> PaneId {
@@ -435,11 +471,14 @@ impl MuxModel {
         } else {
             Some(pane_id)
         };
+        self.bump_layout_revision();
         pane_id
     }
 
     pub fn swap_panes(&mut self, first: PaneId, second: PaneId) -> MuxResult<()> {
-        self.active_tab_mut().root.swap_panes(first, second)
+        self.active_tab_mut().root.swap_panes(first, second)?;
+        self.bump_layout_revision();
+        Ok(())
     }
 
     pub fn move_active_pane(&mut self, direction: FocusDirection) -> MuxResult<PaneId> {
@@ -447,6 +486,7 @@ impl MuxModel {
         let active = tab.active_pane;
         let target = tab.pane_in_direction(direction)?;
         tab.root.swap_panes(active, target)?;
+        self.bump_layout_revision();
         Ok(target)
     }
 
@@ -510,6 +550,7 @@ impl MuxModel {
             workspaces,
             active_workspace,
             counters,
+            layout_revision: initial_layout_revision(),
         })
     }
 
@@ -646,7 +687,10 @@ impl Tab {
     }
 
     fn pane_in_direction(&self, direction: FocusDirection) -> MuxResult<PaneId> {
-        let assignments = self.layout(LogicalRect::unit());
+        // Navigation needs enough integral cells for every split to retain a
+        // distinct centre. A unit rectangle collapses same-axis children once
+        // integer layout rounding is applied.
+        let assignments = self.layout(LogicalRect::new(0.0, 0.0, 10_000.0, 10_000.0));
         let active = assignments
             .iter()
             .find(|assignment| assignment.pane_id == self.active_pane)
@@ -1056,35 +1100,53 @@ impl SplitTree {
                 children,
                 ratios,
             } => {
-                let mut offset = 0.0;
+                let extent = match axis {
+                    SplitAxis::Horizontal => area.width,
+                    SplitAxis::Vertical => area.height,
+                }
+                .floor()
+                .max(0.0) as u32;
+                let reserve_one_cell = extent >= children.len() as u32;
+                let mut consumed = 0u32;
+                let mut cumulative_ratio = 0.0f32;
                 for (index, child) in children.iter().enumerate() {
                     let ratio = ratios.get(index).copied().unwrap_or_default();
+                    cumulative_ratio += ratio;
+                    let remaining = children.len().saturating_sub(index + 1) as u32;
+                    let end = if remaining == 0 {
+                        extent
+                    } else {
+                        let desired =
+                            (extent as f32 * cumulative_ratio.clamp(0.0, 1.0)).round() as u32;
+                        let minimum = if reserve_one_cell {
+                            consumed.saturating_add(1)
+                        } else {
+                            consumed
+                        };
+                        let maximum = if reserve_one_cell {
+                            extent.saturating_sub(remaining)
+                        } else {
+                            extent
+                        };
+                        desired.clamp(minimum.min(maximum), maximum)
+                    };
+                    let length = end.saturating_sub(consumed) as f32;
+                    let offset = consumed as f32;
                     let rect = match axis {
                         SplitAxis::Horizontal => LogicalRect {
                             x: area.x + offset,
                             y: area.y,
-                            width: if index + 1 == children.len() {
-                                (area.width - offset).max(0.0)
-                            } else {
-                                area.width * ratio
-                            },
+                            width: length,
                             height: area.height,
                         },
                         SplitAxis::Vertical => LogicalRect {
                             x: area.x,
                             y: area.y + offset,
                             width: area.width,
-                            height: if index + 1 == children.len() {
-                                (area.height - offset).max(0.0)
-                            } else {
-                                area.height * ratio
-                            },
+                            height: length,
                         },
                     };
-                    offset += match axis {
-                        SplitAxis::Horizontal => rect.width,
-                        SplitAxis::Vertical => rect.height,
-                    };
+                    consumed = end;
                     child.assign_layout(rect, output);
                 }
             }
@@ -1741,6 +1803,24 @@ mod tests {
     }
 
     #[test]
+    fn directional_focus_distinguishes_three_same_axis_panes() {
+        let mut model = model();
+        let first = model.active_tab().active_pane;
+        let second = model
+            .split_active_pane(SplitAxis::Horizontal, SessionSpec::local("default"))
+            .expect("second pane");
+        let third = model
+            .split_active_pane(SplitAxis::Horizontal, SessionSpec::local("default"))
+            .expect("third pane");
+        assert_eq!(model.active_tab().active_pane, third);
+
+        assert_eq!(model.focus_direction(FocusDirection::Left), Ok(second));
+        assert_eq!(model.focus_direction(FocusDirection::Left), Ok(first));
+        assert_eq!(model.focus_direction(FocusDirection::Right), Ok(second));
+        assert_eq!(model.focus_direction(FocusDirection::Right), Ok(third));
+    }
+
+    #[test]
     fn workspaces_can_be_created_switched_renamed_and_closed() {
         let mut model = model();
         let first = model.active_workspace;
@@ -1776,6 +1856,46 @@ mod tests {
         assert_eq!(layout.len(), 3);
         assert!(layout.iter().all(|assignment| assignment.rect.width > 0.0));
         assert!(layout.iter().all(|assignment| assignment.rect.height > 0.0));
+    }
+
+    #[test]
+    fn odd_cell_extents_produce_integral_gapless_nested_layouts() {
+        let mut model = model();
+        let _right = model
+            .split_active_pane(SplitAxis::Horizontal, SessionSpec::local("default"))
+            .expect("horizontal split");
+        let _bottom_right = model
+            .split_active_pane(SplitAxis::Vertical, SessionSpec::local("default"))
+            .expect("vertical split");
+
+        let width = 121usize;
+        let height = 41usize;
+        let layout =
+            model
+                .active_tab()
+                .layout(LogicalRect::new(0.0, 0.0, width as f32, height as f32));
+        let mut coverage = vec![0u8; width * height];
+
+        for assignment in layout {
+            let rect = assignment.rect;
+            assert_eq!(rect.x.fract(), 0.0, "pane x must align to a cell");
+            assert_eq!(rect.y.fract(), 0.0, "pane y must align to a cell");
+            assert_eq!(rect.width.fract(), 0.0, "pane width must use whole cells");
+            assert_eq!(rect.height.fract(), 0.0, "pane height must use whole cells");
+            assert_eq!(assignment.terminal_size.cols, rect.width as u16);
+            assert_eq!(assignment.terminal_size.rows, rect.height as u16);
+
+            for row in rect.y as usize..(rect.y + rect.height) as usize {
+                for col in rect.x as usize..(rect.x + rect.width) as usize {
+                    coverage[row * width + col] += 1;
+                }
+            }
+        }
+
+        assert!(
+            coverage.iter().all(|count| *count == 1),
+            "nested pane layouts must cover every terminal cell exactly once"
+        );
     }
 
     #[test]
@@ -1938,6 +2058,25 @@ mod tests {
             external_mux_compatibility_policy()
                 .contains("ordinary terminal applications inside panes")
         );
+    }
+
+    #[test]
+    fn layout_revision_changes_only_for_layout_affecting_mutations() {
+        let mut model = model();
+        let initial = model.layout_revision();
+        let tab_id = model.active_tab().id;
+
+        model.rename_tab(tab_id, "renamed").expect("rename tab");
+        assert_eq!(model.layout_revision(), initial);
+
+        model
+            .split_active_pane(SplitAxis::Horizontal, SessionSpec::local("default"))
+            .expect("split pane");
+        let after_split = model.layout_revision();
+        assert_ne!(after_split, initial);
+
+        model.toggle_zoom_active_pane();
+        assert_ne!(model.layout_revision(), after_split);
     }
 
     #[test]

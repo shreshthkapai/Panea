@@ -1,0 +1,11 @@
+# `DCS tmux; ... ST` carries a sequence meant for the outer terminal, with inner
+# escapes doubled. Un-doubling yields a real SGR, so the text that follows is
+# styled -- the payload is applied, not printed.
+size: 16x3
+description: tmux passthrough applies its un-doubled payload
+
+--- input
+\ePtmux;\e\e[1m\stBOLD
+
+--- expect-cell
+row=0 col=0 text=B bold=true

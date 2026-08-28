@@ -10,7 +10,7 @@ resolution, and glyph rasterization remain in `font-system`.
 Feature name: Unicode and font rendering
 Layer: render performance
 User-facing behavior: terminal graphemes render through OpenType shaping, configured fallback chains, real style faces, and color emoji sources without changing raw terminal cells.
-Config keys: font.family, font.fallback_families, font.size, font.line_height
+Config keys: font.family, font.fallback_families, font.size, font.line_height, font.ligatures
 macOS behavior: system font discovery plus the same Rust shaping/raster contract; Apple Color Emoji is an automatic fallback candidate.
 Windows behavior: system font discovery plus the same Rust shaping/raster contract; Cascadia Mono, Consolas, and Segoe UI Emoji are automatic candidates.
 Linux X11 behavior: system font discovery plus the same Rust shaping/raster contract; DejaVu and Noto-family fonts are used when installed.
@@ -42,9 +42,15 @@ Can diagnostics show its cost? Glyph cache hits/misses and atlas uploads/occupan
 
 - `font-system` queries real regular/bold/italic/bold-italic faces through
   `fontdb`; it does not synthesize style metadata.
+- System font discovery is retained across live font reloads. Each font file is
+  read into one shared byte allocation, and parsed AbGlyph and Rustybuzz faces
+  borrow that allocation instead of holding independent full-file copies.
 - `font.size` is measured in typographic points. The desktop runtime converts
   points to physical pixels using the active window scale factor, and rebuilds
   cell metrics when a window moves between displays.
+- The primary zero-glyph advance is rounded to at least one physical pixel for
+  terminal cell geometry. Shaped run advances are fitted to that integer grid
+  without rounding each glyph independently.
 - The generic `monospace` family resolves through Panea's portable modern
   fallback order before the host's legacy generic alias.
 - Rustybuzz shapes OpenType runs and preserves cluster offsets.
@@ -73,8 +79,11 @@ Can diagnostics show its cost? Glyph cache hits/misses and atlas uploads/occupan
 - Baseline correction is part of the renderer contract, not a per-platform
   `glyph_offset_y` workaround. A future user offset may be added for deliberate
   typography customization, but it must apply after the correct shared baseline.
-- Compatible adjacent ASCII cells are shaped as one run, allowing configured
-  font ligatures while terminal selection and cursor positions remain cell-based.
+- Ligatures are disabled by default. When `font.ligatures` is enabled,
+  compatible adjacent ASCII cells are shaped as one run so programming-font
+  ligatures work while terminal selection and cursor positions remain
+  cell-based. Complex-script graphemes stay in independent terminal cells
+  until cluster-to-cell mapping supports mixed direction and script runs.
 - CJK and emoji cells remain independently owned terminal graphemes; wide-cell
   occupancy remains a `term-core` responsibility.
 - Shaped glyph advances remain floating point until final pixel placement so

@@ -1,0 +1,11 @@
+# A powerline-style prompt: coloured segments where the colour lives in blank
+# cells. Erasing to end of line must keep the background it was erased with.
+size: 16x2
+description: prompt segments keep the background carried by blank cells
+
+--- input
+\e[48;5;236m\e[38;5;252m user \e[0m\e[48;5;240m git \e[0m
+
+--- expect-cell
+row=0 col=1 has_background=true has_foreground=true
+row=0 col=7 has_background=true

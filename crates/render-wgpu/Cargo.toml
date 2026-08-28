@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "GPU renderer implementation, glyph atlas, batches, and frame scheduler."
 
+[features]
+default = []
+conformance = []
+
 [lints]
 workspace = true
 
@@ -13,10 +17,12 @@ workspace = true
 assets = { path = "../assets" }
 bytemuck.workspace = true
 font-system = { path = "../font-system" }
+hashbrown.workspace = true
 image.workspace = true
 render-core = { path = "../render-core" }
 serde.workspace = true
 serde_json.workspace = true
+unicode-width.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 

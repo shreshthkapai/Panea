@@ -1,0 +1,14 @@
+# An unrecognised DCS string is consumed to its terminator and ignored (VT500).
+# Only `DCS tmux;` is interpreted, and that is covered separately -- anything
+# else must leave no trace, or a device-control payload would be typed onto the
+# screen.
+size: 16x3
+description: an unrecognised DCS string leaves no trace
+
+--- input
+A\eP1;2|q[2Jpayload\stB
+
+--- expect-grid
+|AB|
+||
+||

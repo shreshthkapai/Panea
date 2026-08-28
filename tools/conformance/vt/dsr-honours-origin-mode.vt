@@ -1,0 +1,11 @@
+# With origin mode set, DSR 6 reports the cursor relative to the scrolling
+# region's top margin. Reporting an absolute row puts a cursor handshake inside
+# a region off by the margin.
+size: 10x8
+description: the cursor report is relative to the top margin under origin mode
+
+--- input
+\e[3;6r\e[?6h\e[1;1H\e[6n
+
+--- expect-reply
+\e[1;1R

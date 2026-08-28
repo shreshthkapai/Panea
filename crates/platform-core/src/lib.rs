@@ -266,6 +266,7 @@ pub struct KeyModifiers {
 pub struct KeyEvent {
     pub physical_key: Option<String>,
     pub logical_key: String,
+    pub logical_key_without_modifiers: String,
     pub text: Option<String>,
     pub state: KeyState,
     pub modifiers: KeyModifiers,
@@ -287,7 +288,13 @@ pub enum MouseEventKind {
     Pressed(MouseButton),
     Released(MouseButton),
     Moved,
-    Wheel { delta_x: f64, delta_y: f64 },
+    Wheel(MouseScrollDelta),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MouseScrollDelta {
+    Lines { x: f64, y: f64 },
+    Pixels { x: f64, y: f64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -302,8 +309,13 @@ pub struct MouseEvent {
 pub enum ImeEvent {
     Enabled,
     Disabled,
-    Preedit { text: String },
-    Commit { text: String },
+    Preedit {
+        text: String,
+        cursor: Option<(usize, usize)>,
+    },
+    Commit {
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -498,8 +510,248 @@ pub trait WindowProvider {
     fn poll_input_events(&mut self) -> Vec<InputEvent>;
 }
 
+/// A Windows virtual key with the scan code and enhanced-key flag that go with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Win32VirtualKey {
+    pub virtual_key: u16,
+    pub scan_code: u16,
+    /// True for keys the keyboard reports with an `0xE0` prefix.
+    pub enhanced: bool,
+}
+
+/// Maps a physical key name to its Windows virtual key and PC set-1 scan code.
+///
+/// Names come from winit's `KeyCode`, either bare (`"KeyA"`) or in the debug
+/// form the platform layer produces (`"Code(KeyA)"`). Returns `None` for keys
+/// with no Windows equivalent, including `Unidentified`, where the caller falls
+/// back to a character-only record.
+#[must_use]
+pub fn win32_virtual_key(physical_key: &str) -> Option<Win32VirtualKey> {
+    let name = physical_key
+        .strip_prefix("Code(")
+        .and_then(|value| value.strip_suffix(')'))
+        .unwrap_or(physical_key);
+
+    let (virtual_key, scan_code, enhanced) = match name {
+        // Letters: VK is the ASCII uppercase code.
+        "KeyA" => (0x41, 0x1e, false),
+        "KeyB" => (0x42, 0x30, false),
+        "KeyC" => (0x43, 0x2e, false),
+        "KeyD" => (0x44, 0x20, false),
+        "KeyE" => (0x45, 0x12, false),
+        "KeyF" => (0x46, 0x21, false),
+        "KeyG" => (0x47, 0x22, false),
+        "KeyH" => (0x48, 0x23, false),
+        "KeyI" => (0x49, 0x17, false),
+        "KeyJ" => (0x4a, 0x24, false),
+        "KeyK" => (0x4b, 0x25, false),
+        "KeyL" => (0x4c, 0x26, false),
+        "KeyM" => (0x4d, 0x32, false),
+        "KeyN" => (0x4e, 0x31, false),
+        "KeyO" => (0x4f, 0x18, false),
+        "KeyP" => (0x50, 0x19, false),
+        "KeyQ" => (0x51, 0x10, false),
+        "KeyR" => (0x52, 0x13, false),
+        "KeyS" => (0x53, 0x1f, false),
+        "KeyT" => (0x54, 0x14, false),
+        "KeyU" => (0x55, 0x16, false),
+        "KeyV" => (0x56, 0x2f, false),
+        "KeyW" => (0x57, 0x11, false),
+        "KeyX" => (0x58, 0x2d, false),
+        "KeyY" => (0x59, 0x15, false),
+        "KeyZ" => (0x5a, 0x2c, false),
+        // Digit row: VK is the ASCII digit. Shifted symbols share these keys,
+        // which is why the character has to travel separately in the record.
+        "Digit1" => (0x31, 0x02, false),
+        "Digit2" => (0x32, 0x03, false),
+        "Digit3" => (0x33, 0x04, false),
+        "Digit4" => (0x34, 0x05, false),
+        "Digit5" => (0x35, 0x06, false),
+        "Digit6" => (0x36, 0x07, false),
+        "Digit7" => (0x37, 0x08, false),
+        "Digit8" => (0x38, 0x09, false),
+        "Digit9" => (0x39, 0x0a, false),
+        "Digit0" => (0x30, 0x0b, false),
+        // OEM punctuation.
+        "Minus" => (0xbd, 0x0c, false),
+        "Equal" => (0xbb, 0x0d, false),
+        "BracketLeft" => (0xdb, 0x1a, false),
+        "BracketRight" => (0xdd, 0x1b, false),
+        "Backslash" => (0xdc, 0x2b, false),
+        "Semicolon" => (0xba, 0x27, false),
+        "Quote" => (0xde, 0x28, false),
+        "Backquote" => (0xc0, 0x29, false),
+        "Comma" => (0xbc, 0x33, false),
+        "Period" => (0xbe, 0x34, false),
+        "Slash" => (0xbf, 0x35, false),
+        "IntlBackslash" => (0xe2, 0x56, false),
+        // Editing and whitespace.
+        "Enter" => (0x0d, 0x1c, false),
+        "Tab" => (0x09, 0x0f, false),
+        "Space" => (0x20, 0x39, false),
+        "Backspace" => (0x08, 0x0e, false),
+        "Escape" => (0x1b, 0x01, false),
+        // Navigation cluster: enhanced keys.
+        "Insert" => (0x2d, 0x52, true),
+        "Delete" => (0x2e, 0x53, true),
+        "Home" => (0x24, 0x47, true),
+        "End" => (0x23, 0x4f, true),
+        "PageUp" => (0x21, 0x49, true),
+        "PageDown" => (0x22, 0x51, true),
+        "ArrowUp" => (0x26, 0x48, true),
+        "ArrowDown" => (0x28, 0x50, true),
+        "ArrowLeft" => (0x25, 0x4b, true),
+        "ArrowRight" => (0x27, 0x4d, true),
+        // Modifiers: the generic VK, with the side carried by the scan code and
+        // the enhanced flag, matching what Windows reports.
+        "ShiftLeft" => (0x10, 0x2a, false),
+        "ShiftRight" => (0x10, 0x36, false),
+        "ControlLeft" => (0x11, 0x1d, false),
+        "ControlRight" => (0x11, 0x1d, true),
+        "AltLeft" => (0x12, 0x38, false),
+        "AltRight" => (0x12, 0x38, true),
+        "SuperLeft" => (0x5b, 0x5b, true),
+        "SuperRight" => (0x5c, 0x5c, true),
+        "CapsLock" => (0x14, 0x3a, false),
+        "NumLock" => (0x90, 0x45, true),
+        "ScrollLock" => (0x91, 0x46, false),
+        "ContextMenu" => (0x5d, 0x5d, true),
+        "PrintScreen" => (0x2c, 0x37, true),
+        "Pause" => (0x13, 0x45, false),
+        // Function keys.
+        "F1" => (0x70, 0x3b, false),
+        "F2" => (0x71, 0x3c, false),
+        "F3" => (0x72, 0x3d, false),
+        "F4" => (0x73, 0x3e, false),
+        "F5" => (0x74, 0x3f, false),
+        "F6" => (0x75, 0x40, false),
+        "F7" => (0x76, 0x41, false),
+        "F8" => (0x77, 0x42, false),
+        "F9" => (0x78, 0x43, false),
+        "F10" => (0x79, 0x44, false),
+        "F11" => (0x7a, 0x57, false),
+        "F12" => (0x7b, 0x58, false),
+        "F13" => (0x7c, 0x64, false),
+        "F14" => (0x7d, 0x65, false),
+        "F15" => (0x7e, 0x66, false),
+        "F16" => (0x7f, 0x67, false),
+        "F17" => (0x80, 0x68, false),
+        "F18" => (0x81, 0x69, false),
+        "F19" => (0x82, 0x6a, false),
+        "F20" => (0x83, 0x6b, false),
+        "F21" => (0x84, 0x6c, false),
+        "F22" => (0x85, 0x6d, false),
+        "F23" => (0x86, 0x6e, false),
+        "F24" => (0x87, 0x76, false),
+        // Numpad.
+        "Numpad0" => (0x60, 0x52, false),
+        "Numpad1" => (0x61, 0x4f, false),
+        "Numpad2" => (0x62, 0x50, false),
+        "Numpad3" => (0x63, 0x51, false),
+        "Numpad4" => (0x64, 0x4b, false),
+        "Numpad5" => (0x65, 0x4c, false),
+        "Numpad6" => (0x66, 0x4d, false),
+        "Numpad7" => (0x67, 0x47, false),
+        "Numpad8" => (0x68, 0x48, false),
+        "Numpad9" => (0x69, 0x49, false),
+        "NumpadMultiply" => (0x6a, 0x37, false),
+        "NumpadAdd" => (0x6b, 0x4e, false),
+        "NumpadSubtract" => (0x6d, 0x4a, false),
+        "NumpadDecimal" => (0x6e, 0x53, false),
+        "NumpadDivide" => (0x6f, 0x35, true),
+        "NumpadEnter" => (0x0d, 0x1c, true),
+        _ => return None,
+    };
+
+    Some(Win32VirtualKey {
+        virtual_key,
+        scan_code,
+        enhanced,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn win32_virtual_keys_cover_letters_digits_symbols_navigation_and_modifiers() {
+        use super::{Win32VirtualKey, win32_virtual_key};
+        let key = |name: &str| win32_virtual_key(name).unwrap_or_else(|| panic!("{name} must map"));
+
+        // Accepts both the bare KeyCode name and the `Code(..)` debug form.
+        assert_eq!(
+            key("KeyA"),
+            Win32VirtualKey {
+                virtual_key: 0x41,
+                scan_code: 0x1e,
+                enhanced: false
+            }
+        );
+        assert_eq!(key("Code(KeyA)"), key("KeyA"));
+        assert_eq!(
+            key("Digit7"),
+            Win32VirtualKey {
+                virtual_key: 0x37,
+                scan_code: 0x08,
+                enhanced: false
+            }
+        );
+        assert_eq!(
+            key("Digit0"),
+            Win32VirtualKey {
+                virtual_key: 0x30,
+                scan_code: 0x0b,
+                enhanced: false
+            }
+        );
+        // OEM symbol keys carry their VK_OEM codes.
+        assert_eq!(key("Minus").virtual_key, 0xbd);
+        assert_eq!(key("Equal").virtual_key, 0xbb);
+        assert_eq!(key("Semicolon").virtual_key, 0xba);
+        assert_eq!(key("Quote").virtual_key, 0xde);
+        assert_eq!(key("Backquote").virtual_key, 0xc0);
+        assert_eq!(key("Backslash").virtual_key, 0xdc);
+        // Navigation keys are enhanced (0xE0-prefixed) keys.
+        assert_eq!(
+            key("ArrowUp"),
+            Win32VirtualKey {
+                virtual_key: 0x26,
+                scan_code: 0x48,
+                enhanced: true
+            }
+        );
+        assert!(key("Delete").enhanced && key("Home").enhanced && key("PageDown").enhanced);
+        assert_eq!(
+            key("Enter"),
+            Win32VirtualKey {
+                virtual_key: 0x0d,
+                scan_code: 0x1c,
+                enhanced: false
+            }
+        );
+        assert!(key("NumpadEnter").enhanced);
+        // Modifiers use the generic VK with left/right distinguished by scan code.
+        assert_eq!(
+            key("ShiftLeft"),
+            Win32VirtualKey {
+                virtual_key: 0x10,
+                scan_code: 0x2a,
+                enhanced: false
+            }
+        );
+        assert_eq!(key("ShiftRight").scan_code, 0x36);
+        assert!(key("ControlRight").enhanced && key("AltRight").enhanced);
+        assert_eq!(key("F1").virtual_key, 0x70);
+        assert_eq!(
+            key("F12"),
+            Win32VirtualKey {
+                virtual_key: 0x7b,
+                scan_code: 0x58,
+                enhanced: false
+            }
+        );
+        assert!(win32_virtual_key("Unidentified(0)").is_none());
+    }
+
     use super::*;
 
     #[test]

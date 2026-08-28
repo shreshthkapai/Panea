@@ -1,0 +1,12 @@
+# A cluster cannot grow without bound: UAX-29 never breaks before a combining
+# mark, so an unbounded cell would absorb a whole stream of them. Extra marks
+# past the cap are dropped rather than spilling into the next cell.
+size: 8x2
+chunk: 7
+description: a flood of combining marks stays in one bounded cell
+
+--- input
+e\xcc\x81\xcc\x81\xcc\x81\xcc\x81\xcc\x81\xcc\x81\xcc\x81\xcc\x81\xcc\x81\xcc\x81\xcc\x81\xcc\x81X
+
+--- expect-cell
+row=0 col=1 text=X

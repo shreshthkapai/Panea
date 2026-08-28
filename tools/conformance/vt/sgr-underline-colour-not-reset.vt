@@ -1,0 +1,10 @@
+# `58:2::255:0:0` sets an underline colour. Flattened to semicolons it becomes
+# `58;2;;255;0;0`, where the empty parameter reads as SGR 0 and wipes everything.
+size: 12x2
+description: an underline colour does not reset the pending attributes
+
+--- input
+\e[1m\e[58:2::255:0:0mA
+
+--- expect-cell
+row=0 col=0 bold=true

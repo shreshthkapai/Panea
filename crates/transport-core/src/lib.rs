@@ -7,31 +7,94 @@ use std::{
     fmt,
     sync::{
         Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     thread::{self, JoinHandle},
     time::Duration,
 };
 
+/// High-water mark for output bytes that have been handed to the application
+/// but not yet consumed. Once the queue reaches it the worker stops draining
+/// its transport, which lets the reader's bounded queue fill and pushes
+/// backpressure down to the child process instead of growing memory without
+/// bound. Mature terminals block the reader rather than buffering an unbounded
+/// backlog, because a producer that outruns the parser otherwise turns
+/// `cat hugefile` into gigabytes of resident memory.
+pub const MAX_QUEUED_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Retry cadence used while output delivery is paused by backpressure. The
+/// worker cannot rely on another reader wake to arrive, because the reader is
+/// blocked on its own full queue.
+const OUTPUT_BACKPRESSURE_RETRY_INTERVAL: Duration = Duration::from_millis(4);
+const INPUT_BACKPRESSURE_RETRY_INTERVAL: Duration = Duration::from_millis(4);
+
 /// Platform-neutral callback used to wake an application event loop when a
 /// transport has output or lifecycle state ready to consume.
 #[derive(Clone)]
-pub struct TransportWakeHandle(Arc<dyn Fn() + Send + Sync + 'static>);
+pub struct TransportWakeHandle(Arc<TransportWakeInner>);
+
+struct TransportWakeInner {
+    wake: Box<dyn Fn() + Send + Sync + 'static>,
+    pending: AtomicBool,
+}
 
 impl TransportWakeHandle {
     #[must_use]
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
-        Self(Arc::new(wake))
+        Self(Arc::new(TransportWakeInner {
+            wake: Box::new(wake),
+            pending: AtomicBool::new(false),
+        }))
     }
 
-    pub fn wake(&self) {
-        (self.0)();
+    /// Requests one application wake for the current pending-output period.
+    ///
+    /// Returns `true` only for the caller that transitions the shared handle
+    /// from idle to pending and invokes the callback.
+    pub fn wake(&self) -> bool {
+        if self.0.pending.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        (self.0.wake)();
+        true
+    }
+
+    /// Rearms the handle after the application starts draining output.
+    ///
+    /// Clearing before the drain lets a producer racing with that drain queue
+    /// another event, so coalescing cannot strand newly arrived bytes.
+    pub fn clear_pending(&self) {
+        self.0.pending.store(false, Ordering::Release);
     }
 }
 
 impl fmt::Debug for TransportWakeHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("TransportWakeHandle(..)")
+    }
+}
+
+/// Cloneable, non-blocking emergency termination hook retained outside the
+/// transport worker. It lets the application break a backend out of blocked I/O
+/// before requesting an asynchronous worker shutdown.
+#[derive(Clone)]
+pub struct TransportTerminationHandle(Arc<dyn Fn() + Send + Sync + 'static>);
+
+impl TransportTerminationHandle {
+    #[must_use]
+    pub fn new(terminate: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(terminate))
+    }
+
+    pub fn terminate(&self) {
+        (self.0)();
+    }
+}
+
+impl fmt::Debug for TransportTerminationHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TransportTerminationHandle(..)")
     }
 }
 
@@ -257,6 +320,8 @@ pub struct TransportEventLoop {
     command_tx: Sender<TransportCommand>,
     event_rx: Receiver<TransportEvent>,
     handle: Option<JoinHandle<()>>,
+    queued_output_bytes: Arc<AtomicUsize>,
+    termination_handle: Option<TransportTerminationHandle>,
 }
 
 impl TransportEventLoop {
@@ -286,17 +351,41 @@ impl TransportEventLoop {
         let (command_tx, command_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
         let output_wake_tx = command_tx.clone();
-        transport.set_output_waker(Some(TransportWakeHandle::new(move || {
+        let backend_waker = TransportWakeHandle::new(move || {
             let _ = output_wake_tx.send(TransportCommand::PollOutput);
-        })));
+        });
+        transport.set_output_waker(Some(backend_waker.clone()));
+        let termination_handle = transport.termination_handle();
         let periodic_poll_interval = transport.periodic_poll_interval();
+        let queued_output_bytes = Arc::new(AtomicUsize::new(0));
+        let worker_queued_output_bytes = Arc::clone(&queued_output_bytes);
 
         let handle = thread::spawn(move || {
             let mut running = true;
             let mut pending_input = Vec::with_capacity(256);
+            // Set while output delivery is paused because the application has
+            // not consumed what it already has. The wait below becomes bounded
+            // so the pause is re-evaluated without needing a reader wake.
+            let mut output_backpressure = false;
+            let mut poll_again = false;
 
             while running {
-                let first_command = match periodic_poll_interval {
+                let wait_interval = if poll_again {
+                    Some(Duration::ZERO)
+                } else if output_backpressure || !pending_input.is_empty() {
+                    Some(match periodic_poll_interval {
+                        Some(interval) => interval.min(if output_backpressure {
+                            OUTPUT_BACKPRESSURE_RETRY_INTERVAL
+                        } else {
+                            INPUT_BACKPRESSURE_RETRY_INTERVAL
+                        }),
+                        None if output_backpressure => OUTPUT_BACKPRESSURE_RETRY_INTERVAL,
+                        None => INPUT_BACKPRESSURE_RETRY_INTERVAL,
+                    })
+                } else {
+                    periodic_poll_interval
+                };
+                let first_command = match wait_interval {
                     Some(interval) => match command_rx.recv_timeout(interval) {
                         Ok(command) => Some(command),
                         Err(RecvTimeoutError::Timeout) => None,
@@ -372,14 +461,33 @@ impl TransportEventLoop {
                     break;
                 }
 
+                // Leave unread output in the transport (and, below it, in the
+                // reader's bounded queue and the OS pipe) until the
+                // application catches up. Draining here regardless would move
+                // an unbounded backlog into this process's memory.
+                if worker_queued_output_bytes.load(Ordering::Acquire) >= MAX_QUEUED_OUTPUT_BYTES {
+                    output_backpressure = true;
+                    poll_again = false;
+                    continue;
+                }
+                output_backpressure = false;
+
+                // Rearm before draining so readiness that races with this poll
+                // schedules another pass instead of becoming stranded.
+                backend_waker.clear_pending();
+                poll_again = false;
                 match transport.poll_output() {
                     Ok(output) => {
-                        if !output.bytes.is_empty() {
-                            send_transport_event(
+                        let had_bytes = !output.bytes.is_empty();
+                        if had_bytes {
+                            let queued = output.bytes.len();
+                            if send_transport_event(
                                 &event_tx,
                                 app_waker.as_ref(),
                                 TransportEvent::Output(output.bytes),
-                            );
+                            ) {
+                                worker_queued_output_bytes.fetch_add(queued, Ordering::AcqRel);
+                            }
                         }
 
                         for event in output.lifecycle {
@@ -392,6 +500,12 @@ impl TransportEventLoop {
 
                         if output.closed {
                             running = false;
+                        } else if had_bytes {
+                            // Some transports return one owned chunk at a
+                            // time. Poll again without sleeping so coalesced
+                            // notifications cannot strand later chunks or
+                            // closure messages.
+                            poll_again = true;
                         }
                     }
                     Err(error) => {
@@ -410,6 +524,8 @@ impl TransportEventLoop {
             command_tx,
             event_rx,
             handle: Some(handle),
+            queued_output_bytes,
+            termination_handle,
         }
     }
 
@@ -421,16 +537,32 @@ impl TransportEventLoop {
 
     #[must_use]
     pub fn poll_event(&self) -> Option<TransportEvent> {
-        self.event_rx.try_recv().ok()
+        let event = self.event_rx.try_recv().ok()?;
+        if let TransportEvent::Output(bytes) = &event {
+            let consumed = bytes.len();
+            let _ = self.queued_output_bytes.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |queued| Some(queued.saturating_sub(consumed)),
+            );
+        }
+        Some(event)
+    }
+
+    /// Output bytes delivered to the application but not yet consumed. Reaching
+    /// [`MAX_QUEUED_OUTPUT_BYTES`] pauses output delivery until the application
+    /// drains what it already holds.
+    #[must_use]
+    pub fn queued_output_bytes(&self) -> usize {
+        self.queued_output_bytes.load(Ordering::Acquire)
     }
 
     pub fn shutdown(mut self) -> Result<(), TransportLoopError> {
-        self.send_command(TransportCommand::Shutdown)?;
-
-        if let Some(handle) = self.handle.take() {
-            handle.join().map_err(|_| TransportLoopError::Closed)?;
+        if let Some(termination_handle) = self.termination_handle.take() {
+            termination_handle.terminate();
         }
-
+        let _ = self.command_tx.send(TransportCommand::Shutdown);
+        let _ = self.handle.take();
         Ok(())
     }
 }
@@ -446,30 +578,55 @@ fn flush_pending_transport_input<T>(
     if pending_input.is_empty() {
         return;
     }
-    if let Err(error) = transport.write_input(pending_input) {
-        send_transport_event(
-            event_tx,
-            app_waker,
-            TransportEvent::Error(error.to_string()),
-        );
+    match transport.write_input(pending_input) {
+        Ok(written) if written <= pending_input.len() => {
+            pending_input.drain(..written);
+        }
+        Ok(written) => {
+            send_transport_event(
+                event_tx,
+                app_waker,
+                TransportEvent::Error(format!(
+                    "transport reported writing {written} bytes from a {} byte input buffer",
+                    pending_input.len()
+                )),
+            );
+            pending_input.clear();
+        }
+        Err(error) => {
+            send_transport_event(
+                event_tx,
+                app_waker,
+                TransportEvent::Error(error.to_string()),
+            );
+            // `Ok(0)` is the retryable backpressure signal. An error is
+            // terminal for this buffered write; retaining it would emit the
+            // same error and wake the UI every retry tick forever.
+            pending_input.clear();
+        }
     }
-    pending_input.clear();
 }
 
+/// Returns whether the event was accepted by the application queue.
 fn send_transport_event(
     event_tx: &Sender<TransportEvent>,
     app_waker: Option<&TransportWakeHandle>,
     event: TransportEvent,
-) {
-    if event_tx.send(event).is_ok()
-        && let Some(app_waker) = app_waker
-    {
+) -> bool {
+    if event_tx.send(event).is_err() {
+        return false;
+    }
+    if let Some(app_waker) = app_waker {
         app_waker.wake();
     }
+    true
 }
 
 impl Drop for TransportEventLoop {
     fn drop(&mut self) {
+        if let Some(termination_handle) = self.termination_handle.take() {
+            termination_handle.terminate();
+        }
         let _ = self.command_tx.send(TransportCommand::Shutdown);
         let _ = self.handle.take();
     }
@@ -481,13 +638,21 @@ pub trait TerminalTransport: Send {
     /// invoke it after queueing output or lifecycle changes.
     fn set_output_waker(&mut self, _waker: Option<TransportWakeHandle>) {}
 
+    /// Returns a hook that can terminate a child or connection independently
+    /// of this transport, including while the worker is blocked in I/O.
+    fn termination_handle(&self) -> Option<TransportTerminationHandle> {
+        None
+    }
+
     /// Periodic output polling for backends without readiness callbacks.
     /// Wake-driven transports return `None` and sleep until explicitly woken.
     fn periodic_poll_interval(&self) -> Option<Duration> {
         Some(Duration::from_millis(8))
     }
 
-    fn write_input(&mut self, bytes: &[u8]) -> TransportResult<()>;
+    /// Attempts to accept input without blocking output delivery and returns
+    /// the number of bytes accepted. Returning zero requests a later retry.
+    fn write_input(&mut self, bytes: &[u8]) -> TransportResult<usize>;
 
     fn resize(&mut self, size: TerminalSize) -> TransportResult<()>;
 
@@ -509,14 +674,226 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
             mpsc,
         },
+        thread,
         time::Duration,
     };
 
     use super::{
-        SessionMetadata, TerminalSize, TerminalTransport, TransportCommand, TransportEvent,
-        TransportEventLoop, TransportInput, TransportKind, TransportOutput, TransportResult,
-        TransportState, TransportWakeHandle,
+        SessionMetadata, TerminalSize, TerminalTransport, TransportCommand, TransportError,
+        TransportEvent, TransportEventLoop, TransportInput, TransportKind, TransportOutput,
+        TransportResult, TransportState, TransportTerminationHandle, TransportWakeHandle,
     };
+
+    struct PartialWriteTransport {
+        accepted: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl TerminalTransport for PartialWriteTransport {
+        fn periodic_poll_interval(&self) -> Option<Duration> {
+            Some(Duration::from_millis(1))
+        }
+
+        fn write_input(&mut self, bytes: &[u8]) -> TransportResult<usize> {
+            let accepted = bytes.len().min(2);
+            self.accepted
+                .lock()
+                .expect("accepted input lock")
+                .extend_from_slice(&bytes[..accepted]);
+            Ok(accepted)
+        }
+
+        fn resize(&mut self, _size: TerminalSize) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn poll_output(&mut self) -> TransportResult<TransportOutput> {
+            Ok(TransportOutput::bytes(Vec::new()))
+        }
+
+        fn shutdown(&mut self) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn session_metadata(&self) -> SessionMetadata {
+            test_metadata()
+        }
+
+        fn state(&self) -> TransportState {
+            TransportState::Running
+        }
+    }
+
+    struct StalledWriteTransport {
+        started: Option<mpsc::Sender<()>>,
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl TerminalTransport for StalledWriteTransport {
+        fn periodic_poll_interval(&self) -> Option<Duration> {
+            None
+        }
+
+        fn termination_handle(&self) -> Option<TransportTerminationHandle> {
+            let release = Arc::clone(&self.release);
+            Some(TransportTerminationHandle::new(move || {
+                let (released, ready) = &*release;
+                *released.lock().expect("release lock") = true;
+                ready.notify_all();
+            }))
+        }
+
+        fn write_input(&mut self, bytes: &[u8]) -> TransportResult<usize> {
+            if let Some(started) = self.started.take() {
+                let _ = started.send(());
+            }
+            let (released, ready) = &*self.release;
+            let guard = released.lock().expect("release lock");
+            let _ = ready
+                .wait_timeout_while(guard, Duration::from_millis(300), |released| !*released)
+                .expect("release wait");
+            Ok(bytes.len())
+        }
+
+        fn resize(&mut self, _size: TerminalSize) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn poll_output(&mut self) -> TransportResult<TransportOutput> {
+            Ok(TransportOutput::bytes(Vec::new()))
+        }
+
+        fn shutdown(&mut self) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn session_metadata(&self) -> SessionMetadata {
+            test_metadata()
+        }
+
+        fn state(&self) -> TransportState {
+            TransportState::Running
+        }
+    }
+
+    struct FloodTransport {
+        polls: Arc<AtomicUsize>,
+        chunk: usize,
+    }
+
+    struct FailingWriteTransport {
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl TerminalTransport for FailingWriteTransport {
+        fn periodic_poll_interval(&self) -> Option<Duration> {
+            Some(Duration::from_millis(1))
+        }
+
+        fn write_input(&mut self, _bytes: &[u8]) -> TransportResult<usize> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Err(TransportError::new("permanent input failure"))
+        }
+
+        fn resize(&mut self, _size: TerminalSize) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn poll_output(&mut self) -> TransportResult<TransportOutput> {
+            Ok(TransportOutput::bytes(Vec::new()))
+        }
+
+        fn shutdown(&mut self) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn session_metadata(&self) -> SessionMetadata {
+            test_metadata()
+        }
+
+        fn state(&self) -> TransportState {
+            TransportState::Running
+        }
+    }
+
+    impl TerminalTransport for FloodTransport {
+        fn periodic_poll_interval(&self) -> Option<Duration> {
+            Some(Duration::from_millis(1))
+        }
+
+        fn write_input(&mut self, bytes: &[u8]) -> TransportResult<usize> {
+            Ok(bytes.len())
+        }
+
+        fn resize(&mut self, _size: TerminalSize) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn poll_output(&mut self) -> TransportResult<TransportOutput> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            Ok(TransportOutput::bytes(vec![b'x'; self.chunk]))
+        }
+
+        fn shutdown(&mut self) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn session_metadata(&self) -> SessionMetadata {
+            test_metadata()
+        }
+
+        fn state(&self) -> TransportState {
+            TransportState::Running
+        }
+    }
+
+    #[test]
+    fn unconsumed_output_pauses_transport_polling_until_the_application_catches_up() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let events = TransportEventLoop::spawn(FloodTransport {
+            polls: Arc::clone(&polls),
+            chunk: 256 * 1024,
+        });
+
+        // A producer that is never read must stop being drained rather than
+        // moving an unbounded backlog into this process.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while events.queued_output_bytes() < super::MAX_QUEUED_OUTPUT_BYTES {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "queued output never reached the backpressure threshold"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let paused_at = polls.load(Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            paused_at,
+            "polling must stay paused while the application has not consumed its output"
+        );
+
+        let mut drained = 0usize;
+        while let Some(event) = events.poll_event() {
+            if let TransportEvent::Output(bytes) = event {
+                drained += bytes.len();
+            }
+        }
+        assert!(drained > 0);
+        assert_eq!(events.queued_output_bytes(), 0);
+
+        // Draining releases the pause, so output resumes flowing.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while polls.load(Ordering::SeqCst) <= paused_at {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "polling never resumed after the backlog was consumed"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let _ = events.shutdown();
+    }
 
     #[test]
     fn ordinary_terminal_input_stays_inline() {
@@ -524,6 +901,83 @@ mod tests {
 
         assert_eq!(input.as_ref(), b"\x1b[1;5D");
         assert!(!input.spilled());
+    }
+
+    #[test]
+    fn permanent_input_failure_is_reported_once_without_a_retry_storm() {
+        let writes = Arc::new(AtomicUsize::new(0));
+        let event_loop = TransportEventLoop::spawn(FailingWriteTransport {
+            writes: Arc::clone(&writes),
+        });
+        event_loop
+            .send_command(TransportCommand::write_input(b"lost".as_slice()))
+            .expect("queue failing input");
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        loop {
+            if matches!(event_loop.poll_event(), Some(TransportEvent::Error(_))) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "input error was not reported"
+            );
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        event_loop.shutdown().expect("shutdown transport worker");
+    }
+
+    #[test]
+    fn transport_worker_retries_only_the_unwritten_input_tail() {
+        let accepted = Arc::new(Mutex::new(Vec::new()));
+        let event_loop = TransportEventLoop::spawn(PartialWriteTransport {
+            accepted: Arc::clone(&accepted),
+        });
+
+        event_loop
+            .send_command(TransportCommand::write_input(b"abcdef".as_slice()))
+            .expect("queue input");
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        while accepted.lock().expect("accepted input lock").len() < 6
+            && std::time::Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+
+        assert_eq!(
+            accepted.lock().expect("accepted input lock").as_slice(),
+            b"abcdef"
+        );
+        event_loop.shutdown().expect("shutdown transport worker");
+    }
+
+    #[test]
+    fn shutdown_terminates_and_detaches_a_stalled_transport_worker() {
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let event_loop = TransportEventLoop::spawn(StalledWriteTransport {
+            started: Some(started_tx),
+            release: Arc::clone(&release),
+        });
+        event_loop
+            .send_command(TransportCommand::write_input(b"blocked".as_slice()))
+            .expect("queue stalled input");
+        started_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("backend write starts");
+
+        let started = std::time::Instant::now();
+        event_loop.shutdown().expect("shutdown transport worker");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "shutdown must not join a stalled worker: {:?}",
+            started.elapsed()
+        );
+        assert!(*release.0.lock().expect("release lock"));
     }
 
     struct WakeDrivenTransport {
@@ -536,13 +990,58 @@ mod tests {
         polls: Arc<AtomicUsize>,
     }
 
+    struct ExternalWakeTransport {
+        output: Arc<Mutex<VecDeque<Vec<u8>>>>,
+        waker: Arc<Mutex<Option<TransportWakeHandle>>>,
+    }
+
+    impl TerminalTransport for ExternalWakeTransport {
+        fn set_output_waker(&mut self, waker: Option<TransportWakeHandle>) {
+            *self.waker.lock().expect("backend waker lock") = waker;
+        }
+
+        fn periodic_poll_interval(&self) -> Option<Duration> {
+            None
+        }
+
+        fn write_input(&mut self, bytes: &[u8]) -> TransportResult<usize> {
+            Ok(bytes.len())
+        }
+
+        fn resize(&mut self, _size: TerminalSize) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn poll_output(&mut self) -> TransportResult<TransportOutput> {
+            Ok(TransportOutput::bytes(
+                self.output
+                    .lock()
+                    .expect("external output lock")
+                    .pop_front()
+                    .unwrap_or_default(),
+            ))
+        }
+
+        fn shutdown(&mut self) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn session_metadata(&self) -> SessionMetadata {
+            test_metadata()
+        }
+
+        fn state(&self) -> TransportState {
+            TransportState::Running
+        }
+    }
+
     impl TerminalTransport for IdleWakeTransport {
         fn periodic_poll_interval(&self) -> Option<Duration> {
             None
         }
 
-        fn write_input(&mut self, _bytes: &[u8]) -> TransportResult<()> {
-            Ok(())
+        fn write_input(&mut self, bytes: &[u8]) -> TransportResult<usize> {
+            Ok(bytes.len())
         }
 
         fn resize(&mut self, _size: TerminalSize) -> TransportResult<()> {
@@ -578,7 +1077,7 @@ mod tests {
             None
         }
 
-        fn write_input(&mut self, bytes: &[u8]) -> TransportResult<()> {
+        fn write_input(&mut self, bytes: &[u8]) -> TransportResult<usize> {
             let first = {
                 let mut writes = self.writes.lock().expect("writes lock");
                 let first = writes.is_empty();
@@ -591,7 +1090,7 @@ mod tests {
                     .release_first_write
                     .recv_timeout(Duration::from_millis(200));
             }
-            Ok(())
+            Ok(bytes.len())
         }
 
         fn resize(&mut self, _size: TerminalSize) -> TransportResult<()> {
@@ -631,7 +1130,7 @@ mod tests {
             self.waker = waker;
         }
 
-        fn write_input(&mut self, bytes: &[u8]) -> TransportResult<()> {
+        fn write_input(&mut self, bytes: &[u8]) -> TransportResult<usize> {
             self.writes
                 .lock()
                 .expect("writes lock")
@@ -640,7 +1139,7 @@ mod tests {
             if let Some(waker) = &self.waker {
                 waker.wake();
             }
-            Ok(())
+            Ok(bytes.len())
         }
 
         fn resize(&mut self, _size: TerminalSize) -> TransportResult<()> {
@@ -674,7 +1173,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_wake_handle_is_cloneable_and_backend_agnostic() {
+    fn transport_wake_handle_coalesces_clones_until_cleared() {
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&calls);
         let wake = TransportWakeHandle::new(move || {
@@ -684,6 +1183,9 @@ mod tests {
         wake.wake();
         wake.clone().wake();
 
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        wake.clear_pending();
+        wake.clone().wake();
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
@@ -709,6 +1211,7 @@ mod tests {
         let app_waker = TransportWakeHandle::new(move || {
             let _ = wake_tx.send(());
         });
+        let app_waker_rearm = app_waker.clone();
         let event_loop = TransportEventLoop::spawn_with_waker(transport, app_waker);
 
         event_loop
@@ -726,6 +1229,110 @@ mod tests {
             writes.lock().expect("writes lock").as_slice(),
             &[b"panea".to_vec()]
         );
+
+        app_waker_rearm.clear_pending();
+        event_loop
+            .send_command(TransportCommand::write_input(b"again".as_slice()))
+            .expect("queue second input");
+        wake_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("backend wake should rearm after output is polled");
+        assert_eq!(
+            event_loop.poll_event(),
+            Some(TransportEvent::Output(b"again".to_vec()))
+        );
+    }
+
+    #[test]
+    fn backend_readiness_rearms_after_each_transport_poll() {
+        let output = Arc::new(Mutex::new(VecDeque::new()));
+        let backend_waker = Arc::new(Mutex::new(None));
+        let (app_wake_tx, app_wake_rx) = mpsc::channel();
+        let app_waker = TransportWakeHandle::new(move || {
+            let _ = app_wake_tx.send(());
+        });
+        let app_waker_rearm = app_waker.clone();
+        let event_loop = TransportEventLoop::spawn_with_waker(
+            ExternalWakeTransport {
+                output: Arc::clone(&output),
+                waker: Arc::clone(&backend_waker),
+            },
+            app_waker,
+        );
+        let wake_backend = || {
+            backend_waker
+                .lock()
+                .expect("backend waker lock")
+                .as_ref()
+                .expect("backend waker installed")
+                .wake();
+        };
+
+        output
+            .lock()
+            .expect("external output lock")
+            .push_back(b"first".to_vec());
+        wake_backend();
+        app_wake_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("first app wake");
+        assert_eq!(
+            event_loop.poll_event(),
+            Some(TransportEvent::Output(b"first".to_vec()))
+        );
+
+        app_waker_rearm.clear_pending();
+        output
+            .lock()
+            .expect("external output lock")
+            .push_back(b"second".to_vec());
+        wake_backend();
+        app_wake_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("second app wake");
+        assert_eq!(
+            event_loop.poll_event(),
+            Some(TransportEvent::Output(b"second".to_vec()))
+        );
+    }
+
+    #[test]
+    fn one_coalesced_wake_drains_all_prequeued_backend_output() {
+        let output = Arc::new(Mutex::new(VecDeque::from([
+            b"first".to_vec(),
+            b"second".to_vec(),
+        ])));
+        let backend_waker = Arc::new(Mutex::new(None));
+        let (app_wake_tx, app_wake_rx) = mpsc::channel();
+        let event_loop = TransportEventLoop::spawn_with_waker(
+            ExternalWakeTransport {
+                output: Arc::clone(&output),
+                waker: Arc::clone(&backend_waker),
+            },
+            TransportWakeHandle::new(move || {
+                let _ = app_wake_tx.send(());
+            }),
+        );
+        backend_waker
+            .lock()
+            .expect("backend waker lock")
+            .as_ref()
+            .expect("backend waker installed")
+            .wake();
+        app_wake_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("coalesced app wake");
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
+        let mut received = Vec::new();
+        while received.len() < 2 && std::time::Instant::now() < deadline {
+            if let Some(TransportEvent::Output(bytes)) = event_loop.poll_event() {
+                received.push(bytes);
+            } else {
+                thread::yield_now();
+            }
+        }
+        assert_eq!(received, [b"first".to_vec(), b"second".to_vec()]);
     }
 
     #[test]

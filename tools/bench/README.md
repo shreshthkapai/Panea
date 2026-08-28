@@ -17,13 +17,21 @@ cargo xtask bench render-partial-update
 cargo xtask bench cat-large-file
 cargo xtask bench scrollback
 cargo xtask bench resize
+cargo xtask bench resize-scrollback
 cargo xtask bench parser-input
 cargo xtask bench unicode
+cargo xtask bench parser-throughput
 cargo xtask bench alternate-screen
 cargo xtask bench cursor-animation
 ```
 
 The first benchmark fixtures are deterministic generators in `panea-bench`.
+
+`resize-scrollback` builds a large retained history, alternates narrow and wide
+terminal sizes, and reports latency distribution plus canonical history, lazy
+materialization, cache, and row-count scan statistics. It fails if derived
+history exceeds the bounded logical-line cache or repeated widths bypass the
+bounded row-count summary cache.
 `render-coding-agent` covers dense agent output and long URLs.
 `render-partial-update` reports p50 and p95 CPU preparation time while changing
 one cell and recycling the production batch storage between frames.

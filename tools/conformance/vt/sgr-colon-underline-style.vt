@@ -1,0 +1,11 @@
+# Colon-separated SGR sub-parameters. `4:3` selects a curly underline; a parser
+# that flattens the colon to a semicolon reads it as `4;3` (underline + italic).
+size: 12x2
+description: colon SGR sub-parameters do not turn into unrelated attributes
+
+--- input
+\e[4:3mA\e[0mB
+
+--- expect-cell
+row=0 col=0 underline=true italic=false
+row=0 col=1 underline=false italic=false

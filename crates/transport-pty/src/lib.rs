@@ -7,17 +7,18 @@ use std::{
     io::{Read, Write},
     path::PathBuf,
     sync::{
-        Arc, Mutex,
-        mpsc::{self, Receiver},
+        Arc, Mutex, OnceLock,
+        mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use transport_core::{
     SessionMetadata, TerminalSize, TerminalTransport, TransportError, TransportKind,
-    TransportLifecycleEvent, TransportOutput, TransportResult, TransportState, TransportWakeHandle,
+    TransportLifecycleEvent, TransportOutput, TransportResult, TransportState,
+    TransportTerminationHandle, TransportWakeHandle,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +56,11 @@ impl LocalShellProfile {
                 name: "default".to_owned(),
                 kind: LocalShellKind::Default,
                 program,
-                args: Vec::new(),
+                args: if cfg!(target_os = "macos") {
+                    vec!["-l".to_owned()]
+                } else {
+                    Vec::new()
+                },
                 env: BTreeMap::new(),
                 working_directory: None,
                 startup_command: None,
@@ -233,16 +238,21 @@ impl LocalShellProfile {
 
 pub struct LocalPtyTransport {
     master: Option<Box<dyn MasterPty + Send>>,
-    writer: Option<Box<dyn Write + Send>>,
-    child: Box<dyn Child + Send + Sync>,
-    process_id: Option<u32>,
+    writer_tx: Option<SyncSender<Vec<u8>>>,
+    writer_rx: Receiver<WriterMessage>,
+    writer_thread: Option<JoinHandle<()>>,
+    child_killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
+    child_rx: Receiver<ChildMessage>,
+    child_thread: Option<JoinHandle<()>>,
     reader_rx: Receiver<ReaderMessage>,
     reader_thread: Option<JoinHandle<()>>,
-    output_waker: Arc<Mutex<Option<TransportWakeHandle>>>,
+    read_buffer_pool: ReadBufferPool,
+    output_waker: Arc<OnceLock<TransportWakeHandle>>,
     diagnostics: LocalPtyDiagnostics,
     metadata: SessionMetadata,
     state: TransportState,
     pending_lifecycle: VecDeque<TransportLifecycleEvent>,
+    pending_reader_termination_failure: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,11 +294,23 @@ impl LocalPtyDiagnostics {
         self.read_events += 1;
 
         const PREVIEW_LIMIT: usize = 256;
-        self.last_bytes_preview.extend_from_slice(chunk);
-        if self.last_bytes_preview.len() > PREVIEW_LIMIT {
-            let drain_count = self.last_bytes_preview.len() - PREVIEW_LIMIT;
-            self.last_bytes_preview.drain(..drain_count);
+        if chunk.len() >= PREVIEW_LIMIT {
+            self.last_bytes_preview.clear();
+            self.last_bytes_preview
+                .extend_from_slice(&chunk[chunk.len() - PREVIEW_LIMIT..]);
+            return;
         }
+        let overflow = self
+            .last_bytes_preview
+            .len()
+            .saturating_add(chunk.len())
+            .saturating_sub(PREVIEW_LIMIT);
+        if overflow > 0 {
+            self.last_bytes_preview.copy_within(overflow.., 0);
+            self.last_bytes_preview
+                .truncate(self.last_bytes_preview.len() - overflow);
+        }
+        self.last_bytes_preview.extend_from_slice(chunk);
     }
 }
 
@@ -320,19 +342,28 @@ impl LocalPtyTransport {
             .map_err(|error| TransportError::new(format!("failed to open PTY writer: {error}")))?;
 
         let process_id = child.process_id();
-        let output_waker = Arc::new(Mutex::new(None));
-        let (reader_rx, reader_thread) = spawn_reader(reader, Arc::clone(&output_waker));
+        let output_waker = Arc::new(OnceLock::new());
+        let read_buffer_pool = ReadBufferPool::new();
+        let (reader_rx, reader_thread) =
+            spawn_reader(reader, Arc::clone(&output_waker), read_buffer_pool.clone());
+        let (writer_tx, writer_rx, writer_thread) = spawn_writer(writer, Arc::clone(&output_waker));
+        let child_killer = Arc::new(Mutex::new(child.clone_killer()));
+        let (child_rx, child_thread) = spawn_child_waiter(child, Arc::clone(&output_waker));
 
         let mut pending_lifecycle = VecDeque::new();
         pending_lifecycle.push_back(TransportLifecycleEvent::Started);
 
         Ok(Self {
             master: Some(pair.master),
-            writer: Some(writer),
-            child,
-            process_id,
+            writer_tx: Some(writer_tx),
+            writer_rx,
+            writer_thread: Some(writer_thread),
+            child_killer,
+            child_rx,
+            child_thread: Some(child_thread),
             reader_rx,
             reader_thread: Some(reader_thread),
+            read_buffer_pool,
             output_waker,
             diagnostics: LocalPtyDiagnostics::new(
                 command_label,
@@ -351,6 +382,7 @@ impl LocalPtyTransport {
             },
             state: TransportState::Running,
             pending_lifecycle,
+            pending_reader_termination_failure: None,
         })
     }
 
@@ -369,7 +401,7 @@ impl LocalPtyTransport {
             self.state = TransportState::DrainingOutput { exit_code };
             self.diagnostics.child_exited = true;
             self.diagnostics.state = self.state.clone();
-            self.writer.take();
+            self.writer_tx.take();
             self.close_master_without_blocking();
             self.pending_lifecycle
                 .push_back(TransportLifecycleEvent::Exited { exit_code });
@@ -394,41 +426,13 @@ impl LocalPtyTransport {
             .push_back(TransportLifecycleEvent::Closed);
     }
 
-    fn wait_for_child_exit(&mut self, timeout: Duration) -> TransportResult<Option<i32>> {
-        if let TransportState::Closed { exit_code } | TransportState::DrainingOutput { exit_code } =
-            self.state
-        {
-            return Ok(exit_code);
-        }
-
-        let deadline = Instant::now() + timeout;
-
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => {
-                    let exit_code = Some(status.exit_code() as i32);
-                    self.mark_child_exited(exit_code);
-                    return Ok(exit_code);
-                }
-                Ok(None) if Instant::now() < deadline => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Ok(None) => return Ok(None),
-                Err(error) => {
-                    self.mark_failed(error.to_string());
-                    return Err(TransportError::new(format!(
-                        "failed to wait for shell termination: {error}"
-                    )));
-                }
-            }
-        }
-    }
-
     fn request_child_termination(&mut self) -> TransportResult<()> {
         self.state = TransportState::TerminatingChild;
         self.diagnostics.state = self.state.clone();
         self.diagnostics.kill_attempted = true;
-        self.child
+        self.child_killer
+            .lock()
+            .map_err(|_| TransportError::new("local shell termination handle is poisoned"))?
             .kill()
             .map_err(|error| TransportError::new(format!("failed to terminate shell: {error}")))
     }
@@ -439,7 +443,7 @@ impl LocalPtyTransport {
         }
     }
 
-    fn join_reader_if_finished(&mut self) {
+    fn join_background_threads_if_finished(&mut self) {
         if self
             .reader_thread
             .as_ref()
@@ -447,6 +451,47 @@ impl LocalPtyTransport {
             && let Some(reader_thread) = self.reader_thread.take()
         {
             let _ = reader_thread.join();
+        }
+        if self
+            .writer_thread
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+            && let Some(writer_thread) = self.writer_thread.take()
+        {
+            let _ = writer_thread.join();
+        }
+        if self
+            .child_thread
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+            && let Some(child_thread) = self.child_thread.take()
+        {
+            let _ = child_thread.join();
+        }
+    }
+
+    fn drain_child_messages(&mut self) {
+        while let Ok(message) = self.child_rx.try_recv() {
+            match message {
+                ChildMessage::Exited(exit_code) => self.mark_child_exited(exit_code),
+                ChildMessage::Failed(message) => self.mark_failed(message),
+            }
+        }
+    }
+
+    fn drain_writer_messages(&mut self) {
+        while let Ok(message) = self.writer_rx.try_recv() {
+            match message {
+                WriterMessage::Failed(message) => {
+                    self.writer_tx.take();
+                    if matches!(
+                        self.state,
+                        TransportState::Starting | TransportState::Running
+                    ) {
+                        self.mark_failed(format!("local PTY writer failed: {message}"));
+                    }
+                }
+            }
         }
     }
 
@@ -467,17 +512,27 @@ impl LocalPtyTransport {
                 ReaderMessage::Started => {
                     self.diagnostics.reader_started = true;
                 }
-                ReaderMessage::Bytes(mut chunk) => {
-                    self.diagnostics.record_bytes(&chunk);
-                    bytes.append(&mut chunk);
+                ReaderMessage::Bytes { buffer, len } => {
+                    let payload = &buffer[..len.min(buffer.len())];
+                    self.diagnostics.record_bytes(payload);
+                    bytes = payload.to_vec();
+                    self.read_buffer_pool.recycle(buffer);
+                    break;
                 }
                 ReaderMessage::Closed => {
                     self.diagnostics.reader_stopped = true;
                 }
                 ReaderMessage::Failed(message) => {
                     self.diagnostics.reader_error = Some(message.clone());
-                    self.mark_failed(message);
-                    closed = true;
+                    self.diagnostics.reader_stopped = true;
+                    if reader_failure_requires_child_termination(&self.state)
+                        && let Err(error) = self.request_child_termination()
+                    {
+                        let failure =
+                            format!("{message}; child termination request failed: {error}");
+                        self.diagnostics.reader_error = Some(failure.clone());
+                        self.pending_reader_termination_failure = Some(failure);
+                    }
                 }
                 ReaderMessage::Stopped => {
                     self.diagnostics.reader_stopped = true;
@@ -499,16 +554,27 @@ impl LocalPtyTransport {
 
 impl TerminalTransport for LocalPtyTransport {
     fn set_output_waker(&mut self, waker: Option<TransportWakeHandle>) {
-        if let Ok(mut output_waker) = self.output_waker.lock() {
-            *output_waker = waker;
+        if let Some(waker) = waker
+            && self.output_waker.set(waker.clone()).is_ok()
+        {
+            waker.wake();
         }
+    }
+
+    fn termination_handle(&self) -> Option<TransportTerminationHandle> {
+        let child_killer = Arc::clone(&self.child_killer);
+        Some(TransportTerminationHandle::new(move || {
+            if let Ok(mut child_killer) = child_killer.lock() {
+                let _ = child_killer.kill();
+            }
+        }))
     }
 
     fn periodic_poll_interval(&self) -> Option<Duration> {
         None
     }
 
-    fn write_input(&mut self, bytes: &[u8]) -> TransportResult<()> {
+    fn write_input(&mut self, bytes: &[u8]) -> TransportResult<usize> {
         if matches!(
             self.state,
             TransportState::ClosingInput
@@ -520,14 +586,11 @@ impl TerminalTransport for LocalPtyTransport {
             return Err(TransportError::new("cannot write to a closed local PTY"));
         }
 
-        let writer = self
-            .writer
-            .as_mut()
+        let writer_tx = self
+            .writer_tx
+            .as_ref()
             .ok_or_else(|| TransportError::new("local PTY writer is closed"))?;
-        writer
-            .write_all(bytes)
-            .and_then(|()| writer.flush())
-            .map_err(|error| TransportError::new(format!("failed to write to local PTY: {error}")))
+        queue_writer_input(writer_tx, bytes)
     }
 
     fn resize(&mut self, size: TerminalSize) -> TransportResult<()> {
@@ -549,24 +612,18 @@ impl TerminalTransport for LocalPtyTransport {
     }
 
     fn poll_output(&mut self) -> TransportResult<TransportOutput> {
+        self.drain_child_messages();
+        self.drain_writer_messages();
         let mut output = self.drain_reader_messages();
+        self.drain_child_messages();
+        self.drain_writer_messages();
 
-        if matches!(
-            self.state,
-            TransportState::Running
-                | TransportState::ClosingInput
-                | TransportState::TerminatingChild
-        ) {
-            match self.child.try_wait() {
-                Ok(Some(status)) => {
-                    let exit_code = Some(status.exit_code() as i32);
-                    self.mark_child_exited(exit_code);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    self.mark_failed(error.to_string());
-                }
+        if unresolved_reader_termination_failure_is_terminal(&self.state) {
+            if let Some(message) = self.pending_reader_termination_failure.take() {
+                self.mark_failed(message);
             }
+        } else {
+            self.pending_reader_termination_failure.take();
         }
 
         while let Some(event) = self.pending_lifecycle.pop_front() {
@@ -593,7 +650,7 @@ impl TerminalTransport for LocalPtyTransport {
             output.lifecycle.push(event);
         }
 
-        self.join_reader_if_finished();
+        self.join_background_threads_if_finished();
         self.diagnostics.state = self.state.clone();
 
         Ok(output)
@@ -608,44 +665,12 @@ impl TerminalTransport for LocalPtyTransport {
         self.diagnostics.state = self.state.clone();
         self.pending_lifecycle
             .push_back(TransportLifecycleEvent::ShutdownRequested);
-        self.writer.take();
-
-        if self
-            .wait_for_child_exit(Duration::from_millis(250))?
-            .is_none()
-        {
-            self.request_child_termination()?;
-
-            if self
-                .wait_for_child_exit(Duration::from_millis(1000))?
-                .is_none()
-            {
-                self.diagnostics.shutdown_timed_out = true;
-                self.mark_failed(format!(
-                    "timed out terminating local shell process {:?}",
-                    self.process_id
-                ));
-                self.close_master_without_blocking();
-                self.join_reader_if_finished();
-                self.diagnostics.state = self.state.clone();
-                return Err(TransportError::new(format!(
-                    "timed out terminating local shell process {:?}",
-                    self.process_id
-                )));
-            }
-        }
-
+        self.writer_tx.take();
+        self.request_child_termination()?;
         self.close_master_without_blocking();
+        self.drain_child_messages();
         let _ = self.drain_reader_messages();
-        self.join_reader_if_finished();
-
-        let exit_code = match self.state {
-            TransportState::DrainingOutput { exit_code } | TransportState::Closed { exit_code } => {
-                exit_code
-            }
-            _ => None,
-        };
-        self.mark_closed(exit_code);
+        self.join_background_threads_if_finished();
         self.diagnostics.state = self.state.clone();
 
         Ok(())
@@ -667,50 +692,193 @@ impl Drop for LocalPtyTransport {
             TransportState::Running
                 | TransportState::ClosingInput
                 | TransportState::TerminatingChild
+                | TransportState::Failed { .. }
         ) {
-            self.writer.take();
-            self.diagnostics.kill_attempted = true;
-            let _ = self.child.kill();
-            if let Ok(Some(status)) = self.child.try_wait() {
-                self.mark_child_exited(Some(status.exit_code() as i32));
-            }
+            self.writer_tx.take();
+            let _ = self.request_child_termination();
             self.close_master_without_blocking();
-            self.join_reader_if_finished();
+            self.join_background_threads_if_finished();
         }
     }
 }
 
+fn reader_failure_requires_child_termination(state: &TransportState) -> bool {
+    // PTY readers can report EIO as a normal child exits, so the child waiter
+    // remains the authoritative lifecycle source. If no exit is in progress,
+    // force the child toward that waiter instead of leaving a broken reader in
+    // Running forever.
+    matches!(state, TransportState::Starting | TransportState::Running)
+}
+
+fn unresolved_reader_termination_failure_is_terminal(state: &TransportState) -> bool {
+    !matches!(
+        state,
+        TransportState::DrainingOutput { .. }
+            | TransportState::Closed { .. }
+            | TransportState::Failed { .. }
+    )
+}
+
+enum WriterMessage {
+    Failed(String),
+}
+
+enum ChildMessage {
+    Exited(Option<i32>),
+    Failed(String),
+}
+
 enum ReaderMessage {
     Started,
-    Bytes(Vec<u8>),
+    /// A filled scratch buffer plus the number of valid bytes in it. The buffer
+    /// is owned by [`ReadBufferPool`] and must be recycled after the payload is
+    /// copied out.
+    Bytes {
+        buffer: Vec<u8>,
+        len: usize,
+    },
     Closed,
     Failed(String),
     Stopped,
 }
 
+/// Reader chunk size. Larger reads mean proportionally fewer event-loop wakes
+/// and syscalls under heavy output than the 8 KiB this used to use.
+const READ_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Depth of the reader's queue, in chunks. The send below blocks once it is
+/// full, so a child that outruns the parser stalls on the PTY instead of
+/// letting this process buffer its output without bound. Draining the queue on
+/// the consumer side unblocks the reader again.
+const READER_QUEUE_CHUNKS: usize = 8;
+const WRITER_QUEUE_CHUNKS: usize = 64;
+
+fn spawn_writer(
+    mut writer: Box<dyn Write + Send>,
+    output_waker: Arc<OnceLock<TransportWakeHandle>>,
+) -> (SyncSender<Vec<u8>>, Receiver<WriterMessage>, JoinHandle<()>) {
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(WRITER_QUEUE_CHUNKS);
+    let (message_tx, message_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        while let Ok(bytes) = rx.recv() {
+            if let Err(error) = writer.write_all(&bytes).and_then(|()| writer.flush()) {
+                if message_tx
+                    .send(WriterMessage::Failed(error.to_string()))
+                    .is_ok()
+                {
+                    wake_output(&output_waker);
+                }
+                break;
+            }
+        }
+    });
+    (tx, message_rx, handle)
+}
+
+fn queue_writer_input(writer_tx: &SyncSender<Vec<u8>>, bytes: &[u8]) -> TransportResult<usize> {
+    match writer_tx.try_send(bytes.to_vec()) {
+        Ok(()) => Ok(bytes.len()),
+        Err(TrySendError::Full(_)) => Ok(0),
+        Err(TrySendError::Disconnected(_)) => Err(TransportError::new("local PTY writer stopped")),
+    }
+}
+
+fn spawn_child_waiter(
+    mut child: Box<dyn Child + Send + Sync>,
+    output_waker: Arc<OnceLock<TransportWakeHandle>>,
+) -> (Receiver<ChildMessage>, JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let message = match child.wait() {
+            Ok(status) => ChildMessage::Exited(Some(status.exit_code() as i32)),
+            Err(error) => ChildMessage::Failed(error.to_string()),
+        };
+        if tx.send(message).is_ok() {
+            wake_output(&output_waker);
+        }
+    });
+    (rx, handle)
+}
+
+/// Recycles reader scratch buffers between the reader thread and the transport.
+///
+/// Allocating a fresh `vec![0; READ_BUFFER_BYTES]` per read cost a 64 KiB
+/// allocation *and* a 64 KiB zeroing pass for every chunk, however small — one
+/// per keystroke echo. Pooled buffers stay at full length so they never need
+/// re-zeroing.
+#[derive(Clone)]
+struct ReadBufferPool {
+    buffers: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl ReadBufferPool {
+    fn new() -> Self {
+        Self {
+            buffers: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// A buffer of exactly `READ_BUFFER_BYTES` length, ready to be read into.
+    fn take(&self) -> Vec<u8> {
+        let pooled = self
+            .buffers
+            .lock()
+            .ok()
+            .and_then(|mut buffers| buffers.pop());
+        match pooled {
+            Some(mut buffer) => {
+                // Pooled buffers are stored at full length, so this is a no-op
+                // in the steady state rather than another zeroing pass.
+                if buffer.len() != READ_BUFFER_BYTES {
+                    buffer.resize(READ_BUFFER_BYTES, 0);
+                }
+                buffer
+            }
+            None => vec![0_u8; READ_BUFFER_BYTES],
+        }
+    }
+
+    fn recycle(&self, buffer: Vec<u8>) {
+        if buffer.len() != READ_BUFFER_BYTES {
+            return;
+        }
+        if let Ok(mut buffers) = self.buffers.lock()
+            && buffers.len() < READER_QUEUE_CHUNKS + 1
+        {
+            buffers.push(buffer);
+        }
+    }
+}
+
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
-    output_waker: Arc<Mutex<Option<TransportWakeHandle>>>,
+    output_waker: Arc<OnceLock<TransportWakeHandle>>,
+    pool: ReadBufferPool,
 ) -> (Receiver<ReaderMessage>, JoinHandle<()>) {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(READER_QUEUE_CHUNKS);
 
     let handle = thread::spawn(move || {
-        let mut buffer = [0_u8; 8192];
         if tx.send(ReaderMessage::Started).is_ok() {
             wake_output(&output_waker);
         }
 
         loop {
+            let mut buffer = pool.take();
             match reader.read(&mut buffer) {
                 Ok(0) => {
+                    pool.recycle(buffer);
                     if tx.send(ReaderMessage::Closed).is_ok() {
                         wake_output(&output_waker);
                     }
                     break;
                 }
                 Ok(count) => {
+                    // The buffer keeps its full length and goes back to the
+                    // pool; only the bytes actually read are handed onward, so a
+                    // small chunk no longer carries a 64 KiB allocation with it
+                    // through the queues.
                     if tx
-                        .send(ReaderMessage::Bytes(buffer[..count].to_vec()))
+                        .send(ReaderMessage::Bytes { buffer, len: count })
                         .is_err()
                     {
                         break;
@@ -734,12 +902,8 @@ fn spawn_reader(
     (rx, handle)
 }
 
-fn wake_output(output_waker: &Arc<Mutex<Option<TransportWakeHandle>>>) {
-    let waker = output_waker
-        .lock()
-        .ok()
-        .and_then(|output_waker| output_waker.clone());
-    if let Some(waker) = waker {
+fn wake_output(output_waker: &Arc<OnceLock<TransportWakeHandle>>) {
+    if let Some(waker) = output_waker.get() {
         waker.wake();
     }
 }
@@ -779,7 +943,10 @@ mod tests {
     use std::{
         fmt::Write as _,
         io::Cursor,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Condvar,
+            atomic::{AtomicUsize, Ordering},
+        },
         thread,
         time::{Duration, Instant},
     };
@@ -790,24 +957,253 @@ mod tests {
     }
 
     #[test]
+    fn recycled_read_buffers_are_reused_at_full_length() {
+        let pool = ReadBufferPool::new();
+
+        let pooled = || pool.buffers.lock().expect("pool lock").len();
+
+        let first = pool.take();
+        assert_eq!(first.len(), READ_BUFFER_BYTES);
+        assert_eq!(pooled(), 0, "a taken buffer must leave the pool");
+
+        pool.recycle(first);
+        assert_eq!(pooled(), 1, "a returned buffer must be retained for reuse");
+
+        // Taking it back must reuse the retained buffer rather than allocating.
+        let second = pool.take();
+        assert_eq!(pooled(), 0);
+        assert_eq!(
+            second.len(),
+            READ_BUFFER_BYTES,
+            "pooled buffers stay at full length so reads need no zeroing pass"
+        );
+        pool.recycle(second);
+
+        // A short-changed buffer is dropped rather than poisoning the pool.
+        let mut truncated = pool.take();
+        truncated.truncate(8);
+        pool.recycle(truncated);
+        assert_eq!(pooled(), 0, "a truncated buffer must not be retained");
+        assert_eq!(pool.take().len(), READ_BUFFER_BYTES);
+
+        // The pool is bounded: a burst of returns cannot grow it without limit.
+        for _ in 0..(READER_QUEUE_CHUNKS * 4) {
+            pool.recycle(vec![0_u8; READ_BUFFER_BYTES]);
+        }
+        assert_eq!(pooled(), READER_QUEUE_CHUNKS + 1);
+    }
+
+    #[test]
+    fn a_small_chunk_does_not_carry_a_full_read_buffer_downstream() {
+        let output_waker = Arc::new(OnceLock::new());
+        let (messages, reader) = spawn_reader(
+            Box::new(Cursor::new(b"hi".to_vec())),
+            output_waker,
+            ReadBufferPool::new(),
+        );
+        reader.join().expect("reader thread");
+
+        let payload = messages
+            .try_iter()
+            .find_map(|message| match message {
+                ReaderMessage::Bytes { buffer, len } => Some(buffer[..len].to_vec()),
+                _ => None,
+            })
+            .expect("output chunk");
+
+        // The scratch buffer stays behind in the pool; only the bytes actually
+        // read travel onward.
+        assert_eq!(payload, b"hi");
+        assert_eq!(payload.len(), 2);
+    }
+
+    #[test]
     fn reader_wakes_consumer_when_output_is_queued() {
         let wake_count = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&wake_count);
-        let output_waker = Arc::new(Mutex::new(Some(TransportWakeHandle::new(move || {
-            observed.fetch_add(1, Ordering::Relaxed);
-        }))));
+        let output_waker = Arc::new(OnceLock::new());
+        output_waker
+            .set(TransportWakeHandle::new(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }))
+            .expect("set output waker");
         let (messages, reader) = spawn_reader(
             Box::new(Cursor::new(b"panea-output".to_vec())),
             output_waker,
+            ReadBufferPool::new(),
         );
 
         reader.join().expect("reader thread");
         let messages = messages.try_iter().collect::<Vec<_>>();
 
         assert!(messages.iter().any(|message| {
-            matches!(message, ReaderMessage::Bytes(bytes) if bytes == b"panea-output")
+            matches!(
+                message,
+                ReaderMessage::Bytes { buffer, len } if &buffer[..*len] == b"panea-output"
+            )
         }));
-        assert!(wake_count.load(Ordering::Relaxed) >= 2);
+        assert_eq!(wake_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[derive(Debug)]
+    struct ImmediateExitChild;
+
+    impl portable_pty::ChildKiller for ImmediateExitChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(Self)
+        }
+    }
+
+    impl portable_pty::Child for ImmediateExitChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(Some(portable_pty::ExitStatus::with_exit_code(7)))
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Ok(portable_pty::ExitStatus::with_exit_code(7))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(42)
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    #[test]
+    fn child_exit_waiter_wakes_without_pty_output() {
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&wake_count);
+        let output_waker = Arc::new(OnceLock::new());
+        output_waker
+            .set(TransportWakeHandle::new(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }))
+            .expect("set output waker");
+
+        let (messages, waiter) = spawn_child_waiter(Box::new(ImmediateExitChild), output_waker);
+        waiter.join().expect("child waiter thread");
+
+        assert!(matches!(
+            messages.recv_timeout(Duration::from_millis(50)),
+            Ok(ChildMessage::Exited(Some(7)))
+        ));
+        assert_eq!(wake_count.load(Ordering::Relaxed), 1);
+    }
+
+    struct GatedWriter {
+        started: mpsc::Sender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "writer failed",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Write for GatedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let _ = self.started.send(());
+            let (released, ready) = &*self.release;
+            let guard = released.lock().expect("release lock");
+            let _ = ready
+                .wait_timeout_while(guard, Duration::from_millis(300), |released| !*released)
+                .expect("release wait");
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn writer_queue_accepts_input_without_waiting_for_the_pty_pipe() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let output_waker = Arc::new(OnceLock::new());
+        let (writer_tx, _writer_messages, writer_thread) = spawn_writer(
+            Box::new(GatedWriter {
+                started: started_tx,
+                release: Arc::clone(&release),
+            }),
+            output_waker,
+        );
+
+        let started = Instant::now();
+        assert_eq!(queue_writer_input(&writer_tx, b"large paste"), Ok(11));
+        assert!(started.elapsed() < Duration::from_millis(50));
+        started_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("writer thread starts OS write");
+
+        release
+            .0
+            .lock()
+            .map(|mut released| *released = true)
+            .unwrap();
+        release.1.notify_all();
+        drop(writer_tx);
+        writer_thread.join().expect("writer thread");
+    }
+
+    #[test]
+    fn writer_failure_is_reported_and_wakes_the_transport() {
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&wake_count);
+        let output_waker = Arc::new(OnceLock::new());
+        output_waker
+            .set(TransportWakeHandle::new(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }))
+            .expect("set output waker");
+        let (writer_tx, writer_messages, writer_thread) =
+            spawn_writer(Box::new(FailingWriter), output_waker);
+
+        assert_eq!(queue_writer_input(&writer_tx, b"input"), Ok(5));
+        writer_thread.join().expect("writer thread");
+
+        assert!(matches!(
+            writer_messages.recv_timeout(Duration::from_millis(50)),
+            Ok(WriterMessage::Failed(message)) if message.contains("writer failed")
+        ));
+        assert_eq!(wake_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn reader_failure_only_terminates_a_child_that_is_still_running() {
+        assert!(!reader_failure_requires_child_termination(
+            &TransportState::DrainingOutput { exit_code: Some(0) }
+        ));
+        assert!(reader_failure_requires_child_termination(
+            &TransportState::Running
+        ));
+        assert!(!reader_failure_requires_child_termination(
+            &TransportState::TerminatingChild
+        ));
+        assert!(unresolved_reader_termination_failure_is_terminal(
+            &TransportState::TerminatingChild
+        ));
+        assert!(!unresolved_reader_termination_failure_is_terminal(
+            &TransportState::DrainingOutput { exit_code: Some(0) }
+        ));
     }
 
     #[test]

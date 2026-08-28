@@ -2380,6 +2380,13 @@ impl PerformanceOverlay {
                 ),
             ),
             format!(
+                "scene layouts hit {} build {} rows reuse {} rebuild {}",
+                latest.scene_layout_cache_hits,
+                latest.scene_layout_builds,
+                latest.scene_rows_reused,
+                latest.scene_rows_rebuilt,
+            ),
+            format!(
                 "pty {}/s parser {}/s mem {} scrollback {} status {warning}",
                 format_bytes(latest.pty_read_bytes_per_second),
                 format_bytes(latest.parser_bytes_per_second),

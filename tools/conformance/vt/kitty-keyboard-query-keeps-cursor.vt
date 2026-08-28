@@ -1,0 +1,10 @@
+# CSI ? u queries the kitty keyboard flags. It must not be treated as SCORC
+# (restore cursor), which would move the cursor to a saved position.
+size: 10x3
+description: the kitty keyboard query does not move the cursor
+
+--- input
+ab\e7\r\ncd\e[?u
+
+--- expect-cursor
+row=1 col=2

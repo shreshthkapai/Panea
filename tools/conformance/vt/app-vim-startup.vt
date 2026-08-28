@@ -1,0 +1,22 @@
+# A vim-shaped startup: enter the alternate screen, reserve a status row with
+# DECSTBM, draw a tilde column and a status line, then leave. On exit the
+# primary screen and its shell prompt must be intact.
+size: 20x6
+description: an editor's alternate-screen session leaves the primary screen intact
+
+--- input
+$\x20ls\r\nfile.txt\r\n$\x20vim\e[?1049h\e[1;1H\e[2J\e[1;20r
+\e[1;1H~\e[2;1H~\e[3;1H~
+\e[6;1H\e[7m-- INSERT --\e[0m
+\e[?1049l
+
+--- expect-grid
+|$ ls|
+|file.txt|
+|$ vim|
+||
+||
+||
+
+--- expect-cursor
+row=2 col=5

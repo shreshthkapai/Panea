@@ -21,15 +21,16 @@ use platform_core::{
     CompositorInfo, DecorationMode, DecorationModeDiagnostic, DesktopPlatform, DpiBehavior,
     DpiInfo, ImeEvent, ImeSupport, InputEvent, KeyEvent, KeyModifiers, KeyState,
     LinuxWindowBackend, LinuxWindowBackendDiagnostic, MonitorInfo, MouseButton, MouseEvent,
-    MouseEventKind, NotificationAvailability, NotificationBackend, NotificationDiagnostic,
-    NotificationProvider, NotificationRequest, NotificationUrgency, PlatformCapabilities,
-    PlatformFallback, PowerSource, PowerState, PowerStateDiagnostic, PowerStateProvider,
-    ShellEnvironmentInfo, UrlOpenDiagnostic, UrlOpener, WindowAction, WindowChromeAction,
-    WindowChromeActionDiagnostic, WindowChromeActionExecutor, WindowMode, WindowModeDiagnostic,
-    execute_window_chrome_action,
+    MouseEventKind, MouseScrollDelta as PlatformMouseScrollDelta, NotificationAvailability,
+    NotificationBackend, NotificationDiagnostic, NotificationProvider, NotificationRequest,
+    NotificationUrgency, PlatformCapabilities, PlatformFallback, PowerSource, PowerState,
+    PowerStateDiagnostic, PowerStateProvider, ShellEnvironmentInfo, UrlOpenDiagnostic, UrlOpener,
+    WindowChromeAction, WindowChromeActionDiagnostic, WindowChromeActionExecutor, WindowMode,
+    WindowModeDiagnostic, execute_window_chrome_action,
 };
 use starship_battery::units::ratio::percent;
 use starship_battery::{Manager as BatteryManager, State as BatteryState};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::{
     dpi::LogicalSize,
     event::{ElementState, Ime, MouseScrollDelta, WindowEvent},
@@ -615,7 +616,32 @@ impl InputTranslator {
                 self.modifiers = modifiers_from_winit(modifiers.state());
                 Vec::new()
             }
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } => {
+                let logical_key_without_modifiers = key_name(&event.key_without_modifiers());
+                if matches!(event.logical_key, Key::Named(NamedKey::AltGraph)) {
+                    self.modifiers.alt_graph = event.state == ElementState::Pressed;
+                } else if event.state == ElementState::Pressed
+                    && infer_alt_graph(
+                        self.modifiers,
+                        event.text.as_deref(),
+                        &logical_key_without_modifiers,
+                        detected_platform(),
+                    )
+                {
+                    self.modifiers.alt_graph = true;
+                }
+                if quarantine_synthetic_key_event(
+                    &mut self.pressed_keys,
+                    &event.physical_key,
+                    event.state,
+                    *is_synthetic,
+                ) {
+                    return Vec::new();
+                }
                 if should_suppress_initial_activation_key(
                     &mut self.suppressed_activation_keys,
                     &event.physical_key,
@@ -632,20 +658,17 @@ impl InputTranslator {
                 ) {
                     return Vec::new();
                 }
-                if matches!(event.logical_key, Key::Named(NamedKey::AltGraph)) {
-                    self.modifiers.alt_graph = event.state == ElementState::Pressed;
-                }
                 if event.state != ElementState::Pressed {
-                    return vec![InputEvent::Key(key_event_from_winit(event, self.modifiers))];
+                    return vec![InputEvent::Key(key_event_from_winit(
+                        event,
+                        self.modifiers,
+                        logical_key_without_modifiers,
+                    ))];
                 }
 
-                let key = key_event_from_winit(event, self.modifiers);
-                let action = recovery_action(&key);
-                if let Some(action) = action {
-                    vec![InputEvent::WindowAction(action)]
-                } else {
-                    vec![InputEvent::Key(key)]
-                }
+                let key =
+                    key_event_from_winit(event, self.modifiers, logical_key_without_modifiers);
+                vec![InputEvent::Key(key)]
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position = (position.x, position.y);
@@ -668,9 +691,8 @@ impl InputTranslator {
                 })]
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let (delta_x, delta_y) = wheel_delta(*delta);
                 vec![InputEvent::Mouse(MouseEvent {
-                    kind: MouseEventKind::Wheel { delta_x, delta_y },
+                    kind: MouseEventKind::Wheel(wheel_delta(*delta)),
                     x: self.cursor_position.0,
                     y: self.cursor_position.1,
                     modifiers: self.modifiers,
@@ -678,8 +700,11 @@ impl InputTranslator {
             }
             WindowEvent::Ime(ime) => match ime {
                 Ime::Enabled => vec![InputEvent::Ime(ImeEvent::Enabled)],
-                Ime::Preedit(text, _) => {
-                    vec![InputEvent::Ime(ImeEvent::Preedit { text: text.clone() })]
+                Ime::Preedit(text, cursor) => {
+                    vec![InputEvent::Ime(ImeEvent::Preedit {
+                        text: text.clone(),
+                        cursor: *cursor,
+                    })]
                 }
                 Ime::Commit(text) => ime_commit_text(text).map_or_else(Vec::new, |text| {
                     vec![InputEvent::Ime(ImeEvent::Commit { text })]
@@ -730,17 +755,32 @@ fn should_forward_key_event(
 ) -> bool {
     match state {
         ElementState::Pressed => {
-            if repeat && !pressed_keys.contains(key) {
-                return false;
+            if repeat {
+                pressed_keys.insert(*key);
+                return true;
             }
-            pressed_keys.insert(*key);
-            true
+            pressed_keys.insert(*key)
         }
         ElementState::Released => {
             pressed_keys.remove(key);
             true
         }
     }
+}
+
+fn quarantine_synthetic_key_event(
+    pressed_keys: &mut HashSet<PhysicalKey>,
+    key: &PhysicalKey,
+    state: ElementState,
+    is_synthetic: bool,
+) -> bool {
+    if !is_synthetic {
+        return false;
+    }
+    if state == ElementState::Released {
+        pressed_keys.remove(key);
+    }
+    true
 }
 
 fn ime_commit_text(text: &str) -> Option<String> {
@@ -1231,15 +1271,15 @@ fn clipboard_capabilities() -> Vec<platform_core::ClipboardCapability> {
     capabilities
 }
 
-fn key_event_from_winit(event: &winit::event::KeyEvent, modifiers: KeyModifiers) -> KeyEvent {
+fn key_event_from_winit(
+    event: &winit::event::KeyEvent,
+    modifiers: KeyModifiers,
+    logical_key_without_modifiers: String,
+) -> KeyEvent {
     KeyEvent {
         physical_key: Some(format!("{:?}", event.physical_key)),
-        logical_key: match &event.logical_key {
-            Key::Named(named) => format!("{named:?}"),
-            Key::Character(text) => text.to_string(),
-            Key::Unidentified(_) => "Unidentified".to_owned(),
-            Key::Dead(dead) => format!("Dead({dead:?})"),
-        },
+        logical_key: key_name(&event.logical_key),
+        logical_key_without_modifiers,
         text: event.text.as_ref().map(ToString::to_string),
         state: match event.state {
             ElementState::Pressed => KeyState::Pressed,
@@ -1250,19 +1290,25 @@ fn key_event_from_winit(event: &winit::event::KeyEvent, modifiers: KeyModifiers)
     }
 }
 
-fn recovery_action(event: &KeyEvent) -> Option<WindowAction> {
-    if !(event.modifiers.ctrl && event.modifiers.shift) {
-        return None;
+fn key_name(key: &Key) -> String {
+    match key {
+        Key::Named(named) => format!("{named:?}"),
+        Key::Character(text) => text.to_string(),
+        Key::Unidentified(_) => "Unidentified".to_owned(),
+        Key::Dead(dead) => format!("Dead({dead:?})"),
     }
+}
 
-    match event.logical_key.to_ascii_lowercase().as_str() {
-        "f" => Some(WindowAction::ToggleFullscreen),
-        "d" => Some(WindowAction::RestoreWindowDecorations),
-        "m" => Some(WindowAction::ToggleFrameless),
-        "w" => Some(WindowAction::CloseWindow),
-        "p" => Some(WindowAction::OpenCommandPaletteLater),
-        _ => None,
-    }
+fn infer_alt_graph(
+    modifiers: KeyModifiers,
+    text: Option<&str>,
+    logical_key_without_modifiers: &str,
+    platform: DesktopPlatform,
+) -> bool {
+    matches!(platform, DesktopPlatform::Windows)
+        && modifiers.ctrl
+        && modifiers.alt
+        && text.is_some_and(|text| text != logical_key_without_modifiers)
 }
 
 fn modifiers_from_winit(modifiers: ModifiersState) -> KeyModifiers {
@@ -1286,10 +1332,16 @@ fn mouse_button(button: winit::event::MouseButton) -> MouseButton {
     }
 }
 
-fn wheel_delta(delta: MouseScrollDelta) -> (f64, f64) {
+fn wheel_delta(delta: MouseScrollDelta) -> PlatformMouseScrollDelta {
     match delta {
-        MouseScrollDelta::LineDelta(x, y) => (f64::from(x), f64::from(y)),
-        MouseScrollDelta::PixelDelta(position) => (position.x, position.y),
+        MouseScrollDelta::LineDelta(x, y) => PlatformMouseScrollDelta::Lines {
+            x: f64::from(x),
+            y: f64::from(y),
+        },
+        MouseScrollDelta::PixelDelta(position) => PlatformMouseScrollDelta::Pixels {
+            x: position.x,
+            y: position.y,
+        },
     }
 }
 
@@ -1505,19 +1557,26 @@ mod tests {
     }
 
     #[test]
-    fn orphan_key_repeat_is_not_forwarded_as_terminal_input() {
+    fn orphan_key_repeat_is_treated_as_a_fresh_press() {
         let key = PhysicalKey::Code(KeyCode::Enter);
         let mut pressed = HashSet::new();
 
-        assert!(!should_forward_key_event(
+        assert!(should_forward_key_event(
             &mut pressed,
             &key,
             ElementState::Pressed,
             true,
         ));
-        assert!(pressed.is_empty());
+        assert!(pressed.contains(&key));
 
         assert!(should_forward_key_event(
+            &mut pressed,
+            &key,
+            ElementState::Pressed,
+            true,
+        ));
+
+        assert!(!should_forward_key_event(
             &mut pressed,
             &key,
             ElementState::Pressed,
@@ -1539,12 +1598,100 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_key_events_are_quarantined_and_releases_clear_pressed_state() {
+        let key = PhysicalKey::Code(KeyCode::KeyA);
+        let mut pressed = HashSet::from([key]);
+
+        assert!(quarantine_synthetic_key_event(
+            &mut pressed,
+            &key,
+            ElementState::Pressed,
+            true,
+        ));
+        assert!(pressed.contains(&key));
+
+        assert!(quarantine_synthetic_key_event(
+            &mut pressed,
+            &key,
+            ElementState::Released,
+            true,
+        ));
+        assert!(pressed.is_empty());
+        assert!(!quarantine_synthetic_key_event(
+            &mut pressed,
+            &key,
+            ElementState::Pressed,
+            false,
+        ));
+    }
+
+    #[test]
+    fn duplicate_initial_key_press_is_not_forwarded_as_terminal_input() {
+        let key = PhysicalKey::Code(KeyCode::KeyH);
+        let mut pressed = HashSet::new();
+
+        assert!(should_forward_key_event(
+            &mut pressed,
+            &key,
+            ElementState::Pressed,
+            false,
+        ));
+        assert!(!should_forward_key_event(
+            &mut pressed,
+            &key,
+            ElementState::Pressed,
+            false,
+        ));
+        assert!(should_forward_key_event(
+            &mut pressed,
+            &key,
+            ElementState::Pressed,
+            true,
+        ));
+        assert!(should_forward_key_event(
+            &mut pressed,
+            &key,
+            ElementState::Released,
+            false,
+        ));
+        assert!(pressed.is_empty());
+        assert!(should_forward_key_event(
+            &mut pressed,
+            &key,
+            ElementState::Pressed,
+            false,
+        ));
+        assert!(should_forward_key_event(
+            &mut pressed,
+            &key,
+            ElementState::Released,
+            false,
+        ));
+    }
+
+    #[test]
     fn ime_commit_accepts_composed_text_but_not_command_controls() {
         assert_eq!(ime_commit_text("日本語").as_deref(), Some("日本語"));
         assert_eq!(ime_commit_text("e\u{301}").as_deref(), Some("e\u{301}"));
         assert_eq!(ime_commit_text("\r"), None);
         assert_eq!(ime_commit_text("\n"), None);
         assert_eq!(ime_commit_text(""), None);
+    }
+
+    #[test]
+    fn ime_preedit_preserves_the_native_cursor_range() {
+        let mut translator = InputTranslator::new();
+
+        assert_eq!(
+            translator.translate_window_event(&WindowEvent::Ime(Ime::Preedit(
+                "かな".to_owned(),
+                Some((0, 3)),
+            ))),
+            vec![InputEvent::Ime(ImeEvent::Preedit {
+                text: "かな".to_owned(),
+                cursor: Some((0, 3)),
+            })]
+        );
     }
 
     #[test]
@@ -1584,26 +1731,45 @@ mod tests {
     }
 
     #[test]
-    fn recovery_shortcuts_translate_to_window_actions() {
-        let event = KeyEvent {
-            physical_key: Some("KeyF".to_owned()),
-            logical_key: "f".to_owned(),
-            text: Some("f".to_owned()),
-            state: KeyState::Pressed,
-            modifiers: KeyModifiers {
-                shift: true,
-                ctrl: true,
-                alt: false,
-                super_key: false,
-                alt_graph: false,
-            },
-            repeat: false,
+    fn wheel_delta_preserves_line_and_pixel_units() {
+        assert!(matches!(
+            wheel_delta(MouseScrollDelta::LineDelta(0.25, -1.5)),
+            platform_core::MouseScrollDelta::Lines { x, y }
+                if x == 0.25 && y == -1.5
+        ));
+        assert!(matches!(
+            wheel_delta(MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(8.0, 11.0))),
+            platform_core::MouseScrollDelta::Pixels { x, y }
+                if x == 8.0 && y == 11.0
+        ));
+    }
+
+    #[test]
+    fn windows_alt_graph_is_inferred_from_ctrl_alt_composed_text() {
+        let modifiers = KeyModifiers {
+            ctrl: true,
+            alt: true,
+            ..KeyModifiers::default()
         };
 
-        assert_eq!(
-            recovery_action(&event),
-            Some(WindowAction::ToggleFullscreen)
-        );
+        assert!(infer_alt_graph(
+            modifiers,
+            Some("@"),
+            "q",
+            DesktopPlatform::Windows,
+        ));
+        assert!(!infer_alt_graph(
+            modifiers,
+            Some("q"),
+            "q",
+            DesktopPlatform::Windows,
+        ));
+        assert!(!infer_alt_graph(
+            modifiers,
+            Some("@"),
+            "q",
+            DesktopPlatform::MacOs,
+        ));
     }
 
     #[test]

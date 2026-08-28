@@ -175,6 +175,14 @@ impl AppConfig {
         if !(0.2..=1.0).contains(&self.window.opacity) {
             report.error("window.opacity", "opacity must be between 0.2 and 1.0");
         }
+        if !self.renderer.text_gamma_adjustment.is_finite()
+            || !(1.0..=2.0).contains(&self.renderer.text_gamma_adjustment)
+        {
+            report.error(
+                "renderer.text_gamma_adjustment",
+                "text gamma adjustment must be between 1.0 and 2.0",
+            );
+        }
         if self.window.padding_x > 256
             || self.window.padding_y > 256
             || self.window.margin_x > 256
@@ -450,6 +458,7 @@ impl AppConfig {
         if self.renderer.present_mode != next.renderer.present_mode
             || self.renderer.damage_tracking != next.renderer.damage_tracking
             || self.renderer.gpu_timestamps != next.renderer.gpu_timestamps
+            || self.renderer.text_gamma_adjustment != next.renderer.text_gamma_adjustment
         {
             plan.restart_required.push(RestartRequiredChange {
                 path: "renderer".to_owned(),
@@ -1153,6 +1162,7 @@ pub struct RendererConfig {
     pub damage_tracking: bool,
     pub present_mode: PresentModePreference,
     pub gpu_timestamps: bool,
+    pub text_gamma_adjustment: f32,
 }
 
 impl Default for RendererConfig {
@@ -1163,6 +1173,7 @@ impl Default for RendererConfig {
             damage_tracking: false,
             present_mode: PresentModePreference::Auto,
             gpu_timestamps: false,
+            text_gamma_adjustment: 1.2,
         }
     }
 }
@@ -1194,7 +1205,7 @@ impl Default for FontConfig {
             size: 13.0,
             line_height: 1.2,
             fallback_families: Vec::new(),
-            ligatures: true,
+            ligatures: false,
         }
     }
 }
@@ -2430,7 +2441,7 @@ impl FullscreenTitlebarConfigPatch {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct RendererConfigPatch {
     pub backend: Option<RendererBackendPreference>,
@@ -2438,6 +2449,7 @@ pub struct RendererConfigPatch {
     pub damage_tracking: Option<bool>,
     pub present_mode: Option<PresentModePreference>,
     pub gpu_timestamps: Option<bool>,
+    pub text_gamma_adjustment: Option<f32>,
 }
 
 impl RendererConfigPatch {
@@ -2447,6 +2459,10 @@ impl RendererConfigPatch {
         apply_opt(&mut config.damage_tracking, &self.damage_tracking);
         apply_opt(&mut config.present_mode, &self.present_mode);
         apply_opt(&mut config.gpu_timestamps, &self.gpu_timestamps);
+        apply_opt(
+            &mut config.text_gamma_adjustment,
+            &self.text_gamma_adjustment,
+        );
     }
 }
 
@@ -3872,6 +3888,13 @@ pub fn export_schema() -> ConfigSchema {
                         false,
                         false,
                     ),
+                    field(
+                        "renderer.text_gamma_adjustment",
+                        "number",
+                        default.renderer.text_gamma_adjustment,
+                        false,
+                        false,
+                    ),
                 ],
             },
             ConfigSchemaSection {
@@ -4183,6 +4206,35 @@ mod tests {
         assert_eq!(config.font.family, FontConfig::default().family);
         assert_eq!(config.font.size, 14.0);
         assert!(!config.renderer.damage_tracking);
+        assert_eq!(config.renderer.text_gamma_adjustment, 1.2);
+    }
+
+    #[test]
+    fn terminal_ligatures_are_opt_in_by_default() {
+        assert!(!FontConfig::default().ligatures);
+    }
+
+    #[test]
+    fn renderer_text_gamma_adjustment_deserializes_and_validates() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            [renderer]
+            text_gamma_adjustment = 1.35
+            "#,
+        )
+        .expect("renderer gamma should deserialize");
+        assert_eq!(config.renderer.text_gamma_adjustment, 1.35);
+        assert!(!config.validate().has_errors());
+
+        let mut invalid = config;
+        invalid.renderer.text_gamma_adjustment = 0.0;
+        assert!(
+            invalid
+                .validate()
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.path == "renderer.text_gamma_adjustment" })
+        );
     }
 
     #[test]

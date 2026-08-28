@@ -641,16 +641,21 @@ impl SemanticEscapeParser {
                         self.state = ParserState::Escape;
                     }
                 }
-                ParserState::Escape => {
-                    if *byte == b']' {
+                ParserState::Escape => match *byte {
+                    b']' => {
                         self.state = ParserState::Osc {
                             escape_seen: false,
                             content: Vec::new(),
                         };
-                    } else {
-                        self.state = ParserState::Ground;
                     }
-                }
+                    // DCS, SOS, PM, APC: consume the payload without reading it.
+                    b'P' | b'X' | b'^' | b'_' => {
+                        self.state = ParserState::IgnoringString { escape_seen: false };
+                    }
+                    // A second ESC restarts the sequence rather than dropping it.
+                    ESC => {}
+                    _ => self.state = ParserState::Ground,
+                },
                 ParserState::Osc {
                     escape_seen,
                     content,
@@ -696,6 +701,11 @@ impl SemanticEscapeParser {
                     (ESC, _) => *escape_seen = true,
                     (_, _) => *escape_seen = false,
                 },
+                ParserState::IgnoringString { escape_seen } => match (*byte, *escape_seen) {
+                    (BEL, _) | (b'\\', true) => self.state = ParserState::Ground,
+                    (ESC, _) => *escape_seen = true,
+                    (_, _) => *escape_seen = false,
+                },
             }
         }
 
@@ -707,8 +717,22 @@ impl SemanticEscapeParser {
 enum ParserState {
     Ground,
     Escape,
-    Osc { escape_seen: bool, content: Vec<u8> },
-    IgnoringOsc { escape_seen: bool },
+    Osc {
+        escape_seen: bool,
+        content: Vec<u8>,
+    },
+    IgnoringOsc {
+        escape_seen: bool,
+    },
+    /// A DCS, APC, PM or SOS payload, skipped wholesale.
+    ///
+    /// This scanner runs alongside the terminal parser over the same bytes, so
+    /// it has to respect the same string-control boundaries. Treating `ESC P` and
+    /// `ESC _` as ordinary bytes meant a marker appearing *inside* a tmux
+    /// passthrough or kitty graphics payload was read as one of ours.
+    IgnoringString {
+        escape_seen: bool,
+    },
 }
 
 pub fn parse_osc_payload(
@@ -771,13 +795,24 @@ fn osc_633_event(
             metadata: metadata_from_kv(&fields[1..]),
         }),
         Some("B") => Ok(SemanticEvent::PromptEnded { position }),
-        Some("C") => Ok(SemanticEvent::InputEnded { position }),
+        // VS Code's `C` marks the command as executed, so output begins here.
+        // Mapping it to InputEnded alone left the output region unopened, which
+        // put the wrong span on every command block from pwsh's integration.
+        Some("C") => Ok(SemanticEvent::OutputStarted { position }),
         Some("D") => Ok(SemanticEvent::CommandFinished {
             position,
             exit_status: parse_exit_status(fields.get(1).copied()),
             duration: parse_duration(fields.get(2).copied()),
         }),
-        Some("E") => Ok(SemanticEvent::InputStarted { position }),
+        // `E;<command line>` reports the command itself. The payload may contain
+        // escaped separators, so keep everything after the marker.
+        Some("E") => Ok(match fields.len() {
+            0 | 1 => SemanticEvent::InputStarted { position },
+            _ => SemanticEvent::CommandLineRecorded {
+                position,
+                command: decode_command_line(&fields[1..].join(";")),
+            },
+        }),
         Some("P") => panea_event(raw, &fields[1..], position),
         _ => Err(SemanticParseError::UnsupportedOsc(raw.to_owned())),
     }
@@ -909,14 +944,56 @@ fn parse_cwd_payload(payload: &str) -> String {
     percent_decode(payload)
 }
 
+/// Decodes the `\xNN` escapes VS Code applies to an `OSC 633;E` command line so
+/// separators and newlines survive the payload.
+fn decode_command_line(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            match bytes.get(index + 1) {
+                Some(b'\\') => {
+                    out.push(b'\\');
+                    index += 2;
+                    continue;
+                }
+                // Decode from raw bytes: slicing the string here would panic on
+                // a `\x` that precedes a multi-byte scalar.
+                Some(b'x' | b'X') => {
+                    if let Some(hex) = bytes
+                        .get(index + 2..index + 4)
+                        .and_then(|escape| std::str::from_utf8(escape).ok())
+                        .and_then(|escape| u8::from_str_radix(escape, 16).ok())
+                    {
+                        out.push(hex);
+                        index += 4;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
 fn percent_decode(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
+        // Decode the escape from raw bytes. Slicing `value` by byte offset
+        // panics whenever a `%` is followed by the interior of a multi-byte
+        // scalar, and a remote working directory reaches this from untrusted
+        // terminal output.
         if bytes[index] == b'%'
-            && index + 2 < bytes.len()
-            && let Ok(hex) = u8::from_str_radix(&value[index + 1..index + 3], 16)
+            && let Some(hex) = bytes
+                .get(index + 1..index + 3)
+                .and_then(|escape| std::str::from_utf8(escape).ok())
+                .and_then(|escape| u8::from_str_radix(escape, 16).ok())
         {
             out.push(hex);
             index += 3;
@@ -1114,6 +1191,120 @@ mod tests {
             events[1].event,
             SemanticEvent::OutputStarted { .. }
         ));
+    }
+
+    #[test]
+    fn markers_inside_string_controls_are_not_mistaken_for_ours() {
+        let mut parser = SemanticEscapeParser::new();
+        let position = BufferPosition::new(0, 0);
+
+        // A tmux passthrough payload that happens to carry our own marker bytes.
+        let events = parser.parse(b"\x1bPtmux;\x1b\x1b]133;A\x07\x1b\\ready", position);
+        assert!(
+            events.is_empty(),
+            "a marker inside a DCS payload must not fire, got {events:?}"
+        );
+
+        // An APC payload (kitty graphics carries arbitrary binary).
+        let events = parser.parse(b"\x1b_Gf=100;\x1b]133;C\x07\x1b\\", position);
+        assert!(
+            events.is_empty(),
+            "a marker inside an APC payload must not fire"
+        );
+
+        // The scanner must still be usable afterwards.
+        let events = parser.parse(b"\x1b]133;A\x07", position);
+        assert_eq!(events.len(), 1, "real markers must still be recognised");
+    }
+
+    #[test]
+    fn osc_633_markers_follow_the_vs_code_contract() {
+        let position = BufferPosition::new(2, 0);
+
+        // `C` means the command was executed, so output begins here.
+        let executed = parse_osc_payload(b"633;C", position)
+            .expect("parse")
+            .expect("event");
+        assert_eq!(executed.event, SemanticEvent::OutputStarted { position });
+
+        // `E;<command line>` reports the command itself, with `\xNN` escapes.
+        let recorded = parse_osc_payload(b"633;E;git commit -m \\x22wip\\x22", position)
+            .expect("parse")
+            .expect("event");
+        assert_eq!(
+            recorded.event,
+            SemanticEvent::CommandLineRecorded {
+                position,
+                command: "git commit -m \"wip\"".to_owned()
+            }
+        );
+
+        // An escaped separator must survive being split on `;`.
+        let separated = parse_osc_payload(b"633;E;echo a\\x3b echo b", position)
+            .expect("parse")
+            .expect("event");
+        assert_eq!(
+            separated.event,
+            SemanticEvent::CommandLineRecorded {
+                position,
+                command: "echo a; echo b".to_owned()
+            }
+        );
+
+        // A bare `E` still just opens input.
+        let bare = parse_osc_payload(b"633;E", position)
+            .expect("parse")
+            .expect("event");
+        assert_eq!(bare.event, SemanticEvent::InputStarted { position });
+    }
+
+    #[test]
+    fn command_line_escapes_before_multi_byte_scalars_do_not_panic() {
+        let position = BufferPosition::new(0, 0);
+        for payload in [
+            "633;E;echo \\x€",
+            "633;E;echo \\x",
+            "633;E;echo \\",
+            "633;E;echo \\xZZ",
+            "633;E;echo \\\\x41",
+        ] {
+            assert!(
+                parse_osc_payload(payload.as_bytes(), position).is_ok(),
+                "payload {payload:?} must not fail to parse"
+            );
+        }
+    }
+
+    #[test]
+    fn percent_escapes_before_multi_byte_scalars_do_not_panic() {
+        let position = BufferPosition::new(0, 0);
+
+        // A `%` followed by the interior of a multi-byte scalar used to panic
+        // while slicing the payload by byte offset. Reachable from any remote
+        // working directory, and outside the desktop's parser panic boundary.
+        for payload in [
+            "7;file://host/%€",
+            "7;file://host/tmp/%",
+            "7;file://host/tmp/%A",
+            "7;file://host/%ff%€%20done",
+            "777;cwd;path=/tmp/%こんにちは",
+        ] {
+            let parsed = parse_osc_payload(payload.as_bytes(), position);
+            assert!(parsed.is_ok(), "payload {payload:?} must not fail to parse");
+        }
+
+        let decoded = parse_osc_payload(b"7;file://host/tmp/caf%C3%A9", position)
+            .expect("parse")
+            .expect("event");
+        assert_eq!(
+            decoded.event,
+            SemanticEvent::CurrentWorkingDirectoryChanged {
+                position,
+                directory: "/tmp/café".to_owned(),
+                remote: false
+            },
+            "valid escapes must still decode"
+        );
     }
 
     #[test]

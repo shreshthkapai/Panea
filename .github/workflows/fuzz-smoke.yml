@@ -25,3 +25,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Run parser/core/shell fuzz property smoke tests
         run: cargo run -p xtask -- fuzz-smoke
+      - name: Enforce parser throughput regression floor
+        run: cargo run --release -p panea-bench -- parser-throughput

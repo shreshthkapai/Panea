@@ -1,0 +1,10 @@
+# DECSC/DECRC are per screen. An application saving the cursor on the alternate
+# screen must not clobber the position the shell saved on the primary one.
+size: 10x4
+description: each screen keeps its own saved cursor
+
+--- input
+\e[3;5H\e7\e[?1049h\e[1;1H\e7\e[?1049l\e8
+
+--- expect-cursor
+row=2 col=4

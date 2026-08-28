@@ -63,4 +63,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "osc7"
+path = "fuzz_targets/osc7.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

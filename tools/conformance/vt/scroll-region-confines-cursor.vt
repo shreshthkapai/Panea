@@ -1,0 +1,11 @@
+# With DECSTBM set, cursor-down is confined to the bottom margin whenever the
+# cursor is already inside the region, independent of origin mode. Applications
+# reserve a status row this way.
+size: 8x6
+description: cursor movement stops at the scrolling region's bottom margin
+
+--- input
+\e[2;4r\e[3;1H\e[20B
+
+--- expect-cursor
+row=3 col=0

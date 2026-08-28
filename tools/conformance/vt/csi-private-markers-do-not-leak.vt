@@ -1,0 +1,16 @@
+# Private markers and intermediates must be consumed with the sequence.
+# A parser that bails on '>' '$' or '!' prints the final byte as text, which is
+# what made modern TUIs show stray q/p characters on startup.
+size: 20x3
+description: private-marker and intermediate CSI sequences print nothing
+
+--- input
+\e[>q\e[?2026$p\e[!p\e[>4;2mAB
+
+--- expect-grid
+|AB|
+||
+||
+
+--- expect-cursor
+row=0 col=2

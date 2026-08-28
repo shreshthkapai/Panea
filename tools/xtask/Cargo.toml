@@ -19,7 +19,7 @@ config-core = { path = "../../crates/config-core" }
 config-toml = { path = "../../crates/config-toml" }
 diagnostics = { path = "../../crates/diagnostics" }
 image.workspace = true
-render-wgpu = { path = "../../crates/render-wgpu" }
+render-wgpu = { path = "../../crates/render-wgpu", features = ["conformance"] }
 security = { path = "../../crates/security" }
 serde_json.workspace = true
 sha2.workspace = true

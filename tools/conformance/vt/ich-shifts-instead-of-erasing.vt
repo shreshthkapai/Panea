@@ -1,0 +1,12 @@
+# ICH (CSI @) inserts blanks and shifts the rest of the line right. The
+# character under the cursor must move, not be overwritten -- shells use ICH for
+# mid-line insertion on every keystroke.
+size: 10x2
+description: insert-character shifts the cursor cell rightwards
+
+--- input
+abcd\e[1;3H\e[1@
+
+--- expect-grid
+|ab cd|
+||

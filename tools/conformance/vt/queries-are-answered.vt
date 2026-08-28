@@ -1,0 +1,13 @@
+# Feature probes must be answered or the application waits on a timeout. DA1
+# identifies the terminal, DSR 6 reports the cursor, and DECRQM reports whether
+# a mode is recognised.
+size: 12x3
+description: device and mode queries produce replies
+
+--- input
+\e[c\e[6n\e[?2026$p
+
+--- expect-reply
+\e[?
+\e[1;1R
+$y

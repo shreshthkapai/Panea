@@ -893,6 +893,9 @@ fn set_config_value(config: &mut AppConfig, path: &str, value: &ConfigValue) -> 
             config.renderer.present_mode = parse_present_mode(value_as_string_ref(value)?)?;
         }
         "renderer.gpu_timestamps" => config.renderer.gpu_timestamps = value_as_bool(value)?,
+        "renderer.text_gamma_adjustment" => {
+            config.renderer.text_gamma_adjustment = value_as_f64(value)? as f32;
+        }
         "font.family" => config.font.family = value_as_string(value)?,
         "font.size" => config.font.size = value_as_f64(value)?,
         "font.line_height" => config.font.line_height = value_as_f64(value)?,

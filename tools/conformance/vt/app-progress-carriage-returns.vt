@@ -1,0 +1,11 @@
+# Progress output overwrites one line with repeated carriage returns. The line
+# must show the final state only, with no residue from the longer earlier text.
+size: 20x2
+description: carriage-return progress updates leave no residue
+
+--- input
+downloading 10%\rdownloading 100%\r\e[Kdone
+
+--- expect-grid
+|done|
+||

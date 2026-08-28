@@ -34,6 +34,7 @@ const FULLSCREEN_CHROME_SURFACE_HEIGHT: u32 = 1_080;
 const FULLSCREEN_CHROME_HEIGHT: u32 = 36;
 const FULLSCREEN_CHROME_TRANSITION: Duration = Duration::from_millis(120);
 const FULLSCREEN_CHROME_FPS: u64 = 60;
+const DEFAULT_PARSER_THROUGHPUT_MIN_MIB_PER_SECOND: f64 = 5.0;
 
 fn main() -> ExitCode {
     match run() {
@@ -100,7 +101,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         "color-heavy" => parse_and_render("color-heavy", color_heavy_fixture(4_000), 2),
         "scrollback" => parse_fixture("scrollback", large_log_fixture(50_000), 1),
         "resize" => resize_bench(),
+        "resize-scrollback" => lazy_scrollback_resize_bench(),
         "parser-input" => parser_grid_input_cost(),
+        "parser-throughput" => parser_throughput_gate(),
         "input-latency" => {
             eprintln!(
                 "'input-latency' is retained as an alias; this benchmark measures parser/grid cost only. Use 'cargo xtask bench gui-input' for prompt-to-present latency."
@@ -120,7 +123,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 fn print_help() {
     println!(
-        "usage: cargo xtask bench <all|gui-startup|gui-prompt|gui-input|profiles|render-grid|render-full-ascii|render-mixed-unicode|render-emoji-heavy|render-fast-scrolling|render-large-scrollback-viewport|render-many-panes|render-coding-agent|render-partial-update|render-cursor-animation|render-command-blocks|cat-large-file|color-heavy|scrollback|resize|parser-input|unicode|alternate-screen|cursor-animation|command-blocks|fullscreen-chrome>"
+        "usage: cargo xtask bench <all|gui-startup|gui-prompt|gui-input|profiles|render-grid|render-full-ascii|render-mixed-unicode|render-emoji-heavy|render-fast-scrolling|render-large-scrollback-viewport|render-many-panes|render-coding-agent|render-partial-update|render-cursor-animation|render-command-blocks|cat-large-file|color-heavy|scrollback|resize|resize-scrollback|parser-input|parser-throughput|unicode|alternate-screen|cursor-animation|command-blocks|fullscreen-chrome>"
     );
 }
 
@@ -151,6 +154,7 @@ fn run_all() -> Result<(), Box<dyn Error>> {
     parse_fixture("scrollback", large_log_fixture(50_000), 1)?;
     resize_bench()?;
     parser_grid_input_cost()?;
+    parser_throughput_gate()?;
     parse_and_render("unicode", unicode_fixture(4_000), 2)?;
     parse_fixture("alternate-screen", alternate_screen_fixture(2_000), 20)?;
     cursor_animation_cost()?;
@@ -604,6 +608,66 @@ fn resize_bench() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn lazy_scrollback_resize_bench() -> Result<(), Box<dyn Error>> {
+    let mut terminal =
+        TerminalEmulator::with_scrollback_limit(CoreTerminalSize::new(120, 36), 50_000);
+    terminal.apply_bytes(&large_log_fixture(20_000))?;
+    let sizes = [
+        CoreTerminalSize::new(80, 24),
+        CoreTerminalSize::new(160, 48),
+        CoreTerminalSize::new(100, 30),
+        CoreTerminalSize::new(132, 40),
+    ];
+    let iterations = 16_u64;
+    let mut samples = Vec::with_capacity(iterations as usize);
+    let started = Instant::now();
+
+    for index in 0..iterations {
+        let sample_started = Instant::now();
+        terminal.resize(sizes[index as usize % sizes.len()])?;
+        samples.push(sample_started.elapsed());
+    }
+
+    samples.sort_unstable();
+    let stats = terminal.history_stats();
+    println!(
+        "bench=resize-scrollback p50={:?} p95={:?} p99={:?} canonical_lines={} canonical_cells={} materialized_lines={} materialized_rows={} cache_hits={} cache_misses={} cache_evictions={} row_count_cells_scanned={}",
+        duration_percentile(&samples, 50),
+        duration_percentile(&samples, 95),
+        duration_percentile(&samples, 99),
+        stats.canonical_logical_lines,
+        stats.canonical_cells,
+        stats.materialized_logical_lines,
+        stats.materialized_physical_rows,
+        stats.cache_hits,
+        stats.cache_misses,
+        stats.cache_evictions,
+        stats.row_count_cells_scanned,
+    );
+    if stats.materialized_logical_lines > 64 {
+        return Err("lazy history cache exceeded its configured logical-line budget".into());
+    }
+    let scan_budget = u64::try_from(stats.canonical_cells)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(6);
+    if stats.row_count_cells_scanned > scan_budget {
+        return Err(format!(
+            "resize rescanned cold history beyond the width-summary budget: {} cells scanned, budget {scan_budget}",
+            stats.row_count_cells_scanned
+        )
+        .into());
+    }
+
+    print_result(BenchmarkResult {
+        name: "resize-scrollback",
+        iterations,
+        bytes: 0,
+        elapsed: started.elapsed(),
+        instrumentation: RenderInstrumentation::default(),
+    });
+    Ok(())
+}
+
 fn parser_grid_input_cost() -> Result<(), Box<dyn Error>> {
     let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(DEFAULT_COLS, DEFAULT_ROWS));
     let sample_count = 2_000_usize;
@@ -631,6 +695,50 @@ fn parser_grid_input_cost() -> Result<(), Box<dyn Error>> {
         duration_percentile(&samples, 99),
     );
     Ok(())
+}
+
+fn parser_throughput_gate() -> Result<(), Box<dyn Error>> {
+    let fixture = large_log_fixture(50_000);
+    let iterations = 4_usize;
+    let bytes = fixture.len().saturating_mul(iterations);
+    let mut terminal = TerminalEmulator::new(CoreTerminalSize::new(DEFAULT_COLS, DEFAULT_ROWS));
+    let started = Instant::now();
+
+    for _ in 0..iterations {
+        for chunk in fixture.chunks(64 * 1024) {
+            terminal.apply_bytes(black_box(chunk))?;
+            black_box(terminal.state_mut().take_pending_output());
+        }
+    }
+
+    let elapsed = started.elapsed();
+    let throughput = throughput_mib_per_second(bytes, elapsed);
+    let minimum = env::var("PANEA_PARSER_MIN_MIB_PER_SEC")
+        .ok()
+        .map(|value| value.parse::<f64>())
+        .transpose()?
+        .unwrap_or(DEFAULT_PARSER_THROUGHPUT_MIN_MIB_PER_SECOND);
+    println!(
+        "bench=parser-throughput bytes={bytes} elapsed={elapsed:?} throughput_mib_per_second={throughput:.2} minimum_mib_per_second={minimum:.2}"
+    );
+    if !parser_throughput_passes(throughput, minimum) {
+        return Err(format!(
+            "parser throughput {throughput:.2} MiB/s is below the {minimum:.2} MiB/s regression gate"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn throughput_mib_per_second(bytes: usize, elapsed: Duration) -> f64 {
+    if elapsed.is_zero() {
+        return 0.0;
+    }
+    bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64()
+}
+
+fn parser_throughput_passes(actual: f64, minimum: f64) -> bool {
+    actual.is_finite() && minimum.is_finite() && actual >= minimum.max(0.0)
 }
 
 fn duration_percentile(sorted: &[Duration], percentile: usize) -> Duration {
@@ -870,6 +978,7 @@ fn generated_scene(cols: u16, rows: u16, feature_mode: OptionalFeatureCostMode) 
                     italic: col % 29 == 0,
                     underline: row % 9 == 0,
                     strikethrough: false,
+                    ..RenderCellStyle::default()
                 },
             });
         }
@@ -1030,6 +1139,8 @@ fn scene_from_terminal(terminal: &TerminalEmulator) -> RenderScene {
                 italic: cell.attributes.italic,
                 underline: cell.attributes.underline,
                 strikethrough: cell.attributes.strikethrough,
+                overline: cell.attributes.overline,
+                hidden: cell.attributes.hidden,
             },
         });
     }
@@ -1283,6 +1394,21 @@ mod tests {
         ];
         assert_eq!(duration_percentile(&samples, 50), Duration::from_micros(30));
         assert_eq!(duration_percentile(&samples, 95), Duration::from_micros(50));
+    }
+
+    #[test]
+    fn parser_throughput_uses_binary_megabytes_per_second() {
+        assert_eq!(
+            throughput_mib_per_second(4 * 1024 * 1024, Duration::from_secs(2)),
+            2.0
+        );
+        assert_eq!(throughput_mib_per_second(1024, Duration::ZERO), 0.0);
+    }
+
+    #[test]
+    fn parser_throughput_gate_rejects_samples_below_threshold() {
+        assert!(parser_throughput_passes(5.0, 5.0));
+        assert!(!parser_throughput_passes(4.99, 5.0));
     }
 
     #[test]

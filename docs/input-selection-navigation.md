@@ -64,11 +64,72 @@ and Escape closes search. While keyboard selection is active, arrows,
 Home/End, and PageUp/PageDown extend the range; Enter keeps the selection and
 leaves selection mode, while Escape clears it.
 
+## Keyboard Protocols
+
+Applications can ask for richer key reporting than legacy VT bytes allow. Panea
+supports two such protocols and never guesses between them by terminal or
+application name; the choice follows only the modes the application sets.
+
+### Legacy VT (default)
+
+With no protocol enabled, keys are encoded as the traditional bytes: printable
+text as itself, Ctrl+letter as a control character, navigation and function keys
+as CSI/SS3 sequences honouring normal/application cursor and keypad modes. Key
+releases and bare modifier presses produce nothing, because legacy encodings
+have no way to express them.
+
+### Kitty keyboard protocol (`CSI > flags u`)
+
+Flag 1 (disambiguate) keeps the legacy encoding for every key that has one, and
+uses CSI-u only where legacy is ambiguous or absent: Escape, F13 and above,
+Super-modified keys, and modified Enter/Tab/Backspace. Flag 8 (report all keys)
+moves everything to CSI-u. Flag 2 adds release and repeat events. An
+application that pushes flags but cannot parse CSI-u still gets working input,
+because flag 1 alone never changes plain text.
+
+### Win32 input mode (`CSI ? 9001 h`)
+
+This is the ConPTY contract used by Windows-native applications, including
+Windows-native multiplexers. Each key becomes a serialized
+`KEY_EVENT_RECORD`:
+
+```
+CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _
+```
+
+- `Vk` - Windows virtual-key code, `0` for text with no key behind it (IME).
+- `Sc` - PC set-1 scan code, `0` when unknown.
+- `Uc` - one UTF-16 code unit. A character outside the BMP is sent as two
+  records, one per surrogate, exactly as Windows reports it.
+- `Kd` - `1` for press, `0` for release.
+- `Cs` - control-key state bits: right Alt `0x01`, left Alt `0x02`, right Ctrl
+  `0x04`, left Ctrl `0x08`, Shift `0x10`, enhanced key `0x100`. AltGr is right
+  Alt plus left Ctrl (`0x09`), which is what Windows itself reports.
+- `Rc` - repeat count, at least `1`.
+
+Because the record carries the virtual key, the scan code, the character, and
+the modifier state independently, it expresses what legacy encodings cannot:
+Shift+Enter distinct from Enter distinct from Ctrl+Enter, Ctrl+Shift+letter,
+a modifier pressed on its own, key releases, left versus right modifiers, and
+enhanced (navigation cluster) keys.
+
+### Precedence
+
+When win32 input mode is on it wins, and kitty encoding is suppressed for as
+long as it stays on. An application that has enabled 9001 is reading console
+records; CSI-u sequences arriving on the same channel are either discarded or
+mistaken for text. Turning 9001 off restores whichever protocol the
+application had asked for before.
+
 ## Implementation Status
 
 - Shared key encoding covers printable/control text, Alt/AltGr, navigation,
   editing keys, F1-F12, normal/application cursor keys, and normal/application
   keypad keys.
+- The kitty keyboard protocol and win32 input mode are both implemented, with
+  win32 input mode taking precedence while it is set. Records carry virtual
+  key, scan code, UTF-16 unit, press/release, and control-key state, so key
+  releases, bare modifiers, AltGr, and Ctrl/Shift+Enter are all expressible.
 - Mouse reporting covers normal, button-motion, all-motion, wheel, legacy, and
   SGR reports. Focus reports are emitted only when requested by terminal mode.
 - Mouse and keyboard normal/rectangular selection use absolute buffer positions.

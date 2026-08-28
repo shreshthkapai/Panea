@@ -4,6 +4,10 @@ use term_core::{
     CellAttributes, ClearMode, Color, CursorDirection, GraphicRendition, GridPosition, Line,
     Selection, TerminalAction, TerminalCore, TerminalMode, TerminalSize, TerminalState,
 };
+use term_parser::TerminalEmulator;
+
+const MAX_CELL_GRAPHEME_SCALARS: usize = 16;
+const MAX_PENDING_OUTPUT_PER_STEP: usize = 64 * 1024;
 
 pub fn assert_terminal_invariants(terminal: &TerminalState) {
     let grid = terminal.grid();
@@ -20,6 +24,7 @@ pub fn assert_terminal_invariants(terminal: &TerminalState) {
         assert_eq!(line.cells.len(), cols);
         assert_line_invariants(&line);
     }
+    assert!(terminal.scrollback_lines().len() <= terminal.scrollback_limit());
 
     assert_eq!(terminal.visible_grid().cells.len(), rows * cols);
 
@@ -35,6 +40,7 @@ pub fn assert_terminal_invariants(terminal: &TerminalState) {
 
 fn assert_line_invariants(line: &Line) {
     for (index, cell) in line.cells.iter().enumerate() {
+        assert!(cell.text.chars().count() <= MAX_CELL_GRAPHEME_SCALARS);
         assert!(cell.width <= 2);
         if cell.wide_continuation {
             assert_eq!(cell.width, 0);
@@ -48,6 +54,26 @@ fn assert_line_invariants(line: &Line) {
             }
         }
     }
+}
+
+pub fn assert_pending_output_invariants(terminal: &mut TerminalState) {
+    let output = terminal.take_pending_output();
+    assert!(output.len() <= MAX_PENDING_OUTPUT_PER_STEP);
+    assert!(std::str::from_utf8(&output).is_ok());
+}
+
+pub fn assert_alt_screen_saved_cursor_round_trip(data: &[u8]) {
+    let row = u16::from(data.first().copied().unwrap_or(2) % 6) + 1;
+    let col = u16::from(data.get(1).copied().unwrap_or(3) % 20) + 1;
+    let mut terminal = TerminalEmulator::new(TerminalSize::new(24, 8));
+    let sequence = format!(
+        "\x1b[{row};{col}H\x1b7\x1b[?1049h\x1b[8;24H\x1b[?1049l\x1b8"
+    );
+    terminal.apply_bytes(sequence.as_bytes()).unwrap();
+    let cursor = terminal.cursor_state().position;
+    assert_eq!(cursor.row, i64::from(row - 1));
+    assert_eq!(cursor.col, col - 1);
+    assert_pending_output_invariants(terminal.state_mut());
 }
 
 pub fn fuzz_char(byte: u8) -> char {
@@ -77,6 +103,7 @@ pub fn fuzz_char(byte: u8) -> char {
 
 pub fn apply_grid_ops(data: &[u8]) {
     let mut terminal = TerminalState::new(TerminalSize::new(16, 6));
+    let mut scroll_region = None;
 
     for chunk in data.chunks(9) {
         let tag = byte(chunk, 0);
@@ -85,8 +112,13 @@ pub fn apply_grid_ops(data: &[u8]) {
         let c = u16_from(chunk, 5);
         let d = u16_from(chunk, 7);
         apply_grid_op(&mut terminal, tag, a, b, c, d);
+        update_scroll_region(&terminal, tag, a, c, &mut scroll_region);
         assert_terminal_invariants(&terminal);
+        assert_cursor_within_origin_margins(&terminal, scroll_region);
+        assert_pending_output_invariants(&mut terminal);
     }
+
+    assert_alt_screen_saved_cursor_round_trip(data);
 }
 
 pub fn apply_grid_op(terminal: &mut TerminalState, tag: u8, a: u16, b: u16, c: u16, d: u16) {
@@ -95,7 +127,7 @@ pub fn apply_grid_op(terminal: &mut TerminalState, tag: u8, a: u16, b: u16, c: u
     let col = (b % size.cols.max(1)) + 1;
     let count = (c % 16) + 1;
 
-    match tag % 27 {
+    match tag % 39 {
         0 => terminal
             .apply_action(TerminalAction::Print(fuzz_char((a ^ b ^ c ^ d) as u8)))
             .unwrap(),
@@ -169,7 +201,7 @@ pub fn apply_grid_op(terminal: &mut TerminalState, tag: u8, a: u16, b: u16, c: u
             })
             .unwrap(),
         20 => terminal
-            .apply_action(TerminalAction::SetGraphicRendition(vec![sgr(a, b, c, d)]))
+            .apply_action(TerminalAction::SetGraphicRendition(sgr(a, b, c, d)))
             .unwrap(),
         21 => terminal
             .apply_action(TerminalAction::SetScrollRegion {
@@ -185,7 +217,68 @@ pub fn apply_grid_op(terminal: &mut TerminalState, tag: u8, a: u16, b: u16, c: u
             .resize(TerminalSize::new((a % 96).max(1), (b % 32).max(1)))
             .unwrap(),
         25 => set_fuzz_selection(terminal, a, b, c, d, false),
-        _ => set_fuzz_selection(terminal, a, b, c, d, true),
+        26 => set_fuzz_selection(terminal, a, b, c, d, true),
+        27 => terminal
+            .apply_action(TerminalAction::SetMode {
+                mode: TerminalMode::Origin,
+                enabled: d % 2 == 0,
+            })
+            .unwrap(),
+        28 => terminal.apply_action(TerminalAction::ReverseIndex).unwrap(),
+        29 => terminal
+            .apply_action(TerminalAction::ScrollUp(count))
+            .unwrap(),
+        30 => terminal
+            .apply_action(TerminalAction::ScrollDown(count))
+            .unwrap(),
+        31 => terminal
+            .apply_action(TerminalAction::RepeatLastPrinted(count))
+            .unwrap(),
+        32 => terminal.apply_action(TerminalAction::SetTabStop).unwrap(),
+        33 => terminal.apply_action(TerminalAction::ClearTabStop).unwrap(),
+        34 => terminal
+            .apply_action(TerminalAction::ClearAllTabStops)
+            .unwrap(),
+        35 => terminal.apply_action(TerminalAction::SaveCursor).unwrap(),
+        36 => terminal.apply_action(TerminalAction::RestoreCursor).unwrap(),
+        37 => terminal
+            .apply_action(TerminalAction::BackTab(count))
+            .unwrap(),
+        _ => terminal.apply_action(TerminalAction::NextLine).unwrap(),
+    }
+}
+
+fn update_scroll_region(
+    terminal: &TerminalState,
+    tag: u8,
+    row_seed: u16,
+    count_seed: u16,
+    scroll_region: &mut Option<(i64, i64)>,
+) {
+    match tag % 39 {
+        21 => {
+            let rows = terminal.grid().size.rows.max(1);
+            let top = (row_seed % rows) + 1;
+            let count = (count_seed % 16) + 1;
+            let bottom = top.saturating_add(count).min(rows);
+            if top < bottom {
+                *scroll_region = Some((i64::from(top - 1), i64::from(bottom - 1)));
+            }
+        }
+        22 | 23 | 24 => *scroll_region = None,
+        _ => {}
+    }
+}
+
+fn assert_cursor_within_origin_margins(
+    terminal: &TerminalState,
+    scroll_region: Option<(i64, i64)>,
+) {
+    if terminal.modes_ref().contains(&TerminalMode::Origin)
+        && let Some((top, bottom)) = scroll_region
+    {
+        let row = terminal.cursor_state().position.row;
+        assert!(row >= top && row <= bottom);
     }
 }
 
@@ -238,9 +331,9 @@ fn sgr(a: u16, b: u16, c: u16, d: u16) -> GraphicRendition {
 pub fn fill_unicode_grid(terminal: &mut TerminalState, data: &[u8]) {
     let attributes = CellAttributes::default();
     terminal
-        .apply_action(TerminalAction::SetGraphicRendition(vec![
+        .apply_action(TerminalAction::SetGraphicRendition(
             GraphicRendition::Foreground(Color::DefaultForeground),
-        ]))
+        ))
         .unwrap();
     for byte in data {
         terminal
@@ -248,9 +341,9 @@ pub fn fill_unicode_grid(terminal: &mut TerminalState, data: &[u8]) {
             .unwrap();
     }
     terminal
-        .apply_action(TerminalAction::SetGraphicRendition(vec![
+        .apply_action(TerminalAction::SetGraphicRendition(
             GraphicRendition::Background(Color::DefaultBackground),
-        ]))
+        ))
         .unwrap();
     let _ = attributes;
 }

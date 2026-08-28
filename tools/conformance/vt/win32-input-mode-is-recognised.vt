@@ -1,0 +1,11 @@
+# DECSET 9001 is Windows win32-input-mode. The terminal tracks it so that key
+# encoding can defer to the Windows-native input contract while it is on, and
+# DECRQM reports it as a recognised, set mode rather than unknown.
+size: 12x3
+description: win32-input-mode is tracked and reported by DECRQM
+
+--- input
+\e[?9001h\e[?9001$p
+
+--- expect-reply
+\e[?9001;1$y
