@@ -4219,3 +4219,174 @@ fn window_chrome_changes_damage_old_and_new_surface_bounds() {
             .any(|region| region.y <= 12 && region.height >= 36)
     );
 }
+
+/// Bounds of every quad in a batch, for the coverage checks below.
+fn batch_quad_bounds(batch: &QuadBatch) -> Vec<RenderRect> {
+    batch
+        .vertices
+        .chunks_exact(4)
+        .map(|quad| {
+            quad_bounds([
+                quad[0].position_px,
+                quad[1].position_px,
+                quad[2].position_px,
+                quad[3].position_px,
+            ])
+        })
+        .collect()
+}
+
+fn covered(damage: &[DamageRegion], rect: RenderRect) -> bool {
+    damage.iter().any(|region| rect_contains(*region, rect))
+}
+
+/// Drives the real cursor runtime, damage tracker, and batch planner through a
+/// held-Enter prompt redraw sequence under retained damage, and checks the two
+/// invariants a partial redraw has to keep: everything drawn this frame lies in
+/// this frame's damage, and everything drawn last frame is either drawn again
+/// identically or lies in this frame's damage. A violation of the second is
+/// ink from an old frame that the new frame never clears.
+#[test]
+fn held_enter_prompt_redraws_never_leave_cursor_ink_outside_damage() {
+    let mut fonts = FontSystem::new(font_system::FontConfig::default());
+    let Ok(font_metrics) = fonts.cell_metrics() else {
+        return;
+    };
+    let settings = CursorAnimationSettings::panea(165, 4, 2_200_000);
+    let mut runtime = CursorAnimationRuntime::new();
+    let mut tracker = DamageTracker::new();
+    let mut planner = RenderBatchPlanner::default();
+
+    let beam = |row: i64, col: u16, visible: bool| CursorVisual {
+        position: CellPosition { row, col },
+        shape: RenderCursorShape::Beam,
+        color: RenderColor::rgb(245, 224, 220),
+        text_color: None,
+        visible,
+        thickness_percent: 22,
+        corner_radius_px: 0,
+        inactive: false,
+    };
+    let rows: i64 = 3;
+    let make_scene = |prompt_rows: &[i64], cursor: CursorVisual| {
+        let mut cells = Vec::new();
+        for &row in prompt_rows {
+            cells.push(cell(row, 0, "\u{276f}"));
+            cells.push(cell(row, 1, " "));
+        }
+        let mut s = scene(cells);
+        s.grid.columns = 12;
+        s.grid.rows = rows as u16;
+        s.cursor = Some(cursor);
+        s
+    };
+
+    let mut previous_ink: Vec<RenderRect> = Vec::new();
+    let mut frame_index = 0usize;
+    let mut check = |label: &str,
+                     scene: &RenderScene,
+                     batches: &PreparedRenderBatches,
+                     previous_ink: &mut Vec<RenderRect>,
+                     full: bool| {
+        let mut ink = batch_quad_bounds(&batches.cursor);
+        ink.extend(batch_quad_bounds(&batches.cursor_effects));
+        ink.extend(batch_quad_bounds(&batches.cursor_trail));
+        if !full {
+            for rect in &ink {
+                assert!(
+                    covered(&batches.damage_regions, *rect),
+                    "frame {frame_index} ({label}): cursor ink {rect:?} drawn outside damage {:?}",
+                    batches.damage_regions
+                );
+            }
+            for old in previous_ink.iter() {
+                let redrawn = ink.iter().any(|now| now == old);
+                assert!(
+                    redrawn || covered(&batches.damage_regions, *old),
+                    "frame {frame_index} ({label}): ink from the previous frame at {old:?} is neither redrawn nor cleared; damage={:?} cursor={:?} animations={}",
+                    batches.damage_regions,
+                    scene.cursor.map(|c| c.position),
+                    scene.animations.len()
+                );
+            }
+        }
+        *previous_ink = ink;
+        frame_index += 1;
+    };
+
+    // First frame: full.
+    let mut prompt_rows: Vec<i64> = vec![0];
+    let mut current = make_scene(&prompt_rows, beam(0, 2, true));
+    runtime.populate_scene(&mut current, font_metrics, settings);
+    current.damage_regions = tracker.update(&current, font_metrics);
+    let batches = planner
+        .prepare_full(&current, &mut fonts)
+        .expect("full frame");
+    check("initial", &current, &batches, &mut previous_ink, true);
+
+    let mut row = 0i64;
+    for enter in 0..8 {
+        // Enter: shell moves to the next line, cursor at column 0, then the
+        // prompt is written and the cursor lands after it. The right-aligned
+        // block sends the cursor far right in between, exactly as oh-my-posh
+        // does, and every one of those positions can be caught by a frame.
+        row = (row + 1) % rows;
+        prompt_rows.retain(|r| *r != row);
+        let steps: [(u16, bool, bool); 4] = [
+            (0, false, false), // CR, cursor hidden while redrawing
+            (11, true, false), // right prompt block written
+            (0, true, false),  // back to the start of the line
+            (2, true, true),   // prompt text landed, cursor after it
+        ];
+        for (col, visible, with_prompt) in steps {
+            if with_prompt {
+                prompt_rows.push(row);
+            }
+            let mut next = make_scene(&prompt_rows, beam(row, col, visible));
+            runtime.populate_scene(&mut next, font_metrics, settings);
+            next.damage_regions = tracker.update(&next, font_metrics);
+            let batches = planner.prepare(&next, &mut fonts).expect("content frame");
+            check("content", &next, &batches, &mut previous_ink, false);
+            current = next;
+
+            // Animation frames until the runtime is quiet, but on the odd
+            // Enters interrupt them early: a held key does not wait.
+            let mut ticks = 0;
+            while runtime.needs_frame() {
+                std::thread::sleep(Duration::from_millis(4));
+                runtime.refresh_retained_scene(&mut current, font_metrics, settings);
+                current.damage_regions = tracker.update_animations_only(&current, font_metrics);
+                let batches = planner
+                    .prepare(&current, &mut fonts)
+                    .expect("animation frame");
+                check("animation", &current, &batches, &mut previous_ink, false);
+                ticks += 1;
+                if enter % 2 == 1 && ticks >= 3 {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Settle completely and confirm the static cursor is drawn where the
+    // terminal says it is.
+    while runtime.needs_frame() {
+        std::thread::sleep(Duration::from_millis(4));
+        runtime.refresh_retained_scene(&mut current, font_metrics, settings);
+        current.damage_regions = tracker.update_animations_only(&current, font_metrics);
+        let batches = planner.prepare(&current, &mut fonts).expect("settle frame");
+        check("settle", &current, &batches, &mut previous_ink, false);
+    }
+    runtime.refresh_retained_scene(&mut current, font_metrics, settings);
+    current.damage_regions = tracker.update_animations_only(&current, font_metrics);
+    let final_batches = planner.prepare(&current, &mut fonts).expect("final frame");
+    let cursor_cell = cell_region(current.cursor.expect("cursor").position, font_metrics);
+    let drawn = batch_quad_bounds(&final_batches.cursor);
+    assert!(
+        drawn.iter().any(|rect| rect_contains(cursor_cell, *rect))
+            || previous_ink
+                .iter()
+                .any(|rect| rect_contains(cursor_cell, *rect)),
+        "after settling, the cursor must be drawn inside its own cell {cursor_cell:?}; drawn={drawn:?} previous={previous_ink:?}"
+    );
+}
