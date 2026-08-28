@@ -71,6 +71,14 @@ Can diagnostics show its cost? Glyph cache hits/misses and atlas uploads/occupan
 - Swash rasterizes monochrome outlines, COLR/CPAL color outlines, and embedded
   color bitmaps. The GPU atlas stores RGBA data so color emoji are not tinted by
   the terminal foreground color.
+- Glyph coverage reaches the surface unaltered by default. The renderer
+  applies `pow(coverage, 1.0 / renderer.text_gamma_adjustment)` before
+  coverage becomes alpha, and the default of `1.0` makes that the identity, so
+  a stroke is as heavy as the outline the font designer drew. Values above
+  `1.0` deliberately add ink to partially covered pixels; see
+  [Configuration](config.md) for the measured effect. Blending itself is
+  gamma-correct: colors are converted to linear before the blend and the
+  surface encodes back to sRGB.
 - Monochrome glyphs use grayscale alpha masks. LCD subpixel masks are not used
   without a known display pixel geometry and an opaque composition path, because
   applying them to transparent surfaces or incompatible monitor layouts creates

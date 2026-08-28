@@ -924,13 +924,13 @@ fn transparent_surface_prefers_premultiplied_compositing_and_blending() {
 }
 
 #[test]
-fn text_gamma_adjustment_strengthens_partial_glyph_coverage() {
+fn text_gamma_adjustment_is_identity_by_default_and_strengthens_coverage_when_raised() {
     let adjusted = adjust_text_coverage(0.25, 1.2);
 
     assert!(adjusted > 0.25);
     assert!(adjusted < 1.0);
     assert_eq!(adjust_text_coverage(0.25, 1.0), 0.25);
-    assert_eq!(RendererOptions::default().text_gamma_adjustment, 1.2);
+    assert_eq!(RendererOptions::default().text_gamma_adjustment, 1.0);
 }
 
 #[test]

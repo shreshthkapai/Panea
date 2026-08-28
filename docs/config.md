@@ -267,6 +267,57 @@ Clicking its first metrics row opens controls for detail, placement, and hide.
 When persistence is enabled, those runtime choices are stored in Panea's OS
 state directory without rewriting the portable config file.
 
+## Renderer
+
+All renderer keys are portable and apply identically on Windows, macOS, Linux
+X11, and Linux Wayland.
+
+```toml
+[renderer]
+backend = "auto"                # auto, or a specific WGPU backend
+vsync = true                    # present synchronized to the display refresh
+present_mode = "auto"           # auto, fifo, mailbox, immediate
+damage_tracking = false         # partial redraw of changed cells only
+gpu_timestamps = false          # GPU timestamp queries for diagnostics
+text_gamma_adjustment = 1.0     # 1.0-2.0; glyph coverage curve
+```
+
+### `text_gamma_adjustment`
+
+Glyph coverage is raised to the power `1.0 / text_gamma_adjustment` before it
+becomes alpha. At the default of `1.0` the curve is the identity: a pixel that
+the rasterizer says is 40% covered is drawn at 40% alpha, which is the
+gamma-correct result and matches what the platform rasterizer intends.
+
+Values above `1.0` add ink to every partially covered pixel, which makes text
+progressively heavier. The effect is strongest exactly where the eye reads
+stroke weight, because faint edge pixels gain the most:
+
+| rasterizer coverage | at 1.2 | extra ink |
+| --- | --- | --- |
+| 0.10 | 0.147 | +47% |
+| 0.25 | 0.315 | +26% |
+| 0.50 | 0.561 | +12% |
+| 0.75 | 0.787 | +5% |
+
+Measured over a full ASCII sample rendered with CaskaydiaCove NF at 10.4pt on a
+133% display, 89.6% of all lit pixels are partially covered, and `1.2` adds
+7.0% total ink across the sample. Raise the value only if you deliberately want
+heavier text than the font designer's outlines; the range is clamped to
+`1.0..=2.0` and anything outside it is a config error.
+
+### `damage_tracking`
+
+When enabled, Panea retains the previous frame and redraws only the cells whose
+content changed, which lowers GPU work on mostly-static screens. It defaults to
+off because correctness depends on every changed pixel being covered by a
+damage region: text damage is expanded by two cells on either side so ligatures
+and horizontally overhanging glyphs repaint whole, but there is no vertical
+expansion, and cursor-only movement damages a single cell. Fonts whose ink
+leaves the cell box vertically, or glyphs wider than the cell they are assigned
+(many non-Mono Nerd Font icons), can leave residue from the previous frame that
+reads as doubled or thickened text. Turn it off if you see that.
+
 Mux drag behavior is portable and can be disabled independently:
 
 ```toml

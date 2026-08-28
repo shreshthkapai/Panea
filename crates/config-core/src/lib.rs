@@ -1173,7 +1173,7 @@ impl Default for RendererConfig {
             damage_tracking: false,
             present_mode: PresentModePreference::Auto,
             gpu_timestamps: false,
-            text_gamma_adjustment: 1.2,
+            text_gamma_adjustment: 1.0,
         }
     }
 }
@@ -4206,7 +4206,7 @@ mod tests {
         assert_eq!(config.font.family, FontConfig::default().family);
         assert_eq!(config.font.size, 14.0);
         assert!(!config.renderer.damage_tracking);
-        assert_eq!(config.renderer.text_gamma_adjustment, 1.2);
+        assert_eq!(config.renderer.text_gamma_adjustment, 1.0);
     }
 
     #[test]

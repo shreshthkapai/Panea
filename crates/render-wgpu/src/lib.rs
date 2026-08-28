@@ -241,7 +241,7 @@ impl Default for RendererOptions {
             present_mode: PresentMode::Auto,
             damage_tracking: false,
             gpu_timestamps: false,
-            text_gamma_adjustment: 1.2,
+            text_gamma_adjustment: 1.0,
             transparent: false,
             glyph_cache_entries: 8192,
             background: RenderColor::rgb(12, 12, 12),

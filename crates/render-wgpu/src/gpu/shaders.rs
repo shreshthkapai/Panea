@@ -159,7 +159,7 @@ fn quad_primitive_state() -> wgpu::PrimitiveState {
 }
 
 const BATCH_SHADER: &str = r#"
-override text_gamma_adjustment: f32 = 1.2;
+override text_gamma_adjustment: f32 = 1.0;
 
 struct VertexIn {
     @location(0) position_0: vec2<f32>,
