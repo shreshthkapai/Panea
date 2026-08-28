@@ -1,5 +1,9 @@
 // Cursor blink, movement, trail, pulse, and bounded animation state.
 
+/// Cursor moves shorter than this stay snappy (typing keeps the tilt); longer
+/// ones -- pane switches, prompt redraws -- glide instead.
+const PANEA_CURSOR_JUMP_THRESHOLD_CELLS: u16 = 2;
+
 #[derive(Debug)]
 pub struct CursorBlinkRuntime {
     phase_started: Instant,
@@ -77,6 +81,9 @@ pub struct CursorAnimationSettings {
     pub enabled: bool,
     pub tilt: bool,
     pub smooth_movement: bool,
+    /// Cells the cursor must travel on either axis before `smooth_movement`
+    /// takes over from `tilt`. Zero animates every move.
+    pub jump_threshold_cells: u16,
     pub typing_pulse: bool,
     pub typing_stretch: bool,
     pub trail: bool,
@@ -98,6 +105,7 @@ impl Default for CursorAnimationSettings {
             enabled: false,
             tilt: false,
             smooth_movement: false,
+            jump_threshold_cells: 0,
             typing_pulse: false,
             typing_stretch: false,
             trail: false,
@@ -353,7 +361,8 @@ impl CursorAnimationSettings {
         Self {
             enabled: true,
             tilt: true,
-            smooth_movement: false,
+            smooth_movement: true,
+            jump_threshold_cells: PANEA_CURSOR_JUMP_THRESHOLD_CELLS,
             typing_pulse: false,
             typing_stretch: false,
             trail: false,
@@ -487,7 +496,23 @@ impl CursorAnimationRuntime {
                 && previous.position != cursor.position
             {
                 let previous_cell = cell_region(previous.position, metrics);
+                // A focus jump -- switching panes, or a prompt redrawing further
+                // down -- moves the cursor an arbitrary distance on both axes.
+                // Tilt only models same-row shear, so it never fires for stacked
+                // panes and stops firing for side-by-side ones the moment the two
+                // prompts land on different rows. Glide those instead: smooth
+                // movement recomputes its affected region from the interpolated
+                // cell every frame, so damage stays cell-sized however far the
+                // cursor travelled.
+                let glide = settings.smooth_movement
+                    && !cursor_trail_move_within_threshold(
+                        previous_cell,
+                        current_cell,
+                        [current_cell.width, current_cell.height],
+                        settings.jump_threshold_cells,
+                    );
                 if settings.tilt
+                    && !glide
                     && previous.position.row == cursor.position.row
                     && previous.position.col != cursor.position.col
                 {
@@ -503,7 +528,7 @@ impl CursorAnimationRuntime {
                         metrics,
                     );
                 }
-                if settings.smooth_movement {
+                if glide {
                     self.push_animation(
                         settings,
                         CursorAnimationSpec {

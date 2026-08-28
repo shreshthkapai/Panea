@@ -2532,6 +2532,101 @@ fn panea_cursor_motion_tilts_and_extends_left() {
 }
 
 #[test]
+fn panea_pane_switch_glides_in_both_split_directions() {
+    let settings = CursorAnimationSettings::panea(165, 4, 2_200_000);
+    let beam = |row: i64, col: u16| CursorVisual {
+        position: CellPosition { row, col },
+        shape: RenderCursorShape::Beam,
+        color: RenderColor::rgb(120, 190, 255),
+        text_color: None,
+        visible: true,
+        thickness_percent: 22,
+        corner_radius_px: 0,
+        inactive: false,
+    };
+    // Side-by-side panes land on the same row only until the two prompts drift
+    // apart; stacked panes never share a row. Both must animate every time.
+    for (label, from, to) in [
+        ("vertical split, prompts aligned", beam(0, 2), beam(0, 60)),
+        ("vertical split, prompts drifted", beam(0, 2), beam(7, 60)),
+        ("horizontal split", beam(1, 4), beam(20, 4)),
+    ] {
+        let mut runtime = CursorAnimationRuntime::new();
+        let mut initial = scene(vec![cell(0, 0, "a")]);
+        initial.cursor = Some(from);
+        runtime.populate_scene(&mut initial, metrics(), settings);
+
+        let mut switched = scene(vec![cell(0, 0, "a")]);
+        switched.cursor = Some(to);
+        runtime.populate_scene(&mut switched, metrics(), settings);
+
+        let glide = switched
+            .animations
+            .iter()
+            .find(|animation| animation.kind == AnimationKind::CursorSmoothMovement)
+            .unwrap_or_else(|| panic!("{label}: pane switch should glide the cursor"));
+        assert!(
+            glide
+                .affected_region
+                .width
+                .saturating_mul(glide.affected_region.height)
+                <= settings.max_animated_region_pixels,
+            "{label}: glide damage must stay bounded, got {:?}",
+            glide.affected_region
+        );
+        assert!(
+            switched
+                .animations
+                .iter()
+                .all(|animation| animation.kind != AnimationKind::CursorTilt),
+            "{label}: a glide replaces the tilt rather than drawing both cursors"
+        );
+        assert!(
+            runtime.needs_frame(),
+            "{label}: glide must keep frames coming"
+        );
+    }
+}
+
+#[test]
+fn panea_typing_keeps_the_tilt_instead_of_gliding() {
+    let settings = CursorAnimationSettings::panea(165, 4, 2_200_000);
+    let beam = |col| CursorVisual {
+        position: CellPosition { row: 0, col },
+        shape: RenderCursorShape::Beam,
+        color: RenderColor::rgb(120, 190, 255),
+        text_color: None,
+        visible: true,
+        thickness_percent: 22,
+        corner_radius_px: 0,
+        inactive: false,
+    };
+    let mut runtime = CursorAnimationRuntime::new();
+    let mut initial = scene(vec![cell(0, 0, "a")]);
+    initial.cursor = Some(beam(4));
+    runtime.populate_scene(&mut initial, metrics(), settings);
+
+    let mut typed = scene(vec![cell(0, 0, "a")]);
+    typed.cursor = Some(beam(5));
+    runtime.populate_scene(&mut typed, metrics(), settings);
+
+    assert!(
+        typed
+            .animations
+            .iter()
+            .any(|animation| animation.kind == AnimationKind::CursorTilt),
+        "single-cell typing motion should keep the tilt"
+    );
+    assert!(
+        typed
+            .animations
+            .iter()
+            .all(|animation| animation.kind != AnimationKind::CursorSmoothMovement),
+        "typing must not pay for a glide"
+    );
+}
+
+#[test]
 fn panea_motion_batches_tilt_and_extension_without_legacy_trail() {
     let settings = CursorAnimationSettings::panea(165, 4, 250_000);
     let beam = |col| CursorVisual {
@@ -2639,6 +2734,7 @@ fn cursor_animations_damage_only_cursor_regions() {
         enabled: true,
         tilt: false,
         smooth_movement: true,
+        jump_threshold_cells: 0,
         typing_pulse: true,
         typing_stretch: true,
         trail: true,

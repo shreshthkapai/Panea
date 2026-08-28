@@ -790,9 +790,12 @@ fn panea_cursor_animation_profile_compiles_to_a_fast_tilt_overlay() {
     assert!(settings.enabled);
     assert!(settings.tilt);
     assert!(!settings.trail);
-    assert!(!settings.smooth_movement);
     assert!(!settings.typing_pulse);
     assert!(!settings.typing_stretch);
+    // Tilt covers typing; the glide covers focus jumps such as pane switches,
+    // which tilt cannot express because it only shears within a row.
+    assert!(settings.smooth_movement);
+    assert!(settings.jump_threshold_cells > 0);
 }
 
 #[test]

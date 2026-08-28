@@ -2292,6 +2292,7 @@ fn cursor_animation_settings(config: &AppConfig) -> CursorAnimationSettings {
         enabled: config.cursor.animations_enabled,
         tilt: false,
         smooth_movement: config.cursor.smooth_movement,
+        jump_threshold_cells: 0,
         typing_pulse: config.cursor.typing_pulse,
         typing_stretch: config.cursor.typing_stretch,
         trail: config.cursor.trail,
