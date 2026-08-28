@@ -51,7 +51,9 @@ pub struct ConfigWatcher {
     options: ConfigLoadOptions,
     poll_interval: Duration,
     debounce: Duration,
+    content_check_interval: Duration,
     last_poll: Option<Instant>,
+    last_content_check: Option<Instant>,
     last_seen: Option<FileFingerprint>,
     pending: Option<PendingReload>,
 }
@@ -87,12 +89,15 @@ struct FileFingerprint {
 impl ConfigWatcher {
     #[must_use]
     pub fn new(options: ConfigLoadOptions) -> Self {
+        let now = Instant::now();
         let last_seen = current_fingerprint(&options).ok().flatten();
         Self {
             options,
             poll_interval: Duration::from_millis(500),
             debounce: Duration::from_millis(150),
+            content_check_interval: Duration::from_secs(2),
             last_poll: None,
+            last_content_check: Some(now),
             last_seen,
             pending: None,
         }
@@ -110,6 +115,12 @@ impl ConfigWatcher {
         self
     }
 
+    #[must_use]
+    pub fn with_content_check_interval(mut self, interval: Duration) -> Self {
+        self.content_check_interval = interval;
+        self
+    }
+
     pub fn poll(&mut self) -> ConfigWatchEvent {
         let now = Instant::now();
         if let Some(last_poll) = self.last_poll
@@ -119,17 +130,25 @@ impl ConfigWatcher {
         }
         self.last_poll = Some(now);
 
+        let verify_contents = self
+            .last_content_check
+            .is_none_or(|last_check| now.duration_since(last_check) >= self.content_check_interval);
+        if verify_contents {
+            self.last_content_check = Some(now);
+        }
+
         let previous = self
             .pending
             .as_ref()
             .and_then(|pending| pending.fingerprint.as_ref())
             .or(self.last_seen.as_ref());
-        let fingerprint = match current_fingerprint_if_changed(&self.options, previous) {
-            Ok(fingerprint) => fingerprint,
-            Err(error) => {
-                return ConfigWatchEvent::Failed { path: None, error };
-            }
-        };
+        let fingerprint =
+            match current_fingerprint_if_changed(&self.options, previous, verify_contents) {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    return ConfigWatchEvent::Failed { path: None, error };
+                }
+            };
 
         if fingerprint == self.last_seen {
             self.pending = None;
@@ -239,21 +258,27 @@ impl Error for ConfigTomlError {}
 fn current_fingerprint(
     options: &ConfigLoadOptions,
 ) -> Result<Option<FileFingerprint>, ConfigTomlError> {
-    current_fingerprint_if_changed(options, None)
+    current_fingerprint_if_changed(options, None, true)
 }
 
 fn current_fingerprint_if_changed(
     options: &ConfigLoadOptions,
     previous: Option<&FileFingerprint>,
+    verify_contents: bool,
 ) -> Result<Option<FileFingerprint>, ConfigTomlError> {
     if let Some(path) = &options.explicit_path {
-        return fingerprint_for_path_if_changed(path, previous, |path| fs::read(path)).map(Some);
+        return fingerprint_for_path_if_changed(path, previous, verify_contents, |path| {
+            fs::read(path)
+        })
+        .map(Some);
     }
 
     for path in candidate_paths_from_platform(options.platform) {
         if path.exists() {
-            return fingerprint_for_path_if_changed(&path, previous, |path| fs::read(path))
-                .map(Some);
+            return fingerprint_for_path_if_changed(&path, previous, verify_contents, |path| {
+                fs::read(path)
+            })
+            .map(Some);
         }
     }
 
@@ -267,6 +292,7 @@ fn candidate_paths_from_platform(platform: ConfigPlatform) -> Vec<PathBuf> {
 fn fingerprint_for_path_if_changed(
     path: &Path,
     previous: Option<&FileFingerprint>,
+    verify_contents: bool,
     read: impl FnOnce(&Path) -> io::Result<Vec<u8>>,
 ) -> Result<FileFingerprint, ConfigTomlError> {
     let metadata = match fs::metadata(path) {
@@ -299,6 +325,7 @@ fn fingerprint_for_path_if_changed(
         && previous.exists
         && previous.modified == modified
         && previous.len == len
+        && !verify_contents
     {
         return Ok(previous.clone());
     }
@@ -1466,12 +1493,12 @@ mod tests {
         let path = temp_config_path("unchanged-file-stamp-skips-content-read");
         fs::write(&path, "[window]\ntitle = \"Stable\"\n").expect("write stable config");
         let reads = std::cell::Cell::new(0_u32);
-        let first = fingerprint_for_path_if_changed(&path, None, |path| {
+        let first = fingerprint_for_path_if_changed(&path, None, false, |path| {
             reads.set(reads.get() + 1);
             fs::read(path)
         })
         .expect("initial fingerprint");
-        let second = fingerprint_for_path_if_changed(&path, Some(&first), |path| {
+        let second = fingerprint_for_path_if_changed(&path, Some(&first), false, |path| {
             reads.set(reads.get() + 1);
             fs::read(path)
         })
@@ -1479,6 +1506,24 @@ mod tests {
 
         assert_eq!(second, first);
         assert_eq!(reads.get(), 1, "unchanged metadata must avoid another read");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn content_verification_detects_same_metadata_rewrite() {
+        let path = temp_config_path("content-verification-detects-same-metadata-rewrite");
+        let initial = b"[font]\nsize = 13.0\n";
+        let changed = b"[font]\nsize = 17.0\n";
+        fs::write(&path, initial).expect("write initial config");
+
+        let first = fingerprint_for_path_if_changed(&path, None, false, |_| Ok(initial.to_vec()))
+            .expect("initial fingerprint");
+        let second =
+            fingerprint_for_path_if_changed(&path, Some(&first), true, |_| Ok(changed.to_vec()))
+                .expect("verified fingerprint");
+
+        assert_ne!(second, first, "content verification must detect the edit");
 
         let _ = fs::remove_file(path);
     }

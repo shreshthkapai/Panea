@@ -18,12 +18,13 @@ fn config_changes_wake_the_event_loop_without_ui_thread_polling() {
     let path = std::env::temp_dir().join(format!("panea-config-watch-{unique}.toml"));
     fs::write(&path, "[font]\nsize = 13.0\n").expect("write initial config");
 
-    let watcher = DesktopConfigWatcher::Toml(config_toml::ConfigWatcher::new(
-        config_toml::ConfigLoadOptions {
+    let watcher = DesktopConfigWatcher::Toml(
+        config_toml::ConfigWatcher::new(config_toml::ConfigLoadOptions {
             explicit_path: Some(path.clone()),
             ..config_toml::ConfigLoadOptions::default()
-        },
-    ));
+        })
+        .with_content_check_interval(Duration::ZERO),
+    );
     let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = Arc::clone(&wakes);
     let mut watch = DesktopConfigWatchThread::spawn(
