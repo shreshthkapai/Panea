@@ -20,6 +20,16 @@ Every implementation task must obey these rules:
    verification path.
 10. Every cross-platform feature must degrade clearly if the platform blocks
     exact behavior.
+11. Never regenerate screenshot baselines in the same commit as a renderer,
+    shaping, or rasterization change. Capture the change first, let
+    `cargo xtask screenshot verify` fail, and record what it reported; then
+    re-bless the baselines in a separate commit that names the visual
+    difference and why it is intended. Baselines blessed alongside the change
+    that caused them defend the change instead of revealing it.
+12. A default that alters what every user sees is part of the change it ships
+    with: document it in `docs/config.md` and state the reason in the commit
+    message. An undocumented visual default is a regression even when the
+    code behind it is correct.
 
 Panea's core promise is:
 
